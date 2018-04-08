@@ -11,6 +11,8 @@ tags: [storage]
 
 [Alanwu’s blog](http://blog.51cto.com/alanwu)
 
-[Fast16](https://www.usenix.org/conference/fast16)
+[Fast18](https://www.usenix.org/conference/fast18)
 
 [Fast17](https://www.usenix.org/conference/fast17)
+
+[Fast16](https://www.usenix.org/conference/fast16)
