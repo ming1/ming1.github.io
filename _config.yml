@@ -23,7 +23,6 @@ url: "" # the base hostname & protocol for your site, e.g. http://example.com
 github_username:  ming1
 
 # Build settings
-markdown: CommonMark
 theme: minima
 plugins:
   - jekyll-feed
