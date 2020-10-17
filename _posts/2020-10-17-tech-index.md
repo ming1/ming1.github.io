@@ -1,5 +1,5 @@
 ---
-title: technical paper index
+title: Technical paper index
 date: 2020-10-17 00:18:03
 ---
 
