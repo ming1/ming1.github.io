@@ -15,10 +15,13 @@ date: 2020-10-17 00:18:03
      - [Fast17](https://www.usenix.org/conference/fast17)
      - [Fast16](https://www.usenix.org/conference/fast16)
    - Useful links
-     - [Wu Dong's sysnote](http://www.sysnote.org/)
      - [Accela's Blog](http://accelazh.github.io/)
      - [Alanwu’s blog](http://blog.51cto.com/alanwu)
 
 3. Programming
+   - Markdown
+     - [Basic Syntax](https://www.markdownguide.org/basic-syntax/)
+     - [Cheat Sheet](https://www.markdownguide.org/cheat-sheet/)
+     - [Github Docs in CN](https://docs.github.com/cn/free-pro-team@latest/github/writing-on-github/basic-writing-and-formatting-syntax)
    - coding topics
-     - [careercup](https://www.careercup.com/)
+     - [Careercup](https://www.careercup.com/)
