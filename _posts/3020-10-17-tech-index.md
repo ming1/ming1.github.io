@@ -8,7 +8,7 @@ date: 2020-10-17 00:18:03
      - [aarch64 MTE introduction](https://lwn.net/Articles/834289/)
 
 2. Storage
-   -  File and Storage Technologies
+   - File and Storage Technologies
      - [Fast20](https://www.usenix.org/conference/fast20)
      - [Fast19](https://www.usenix.org/conference/fast19)
      - [Fast18](https://www.usenix.org/conference/fast18)
