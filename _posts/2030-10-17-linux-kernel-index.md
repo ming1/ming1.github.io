@@ -1,6 +1,8 @@
 ---
 title: Linux kernel index
 date: 2020-10-17 00:18:03
+category: linux kernel
+tags: [reference, link]
 ---
 
 1. Networking

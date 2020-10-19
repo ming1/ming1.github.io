@@ -1,6 +1,8 @@
 ---
 title: Technical paper index
 date: 2020-10-17 00:18:03
+category: tech
+tags: [reference, link]
 ---
 
 1. Architecture
