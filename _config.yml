@@ -27,15 +27,6 @@ theme: minima
 plugins:
   - jekyll-feed
 
-permalink: /:categories/:title/
-
-# List of links in the navigation bar
-navbar-links:
-  Page: "https://ming1.github.io"
-  Category: "https://ming1.github.io/categories/"
-  Tags: "https://ming1.github.io/tags/"
-  Search: "search"
-
 # Exclude from processing.
 # The following items will not be processed, by default. Create a custom list
 # to override the default setting.
