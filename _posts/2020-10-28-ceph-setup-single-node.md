@@ -1,10 +1,10 @@
 ---
-title: How to deploy simple ceph test environment on single node with Fedora 31
+title: Setup ceph test environment on single node with F31 
 category: tech
 tags: [ceph, test, dev-tips]
 ---
 
-How to deploy simple ceph test environment on single node with Fedora 31
+Setup ceph test environment on single node with F31
 
 # Prepare environment
 
@@ -18,7 +18,7 @@ then restart sshd service:
   
 	#systemctl restart sshd.service 
 
-3 disable fireware
+3 disable firewall
 
 	systemctl stop firewalld
 	systemctl disable firewalld
@@ -35,9 +35,9 @@ then restart sshd service:
 
 # Install ceph packages
 
-1 install ceph packages
+1 install ceph
 
-yum install -y ceph-common ceph-mon ceph-mgr ceph-mds ceph-osd ceph-radosgw
+yum install -y ceph-common ceph-mon ceph-mgr ceph-mds ceph-osd ceph-radosgw rbd-nbd
 
 2 install ceph-deploy via pip since no such packages shipped on F31
 
