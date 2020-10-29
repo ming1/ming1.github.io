@@ -6,7 +6,7 @@ tags: [ceph, test, dev-tips]
 
 Setup ceph test environment on single node with F31
 
-# Prepare environment
+# **Prepare environment**
 
 1 create VM from Fedora 31 cloud image
 
@@ -33,18 +33,15 @@ then restart sshd service:
 
 5 reboot VM
 
-# Install ceph packages
+# **Install ceph packages**
 
-1 install ceph
+	#install ceph
+	yum install -y ceph-common ceph-mon ceph-mgr ceph-mds ceph-osd ceph-radosgw rbd-nbd
+	
+	#install ceph-deploy via pip because F31 doesn't ship this package
+	pip3 install ceph-deploy
 
-yum install -y ceph-common ceph-mon ceph-mgr ceph-mds ceph-osd ceph-radosgw rbd-nbd
-
-2 install ceph-deploy via pip since no such packages shipped on F31
-
-pip3 install ceph-deploy
-
-
-# Setup ceph
+# **Setup ceph**
 
 	ND=$1	#hostname
 	DISK=$2 #disk used for OSD
@@ -67,6 +64,6 @@ pip3 install ceph-deploy
 	#create one pool
 	ceph osd pool create datastore 64 64
 
-# References:
+# **References**
 
 [centos7.5 ceph单机版安装](http://blog.leanote.com/post/dhzbh@163.com/centos7.5-ceph%E5%8D%95%E6%9C%BA%E7%89%88%E5%AE%89%E8%A3%85)
