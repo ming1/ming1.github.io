@@ -19,6 +19,7 @@ tags: [reference, link]
    - Useful links
      - [Accela's Blog](http://accelazh.github.io/)
      - [Alanwu’s blog](http://blog.51cto.com/alanwu)
+     - [SSD tips](http://www.storagesearch.com/)
 
 3. Programming
    - Markdown
