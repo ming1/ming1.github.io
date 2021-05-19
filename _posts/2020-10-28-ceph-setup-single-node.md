@@ -67,3 +67,5 @@ then restart sshd service:
 # **References**
 
 [centos7.5 ceph单机版安装](http://blog.leanote.com/post/dhzbh@163.com/centos7.5-ceph%E5%8D%95%E6%9C%BA%E7%89%88%E5%AE%89%E8%A3%85)
+
+[ceph-deploy fix on Fedora 33](https://bugs.launchpad.net/ubuntu/+source/ceph-deploy/+bug/1864993)
