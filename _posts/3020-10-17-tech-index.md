@@ -28,3 +28,7 @@ tags: [reference, link]
      - [Github Docs in CN](https://docs.github.com/cn/free-pro-team@latest/github/writing-on-github/basic-writing-and-formatting-syntax)
    - coding topics
      - [Careercup](https://www.careercup.com/)
+
+4. Virtualization
+   - kvm/qcow2
+     - [Good introduction in Chinese](https://royhunter.github.io/)
