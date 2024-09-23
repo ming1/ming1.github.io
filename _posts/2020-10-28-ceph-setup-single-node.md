@@ -1,6 +1,6 @@
 ---
 title: Setup ceph test environment on single node with F31 
-category: tech
+category: operation
 tags: [ceph, test, dev-tips]
 ---
 

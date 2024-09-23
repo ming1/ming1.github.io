@@ -1,7 +1,7 @@
 ---
 title: How to add/remove qemu device from script
-category: virt
-tags: [qemu, test, dev-tips]
+category: operation
+tags: [qemu, virt, test, dev-tips]
 ---
 
 One example to add/remove scsi-hd for testing scsi LUN hotplug
