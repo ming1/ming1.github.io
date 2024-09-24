@@ -93,3 +93,19 @@ Source:         %{crates_source}
 Source:         ${package_name}-${version}-vendor.tar.xz
 ```
 
+# **Troubleshoot**
+
+1 cargo test with debug message
+
+```
+%cargo_test -- -- --nocapture
+```
+
+2 build crate from local source repo
+
+```
+cargo package
+```
+
+Then use the built crate tarball to create source rpm and run test.
+

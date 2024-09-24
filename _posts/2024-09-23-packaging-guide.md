@@ -4,9 +4,9 @@ category: operation
 tags: [Fedora, package]
 ---
 
-Fedora packaging guide
+# Fedora packaging guide
 
-# **Terms**
+## Terms
 
 **RPM**
 
@@ -15,16 +15,12 @@ Fedora packaging guide
 **fedpkg**
 
 **lookaside cache**
-
-    For storing upstream tarball, and can't be covered by SCM
+: For storing upstream tarball, and can't be covered by SCM
 
 **mock**
 
 **src.fedoraproject.org**
-
-    alias: pkgs.fedoraproject.org
-    
-    Fedora package sources
+: alias: pkgs.fedoraproject.org, Fedora package sources
 
 **copr.fedorainfracloud.org**
 
@@ -34,15 +30,20 @@ Fedora packaging guide
 
 **dist-git**
 
-# **Fedora Packaging Framework & Principle**
+## Fedora Packaging Framework & Principle
 
 - split Fedora source code into tarball(upstream) and patch(Fedora)
 
 
-# **fedpkg commands**
+## fedpkg commands
+
+1. scratch build
+
+fedpkg build --scratch --srpm ${src_rpm_path}
 
 
-# **Good documents**
+
+## Good References
 
 [Maintaining Packages in Fedora: Cheat Sheet](https://github.com/i386x/pubdocs/blob/main/fedpkg-HOWTO.md)
 
