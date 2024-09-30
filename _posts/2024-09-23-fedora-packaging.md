@@ -107,5 +107,12 @@ Source:         ${package_name}-${version}-vendor.tar.xz
 cargo package
 ```
 
+3 check crate
+
+```
+tar -tf ${crate_path}
+```
+
+
 Then use the built crate tarball to create source rpm and run test.
 
