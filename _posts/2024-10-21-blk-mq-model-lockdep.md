@@ -6,6 +6,9 @@ tags: [linux kernel, block layer, IO]
 
 Model block layer q->q_usage_counter as rwsem 
 
+* TOC
+{:toc}
+
 # **block layer freezing/entering queue deadlock reports**
 
 [occasional block layer hang when setting 'echo noop > /sys/block/sda/queue/scheduler'](https://bugzilla.kernel.org/show_bug.cgi?id=219166)
