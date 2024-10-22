@@ -76,3 +76,9 @@ Originally there isn't such hard requirement for draining all IOs
 - set in blk_mq_destroy_queue() in case of !GD_OWNS_QUEUE
 
 - for draining inflight queue commands
+
+## nest entering queue isn't covered
+
+queue can't be entered in nest way with \*_enter_queue(), otherwise deadlock can be
+caused in blk_mq_freeze_queue() side when waiting on the inner \*_enter_queue()
+
