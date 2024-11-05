@@ -1,18 +1,14 @@
 ---
-# You don't need to edit this file, it's empty on purpose.
-# Edit theme's home layout instead if you wanna make some changes
-# See: https://jekyllrb.com/docs/themes/#overriding-theme-defaults
-layout: home
+layout: page
+title: Ming's Blog
 ---
 
-<header>
-      <h1>{{ site.title | default: site.github.repository_name }}</h1>
-      <h2>{{ site.description | default: site.github.project_tagline }}</h2>
-</header>
+{% include JB/setup %}
 
-<ul>
-{% for post in site.posts %}
-    <h3><a href="{{ post.url }}">{{ post.title }}</a></h3>
-    <p><small><strong>{{ post.date | date: "%B %e, %Y" }}</strong> . {{ post.category }} . <a href="http://ming1.github.com{{ post.url }}#disqus_thread"></a></small></p>
-{% endfor %}
+<ul class="posts">
+  {% for post in site.posts %}
+    <li><span>{{ post.date | date_to_string }}</span> &raquo; <a href="{{ BASE_PATH }}{{ post.url }}">{{ post.title }}</a></li>
+  {% endfor %}
 </ul>
+
+
