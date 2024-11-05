@@ -1,6 +1,6 @@
 ---
 title: Model block layer q->q_usage_counter as rwsem 
-category: Tech
+category: tech
 tags: [linux kernel, block layer, IO]
 ---
 
