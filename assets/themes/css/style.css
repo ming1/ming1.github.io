@@ -67,7 +67,7 @@
 /* added by me */
 
 body {
-  font-size: 16px;
+  font-size: 18px;
   line-height: 24px;
 }
 
@@ -102,7 +102,24 @@ ul, ol {
   margin-bottom: 16px;
 }
 
-h2, h3 {
+h1 {
+  font-size: 30px;
+}
+
+h2 {
+  font-size: 26px;
+  margin-top: 16px;
+  margin-bottom: 16px;
+}
+
+h3 {
+  font-size: 22px;
+  margin-top: 16px;
+  margin-bottom: 16px;
+}
+
+h3 {
+  font-size: 20px;
   margin-top: 16px;
   margin-bottom: 16px;
 }
