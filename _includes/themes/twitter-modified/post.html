@@ -10,6 +10,9 @@
     <div class="content">
       {{ content }}
     </div>
+    <div class="last update">
+  	  <span>{{ page.last_modified_at }}</span>
+    </div>
 
   {% unless page.categories == empty %}
     <ul class="tag_box inline">
@@ -25,7 +28,7 @@
       {% assign tags_list = page.tags %}
       {% include JB/tags_list %}
     </ul>
-  {% endunless %}  
+  {% endunless %}
 
     <hr>
     <div class="pagination">
