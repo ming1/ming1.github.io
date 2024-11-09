@@ -82,3 +82,11 @@ Originally there isn't such hard requirement for draining all IOs
 queue can't be entered in nest way with \*_enter_queue(), otherwise deadlock can be
 caused in blk_mq_freeze_queue() side when waiting on the inner \*_enter_queue()
 
+## tracking outmost `blk_mq_freeze_queue` and `blk_mq_freeze_queue` in owner context
+
+- store the owner task in `struct request_queue` instance
+
+- count the depth of `blk_mq_freeze_queue` in the owner context
+
+Fixed in the following patch [\[PATCH V2 3\/4\] block: always verify unfreeze lock on the owner task](https://lore.kernel.org/linux-block/20241031133723.303835-4-ming.lei@redhat.com/).
+
