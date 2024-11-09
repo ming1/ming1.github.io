@@ -64,6 +64,11 @@ static int blk_validate_limits(struct queue_limits *lim)
 }
 ```
 
+## max block size may be aligned with PAGE_SIZE
+
+Some virtual drivers(loop, nbd, brd, ...), max logical block size is often aligned
+with PAGE_SIZE, this is one device property which is decided by kernel configuration.
+
 ## other potential issues
 
 - blk_round_down_sectors()
