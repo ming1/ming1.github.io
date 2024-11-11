@@ -50,7 +50,6 @@ static int blk_validate_limits(struct queue_limits *lim)
 - blk_validate_limits() failed
 
 ```
-linux kernel v6.13
 static int blk_validate_limits(struct queue_limits *lim)
 {
     ...
@@ -68,6 +67,25 @@ static int blk_validate_limits(struct queue_limits *lim)
 
 Some virtual drivers(loop, nbd, brd, ...), max logical block size is often aligned
 with PAGE_SIZE, this is one device property which is decided by kernel configuration.
+
+## single segment assumption
+
+```
+/*
+ * All drivers must accept single-segments bios that are smaller than PAGE_SIZE.
+ *
+ * This is a quick and dirty check that relies on the fact that bi_io_vec[0] is
+ * always valid if a bio has data.  The check might lead to occasional false
+ * positives when bios are cloned, but compared to the performance impact of
+ * cloned bios themselves the loop below doesn't matter anyway.
+ */
+static inline bool bio_may_need_split(struct bio *bio,
+		const struct queue_limits *lim)
+{
+	return lim->chunk_sectors || bio->bi_vcnt != 1 ||
+		bio->bi_io_vec->bv_len + bio->bi_io_vec->bv_offset > PAGE_SIZE;
+}
+```
 
 ## other potential issues
 
