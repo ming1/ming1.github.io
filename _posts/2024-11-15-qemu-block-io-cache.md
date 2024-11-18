@@ -100,6 +100,25 @@ fdatasync() is still observed
 >     pwritev2(), and its effect applies only to the data range written by the system call.
 > ```
 
+`RWF_DSYNC` can also be set for libaio WRITE from `iocb.aio_rw_flags`, similar for
+io_uring WRITE from `io_uring_sqe.rw_flags`.
+
+Another way for getting per-write-IO DSYNC is to open file with open(O_DSYNC), and linux
+kernel will set `RWF_DSYNC`(`IOCB_DSYNC`) automatically from `iocb_flags()`:
+
+> static inline int iocb_flags(struct file *file)
+> {
+> 	int res = 0;
+> 	if (file->f_flags & O_APPEND)
+> 		res |= IOCB_APPEND;
+> 	if (file->f_flags & O_DIRECT)
+> 		res |= IOCB_DIRECT;
+> 	if (file->f_flags & O_DSYNC)
+> 		res |= IOCB_DSYNC;
+> 	if (file->f_flags & __O_SYNC)
+> 		res |= IOCB_SYNC;
+> 	return res;
+> }
 
 # how is IOCB_DSYNC/IOCB_SYNC handled by linux fs code?
 
