@@ -126,3 +126,22 @@ Observe syscall involved and its latency data in interested process.
 ## write bpftrace script to trace specific
 
 - /usr/share/bcc/tools/funclatency
+
+## disk IO latency
+
+- /usr/share/bcc/tools/biolatency
+
+## FS layer IO latency
+
+- /usr/share/bcc/tools/xfsslower
+
+which doesn't cover AIO(libaio or io_uring) latency, and you have to write
+script to collect AIO latency by your self.
+
+## offcputime
+
+- /usr/share/bcc/tools/offcputime
+
+- /usr/share/bcc/tools/offwaketime
+
+
