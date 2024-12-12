@@ -144,4 +144,223 @@ script to collect AIO latency by your self.
 
 - /usr/share/bcc/tools/offwaketime
 
+[Linux Wakeup and Off-Wake Profiling](https://www.brendangregg.com/blog/2016-02-01/linux-wakeup-offwake-profiling.html)
 
+
+# one example: observe qemu iothread
+
+## use `offwaketime` to collect qemu thread relation
+
+### who wakes up 'iothread'
+
+- from vCPU, guest device trap, such virtio-scsi notify
+
+```
+    waker:           CPU 3/KVM 1953147
+    entry_SYSCALL_64_after_hwframe
+    do_syscall_64
+    __x64_sys_ioctl
+    kvm_vcpu_ioctl
+    kvm_arch_vcpu_ioctl_run
+    vcpu_run
+    vcpu_enter_guest.constprop.0
+    vmx_handle_exit
+    handle_ept_misconfig
+    kvm_io_bus_write
+    __kvm_io_bus_write
+    ioeventfd_write
+    eventfd_signal_mask
+    __wake_up_common
+    pollwake
+    --               --
+    finish_task_switch.isra.0
+    __schedule
+    schedule
+    schedule_hrtimeout_range_clock
+    do_poll.constprop.0
+    do_sys_poll
+    __x64_sys_ppoll
+    do_syscall_64
+    entry_SYSCALL_64_after_hwframe
+    __ppoll
+    target:          IO iothread1 1953138
+        12148042
+```
+
+- from host, IO emulation completion
+ 
+```
+    waker:           irq/117-lpfc:0 986
+    ret_from_fork
+    kthread
+    irq_thread
+    irq_thread_fn
+    lpfc_sli4_hba_intr_handler_th
+    lpfc_sli4_process_eq
+    __lpfc_sli4_hba_process_cq
+    __lpfc_sli4_process_cq
+    lpfc_sli4_fp_handle_cqe
+    lpfc_fcp_io_cmd_wqe_cmpl
+    scsi_io_completion
+    scsi_end_request
+    blk_update_request
+    blk_update_request
+    blkdev_bio_end_io_async
+    aio_complete_rw
+    aio_complete
+    eventfd_signal_mask
+    __wake_up_common
+    pollwake
+    --               --
+    finish_task_switch.isra.0
+    __schedule
+    schedule
+    schedule_hrtimeout_range_clock
+    do_poll.constprop.0
+    do_sys_poll
+    __x64_sys_ppoll
+    do_syscall_64
+    entry_SYSCALL_64_after_hwframe
+    __ppoll
+    target:          IO iothread1 1953138
+        1714091
+```
+
+### which threads are waken up by 'iothread'
+
+- wakeup vCPU 3 for injecting irq, when vCPU is in halt state
+
+```
+    waker:           IO iothread1 1953138
+    entry_SYSCALL_64_after_hwframe
+    do_syscall_64
+    ksys_write
+    vfs_write
+    eventfd_write
+    __wake_up_common
+    irqfd_wakeup
+    kvm_arch_set_irq_inatomic
+    kvm_irq_delivery_to_apic_fast
+    __apic_accept_irq
+    vmx_deliver_interrupt
+    vmx_deliver_posted_interrupt
+    kvm_vcpu_wake_up
+    rcuwait_wake_up
+    --               --
+    finish_task_switch.isra.0
+    __schedule
+    schedule
+    kvm_vcpu_block
+    kvm_vcpu_halt
+    vcpu_run
+    kvm_arch_vcpu_ioctl_run
+    kvm_vcpu_ioctl
+    __x64_sys_ioctl
+    do_syscall_64
+    entry_SYSCALL_64_after_hwframe
+    ioctl
+    target:          CPU 3/KVM 1953147
+        16182368
+```
+
+- wakeup vCPU 1 for injecting irq
+```
+    waker:           IO iothread1 1953138
+    entry_SYSCALL_64_after_hwframe
+    do_syscall_64
+    ksys_write
+    vfs_write
+    eventfd_write
+    __wake_up_common
+    irqfd_wakeup
+    kvm_arch_set_irq_inatomic
+    kvm_irq_delivery_to_apic_fast
+    __apic_accept_irq
+    vmx_deliver_interrupt
+    vmx_deliver_posted_interrupt
+    kvm_vcpu_wake_up
+    rcuwait_wake_up
+    --               --
+    finish_task_switch.isra.0
+    __schedule
+    schedule
+    kvm_vcpu_block
+    kvm_vcpu_halt
+    vcpu_run
+    kvm_arch_vcpu_ioctl_run
+    kvm_vcpu_ioctl
+    __x64_sys_ioctl
+    do_syscall_64
+    entry_SYSCALL_64_after_hwframe
+    ioctl
+    target:          CPU 1/KVM 1953145
+        15330904
+```
+
+- wakeup vCPU 0 for injecting irq
+```
+    waker:           IO iothread1 1953138
+    entry_SYSCALL_64_after_hwframe
+    do_syscall_64
+    ksys_write
+    vfs_write
+    eventfd_write
+    __wake_up_common
+    irqfd_wakeup
+    kvm_arch_set_irq_inatomic
+    kvm_irq_delivery_to_apic_fast
+    __apic_accept_irq
+    vmx_deliver_interrupt
+    vmx_deliver_posted_interrupt
+    kvm_vcpu_wake_up
+    rcuwait_wake_up
+    --               --
+    finish_task_switch.isra.0
+    __schedule
+    schedule
+    kvm_vcpu_block
+    kvm_vcpu_halt
+    vcpu_run
+    kvm_arch_vcpu_ioctl_run
+    kvm_vcpu_ioctl
+    __x64_sys_ioctl
+    do_syscall_64
+    entry_SYSCALL_64_after_hwframe
+    ioctl
+    target:          CPU 0/KVM 1953144
+        13291031
+```
+
+- wakeup vCPU 2 for injecting irq
+```
+    waker:           IO iothread1 1953138
+    entry_SYSCALL_64_after_hwframe
+    do_syscall_64
+    ksys_write
+    vfs_write
+    eventfd_write
+    __wake_up_common
+    irqfd_wakeup
+    kvm_arch_set_irq_inatomic
+    kvm_irq_delivery_to_apic_fast
+    __apic_accept_irq
+    vmx_deliver_interrupt
+    vmx_deliver_posted_interrupt
+    kvm_vcpu_wake_up
+    rcuwait_wake_up
+    --               --
+    finish_task_switch.isra.0
+    __schedule
+    schedule
+    kvm_vcpu_block
+    kvm_vcpu_halt
+    vcpu_run
+    kvm_arch_vcpu_ioctl_run
+    kvm_vcpu_ioctl
+    __x64_sys_ioctl
+    do_syscall_64
+    entry_SYSCALL_64_after_hwframe
+    ioctl
+    target:          CPU 2/KVM 1953146
+        14054218
+```
