@@ -42,6 +42,10 @@ tags: [Fedora, package]
 fedpkg build --scratch --srpm ${src_rpm_path}
 
 
+## package build status
+
+[koschei](https://koschei.fedoraproject.org/)
+
 
 ## Good References
 
