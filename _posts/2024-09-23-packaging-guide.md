@@ -4,6 +4,11 @@ category: operation
 tags: [Fedora, package]
 ---
 
+Fedora packaging guide
+
+* TOC
+{:toc}
+
 # Fedora packaging guide
 
 ## Terms
@@ -12,13 +17,33 @@ tags: [Fedora, package]
 
 - SPEC
 
-- fedpkg
+- mock
+
+build SRPMs in a chroot
+
+Mock  is a simple program that will build source RPMs inside a chroot.
+It doesn't do anything fancy other than populating a chroot with the
+contents specified by a configuration file, then build any input SRPM(s)
+in that chroot.
+
+The content of a chroot is specified by the configuration specified  with
+the  -r  option.  The  default  configuration  file  is /etc/mock/default.cfg,
+which is usually a symlink to one of the installed configurations.
+
 
 - Koji
 
-- mock
+The Koji Build System is Fedora’s RPM buildsystem. Packagers use the koji
+client to request package builds and get information about the buildsystem.
+Koji runs on top of Mock to build RPM packages for specific architectures
+and ensure that they build correctly.
 
-- dist-git
+- fedpkg
+
+You can use the koji command directly, or use fedpkg, a script that interacts
+with the RPM Packaging system and other subsystems, like git and koji itself.
+
+`dnf install fedora-packager fedora-review`
 
 - lookaside cache
 
@@ -30,22 +55,33 @@ For storing upstream tarball, and can't be covered by SCM
 
 - copr.fedorainfracloud.org
 
+Fedora project portal
+
 - pagure.io
+
+> Pagure is an Open Source software code hosting system.
 
 - koschei.fedoraproject.org
 
+package build status summery
+
 ## Fedora Packaging Framework & Principle
 
-- split Fedora source code into tarball(upstream) and patch(Fedora)
+Split Fedora source code into `tarball(upstream)` and patch(Fedora)
+
+The big tarball is stored into lookaside cache by 'fedpkg new-sources' in
+oneshot way, and it is immutable.
+
+The patch is delta change against the tarball.
 
 
-## fedpkg commands
+# fedpkg commands
 
-### scratch build
+## scratch build
 
 fedpkg build --scratch --srpm ${src_rpm_path}
 
-### add new sources
+## add new sources
 
 - `fedpkg new-sources`
 
@@ -77,12 +113,12 @@ run a test build on it.
 Submit a package update for the latest build, not necessary for rawhide.
 
 
-## package build status
+# package build status
 
 [koschei](https://koschei.fedoraproject.org/)
 
 
-## Good References
+# Good References
 
 [Maintaining Packages in Fedora: Cheat Sheet](https://github.com/i386x/pubdocs/blob/main/fedpkg-HOWTO.md)
 
