@@ -89,7 +89,7 @@ static inline bool bio_may_need_split(struct bio *bio,
 
 ## other potential issues
 
-- blk_round_down_sectors()
+### blk_round_down_sectors()
 
 If real 'max_hw_sectors' is less than 64K/512, the calculated number may be
 too big. But in reality, such kind of device may be very unusual.
@@ -114,3 +114,28 @@ int blk_stack_limits(struct queue_limits *t, struct queue_limits *b,
     ...
 }
 ```
+
+### passthrough IO
+
+blk_rq_append_bio() already takes bio_split_rw_at() for checking if the bio can
+be issued.
+
+### map sg
+
+`__blk_rq_map_sg()` takes iterator way in [b7175e24d6ac block: add a dma mapping iterator](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=b7175e24d6acf79d9f3af9ce9d3d50de1fa748ec), and not use PAGE_SIZE
+any more.
+
+
+# patch submission
+
+
+## for addressing Android 16KB page size
+
+[[PATCH v6 0/8] Support limits below the page size](https://lore.kernel.org/linux-block/20230612203314.17820-1-bvanassche@acm.org/) 
+
+
+## for addressing aarch64 64KB page size
+
+[\[PATCH\] block: make queue limits workable in case of 64K PAGE_SIZE](https://lore.kernel.org/linux-block/20250102015620.500754-1-ming.lei@redhat.com/)
+
+[\[PATCH V2\] block: make segment size limit workable for > 4K PAGE_SIZE](https://lore.kernel.org/linux-block/20250210090319.1519778-1-ming.lei@redhat.com/T/#u)
