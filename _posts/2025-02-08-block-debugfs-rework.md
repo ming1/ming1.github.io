@@ -130,3 +130,9 @@ two cases:
     - always lookup debugfs entry from top to bottom
 
     - always remove debugfs entry via debugfs_lookup_and_remove()
+
+    - both q->sysfs_lock and q->debugfs_lock can be cut, but elevator ->sysfs_lock
+    can't be avoided.
+
+    [Test result from Shinichiro Kawasaki](https://lore.kernel.org/linux-block/vc2tk5rrg4xs4vkxwirokp2ugzg6fpbmhlenw7xvjgpndkzere@peyfaxxwefj3/)
+
