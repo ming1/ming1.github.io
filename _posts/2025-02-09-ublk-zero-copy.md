@@ -93,3 +93,37 @@ short read isn't handled correctly too.
 This approach relies on bpf prog to handle IO command, and bpf-aio kfuncs are introduced
 for submitting IO, and it is natural zero-copy because bpf prog works in kernel space.
 
+### basic idea
+
+#### overview
+
+- add two uring APIs `io_buffer_register_bvec()` & `io_buffer_unregister_bvec()`
+
+`io_buffer_register_bvec()` grabs reference of each page in ublk `request`, and
+the reference is dropped after the page is consumed from io_uring read/write OPs
+
+- add two ublk buffer commands: one is for register buffer, another is for un-register
+buffer
+
+The two commands call `io_buffer_register_bvec()` & `io_buffer_unregister_bvec()`.
+
+- reuse `IORING_OP_READ_FIXED` / `IORING_OP_WRITE_FIXED`
+
+The two OPs looks up register buffer in ->prep(), when the ublk register buffer can't
+be done yet, so one fatal problem
+
+
+#### Question: will grabbing ublk request page work really?
+
+ublk request can be freed earlier inevitably when the request buffer crosses multiple
+OPs.
+
+Will this way cause kernel trouble? From storage driver viewpoint, after one request
+is completed, request page ownership are transferred to upper layer(FS)
+
+#### Question: how to avoid to leak kernel buffer?
+
+un-register buffer can't be called from application panic, then when/how to un-register
+it?
+
+
