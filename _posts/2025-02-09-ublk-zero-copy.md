@@ -86,16 +86,7 @@ But io-uring community thinks the change or implementation is too complicated.
 The initial version doesn't work really, IO lifetime requirement isn't addressed, and
 short read isn't handled correctly too.
 
-## ublk-bpf
-
-[\[RFC PATCH 00/22\] ublk: support bpf](https://lore.kernel.org/linux-block/20250107120417.1237392-1-tom.leiming@gmail.com/#r)
-
-This approach relies on bpf prog to handle IO command, and bpf-aio kfuncs are introduced
-for submitting IO, and it is natural zero-copy because bpf prog works in kernel space.
-
-### basic idea
-
-#### overview
+### overview
 
 - add two uring APIs `io_buffer_register_bvec()` & `io_buffer_unregister_bvec()`
 
@@ -113,7 +104,7 @@ The two OPs looks up register buffer in ->prep(), when the ublk register buffer 
 be done yet, so one fatal problem
 
 
-#### Question: will grabbing ublk request page work really?
+### Question: will grabbing ublk request page work really?
 
 ublk request can be freed earlier inevitably when the request buffer crosses multiple
 OPs.
@@ -123,10 +114,18 @@ is completed, request page ownership are transferred to upper layer(FS)
 
 [commit 875f1d0769cd("iov_iter: add ITER_BVEC_FLAG_NO_REF flag")](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=f5eb4d3b92a6a1096ef3480b54782a9409281300)
 
+[comment bvec page lifetime isn't aligned with ublk request](https://lore.kernel.org/linux-block/5f6f6798-8658-4676-8626-44ac6e9b66af@bsbernd.com/T/#mb2c2e712c9cc8b79292fbd2941e3397a9b99a9b0)
 
-#### Question: how to avoid to leak kernel buffer?
+### Question: how to avoid to leak kernel buffer?
 
 un-register buffer can't be called from application panic, then when/how to un-register
 it?
 
+
+## ublk-bpf
+
+[\[RFC PATCH 00/22\] ublk: support bpf](https://lore.kernel.org/linux-block/20250107120417.1237392-1-tom.leiming@gmail.com/#r)
+
+This approach relies on bpf prog to handle IO command, and bpf-aio kfuncs are introduced
+for submitting IO, and it is natural zero-copy because bpf prog works in kernel space.
 
