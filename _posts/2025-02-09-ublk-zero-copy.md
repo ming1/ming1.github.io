@@ -121,6 +121,9 @@ OPs.
 Will this way cause kernel trouble? From storage driver viewpoint, after one request
 is completed, request page ownership are transferred to upper layer(FS)
 
+[commit 875f1d0769cd("iov_iter: add ITER_BVEC_FLAG_NO_REF flag")](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=f5eb4d3b92a6a1096ef3480b54782a9409281300)
+
+
 #### Question: how to avoid to leak kernel buffer?
 
 un-register buffer can't be called from application panic, then when/how to un-register
