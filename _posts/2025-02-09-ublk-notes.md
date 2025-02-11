@@ -27,3 +27,24 @@ Turns out that it is caused by io_uring registered file leak bug:
 [\[PATCH 5.10/5.15\] io_uring: fix registered files leak](https://lore.kernel.org/io-uring/20240312142313.3436-1-pchelkin@ispras.ru/)
 
 [\[PATCH\] io_uring: Fix registered ring file refcount leak](https://lore.kernel.org/lkml/173457120329.744782.1920271046445831362.b4-ty@kernel.dk/T/)
+
+# todo list
+
+## sequential or random IO pattern hint
+
+Figure out if current IO pattern is sequential or random, and provide this hint to
+target code for further optimization.
+
+One case is for improving rublk/zoned sequential perf, see details in
+[why rublk/zoned perfs worse than zloop in sequential write](https://lore.kernel.org/linux-block/Z6QrceGGAJl_X_BM@fedora/)
+
+The feature should be added in libublk-rs.
+
+## create ublk device in async way?
+
+ublk uses uring_cmd as control plane, so it is natural to support ublk creating in
+async way.
+
+One nice feature is to create many ublk device in single pthread context.
+
+The feature should be added in libublk-rs.
