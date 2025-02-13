@@ -81,12 +81,14 @@ But io-uring community thinks the change or implementation is too complicated.
 
 ## io_uring buffer table
 
+### io_uring buffer table V1
+
 [\[PATCH 0/6\] ublk zero-copy support](https://lore.kernel.org/linux-block/20250203154517.937623-1-kbusch@meta.com/)
 
 The initial version doesn't work really, IO lifetime requirement isn't addressed, and
 short read isn't handled correctly too.
 
-### overview
+#### overview
 
 - add two uring APIs `io_buffer_register_bvec()` & `io_buffer_unregister_bvec()`
 
@@ -104,7 +106,7 @@ The two OPs looks up register buffer in ->prep(), when the ublk register buffer 
 be done yet, so one fatal problem
 
 
-### Question: will grabbing ublk request page work really?
+#### Question: will grabbing ublk request page work really?
 
 ublk request can be freed earlier inevitably when the request buffer crosses multiple
 OPs.
@@ -116,10 +118,43 @@ is completed, request page ownership are transferred to upper layer(FS)
 
 [comment bvec page lifetime isn't aligned with ublk request](https://lore.kernel.org/linux-block/5f6f6798-8658-4676-8626-44ac6e9b66af@bsbernd.com/T/#mb2c2e712c9cc8b79292fbd2941e3397a9b99a9b0)
 
-### Question: how to avoid to leak kernel buffer?
+- buffered IO
+
+How page cache read deals with the page after reading IO is complete?
+
+- direct IO
+
+
+#### Question: how to avoid to leak kernel buffer?
 
 un-register buffer can't be called from application panic, then when/how to un-register
 it?
+
+### io_uring buffer table V2
+
+[[PATCHv2 0/6] ublk zero-copy support](https://lore.kernel.org/linux-block/20250211005646.222452-1-kbusch@meta.com/)
+
+
+#### overview
+
+- add ->release() callback
+
+Introduced an optional 'release' callback when the resource node is
+no longer referenced. The callback addresses any buggy applications
+that may complete their request and unregister their index while IO
+is in flight. This obviates any need to take extra page references
+since it prevents the request from completing.
+
+Note:
+
+- it avoids buffer leak issue when application panics, because
+io_sqe_buffers_unregister() is called from io_ring_ctx_free() to
+unregister the buffer automatically if the kernel buffer is registered
+to the buffer table.
+
+#### issue: double completion from buggy application
+
+[double completion from buggy application](https://lore.kernel.org/linux-block/Z6xo0mhJDRa0eaxv@fedora/)
 
 
 ## ublk-bpf
