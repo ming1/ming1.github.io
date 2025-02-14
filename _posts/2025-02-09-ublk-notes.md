@@ -66,6 +66,10 @@ Note short read is from IO command handling, and the original `request` buffer m
 be partitioned to multiple parts, short read may happen on when reading data to
 each part of the buffer from multiple destinations, see section [stackable device support](#stackable-device-support)
 
+### buffer direction
+
+- avoid to leak kernel data, or over-write kernel buffer
+
 
 ### application level requirements
 
@@ -178,6 +182,9 @@ to the buffer table.
 
 [double completion from buggy application](https://lore.kernel.org/linux-block/Z6xo0mhJDRa0eaxv@fedora/)
 
+##### buffer direction isn't respected
+
+[buffer direction](https://lore.kernel.org/linux-block/Z664w0GrgA8LjYko@fedora/)
 
 ### ublk-bpf
 
@@ -186,7 +193,23 @@ to the buffer table.
 This approach relies on bpf prog to handle IO command, and bpf-aio kfuncs are introduced
 for submitting IO, and it is natural zero-copy because bpf prog works in kernel space.
 
+### buffer table with io_uring bpf OP
 
+#### ideas
+
+- implement basic buffer table feature
+
+- re-factor rw/net code, and export kfuncs for bpf to customerized rw/net
+
+  lots of work is involved, is it acceptable? 
+
+- more flexible
+
+  support memory compression, buffer copy, ...
+
+### following up things
+
+- add more ublk limits(segment, ...), for aligning with backing file
 
 
 # Todo list
@@ -209,6 +232,11 @@ async way.
 One nice feature is to create many ublk device in single pthread context.
 
 The feature should be added in libublk-rs.
+
+## support nbd in rublk
+
+### support network targets in async/.await 
+
 
 # Ideas
 
