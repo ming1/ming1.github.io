@@ -9,7 +9,7 @@ Title: ublk notes
 * TOC
 {:toc}
 
-# related io_uring patches
+# Related io_uring patches
 
 ## v5.14 `ublk del -a` hang and io_uring registered files leak
 
@@ -28,7 +28,8 @@ Turns out that it is caused by io_uring registered file leak bug:
 
 [\[PATCH\] io_uring: Fix registered ring file refcount leak](https://lore.kernel.org/lkml/173457120329.744782.1920271046445831362.b4-ty@kernel.dk/T/)
 
-# todo list
+
+# Todo list
 
 ## sequential or random IO pattern hint
 
@@ -48,3 +49,28 @@ async way.
 One nice feature is to create many ublk device in single pthread context.
 
 The feature should be added in libublk-rs.
+
+# Ideas
+
+## compressed block device
+
+[dm-inplace-compression block device](https://lwn.net/Articles/697268/)
+
+[\[PATCH v5\] DM: dm-inplace-compress: inplace compressed DM target](https://lore.kernel.org/all/1489440641-8305-1-git-send-email-linuxram@us.ibm.com/#t)
+
+### overview
+
+- for SSD to decrease WAF
+
+- 1:1 size
+
+
+### other compression ideas
+
+- use kv store to store mapping
+
+[nebari: ACID-compliant database storage implementation using an append-only file format](https://crates.io/crates/nebari) 
+
+
+
+
