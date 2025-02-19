@@ -237,6 +237,36 @@ The feature should be added in libublk-rs.
 
 ### support network targets in async/.await 
 
+### **simplify & refactor the existed ublk/nbd implementation**
+
+
+## support ublk/nvme-tcp
+
+### support host-wide tag first
+
+#### does it need host abstraction?
+
+At least host-wide tagset is required, right.
+
+Can't borrow other ublk's tagset because it will pin that device.
+
+#### or add ctrl commands to create/remove ublk_controller
+
+Looks correct way.
+
+Each ublk char device grabs one reference of the controller
+
+- add ctrl command of CREATE_CTRL & REMOVE_CTRL
+
+- add ctrl command of START_CTRL & STOP_CTRL
+
+- each controller has unique ID, multiple ublk char/block devices
+can be bound to one controller, and share the same tagset.
+
+### depends on libnvme
+
+- Fedora supports libnvme-devel
+
 
 # Ideas
 
