@@ -31,6 +31,691 @@ can verify if the device supports the unmap write zeroes command and
 then decide whether to use it.
 
 
+# blk-throttol
+
+## Overview
+
+### Throttling Algorithm
+
+It uses time-slicing and a token bucket algorithm to enforce I/O quotas for each cgroup.
+
+[Token_bucket](https://en.wikipedia.org/wiki/Token_bucket)
+
+[Rate limiting using the Token Bucket algorithm](https://dev.to/satrobit/rate-limiting-using-the-token-bucket-algorithm-3cjh)
+
+It's all about a bucket and tokens in it. Let's discuss it step by step.
+
+    - Picture a bucket in your mind.
+    
+    - Fill the buckets with tokens at a constant rate.
+    
+    - When a packet arrives, check if there is any token in the bucket.
+
+    - If there was any token left, remove one from the bucket and forward the packet. If the
+    bucket was empty, simply drop the packet.
+
+
+### Terms
+
+#### slice
+
+- default slice window
+
+```
+/* Throttling is performed over a slice and after that slice is renewed */
+#define DFL_THROTL_SLICE_HD (HZ / 10)
+#define DFL_THROTL_SLICE_SSD (HZ / 50)
+#define MAX_THROTL_SLICE (HZ)
+```
+
+- bps/iops is evaluated in one slice
+
+- slice can be extended by adjusting tg->slice_end
+
+- slice trim
+
+Add tg->slice_add, substract bytes/ops from tg->bytes_disp and tg->io_disp;
+Trim the used slices and adjust slice start & end accordingly
+
+trim is called when dispatching one `bio`, what is the motivation for slice
+trim?
+
+
+#### service tree
+
+- one rb tree: each throtl_grp is added via ->rb_node
+
+- each tg is added to this rb tree, and key is ->disp_time
+
+    Q: how is ->disptime figured out?
+
+    A: see tg_update_disptime() and tg_may_dispatch()
+
+    Q: the above two are contradictory?
+
+    No, parent and children.
+
+- throtl_service_queue is embedded in both throtl_grp and throtl_data
+
+
+- throtl_grp->service_queue vs. throtl_data->service_queue
+
+	blk_throtl_dispatch_work_fn(): td->service_queue is used for dispatch bios
+
+
+#### throttle group
+
+- what is the relation among all tgs in one request queue? (tg_data)
+
+- tg can be retrieved via bio->bi_blkg(yes)
+
+- add bio into tg: throtl_add_bio_tg()
+
+
+#### blkcg policy
+
+#### root group
+
+#### dispatch
+
+Dequeue bio from throttle queue and submit it to disk
+
+#### throtl_qnode
+
+- embedded into throtl_grp
+
+- understand it via:
+
+```
+throtl_add_bio_tg
+	tg_dispatch_one_bio
+	__blk_throtl_bio
+```
+
+### principle
+
+```
+/*
+ * To implement hierarchical throttling, throtl_grps form a tree and bios
+ * are dispatched upwards level by level until they reach the top and get
+ * issued.  When dispatching bios from the children and local group at each
+ * level, if the bios are dispatched into a single bio_list, there's a risk
+ * of a local or child group which can queue many bios at once filling up
+ * the list starving others.
+ *
+ * To avoid such starvation, dispatched bios are queued separately
+ * according to where they came from.  When they are again dispatched to
+ * the parent, they're popped in round-robin order so that no single source
+ * hogs the dispatch window.
+ *
+ * throtl_qnode is used to keep the queued bios separated by their sources.
+ * Bios are queued to throtl_qnode which in turn is queued to
+ * throtl_service_queue and then dispatched in round-robin order.
+ *
+ * It's also used to track the reference counts on blkg's.  A qnode always
+ * belongs to a throtl_grp and gets queued on itself or the parent, so
+ * incrementing the reference of the associated throtl_grp when a qnode is
+ * queued and decrementing when dequeued is enough to keep the whole blkg
+ * tree pinned while bios are in flight.
+ */
+```
+
+- tg is added to the rb tree of parent tg's service_queue via tg->rb_node,
+and the key is tg->disp_time, see tg_service_queue_add()
+
+- top root of service_queue is td->service_queue
+
+- how bio is throttled: bio is added to tg->qnode_on_self or tg->qnode_on_parent,
+which is added to tg->service_queue.queued, refer to __blk_throtl_bio() and
+throtl_add_bio_tg()
+
+- schedule is over `throtl_service_queue`, which organized `tg`, and `sq`'s
+first_pending_disptime is setup from the 1st `tg` in the queue, sq->nr_pending
+records how many `tg` there is in the `throtl_service_queue`
+
+
+- td is per-request-queue:
+
+```
+struct request_queue {
+	...
+  #ifdef CONFIG_BLK_DEV_THROTTLING
+          /* Throttle data */
+          struct throtl_data *td;
+  #endif
+	...
+}
+```
+
+```
+throtl_pd_init
+	.pd_init_fn             = throtl_pd_init
+		pol->pd_init_fn
+			blkcg_activate_policy
+				blk_throtl_init
+			blkg_create
+				blkg_lookup_create
+					blkg_tryget_closest
+						bio_associate_blkg_from_css
+							bio_associate_blkg
+							wbc_init_bio
+							bio_associate_blkg_from_page
+				blkg_conf_prep
+					tg_set_conf
+					tg_set_limit
+				blkcg_init_queue
+					blk_alloc_queue
+```
+
+## Data structure
+
+### throtl_data
+
+```
+struct throtl_data
+{
+	/* service tree for active throtl groups */
+	struct throtl_service_queue service_queue;
+
+	struct request_queue *queue;
+
+	/* Total Number of queued bios on READ and WRITE lists */
+	unsigned int nr_queued[2];
+
+	unsigned int throtl_slice;
+
+	/* Work for dispatching throttled bios */
+	struct work_struct dispatch_work;
+
+	bool track_bio_latency;
+};
+```
+
+- per disk throttle data
+
+```
+blk_throtl_init
+    tg_set_conf
+    tg_set_limit
+```
+
+### throtl_grp
+
+```
+struct throtl_grp {
+	/* must be the first member */
+	struct blkg_policy_data pd;
+
+	/* active throtl group service_queue member */
+	struct rb_node rb_node;
+
+	/* throtl_data this group belongs to */
+	struct throtl_data *td;
+
+	/* this group's service queue */
+	struct throtl_service_queue service_queue;
+
+	/*
+	 * qnode_on_self is used when bios are directly queued to this
+	 * throtl_grp so that local bios compete fairly with bios
+	 * dispatched from children.  qnode_on_parent is used when bios are
+	 * dispatched from this throtl_grp into its parent and will compete
+	 * with the sibling qnode_on_parents and the parent's
+	 * qnode_on_self.
+	 */
+	struct throtl_qnode qnode_on_self[2];
+	struct throtl_qnode qnode_on_parent[2];
+
+	/*
+	 * Dispatch time in jiffies. This is the estimated time when group
+	 * will unthrottle and is ready to dispatch more bio. It is used as
+	 * key to sort active groups in service tree.
+	 */
+	unsigned long disptime;
+
+	unsigned int flags;
+
+	/* are there any throtl rules between this group and td? */
+	bool has_rules_bps[2];
+	bool has_rules_iops[2];
+
+	/* bytes per second rate limits */
+	uint64_t bps[2];
+
+	/* IOPS limits */
+	unsigned int iops[2];
+
+	/* Number of bytes dispatched in current slice */
+	uint64_t bytes_disp[2];
+	/* Number of bio's dispatched in current slice */
+	unsigned int io_disp[2];
+
+	uint64_t last_bytes_disp[2];
+	unsigned int last_io_disp[2];
+
+	/*
+	 * The following two fields are updated when new configuration is
+	 * submitted while some bios are still throttled, they record how many
+	 * bytes/ios are waited already in previous configuration, and they will
+	 * be used to calculate wait time under new configuration.
+	 */
+	long long carryover_bytes[2];
+	int carryover_ios[2];
+
+	unsigned long last_check_time;
+
+	/* When did we start a new slice */
+	unsigned long slice_start[2];
+	unsigned long slice_end[2];
+
+	struct blkg_rwstat stat_bytes;
+	struct blkg_rwstat stat_ios;
+};
+```
+
+- per `struct blkcg_gq` because of the `td` field
+
+
+### throtl_service_queue
+
+```
+struct throtl_service_queue {
+	struct throtl_service_queue *parent_sq;	/* the parent service_queue */
+
+	/*
+	 * Bios queued directly to this service_queue or dispatched from
+	 * children throtl_grp's.
+	 */
+	struct list_head	queued[2];	/* throtl_qnode [READ/WRITE] */
+	unsigned int		nr_queued[2];	/* number of queued bios */
+
+	/*
+	 * RB tree of active children throtl_grp's, which are sorted by
+	 * their ->disptime.
+	 */
+	struct rb_root_cached	pending_tree;	/* RB tree of active tgs */
+	unsigned int		nr_pending;	/* # queued in the tree */
+	unsigned long		first_pending_disptime;	/* disptime of the first tg */
+	struct timer_list	pending_timer;	/* fires on first_pending_disptime */
+};
+```
+
+```
+  /**
+   * sq_to_td - return throtl_data the specified service queue belongs to
+   * @sq: the throtl_service_queue of interest
+   *
+   * A service_queue can be embedded in either a throtl_grp or throtl_data.
+   * Determine the associated throtl_data accordingly and return it.
+   */
+  static struct throtl_data *sq_to_td(struct throtl_service_queue *sq)
+
+```
+
+- embedded in both `throtl_grp` and `throtl_data`
+
+
+## Interfaces
+
+### throtl_charge_bio
+
+```
+throtl_charge_bio
+	__blk_throtl_bio
+	tg_dispatch_one_bio
+		throtl_dispatch_tg
+			throtl_select_dispatch
+				throtl_pending_timer_fn
+				throtl_upgrade_state
+					throtl_pd_offline
+					throtl_pending_timer_fn
+						mod_timer(&sq->pending_timer, expires);
+							throtl_schedule_pending_timer
+								throtl_schedule_next_dispatch
+									__blk_throtl_bio
+									throtl_pending_timer_fn
+									tg_conf_updated
+										tg_set_conf
+										tg_set_limit
+									throtl_upgrade_state
+					throtl_upgrade_check
+						__blk_throtl_bio
+					__blk_throtl_bio
+```
+
+### tg_within_bps_limit
+
+- caller
+
+```
+tg_within_bps_limit
+    tg_may_dispatch
+        tg_update_disptime
+        throtl_dispatch_tg
+        tg_within_limit
+            __blk_throtl_bio
+```
+
+- bio is always dispatched in current slice, new bio can extend the tg slice
+window
+
+
+### blk_throtl_bio / __blk_throtl_bio
+
+```
+static inline bool blk_throtl_bio(struct bio *bio)
+```
+
+- Check and throttle bio if this bio is needed
+
+- if throttle is needed, `bio` is added to tg->service_queue
+
+- meantime, this `tg` is added to rbtree of tg->service_queue.parent_sq->pending_tree.rb_root,
+  see throtl_enqueue_tg(tg)
+
+
+- call throtl_schedule_next_dispatch(tg->service_queue.parent_sq)
+
+
+### tg_may_dispatch
+
+```
+/*
+ * Returns whether one can dispatch a bio or not. Also returns approx number
+ * of jiffies to wait before this bio is with-in IO rate and can be dispatched
+ */
+static bool tg_may_dispatch(struct throtl_grp *tg, struct bio *bio,
+			    unsigned long *wait)
+```
+
+- core function for understanding the throttle wait time 
+
+
+
+### throtl_pending_timer_fn
+
+```
+/**
+ * throtl_pending_timer_fn - timer function for service_queue->pending_timer
+ * @t: the pending_timer member of the throtl_service_queue being serviced
+ *
+ * This timer is armed when a child throtl_grp with active bio's become
+ * pending and queued on the service_queue's pending_tree and expires when
+ * the first child throtl_grp should be dispatched.  This function
+ * dispatches bio's from the children throtl_grps to the parent
+ * service_queue.
+ *
+ * If the parent's parent is another throtl_grp, dispatching is propagated
+ * by either arming its pending_timer or repeating dispatch directly.  If
+ * the top-level service_tree is reached, throtl_data->dispatch_work is
+ * kicked so that the ready bio's are issued.
+ */
+static void throtl_pending_timer_fn(struct timer_list *t)
+```
+
+- start dispatch iff the top level is reached
+
+
+### blk_throtl_dispatch_work_fn
+
+```
+/**
+ * blk_throtl_dispatch_work_fn - work function for throtl_data->dispatch_work
+ * @work: work item being executed
+ *
+ * This function is queued for execution when bios reach the bio_lists[]
+ * of throtl_data->service_queue.  Those bios are ready and issued by this
+ * function.
+ */
+static void blk_throtl_dispatch_work_fn(struct work_struct *work)
+```
+
+- pop bio from td's throtl_service_queue' queued bios, then submit
+
+
+
+### throtl_dispatch_tg
+
+```
+static int throtl_dispatch_tg(struct throtl_grp *tg)
+```
+
+
+
+#### tg_dispatch_one_bio
+
+```
+static void tg_dispatch_one_bio(struct throtl_grp *tg, bool rw)
+```
+
+
+### throtl_trim_slice
+
+```
+/* Trim the used slices and adjust slice start accordingly */
+static inline void throtl_trim_slice(struct throtl_grp *tg, bool rw)
+```
+
+```
+throtl_trim_slice
+    tg_dispatch_one_bio
+    __blk_throtl_bio
+```
+
+```
+	/*
+	 * A bio has been dispatched. Also adjust slice_end. It might happen
+	 * that initially cgroup limit was very low resulting in high
+	 * slice_end, but later limit was bumped up and bio was dispatched
+	 * sooner, then we need to reduce slice_end. A high bogus slice_end
+	 * is bad because it does not allow new slice to start.
+	 */
+```
+
+- advance tg's slice window
+
+- clear tg->carryover_bytes[rw] and tg->carryover_ios[rw]
+
+- update tg->bytes_disp[rw] and tg->io_disp[rw]
+
+### throtl_schedule_next_dispatch
+
+```
+/*
+ * throtl_schedule_next_dispatch - schedule the next dispatch cycle
+ * @sq: the service_queue to schedule dispatch for
+ * @force: force scheduling
+ *
+ * Arm @sq->pending_timer so that the next dispatch cycle starts on the
+ * dispatch time of the first pending child.  Returns %true if either timer
+ * is armed or there's no pending child left.  %false if the current
+ * dispatch window is still open and the caller should continue
+ * dispatching.
+ *
+ * If @force is %true, the dispatch timer is always scheduled and this
+ * function is guaranteed to return %true.  This is to be used when the
+ * caller can't dispatch itself and needs to invoke pending_timer
+ * unconditionally.  Note that forced scheduling is likely to induce short
+ * delay before dispatch starts even if @sq->first_pending_disptime is not
+ * in the future and thus shouldn't be used in hot paths.
+ */
+static bool throtl_schedule_next_dispatch(struct throtl_service_queue *sq,
+					  bool force)
+```
+
+```
+throtl_schedule_next_dispatch
+    throtl_pending_timer_fn
+    tg_conf_updated
+    __blk_throtl_bio
+```
+
+
+## Contexts
+
+### `->pending_timer`
+
+```
+mod_timer(&sq->pending_timer, expires)
+    throtl_schedule_pending_timer
+```
+
+```
+throtl_schedule_pending_timer(sq, jiffies + 1)
+    tg_flush_bios
+```
+
+```    
+throtl_schedule_next_dispatch
+    ...
+	if (force || time_after(sq->first_pending_disptime, jiffies)) {
+		throtl_schedule_pending_timer(sq, sq->first_pending_disptime);
+		return true;
+	}
+```
+
+#### `->first_pending_disptime`
+
+```
+parent_sq->first_pending_disptime = tg->disptime
+    update_min_dispatch_time
+        throtl_schedule_next_dispatch
+            throtl_pending_timer_fn
+            tg_conf_updated
+            __blk_throtl_bio
+```
+
+#### `tg->disptime`
+
+- when to dispatch bios in this tg
+
+```
+tg->disptime = disptime
+    tg_update_disptime
+        throtl_select_dispatch
+            throtl_pending_timer_fn
+        throtl_pending_timer_fn
+        tg_conf_updated
+        tg_flush_bios
+            throtl_pd_offline
+            blk_throtl_cancel_bios
+                del_gendisk
+```
+
+### `tg->carryover_bytes[rw]`
+```
+/*
+ * The following two fields are updated when new configuration is
+ * submitted while some bios are still throttled, they record how many
+ * bytes/ios are waited already in previous configuration, and they will
+ * be used to calculate wait time under new configuration.
+ */
+```
+
+- carryover_bytes crosses slice
+
+
+```
+tg->carryover_bytes[rw] = 0
+    throtl_start_new_slice_with_credit
+        start_parent_slice_with_credit
+            tg_dispatch_one_bio
+    throtl_trim_slice
+        tg_dispatch_one_bio
+           throtl_dispatch_tg
+              throtl_select_dispatch
+		__blk_throtl_bio
+
+tg->carryover_bytes[rw] += calculate_bytes_allowed(bps_limit, jiffy_elapsed) - tg->bytes_disp[rw];
+    __tg_update_carryover
+        tg_update_carryover
+            tg_set_conf
+            tg_set_limit
+
+bytes_allowed = calculate_bytes_allowed(bps_limit, jiffy_elapsed_rnd) + tg->carryover_bytes[rw];
+    tg_within_bps_limit
+
+tg->carryover_bytes[rw] -= throtl_bio_data_size(bio)
+    tg_dispatch_in_debt
+        __blk_throtl_bio
+```
+
+### `tg->slice_end[rw]`
+
+- for extending slice mainly
+
+```
+throtl_start_new_slice
+throtl_start_new_slice_with_credit
+    ...
+    tg->slice_end[rw] = jiffies + tg->td->throtl_slice;
+    ...
+```
+
+```
+tg->slice_end[rw] = roundup(jiffy_end, tg->td->throtl_slice)
+    throtl_set_slice_end
+        throtl_extend_slice //only tg_map_dispatch() can extend slice
+            tg_may_dispatch
+        throtl_trim_slice
+
+```
+
+```
+time_in_range(jiffies, tg->slice_start[rw], tg->slice_end[rw])
+    throtl_slice_used
+        throtl_trim_slice
+        tg_may_dispatch
+        start_parent_slice_with_credit
+```
+
+
+## Issues
+
+### bps throttle works too aggressively
+
+[block: throttle: don't add one extra jiffy mistakenly for bps limit](https://lore.kernel.org/linux-block/Z7hAauGfBrwNBRkz@fedora/T/#t)
+
+#### overview
+
+- `./check throtl/001` doesn't pass on bps throttle
+
+- CONFIG_HZ=100
+
+
+##### root cause?
+
+- one HZ time(10ms) is a bit long, it may throttle 10K bytes in case of 1Mbps limit
+
+- but 'blktest throtl/001' runs dd with 4k bs, so 4k takes one 10ms to transfer
+for every slice(20ms), that means 20Kbytes takes 30ms?
+
+- why does dispatch schedule become 40ms?
+
+   timer is often expired with one extra jiffy delayed
+
+   ```
+   bpftrace -e 'kfunc:throtl_pending_timer_fn { @timer_expire_delay = lhist(jiffies - args->t->expires, 0, 16, 1);}'
+   ```
+
+However, timer delay expire shouldn't make a difference because the extra delay will
+be taken into account when dealing with bios. But the precondition is that this slice
+is still valid.
+
+
+#### Yukuai's solution: `update ->carryover_bytes[rw] in tg_within_bps_limit()`
+
+- not wait for the extra bytes, instead take it into account of ->carryover_bytes[]
+
+    - ->carryover_bytes[] may be accounted more than 1 times
+    
+    - ->carryover_bytes[] can be trimed after dispatching this bio in case of no wait
+
+#### Another soluiton: `avoid to trim slice in case of owning too much debt`
+
+[avoid to trim slice in case of owning too much debt](https://lore.kernel.org/linux-block/Z7nAJSKGANoC0Glb@fedora/)
+
+
 # Atomic write
 
 ## background
