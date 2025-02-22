@@ -214,6 +214,8 @@ for submitting IO, and it is natural zero-copy because bpf prog works in kernel 
 
 # Todo list
 
+## libublk-rs supports customized run_dir
+
 ## sequential or random IO pattern hint
 
 Figure out if current IO pattern is sequential or random, and provide this hint to
@@ -290,5 +292,29 @@ can be bound to one controller, and share the same tagset.
 [nebari: ACID-compliant database storage implementation using an append-only file format](https://crates.io/crates/nebari) 
 
 
+## extend ublk for supporting real hardware
+
+### motivation
+
+Allow to support real block storage device with ublk.
+
+
+### approach
+
+Register bpf struct_ops for setting up hardware, register irq, submitting IO &
+completing IO.
+
+- kernel kfuncs
+
+provide hardware device abstraction, pci bus, pci device, and export it to bpf prog
+
+provide irq register/unregister kfunc
+
+
+### ideas
+
+- generic kernel framework for bpf driver? based on both uio and bpf
+
+- rust binding vs. bpf kfunc
 
 
