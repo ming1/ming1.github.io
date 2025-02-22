@@ -705,6 +705,8 @@ is still valid.
 
 #### Yukuai's solution: `update ->carryover_bytes[rw] in tg_within_bps_limit()`
 
+[blk-throttle: fix off-by-one jiffies wait_time](https://lore.kernel.org/linux-block/20250222092823.210318-3-yukuai1@huaweicloud.com/)
+
 - not wait for the extra bytes, instead take it into account of ->carryover_bytes[]
 
     - ->carryover_bytes[] may be accounted more than 1 times
