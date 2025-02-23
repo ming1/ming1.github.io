@@ -669,6 +669,37 @@ time_in_range(jiffies, tg->slice_start[rw], tg->slice_end[rw])
         start_parent_slice_with_credit
 ```
 
+### understanding hierarchical throttling
+
+- Cgroups Hierarchy:
+
+    - tree-like cgroups:
+
+    Processes are organized into cgroups arranged in a tree-like structure.
+    Each cgroup can enforce I/O limits on its processes and child cgroups.
+
+    - Parent-Child Constraints:
+
+    A parent cgroup's limits act as an upper bound for its children. For
+    example, if a parent sets a 100 IOPS limit, its child cgroups cannot exceed
+    this, even if they request a higher limit (e.g., a child’s 150 IOPS becomes
+    effectively 100 IOPS).
+
+- Use Case Example:
+
+Top-Level Group: Limits a VM to 500 IOPS.
+
+Child Groups: Databases (300 IOPS) and backups (200 IOPS) under the VM. Each
+child enforces its own tasks, but their combined usage cannot exceed the parent’s 500 IOPS.
+
+- Key Mechanisms:
+
+    - Recursive Enforcement:
+    Limits are checked at each hierarchy level. A process’s I/O is throttled if it exceeds any ancestor’s limit.
+
+    - Dynamic Adjustments:
+    Changing a parent’s limit immediately affects all descendants.
+
 
 ## Issues
 
