@@ -269,6 +269,10 @@ can be bound to one controller, and share the same tagset.
 
 - Fedora supports libnvme-devel
 
+## ublk-bpf
+
+[RFC patch](https://lore.kernel.org/linux-block/20250107120417.1237392-1-tom.leiming@gmail.com/)
+
 
 # Ideas
 
@@ -290,6 +294,17 @@ can be bound to one controller, and share the same tagset.
 - use kv store to store mapping
 
 [nebari: ACID-compliant database storage implementation using an append-only file format](https://crates.io/crates/nebari) 
+
+
+## dedup feature
+
+### overview
+
+- can be enabled for almost all target
+
+- easier to support than compression target
+
+- but we already have vdo?
 
 
 ## extend ublk for supporting real hardware
