@@ -182,6 +182,9 @@ to the buffer table.
 
 [double completion from buggy application](https://lore.kernel.org/linux-block/Z6xo0mhJDRa0eaxv@fedora/)
 
+The command `UBLK_IO_COMMIT_AND_FETCH_REQ` can only be completed once, so
+double completion won't happen.
+
 ##### buffer direction isn't respected
 
 [buffer direction](https://lore.kernel.org/linux-block/Z664w0GrgA8LjYko@fedora/)
