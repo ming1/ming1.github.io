@@ -279,6 +279,18 @@ can be bound to one controller, and share the same tagset.
 
 # Ideas
 
+## ublk/loop with bmap
+
+### idea
+
+[\[PATCH\] the dm-loop target](https://lore.kernel.org/dm-devel/7d6ae2c9-df8e-50d0-7ad6-b787cb3cfab4@redhat.com/)
+
+[[PATCH] dm: make it possible to open underlying devices in shareable mode](https://lore.kernel.org/dm-devel/40160815-d4b4-668e-389c-134c75ac87f1@redhat.com/T/#t)
+
+Use ioctl(FS_IOC_FIEMAP) to retrieve mapping between file offset with LBA, then
+submit IO to device directly.
+
+
 ## compressed block device
 
 [dm-inplace-compression block device](https://lwn.net/Articles/697268/)
