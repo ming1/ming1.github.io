@@ -904,6 +904,26 @@ your next great app.
 ## atomic write applications
 
 
+# Issues
+
+## kobject of disk->queue_kobj isn't released
+
+### overview
+
+This kobject is never released
+
+```
+kobject_init(&disk->queue_kobj, &blk_queue_ktype)
+    blk_register_queue
+
+kobject_add(&disk->queue_kobj
+    blk_register_queue
+
+kobject_del(&disk->queue_kobj)
+    blk_unregister_queue
+```
+
+
 # Ideas
 
 
