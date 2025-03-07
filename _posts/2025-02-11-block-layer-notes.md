@@ -923,6 +923,14 @@ kobject_del(&disk->queue_kobj)
     blk_unregister_queue
 ```
 
+## smaller bio built from bio split with multi-page bvec
+
+### reports
+
+[block: Check the queue limit before bio submitting](https://lore.kernel.org/linux-block/20231025092255.27930-1-ed.tsai@mediatek.com/)
+
+[[PATCH] block: try to make aligned bio in case of big chunk IO](https://lore.kernel.org/linux-block/20231107100140.2084870-1-ming.lei@redhat.com/)
+
 
 # Ideas
 
