@@ -285,10 +285,32 @@ can be bound to one controller, and share the same tagset.
 
 [\[PATCH\] the dm-loop target](https://lore.kernel.org/dm-devel/7d6ae2c9-df8e-50d0-7ad6-b787cb3cfab4@redhat.com/)
 
+Two key points for loop device(From Dave)
+
+- a) sparse; and
+
+- b) the mapping being mutable via direct access to the loop file whilst
+there is an active mounted filesystem on that loop file.
+
+The reason for a) is obvious: we don't need to allocate space for
+the filesystem so it's effectively thin provisioned. Also, fstrim on
+the mounted loop device can punch out unused space in the mounted
+filesytsem.
+
+The reason for b) is less obvious: snapshots via file cloning,
+deduplication via extent sharing.
+
+The clone operaiton is an atomic modification of the underlying file
+mapping, which then triggers COW on future writes to those mappings,
+which causes the mapping to the change at write IO time.
+
+
 [[PATCH] dm: make it possible to open underlying devices in shareable mode](https://lore.kernel.org/dm-devel/40160815-d4b4-668e-389c-134c75ac87f1@redhat.com/T/#t)
 
 Use ioctl(FS_IOC_FIEMAP) to retrieve mapping between file offset with LBA, then
 submit IO to device directly.
+
+
 
 
 ## compressed block device
