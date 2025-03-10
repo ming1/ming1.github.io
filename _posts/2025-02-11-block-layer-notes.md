@@ -931,6 +931,121 @@ kobject_del(&disk->queue_kobj)
 
 [[PATCH] block: try to make aligned bio in case of big chunk IO](https://lore.kernel.org/linux-block/20231107100140.2084870-1-ming.lei@redhat.com/)
 
+Not solved yet.
+
+
+## loop & ublk/loop poor perf issue
+
+### differences
+
+- loop schedules workqueue for handling aio command
+
+One approach for avoiding the workqueue is to try to handle aio in
+current context directly via `IOCB_NOWAIT`
+
+[\[RESEND PATCH 0/5\] loop: improve loop aio perf by IOCB_NOWAIT](https://lore.kernel.org/linux-block/20250308162312.1640828-1-ming.lei@redhat.com/)
+
+- loop doesn't support MQ
+
+### how to reproduce
+
+- test script
+
+```
+fio --direct=1 --bs=4k --runtime=40 --time_based --numjobs=12 --ioengine=libaio \
+	--iodepth=16 --group_reporting=1 --filename=/mnt/l -name=job --rw=rw --size=5G
+```
+
+- loop
+ublk add -t loop -q 2 -f /dev/sda
+mkfs
+mount /dev/ublkb0 /mnt
+
+- raw device
+
+/dev/sda: virtio-scsi, 4 queues
+
+mount /dev/sda /mnt
+
+- result
+
+    - ublk/loop:     read 41.7MiB/sec, write 41.7MiB/sec
+    - loop:     read 191MiB/sec, write 191MiB/sec
+    - raw sda:  read 296MiB/sec, write 296MiB/sec  
+
+### analysis
+
+- 12 jobs, big contention from FS side, but same contention exists for raw
+  device
+
+- nr_hw_queues vs queue_depth
+
+    nothing changes by increasing ublk/loop's queue depth & nr_hw_queues
+
+- io merge?
+
+    bfq is the default io scheduler for scsi device on Fedora
+
+```
+Disk stats (read/write):
+  ublkb0: ios=425630/425532, sectors=3405040/3404238, merge=0/0, ticks=232911/7379914, in_queue=7612825, util=99.77%
+```
+
+```
+Disk stats (read/write):
+  sda: ios=2226136/2227376, sectors=24166704/24194566, merge=794741/796967, ticks=3103352/1956771, in_queue=5060164, util=100.00%
+```
+
+
+    - plug merge?
+
+      ublk/loop has new io context
+
+raw device merge trace:
+
+```
+@bio_backmerge[
+    bio_attempt_back_merge+270
+    bio_attempt_back_merge+270
+    blk_mq_sched_try_merge+334
+    bfq_bio_merge+218
+    blk_mq_submit_bio+2023
+    __submit_bio+116
+    submit_bio_noacct_nocheck+773
+    iomap_dio_bio_iter+1111
+    __iomap_dio_rw+1278
+    iomap_dio_rw+18
+    xfs_file_dio_read+185
+    xfs_file_read_iter+188
+    aio_read+307
+    io_submit_one+401
+    __x64_sys_io_submit+148
+    do_syscall_64+130
+    entry_SYSCALL_64_after_hwframe+118
+, fio]: 742995
+```
+
+```
+@rq_merge[
+    attempt_merge+1042
+    attempt_merge+1042
+    blk_attempt_req_merge+14
+    elv_attempt_insert_merge+126
+    bfq_insert_requests+307
+    blk_mq_flush_plug_list+419
+    __blk_flush_plug+242
+    blk_finish_plug+40
+    __iomap_dio_rw+1346
+    iomap_dio_rw+18
+    xfs_file_dio_write_aligned+173
+    xfs_file_write_iter+253
+    aio_write+346
+    io_submit_one+1191
+    __x64_sys_io_submit+148
+    do_syscall_64+130
+    entry_SYSCALL_64_after_hwframe+118
+, fio]: 54130
+```
 
 # Ideas
 
