@@ -1047,6 +1047,42 @@ raw device merge trace:
 , fio]: 54130
 ```
 
+## directio with >4GB hugepage
+
+### steps
+
+- create hugepages //x86 doesn't support 16GB, and just 1GB
+
+```
+mkdir /dev/hugepages1G
+mount -t hugetlbfs -o pagesize=1G hugetlbfs /dev/hugepages1G
+echo 2 > /sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages
+touch /dev/hugepages1G/file
+```
+
+note: 16GB hugepage is only supported on aarch64, at most 1GB is
+    supported on x86_64
+
+- boot virtual machine with nocache mode
+
+or 
+
+use the following fio script:
+
+```
+fio --direct=1 --bs=1G --runtime=40 --time_based --numjobs=1 --ioengine=libaio \
+	--mem=mmaphuge:/dev/hugepages4G/file \
+	--iodepth=1 --group_reporting=1 --filename=$DEV -name=job --rw=rw --size=5G
+```
+
+### problems
+
+If hugepage size is > 4G, offset can't be held in bvec->bv_off.
+
+### how to fix it?
+
+
+
 # Ideas
 
 
