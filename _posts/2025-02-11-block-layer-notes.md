@@ -1047,6 +1047,34 @@ raw device merge trace:
 , fio]: 54130
 ```
 
+### IOCB_NOWAIT
+
+[\[RESEND PATCH 0/5\] loop: improve loop aio perf by IOCB_NOWAIT](https://lore.kernel.org/linux-block/20250308162312.1640828-1-ming.lei@redhat.com/)
+
+- basically solve this issue
+
+- drawbacks
+
+Perf of randwrite/write over loop/sparse_back_file drops:
+
+```
+    truncate -s 4G 1.img    #1.img is created on XFS/virtio-scsi
+    losetup -f 1.img --direct-io=on
+    fio --direct=1 --bs=4k --runtime=40 --time_based --numjobs=1 --ioengine=libaio \
+        --iodepth=16 --group_reporting=1 --filename=/dev/loop0 -name=job --rw=$RW
+```
+
+because WRITE is done two times, and the 1st time always return -EAGAIN.
+
+Is it really one big deal?
+
+### typical FS behavior for loop use case
+
+#### container
+
+#### VM image
+
+
 ## directio with >4GB hugepage
 
 ### steps
@@ -1078,6 +1106,8 @@ fio --direct=1 --bs=1G --runtime=40 --time_based --numjobs=1 --ioengine=libaio \
 ### problems
 
 If hugepage size is > 4G, offset can't be held in bvec->bv_off.
+
+[[PATCH v10 0/4] block: add larger order folio instead of pages](https://lore.kernel.org/linux-block/20240911064935.5630-1-kundan.kumar@samsung.com/)
 
 ### how to fix it?
 
