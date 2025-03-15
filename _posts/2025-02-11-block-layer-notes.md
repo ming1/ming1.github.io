@@ -945,6 +945,11 @@ current context directly via `IOCB_NOWAIT`
 
 [\[RESEND PATCH 0/5\] loop: improve loop aio perf by IOCB_NOWAIT](https://lore.kernel.org/linux-block/20250308162312.1640828-1-ming.lei@redhat.com/)
 
+[\[PATCH V2 0/5\] loop: improve loop aio perf by IOCB_NOWAIT](https://lore.kernel.org/linux-block/20250314021148.3081954-1-ming.lei@redhat.com/)
+
+    - contention between write(IOCB_NOWAIT) vs write(WAIT) in workqueue
+      context
+
 - loop doesn't support MQ
 
 ### how to reproduce
@@ -969,7 +974,6 @@ mount /dev/sda /mnt
 
 - result
 
-    - ublk/loop:     read 41.7MiB/sec, write 41.7MiB/sec
     - loop:     read 191MiB/sec, write 191MiB/sec
     - raw sda:  read 296MiB/sec, write 296MiB/sec  
 
