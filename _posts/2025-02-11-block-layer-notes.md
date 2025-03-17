@@ -1079,7 +1079,7 @@ Is it really one big deal?
 #### VM image
 
 
-## directio with >4GB hugepage
+## Directio with >4GB hugepage
 
 ### steps
 
@@ -1096,6 +1096,15 @@ note: 16GB hugepage is only supported on aarch64, at most 1GB is
     supported on x86_64
 
 - boot virtual machine with nocache mode
+
+```
+-m 32G,slots=16,maxmem=128G                                                              \
+-object memory-backend-file,id=mem0,prealloc=on,mem-path=/dev/hugepages-16777216kB,size=16G \
+-object memory-backend-file,id=mem1,prealloc=on,mem-path=/dev/hugepages-16777216kB,size=16G \
+-numa node,nodeid=0,memdev=mem0,cpus=0-3                                                    \
+-numa node,nodeid=1,memdev=mem1,cpus=4-7                                                    \
+```
+
 
 or 
 
