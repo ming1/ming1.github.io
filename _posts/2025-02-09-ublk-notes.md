@@ -215,6 +215,134 @@ for submitting IO, and it is natural zero-copy because bpf prog works in kernel 
 - add more ublk limits(segment, ...), for aligning with backing file
 
 
+# ublk/nbd
+
+## design
+
+- raw C++21 coroutine based & event driven
+
+- in request queueing side, it looks like one complete coroutine based
+implementation
+
+    - tcp socket is stream style, so every tcp send in single socket has
+    
+    to be serialized, then there is only one active io_uring link chain
+
+    - when send request in the active link chain aren't done, new send
+
+    request has to be staggered in next chain; and submitted when the
+
+    active chain is completed
+
+- recv side is for covering both reply and READ data, done in one extra
+  and dedicated coroutine context
+
+- event driven: done in nbd_tgt_io_done() and nbd_handle_io_bg()
+
+    -- deal with send first, next chain needs to be submitted
+
+    -- deal with recv work, can't cut into the active send chain
+
+### how to do it with Rust async/.await?
+
+- for request handling, completely done in coroutine context
+
+    - how to deal with io_uring IO_LINK
+
+    - is there any way to figure out the last queued SQE from io-uring
+      crate?
+
+- how to deal with recv work?
+
+    - recv work should be handled after all sending things are done
+
+- communicating between recv io_task and send_req io_task?
+
+    - async mutex?  should work
+
+
+## implementation
+
+### nbd_handle_io_bg()
+
+- implements .handle_io_background() which is called after all pending
+CQEs are handled
+
+### q_data->in_flight_ios
+
+Track how many inflight nbd IO requests 
+
+### q_data->chained_send_ios
+
+We have ->in_flight_ios, why still need this counter?
+
+It counts how many requests linked in current chain.
+
+
+### q_data->send_sqe_chain_busy
+
+Why not add one function of nbd_uring_link_chain_busy()?
+And this function is implemented by checking q_data->chained_send_ios.
+
+Done.
+
+It is TCP send, so if there is any linked nbd request not completed, we
+can't issue new nbd requests.
+
+
+```
+nbd_handle_io_async()
+    if (q_data->send_sqe_chain_busy)
+        q_data->next_chain.push_back(data);
+    else
+        io->co = __nbd_handle_io_async(q, data, io);
+
+nbd_tgt_io_done()
+    nbd_send_req_done()
+        if (!--q_data->chained_send_ios) {
+            if (q_data->send_sqe_chain_busy)
+                q_data->send_sqe_chain_busy = 0;
+        }
+
+nbd_handle_io_bg
+    __nbd_handle_io_bg
+        nbd_handle_send_bg
+    	    if (!q_data->send_sqe_chain_busy) {
+    		    std::vector<const struct ublk_io_data *> &ios =
+    			    q_data->next_chain;
+
+    		    for (auto it = ios.cbegin(); it != ios.cend(); ++it) {
+    			    auto data = *it;
+    			    struct ublk_io_tgt *io = __ublk_get_io_tgt_data(data);
+    
+    			    ublk_assert(data->tag < q->q_depth);
+    			    io->co = __nbd_handle_io_async(q, data, io);
+    		    }
+
+    		    ios.clear();
+
+    		    if (q_data->chained_send_ios && !q_data->send_sqe_chain_busy)
+    			    q_data->send_sqe_chain_busy = 1;
+    	    }
+	    ...
+        if (q_data->chained_send_ios && !q_data->send_sqe_chain_busy)
+		    q_data->send_sqe_chain_busy = 1;
+    ...
+	if (!q_data->in_flight_ios && q_data->send_sqe_chain_busy) {
+		/* all inflight ios are done, so it is safe to send request */
+		q_data->send_sqe_chain_busy = 0;
+
+		if (!q_data->next_chain.empty())
+			__nbd_handle_io_bg(q, q_data);
+	}
+```
+
+### why resume recv co in nbd_handle_recv_bg()?
+
+- for avoiding recv handling to cut into current send req chain
+
+
+
 # Todo list
 
 ## libublk-rs supports customized run_dir
