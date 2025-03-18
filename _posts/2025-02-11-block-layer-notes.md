@@ -13,22 +13,38 @@ Title: block layer notes
 
 [\[RFC PATCH v2 0/8\] fallocate: introduce FALLOC_FL_WRITE_ZEROES flag](https://lore.kernel.org/linux-block/20250115114637.2705887-1-yi.zhang@huaweicloud.com/)
 
+[\[RFC PATCH -next v3 00/10\] fallocate: introduce FALLOC_FL_WRITE_ZEROES flag](https://lore.kernel.org/linux-block/20250318073545.3518707-1-yi.zhang@huaweicloud.com/)
+
 ## ideas
 
-- Introduce a new feature BLK_FEAT_WRITE_ZEROES_UNMAP
 
-Add the feature to the block device queue limit features, which indicates whether
-the storage is device explicitly supports the unmapped write zeroes command.
+>Currently, we can use the fallocate command to quickly create a
+>pre-allocated file. However, on most filesystems, such as ext4 and XFS,
+>fallocate create pre-allocation blocks in an unwritten state, and the
+>FALLOC_FL_ZERO_RANGE flag also behaves similarly. The extent state must
+>be converted to a written state when the user writes data into this
+>range later, which can trigger numerous metadata changes and consequent
+>journal I/O. This may leads to significant write amplification and
+>performance degradation in synchronous write mode. Therefore, we need a
+>method to create a pre-allocated file with written extents that can be
+>used for pure overwriting. At the monent, the only method available is
+>to create an empty file and write zero data into it (for example, using
+>'dd' with a large block size). However, this method is slow and consumes
+>a considerable amount of disk bandwidth, we must pre-allocate files in
+>advance but cannot add pre-allocated files while user business services
+>are running.
+>
+>Fortunately, with the development and more and more widely used of
+>flash-based storage devices, we can efficiently write zeros to SSDs
+>using the unmap write zeroes command if the devices do not write
+>physical zeroes to the media. For example, if SCSI SSDs support the
+>UMMAP bit or NVMe SSDs support the DEAC bit[1], the write zeroes command
+>does not write actual data to the device, instead, NVMe converts the
+>zeroed range to a deallocated state, which works fast and consumes
+>almost no disk write bandwidth. Consequently, this feature can provide
+>us with a faster method for creating pre-allocated files with written
+>extents and zeroed data.
 
-- Introduce a new flag FALLOC_FL_FORCE_ZERO into the fallocate,
-
-Introduce a new flag FALLOC_FL_FORCE_ZERO into the fallocate,
-filesystems with this operaion should allocate written extents and
-issuing zeroes to the range of the device. If the device supports
-unmap write zeroes command, the zeroing can be accelerated, if not,
-we currently still allow to fall back to submit zeroes data. Users
-can verify if the device supports the unmap write zeroes command and
-then decide whether to use it.
 
 
 # blk-throttol
