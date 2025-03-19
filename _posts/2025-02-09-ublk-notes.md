@@ -478,7 +478,6 @@ submit IO to device directly.
 
 Allow to support real block storage device with ublk.
 
-
 ### approach
 
 Register bpf struct_ops for setting up hardware, register irq, submitting IO &
@@ -489,6 +488,31 @@ completing IO.
 provide hardware device abstraction, pci bus, pci device, and export it to bpf prog
 
 provide irq register/unregister kfunc
+
+
+## host-wide tags
+
+### motivation
+
+[ublk-iscsi](https://groups.google.com/g/ublk/c/2OsDdVDbLSs)
+
+[A case for QLC SSDs in the data center](https://engineering.fb.com/2025/03/04/data-center-engineering/a-case-for-qlc-ssds-in-the-data-center/)
+
+### approach
+
+- Add ADD_HOST control command
+
+    - each host has unique ID, host-wide ublk is added by providing the
+      host controller ID
+
+    - each ublk device grabs one reference of the host controller instance
+
+- Add DEL_HOST control command
+
+    - don't allow new host-wide ublk to be added
+
+    - this host controller will be released after all its ublk devices are
+    removed from this host controller
 
 
 ### ideas
