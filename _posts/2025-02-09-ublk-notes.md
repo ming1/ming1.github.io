@@ -114,6 +114,9 @@ But io-uring community thinks the change or implementation is too complicated.
 The initial version doesn't work really, IO lifetime requirement isn't addressed, and
 short read isn't handled correctly too.
 
+
+[\[PATCHv8 0/6\] ublk zero copy support](https://lore.kernel.org/linux-block/20250227223916.143006-1-kbusch@meta.com/)
+
 ##### overview
 
 - add two uring APIs `io_buffer_register_bvec()` & `io_buffer_unregister_bvec()`
