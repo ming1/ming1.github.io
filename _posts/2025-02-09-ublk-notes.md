@@ -344,6 +344,49 @@ nbd_handle_io_bg
 
 - for avoiding recv handling to cut into current send req chain
 
+# ublk/stripe
+
+## overview
+
+[RAID-0 mdadm Striping vs LVM Striping](https://www.linuxtoday.com/blog/raid-vs-lvm/)
+
+- stripe width
+
+- stripe size
+
+## key points
+
+ublk block IO request has one single bvec IO buffer, which has to spread
+among all backing files:
+
+- for non-zc, readv/writev is needed for deal with the spread
+
+- for zc, there isn't fixed readv/writev yet
+
+### mapping algorithm
+
+- logic_offset / length
+
+- unit
+
+unit_size = nr_files * chunk_size
+
+unit_offset = (logic_offset / unit_size)  * unit_size   #unit_size may not be power_of_2
+
+
+- chunk
+
+#### how to calculate mapped sequence of backing file
+
+(logical_offset - unit_offset) / chunk_size
+
+#### how to calculate mapped offset in the actual backing file
+
+(unit_offset / nr_files) + offset_in_chunk
+
+#### how to calculate nr_iov for IO over backing file
+
+(end / unit_size) - (start / unit_size) + 1
 
 
 # Todo list
