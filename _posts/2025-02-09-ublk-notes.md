@@ -9,24 +9,56 @@ Title: ublk notes
 * TOC
 {:toc}
 
-# Related io_uring patches
+# ublk basic
 
-## v5.14 `ublk del -a` hang and io_uring registered files leak
+## terms
 
-It is reported that `ublk del -a` may hang forever when running ublk
-on v5.14 kernel by backporting ublk to v5.14:
+- client
 
-```
-ublk add -t null
-pkill -9 ublk
-ublk del -a     #hang forever
-```
+application of ublk block device(`/dev/ublkbN`)
 
-Turns out that it is caused by io_uring registered file leak bug:
+- frontend
 
-[\[PATCH 5.10/5.15\] io_uring: fix registered files leak](https://lore.kernel.org/io-uring/20240312142313.3436-1-pchelkin@ispras.ru/)
+`client` and the ublk driver
 
-[\[PATCH\] io_uring: Fix registered ring file refcount leak](https://lore.kernel.org/lkml/173457120329.744782.1920271046445831362.b4-ty@kernel.dk/T/)
+- backend
+
+`ublk server`
+
+- ublk server
+
+backend
+
+- tag
+
+- ublk queue
+
+Aligned with blk-mq's hardqueue, which is served by io_uring.
+
+- io command
+
+Represents by `ublk request`, each io command has unique tag, which is
+originated from blk-mq request's tag.
+
+- uring_cmd
+
+The most important uring_cmd is `UBLK_U_IO_COMMIT_AND_FETCH_REQ` which
+completes previous io command with `result`, meantime starts to fetch new
+io command for this slot automatically.
+
+It has different lifetime with `ublk request`
+
+- ublk request
+
+block layer IO request for ublk block device(`/dev/ublkbN`) 
+
+It has different lifetime with `uring_cmd`.
+
+- ublk_io
+
+For storing per-io flags/io buffer/result/uring_cmd for this slot.
+
+its lifetime is same with ublk queue.
 
 
 # ublk zero copy
@@ -387,6 +419,26 @@ unit_offset = (logic_offset / unit_size)  * unit_size   #unit_size may not be po
 #### how to calculate nr_iov for IO over backing file
 
 (end / unit_size) - (start / unit_size) + 1
+
+
+# Related io_uring patches
+
+## v5.14 `ublk del -a` hang and io_uring registered files leak
+
+It is reported that `ublk del -a` may hang forever when running ublk
+on v5.14 kernel by backporting ublk to v5.14:
+
+```
+ublk add -t null
+pkill -9 ublk
+ublk del -a     #hang forever
+```
+
+Turns out that it is caused by io_uring registered file leak bug:
+
+[\[PATCH 5.10/5.15\] io_uring: fix registered files leak](https://lore.kernel.org/io-uring/20240312142313.3436-1-pchelkin@ispras.ru/)
+
+[\[PATCH\] io_uring: Fix registered ring file refcount leak](https://lore.kernel.org/lkml/173457120329.744782.1920271046445831362.b4-ty@kernel.dk/T/)
 
 
 # Todo list
