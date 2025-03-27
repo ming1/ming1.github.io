@@ -60,6 +60,75 @@ For storing per-io flags/io buffer/result/uring_cmd for this slot.
 
 its lifetime is same with ublk queue.
 
+- ublk char dev open()/close() context
+
+    - single opener
+
+    - should be in same process with ublkq_daemon
+
+    - might in same context with ubq_daemon
+
+- ubq_daemon context
+
+    - uring_cmd handler is run in this context
+
+    - uring_cmd cancel_fn is run in this context
+
+    - is it possible to run from fallback wq?
+
+## cancel code path
+
+### three related variables
+
+- `ubq->canceling`
+
+    - set true in ublk_uring_cmd_cancel_fn() when queue is quiesced
+
+    - read in ublk_queue_rq() for aborting request: fail or requeue(recovery)
+
+- `ubq->force_abort`
+
+    - set in ublk_unquiesce_dev() <- ublk_stop_dev()
+
+    - read in ublk_queue_rq() for failing request if:
+
+            // if ublk_nosrv_dev_should_queue_io(ubq)
+
+            if (ubq->flags & UBLK_F_USER_RECOVERY) && !(ubq->flags & UBLK_F_USER_RECOVERY_FAIL_IO)
+
+- `ubq->fail_io`
+
+    - set in ublk_nosrv_work() if:
+
+            // if !ublk_nosrv_dev_should_queue_io(ubq)
+
+            if !(ubq->flags & UBLK_F_USER_RECOVERY) || (ubq->flags & UBLK_F_USER_RECOVERY_FAIL_IO)
+
+    - read in ublk_queue_rq() for failing request unconditionally
+
+### two jobs
+
+#### abort inflight requests
+
+- the uring_cmd has been done for notifying ublk server to handle IO
+  command
+
+- (io->flags & UBLK_IO_FLAG_ACTIVE) == 0
+
+- aborting request:
+
+    io->flags |= UBLK_IO_FLAG_ABORTED;
+
+    __ublk_fail_req(ubq, io, rq);
+
+
+#### cancel uring_cmd
+
+- no request comming from ublk frontend
+
+- (io->flags & UBLK_IO_FLAG_ACTIVE) != 0
+ 
+- call io_uring_cmd_done(io->cmd, UBLK_IO_RES_ABORT, ...)
 
 # ublk zero copy
 
@@ -439,6 +508,102 @@ Turns out that it is caused by io_uring registered file leak bug:
 [\[PATCH 5.10/5.15\] io_uring: fix registered files leak](https://lore.kernel.org/io-uring/20240312142313.3436-1-pchelkin@ispras.ru/)
 
 [\[PATCH\] io_uring: Fix registered ring file refcount leak](https://lore.kernel.org/lkml/173457120329.744782.1920271046445831362.b4-ty@kernel.dk/T/)
+
+
+# issues
+
+## IO hang when running stress remove test with heavy IO
+
+### how to reproduce
+
+- patches for supporting ->queue_rqs()
+
+- run `make test T=generic/004`
+
+- result
+
+IO hang on blk_mq_freeze_queue_wait() <- del_gendisk()
+
+#### some observations
+
+- not related with UBLK_IO_NEED_GET_DATA, still triggered by not using this
+  feature
+
+- not related with request reference, still triggered by forcing to abort
+  request
+
+- drgn observations:
+
+    - ub:
+        state 2:    UBLK_S_DEV_QUIESCED
+        flags 4e:   
+
+    - ubq:
+        flags: 0x4e (UBLK_F_URING_CMD_COMP_IN_TASK, UBLK_F_NEED_GET_DATA, UBLK_F_USER_RECOVERY, UBLK_F_CMD_IOCTL_ENCODE)
+        
+        force_abort: true
+    
+        canceling: true
+
+    - ublk_io
+        flags
+            6           :  UBLK_IO_FLAG_ABORTED, UBLK_IO_FLAG_OWNED_BY_SRV
+
+            e           :  UBLK_IO_FLAG_NEED_GET_DATA, UBLK_IO_FLAG_ABORTED, UBLK_IO_FLAG_OWNED_BY_SRV
+
+            80000001    :  UBLK_IO_FLAG_CANCELED, UBLK_IO_FLAG_ACTIVE
+
+        cmd:        NULL
+
+    - block request
+        rq_flags 100                :  RQF_IO_STAT
+
+        cmd_flags 8801 or 0         : 
+
+        state 0                     : IDLE
+
+        ref {'counter': 1}          : not completed
+
+### analysis
+
+#### where is the ublk request?
+
+#### story about canceling uring_cmd
+
+[IO_URING_F_CANCEL](https://lore.kernel.org/io-uring/20241127-fuse-uring-for-6-10-rfc4-v7-0-934b3a69baca@ddn.com/)
+
+```
+A IO_URING_F_CANCEL doesn't cancel a request nor removes it
+from io_uring's cancellation list, io_uring_cmd_done() does.
+You might also be getting multiple IO_URING_F_CANCEL calls for
+a request until the request is released.
+```
+
+### how ublk handling F_CANCEL
+
+- set ubq->canceling with request queue frozen
+
+New ublk request won't be dispatched to task work any more, and it can't
+be so because io->cmd(uring_cmd) is done already
+
+- aborting in-flight ublk request
+
+- cancel uring_cmd
+
+    `ubq->canceling` has to be handled as the last one, especially after
+    handling ->force_abort, otherwise it may cause io hang
+
+### how to conquer this one
+
+- brain storm
+
+attach `crash`/`drgn` on the running kernel after the hang is triggered
+
+drgn does help
+
+#### finally it is caused by the ->queue_rqs() patchset
+
+
 
 
 # Todo list
