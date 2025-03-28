@@ -4,7 +4,7 @@ category: tech
 tags: [linux kernel, driver core, sysfs]
 ---
 
-Title: Linux kernel driver cover & sysfs note
+Title: Linux kernel driver core & sysfs note
 
 * TOC
 {:toc}
