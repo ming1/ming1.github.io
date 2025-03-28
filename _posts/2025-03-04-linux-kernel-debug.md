@@ -70,6 +70,92 @@ is 0xffff95cb4fdb0000.
     ffffa32e4102f8b8: ffffffffb05bc352
 ```
 
+## dump kernel data structure
+
+### typical case
+
+- IO hang
+
+- some bad thing happen, but system is still running
+
+### how to dump
+
+`drgn` could be the most easy way to dump kernel.
+
+Sometimes blk-mq debugfs may not be available, such as when del_gendisk()
+is started.
+
+Example for dumping ublk data:
+
+```
+def dump_ubq(q_idx, ubq):
+    print("ubq: idx {} flags {:x} force_abort {} canceling {} fail_io {}".
+          format(q_idx, ubq.flags.value_(),
+                 ubq.force_abort.value_(),
+                 ubq.canceling.value_(),
+                 ubq.fail_io.value_(),
+                 ))
+    for idx in range(ubq.q_depth):
+        io = ubq.ios[idx];
+        f = io.flags.value_()
+        cmd = io.cmd.value_()
+        print("    io-{} flags {:x} cmd {:x}".format(idx, f, cmd));
+
+def dump_ub(ub):
+    print("ublk device: id {} state {} flags {:x}".format(
+            ub.dev_info.dev_id.value_(),
+            ub.dev_info.state.value_(),
+            ub.dev_info.flags.value_(),
+        ))
+
+disk = Object(prog, 'struct gendisk', address=0xffff88810edde000)
+ub = cast("struct ublk_device *", disk.private_data)
+dump_ub(ub)
+
+for idx, entry in xa_for_each(disk.queue.hctx_table.address_of_()):
+    h = cast("struct blk_mq_hw_ctx *", entry)
+    ubq = cast("struct ublk_queue *", h.driver_data)
+    dump_ubq(idx, ubq)
+```
+
+```
+# drgn ublk.py
+ublk device: id 0 state 2 flags 4e
+ubq: idx 0 flags 4e force_abort True canceling True fail_io False
+    io-0 flags 6 cmd 0
+    io-1 flags 6 cmd 0
+    io-2 flags 6 cmd 0
+    io-3 flags 80000001 cmd 0
+ubq: idx 1 flags 4e force_abort True canceling True fail_io False
+    io-0 flags 6 cmd 0
+    io-1 flags 6 cmd 0
+    io-2 flags 6 cmd 0
+    io-3 flags 6 cmd 0
+    request: tag 1 int_tag -1 rq_flags 100 cmd_flags 8801 state 0 ref {'counter': 1}
+    request: tag 2 int_tag -1 rq_flags 100 cmd_flags 0 state 0 ref {'counter': 1}
+ubq: idx 2 flags 4e force_abort True canceling True fail_io False
+    io-0 flags 80000001 cmd 0
+    io-1 flags 6 cmd 0
+    io-2 flags 6 cmd 0
+    io-3 flags 80000001 cmd 0
+    request: tag 0 int_tag -1 rq_flags 100 cmd_flags 8801 state 0 ref {'counter': 1}
+    request: tag 1 int_tag -1 rq_flags 100 cmd_flags 0 state 0 ref {'counter': 1}
+    request: tag 2 int_tag -1 rq_flags 100 cmd_flags 8801 state 0 ref {'counter': 1}
+    request: tag 3 int_tag -1 rq_flags 100 cmd_flags 0 state 0 ref {'counter': 1}
+ubq: idx 3 flags 4e force_abort True canceling True fail_io False
+    io-0 flags 6 cmd 0
+    io-1 flags 6 cmd 0
+    io-2 flags 6 cmd 0
+    io-3 flags e cmd 0
+    request: tag 0 int_tag -1 rq_flags 100 cmd_flags 8801 state 0 ref {'counter': 1}
+    request: tag 1 int_tag -1 rq_flags 100 cmd_flags 0 state 0 ref {'counter': 1}
+    request: tag 2 int_tag -1 rq_flags 100 cmd_flags 8801 state 0 ref {'counter': 1}
+    request: tag 3 int_tag -1 rq_flags 100 cmd_flags 0 state 0 ref {'counter': 1}
+```
+[ublk io hang analysis](https://ming1.github.io/tech/ublk-notes#io-hang-when-running-stress-remove-test-with-heavy-io)
+
+
+
 # memory issue
 
 [Kernel oops with 6.14 when enabling TLS Hannes Reinecke](https://lore.kernel.org/linux-block/08c29e4b-2f71-4b6d-8046-27e407214d8c@suse.com/)
