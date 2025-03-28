@@ -535,10 +535,13 @@ IO hang on blk_mq_freeze_queue_wait() <- del_gendisk()
 - drgn observations:
 
     - ub:
+
         state 2:    UBLK_S_DEV_QUIESCED
+
         flags 4e:   
 
     - ubq:
+
         flags: 0x4e (UBLK_F_URING_CMD_COMP_IN_TASK, UBLK_F_NEED_GET_DATA, UBLK_F_USER_RECOVERY, UBLK_F_CMD_IOCTL_ENCODE)
         
         force_abort: true
@@ -546,7 +549,9 @@ IO hang on blk_mq_freeze_queue_wait() <- del_gendisk()
         canceling: true
 
     - ublk_io
+
         flags
+
             6           :  UBLK_IO_FLAG_ABORTED, UBLK_IO_FLAG_OWNED_BY_SRV
 
             e           :  UBLK_IO_FLAG_NEED_GET_DATA, UBLK_IO_FLAG_ABORTED, UBLK_IO_FLAG_OWNED_BY_SRV
@@ -556,6 +561,7 @@ IO hang on blk_mq_freeze_queue_wait() <- del_gendisk()
         cmd:        NULL
 
     - block request
+
         rq_flags 100                :  RQF_IO_STAT
 
         cmd_flags 8801 or 0         : 
