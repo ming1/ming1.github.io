@@ -610,6 +610,98 @@ drgn does help
 #### finally it is caused by the ->queue_rqs() patchset
 
 
+## ublk/loop over nvme performs much slower
+
+### overview
+
+- setup
+
+machine:
+    hp-dl380g10-01.lab.eng.pek2.redhat.com
+    nvme: optane 500K 4k iops
+
+    not observe this issue on
+        hpe-moonshot-01-c20.khw.eng.bos2.dc.redhat.com(single numa/socket)
+
+ublk add -t loop -q 2 -d 512 -f /dev/nvme0n1
+
+- test result
+
+    - 32 batch(128 QD)
+
+        fio/t/io_uring -p0 /dev/ublkb0
+
+        280K
+
+        fio/t/io_uring -p0 /dev/nvme0n1
+
+        480K
+
+    - 1 batch(128 QD)
+
+        fio/t/io_uring -p0 -s 1 -c 1 /dev/ublkb0
+
+        250K
+
+        fio/t/io_uring -p0 -s -c 1 /dev/nvme0n1
+
+        350K
+
+### observations
+
+- ublk pthread doesn't saturate the CPU
+
+extra wait time for nvme IO
+
+- polling improves nothing
+
+wait 0 events in ublk 
+
+- setup with (IORING_SETUP_SINGLE_ISSUER / IORING_SETUP_DEFER_TASKRUN)
+    -- easier to saturate io task, and iops is improved
+    -- but sometimes ublk io task still may block on nvme
+
+- queue pthread affinity is important for IO performance
+
+    - kublk doesn't support to set affinity yet
+
+    - it works when just setting one cpu for ublk io task
+
+### analysis
+
+### ideas
+
+- observe ublk/nvme nr_reqs in each batch 
+
+    generic bptrace script
+
+    observe both t/io_uring and ublk's io submission & completion pattern
+
+- compare with fio/t/io_uring
+
+    - uring setup flags
+
+        IORING_SETUP_COOP_TASKRUN / IORING_SETUP_SINGLE_ISSUER / IORING_SETUP_DEFER_TASKRUN 
+
+    - reap events
+
+        `to_wait` calculation
+
+- maybe related with numa handling
+
+    - allocate io_cmd_buffer in numa way?
+
+        No difference
+
+
+- dedicated IO ring
+
+    - help to handle IO batch, not necessary to just wait one IO or
+      command
+
+    - inter-ring communication?
+
+- home node?
 
 
 # Todo list
