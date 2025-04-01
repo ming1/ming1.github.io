@@ -46,6 +46,161 @@ Title: block layer notes
 >extents and zeroed data.
 
 
+# blk-mq scheduler
+
+## overview
+
+### q->elevator_lock
+
+```
+hctx_busy_show
+hctx_tags_show
+hctx_tags_bitmap_show
+hctx_sched_tags_show
+hctx_sched_tags_bitmap_show
+```
+
+```
+blkg_conf_open_bdev_frozen      //?
+```
+
+```
+blk_mq_hw_sysfs_show
+```
+
+```
+blk_unregister_queue
+queue_requests_show
+queue_requests_store        // touch hctx->sched_tags
+queue_wb_lat_show
+queue_wb_lat_store
+blk_register_queue
+```
+
+```
+blk_mq_map_swqueue
+    blk_mq_init_allocated_queue
+    __blk_mq_update_nr_hw_queues
+blk_mq_realloc_hw_ctxs
+    blk_mq_init_allocated_queue
+    __blk_mq_update_nr_hw_queues
+blk_mq_elv_switch_none
+    __blk_mq_update_nr_hw_queues
+blk_mq_elv_switch_back
+    __blk_mq_update_nr_hw_queues
+```
+
+### QUEUE_FLAG_SQ_SCHED
+
+set for mq-deadline/bfq
+
+cleared for kyber
+
+
+## interfaces
+
+### blk_mq_init_sched
+
+- allocate tags
+
+- ret = e->ops.init_sched(q, e);
+
+- blk_mq_debugfs_register_sched(q);
+
+- for each hctx
+
+    - e->ops.init_hctx(hctx, i)
+
+    - blk_mq_debugfs_register_sched_hctx
+
+
+### blk_mq_exit_sched
+
+- for each hctx
+
+    - blk_mq_debugfs_unregister_sched_hctx
+
+    - e->type->ops.exit_hctx   
+
+- blk_mq_debugfs_unregister_sched
+
+- e->type->ops.exit_sched
+
+- blk_mq_sched_tags_teardown
+
+## contexts
+
+### add disk
+
+### del disk
+
+### **switch elevator from sysfs**
+
+- require queue to be frozen & quiesced
+
+
+### **update_nr_hw_queues**
+
+- usually for host-wide error handling
+
+- require queue to be frozen
+
+- require elevator to be detached because nr_hw_queues may change
+
+
+#### races with switching elevators
+
+Main trouble is from switch elevator vs. update_nr_hw_queues
+
+#### may del_gendisk() happen when doing update_nr_hw_queues? 
+
+
+### update_nr_requests
+
+blk_mq_update_nr_requests() needs to increase sched_tags's depth,
+and re-allocate tags.
+
+#### race with switching elevator
+
+#### race with update_nr_hw_queues
+
+
+## ideas
+
+### remove unnecessary ->elevator_lock
+
+- move kobject operation out of ->elevator_lock
+
+- reduce unnecessary ->elevator_lock usage
+
+- refactor elevator switch code
+
+    - cover both initialization and switch
+
+    - modular koject deletion, attach, debugfs register, kobject add
+
+    - deal with q->elevator & hctx->sched_tags attachment with spinlock
+
+- how to implement it
+
+    - lifetime simplication(one patchset)
+
+        - cover update_nr_requests
+
+        - do it first
+
+    - modular elevator switch
+
+        - put elevator kobject add/remove together
+
+        - put debugfs register/unregister code together
+
+        - put elevator callback together
+
+        - queue/hctx/nr_requests elevator attachement together by two locks(queue lock, elevator lock)
+
+    - remove elevator sysfs lock(???) 
+
 
 # blk-throttol
 
