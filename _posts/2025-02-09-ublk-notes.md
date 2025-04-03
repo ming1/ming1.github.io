@@ -655,10 +655,12 @@ extra wait time for nvme IO
 
 - polling improves nothing
 
-wait 0 events in ublk 
+    wait 0 events in ublk 
 
 - setup with (IORING_SETUP_SINGLE_ISSUER / IORING_SETUP_DEFER_TASKRUN)
+
     -- easier to saturate io task, and iops is improved
+
     -- but sometimes ublk io task still may block on nvme
 
 - queue pthread affinity is important for IO performance
@@ -667,15 +669,47 @@ wait 0 events in ublk
 
     - it works when just setting one cpu for ublk io task
 
+    - with good affinity set, IOPS can reach ~360K(-z, security), or
+
+    380K(-z, without security builtin)
+
+- NUMA home node 
+
+    ublk/loop/nvme reaches top performance when running 't/io_uring'
+    on CPU not in NUMA home node
+
+    meantime 'ublk' pthread utilizes CPU by 100%
+
+- security_uring_cmd
+
+    After disabling security_uring_cmd(), IOPS is increased by 20 ~ 30K
+
+- /sys/block/ublkb0/queue/rq_affinity
+
+    IOPS isn't affected by setting 0, 1, 2 as `rq_affinity`
+
 ### analysis
 
 ### ideas
 
 - observe ublk/nvme nr_reqs in each batch 
 
-    generic bptrace script
+    - generic bptrace script
 
-    observe both t/io_uring and ublk's io submission & completion pattern
+    - observe both t/io_uring and ublk's io submission & completion pattern
+    
+    - observe how many entries(cmds, ios) in sq in the entry of io_uring_enter(), and
+   
+    - how many entries(cmds, ios) in cq in the exit of io_uring_enter() 
+
+
+    - security_uring_cmd
+    
+    ```
+      - 23.34% io_uring_cmd                                                                                                       ▒
+      + 17.28% ublk_ch_uring_cmd                                                                                               ▒
+      + 5.38% security_uring_cmd       
+    ```
 
 - compare with fio/t/io_uring
 
