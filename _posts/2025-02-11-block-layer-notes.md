@@ -97,6 +97,23 @@ set for mq-deadline/bfq
 cleared for kyber
 
 
+### tag_set
+
+```
+blk_mq_add_queue_tag_set
+    blk_mq_init_allocated_queue
+
+blk_mq_del_queue_tag_set
+    blk_mq_exit_queue
+        blk_mq_destroy_queue
+            __scsi_remove_device
+            nvme_remove_io_tag_set
+            nvme_remove_admin_tag_set
+        del_gendisk
+        disk_release
+```
+
+
 ## interfaces
 
 ### blk_mq_init_sched
