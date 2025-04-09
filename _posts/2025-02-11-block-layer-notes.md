@@ -102,6 +102,12 @@ cleared for kyber
 ```
 blk_mq_add_queue_tag_set
     blk_mq_init_allocated_queue
+        blk_mq_alloc_queue
+            __blk_mq_alloc_disk
+                blk_mq_alloc_disk
+                    nvme_alloc_ns
+                        nvme_scan_ns
+                            nvme_scan_ns_async
 
 blk_mq_del_queue_tag_set
     blk_mq_exit_queue
@@ -112,6 +118,52 @@ blk_mq_del_queue_tag_set
         del_gendisk
         disk_release
 ```
+
+### elevator lifetime
+
+```
+elv_register_queue
+    blk_register_queue
+        add_disk_fwnode
+    elevator_switch
+        blk_mq_elv_switch_back
+            __blk_mq_update_nr_hw_queues
+                blk_mq_update_nr_hw_queues
+                    nvme_pci_update_nr_queues
+                        nvme_reset_work
+                    nvme_rdma_configure_io_queues
+                    nvme_tcp_configure_io_queues
+                    nbd_start_device
+                    nullb_update_nr_hw_queues
+                    blkfront_resume
+        elevator_change
+            elv_iosched_store
+
+elv_unregister_queue
+    blk_unregister_queue
+        del_gendisk
+    elevator_switch
+    elevator_disable
+        blk_mq_elv_switch_none
+            __blk_mq_update_nr_hw_queues
+        elevator_change
+            elv_iosched_store
+
+blk_mq_init_sched
+    elevator_init_mq
+        add_disk_fwnode
+    elevator_switch
+        elevator_change
+            elv_iosched_store
+
+blk_mq_exit_sched
+    elevator_exit
+        elevator_switch
+        elevator_disable
+        del_gendisk
+        add_disk_fwnode
+``` 
+
 
 
 ## interfaces
@@ -183,6 +235,48 @@ and re-allocate tags.
 
 
 ## ideas
+
+### how to annotate lockdep false positive
+
+It can't be annotated
+
+### how to fix this kind of issue
+
+- move kobject & debugfs stuff out of freezing & elevator_lock
+
+- move elevator allocation out of freezing & elevator_lock
+
+- 3 steps of elevator_switch:
+
+    - elev_switch_prep()
+
+        allocate new elevator   //lockless, no freeze & elevator lock
+    
+    - elev_switch()
+
+        setup tags & attach new tags  // freeze & elevator lock
+
+    - elev_switch_post()
+
+        remove old elevator sysfs/debugfs //no freeze & elevator lock
+        add new elevator sysfs/debugfs    //elevator_sys lock
+
+- simplifying elevator switch in blk_mq_update_nr_hw_queues
+
+    - serialize everything about elevator change
+
+    - three chances
+
+        - add/del disk
+
+        - switch elevator via syfs
+
+        - update nr_hw_queues
+
+    - one related commit:
+
+    [[PATCH] Revert "block: freeze the queue earlier in del_gendisk"](https://lore.kernel.org/all/20220919144049.978907-1-hch@lst.de/)
+
 
 ### remove unnecessary ->elevator_lock
 
