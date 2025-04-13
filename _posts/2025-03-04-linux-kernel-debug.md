@@ -190,7 +190,7 @@ ubq: idx 3 flags 4e force_abort True canceling True fail_io False
 ```
 
 
-## check stack trace of iou_exit work
+## check stack trace of iou_exit work, kworker, ublk, fio, ...
 
 We may stuck in iou_exit work.
 
@@ -206,5 +206,27 @@ echo "$pids" | while IFS= read -r line; do
 done
 ```
 
+```
+[<0>] blk_mq_freeze_queue_wait+0x9d/0xe0
+[<0>] del_gendisk+0x22d/0x330
+[<0>] ublk_stop_dev_unlocked+0x39/0x170 [ublk_drv]
+[<0>] ublk_ch_release+0x13e/0x3e0 [ublk_drv]
+[<0>] __fput+0xe3/0x2a0
+[<0>] delayed_fput+0x35/0x50
+[<0>] process_one_work+0x188/0x340
+[<0>] worker_thread+0x257/0x3a0
+[<0>] kthread+0xf9/0x240
+[<0>] ret_from_fork+0x31/0x50
+[<0>] ret_from_fork_asm+0x1a/0x30
+```
+
 ## use drgn to dump kernel internal info
+
+```
++ublk_index_idr = prog["ublk_index_idr"]
++for i, ub in idr_for_each_entry(ublk_index_idr.address_of_(), "struct ublk_device"):
++    dump_ub(ub)
++    dump_blk_queues(ub)
++    print("")
+```
 
