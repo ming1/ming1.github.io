@@ -10,9 +10,28 @@ Title: Linux kernel debug note
 {:toc}
 
 
+# crash tips
+
+## basic
+
+### parsing bits
+
+```
+crash> struct request.atomic_flags 0xffff8ef1677a6000 
+  atomic_flags = 3,
+crash> eval -b 0x3
+hexadecimal: 3  
+    decimal: 3  
+      octal: 3
+     binary: 0000000000000000000000000000000000000000000000000000000000000011
+   bits set: 1 0
+```
+
+
 # use crash & drgn to debug kernel issue
 
 [drgn: Programmable debugger](https://github.com/osandov/drgn)
+
 
 ## how to find address of interested kernel data structure from crash
 
@@ -162,4 +181,30 @@ ubq: idx 3 flags 4e force_abort True canceling True fail_io False
 
 
 
+# ublk
+
+## dump debugfs
+
+```
+(cd /sys/kernel/debug/block/ublkb0 && find . -type f -exec grep -aH . {} \;)
+```
+
+
+## check stack trace of iou_exit work
+
+We may stuck in iou_exit work.
+
+```
+#!/bin/bash
+
+LINES=$(ps -eLf | grep iou_exit)
+pids=$(echo "$LINES" | awk '{print $4}')
+echo "$pids" | while IFS= read -r line; do
+	echo "pid $line"
+	cat /proc/"$line"/stack
+	echo ""
+done
+```
+
+## use drgn to dump kernel internal info
 
