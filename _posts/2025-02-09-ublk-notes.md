@@ -130,6 +130,50 @@ its lifetime is same with ublk queue.
  
 - call io_uring_cmd_done(io->cmd, UBLK_IO_RES_ABORT, ...)
 
+
+# ublk error handling
+
+## overview
+
+### basic functions
+
+- handle ublk server exception
+
+
+- handle IO timeout
+
+
+- support recover feature
+
+
+### key points
+
+- provide forward progress guarantee
+
+
+### in-tree implementation
+
+
+## two-stage canceling
+
+### Uday's patch
+
+[[PATCH v3] ublk: improve detection and handling of ublk server exit](https://lore.kernel.org/linux-block/20250403-ublk_timeout-v3-1-aa09f76c7451@purestorage.com/)
+
+- cancel active uring commands in uring_cmd ->cancel_fn() via IORING_URING_CMD_CANCELABLE
+
+- move request aborting into ublk char device ->release()
+
+### big improvement & cleanup
+
+
+### issues
+
+- can't use ub->mutex in the two stages
+
+
+
+
 # ublk zero copy
 
 ## Requirements
@@ -488,6 +532,30 @@ unit_offset = (logic_offset / unit_size)  * unit_size   #unit_size may not be po
 #### how to calculate nr_iov for IO over backing file
 
 (end / unit_size) - (start / unit_size) + 1
+
+
+# ublk offload aio
+
+## overview
+
+- ublk queue pthread context is only for retrieving & completing io command
+
+- io command is handled in another pthread
+
+- communication is done via eventfd, which need to wakeup io_uring_enter()
+
+## races
+
+- io handing pthread is sending eventfd, however the ublk queue pthread
+  isn't in io_uring_enter()
+
+## use read mshot for getting eventfd notification
+
+[ublk.nfs: use read_mshort for getting eventfd notification](https://github.com/ublk-org/ublksrv/commit/38d5d19f28ff8c9f9f21bfd0f9ffc308ff072a1d)
+
+- avoids the above race
+
+- more efficient
 
 
 # Related io_uring patches
