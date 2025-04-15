@@ -107,70 +107,93 @@ is started.
 Example for dumping ublk data:
 
 ```
+import sys
+from drgn import cast, NULL
+from drgn.helpers.linux.xarray import xa_for_each
+from drgn.helpers.linux.idr import idr_for_each_entry
+
+def dump_request(h, tag, ubq):
+    rq = h.tags.rqs[tag]
+    print("    request: tag {} int_tag {} rq_flags {:x} cmd_flags {:x} state {} ref {}".
+          format(
+              rq.tag.value_(),
+              rq.internal_tag.value_(),
+              rq.rq_flags.value_(),
+              rq.cmd_flags.value_(),
+              rq.state.value_(),
+              rq.ref.value_(),
+              ));
+
 def dump_ubq(q_idx, ubq):
     print("ubq: idx {} flags {:x} force_abort {} canceling {} fail_io {}".
           format(q_idx, ubq.flags.value_(),
                  ubq.force_abort.value_(),
-                 ubq.canceling.value_(),
+                 #ubq.canceling.value_(),
+                 0,
                  ubq.fail_io.value_(),
                  ))
+    if verbose == 0:
+        return
+
     for idx in range(ubq.q_depth):
         io = ubq.ios[idx];
         f = io.flags.value_()
-        cmd = io.cmd.value_()
-        print("    io-{} flags {:x} cmd {:x}".format(idx, f, cmd));
+        res = io.res.value_()
+        print("    io-{} flags {:x} cmd {:x} res {}".format(idx, f, cmd, res))
 
 def dump_ub(ub):
-    print("ublk device: id {} state {} flags {:x}".format(
+    print("ublk dev_info: id {} state {} flags {:x} ub: state {:x}".format(
             ub.dev_info.dev_id.value_(),
             ub.dev_info.state.value_(),
             ub.dev_info.flags.value_(),
+            ub.state.value_(),
+        ))
+    print("blk_mq: q(freeze_depth {} quiesce_depth {})".format(
+        ub.ub_disk.queue.mq_freeze_depth.value_(),
+        ub.ub_disk.queue.quiesce_depth.value_(),
         ))
 
-disk = Object(prog, 'struct gendisk', address=0xffff88810edde000)
-ub = cast("struct ublk_device *", disk.private_data)
-dump_ub(ub)
+def dump_blk_queues(ub):
+    for idx, entry in xa_for_each(ub.ub_disk.queue.hctx_table.address_of_()):
+        h = cast("struct blk_mq_hw_ctx *", entry)
+        #print("hw queue", h)
+        #print("flush queue", h.fq)
+        ubq = cast("struct ublk_queue *", h.driver_data)
+        dump_ubq(idx, ubq)
+        ts = 0
+        sb = h.tags.bitmap_tags.sb
+        for i in range(sb.map_nr):
+            ts = i << sb.shift
+            active_tags = sb.map[i].word & ~sb.map[i].cleared
+            for i in range(64):
+                if (1 << i) & active_tags:
+                    dump_request(h, ts + i, ubq)
 
-for idx, entry in xa_for_each(disk.queue.hctx_table.address_of_()):
-    h = cast("struct blk_mq_hw_ctx *", entry)
-    ubq = cast("struct ublk_queue *", h.driver_data)
-    dump_ubq(idx, ubq)
+verbose=int(sys.argv[1], 10)
+ublk_index_idr = prog["ublk_index_idr"]
+
+for i, ub in idr_for_each_entry(ublk_index_idr.address_of_(), "struct ublk_device"):
+    dump_ub(ub)
+    dump_blk_queues(ub)
+    print("")
 ```
 
 ```
-# drgn ublk.py
-ublk device: id 0 state 2 flags 4e
-ubq: idx 0 flags 4e force_abort True canceling True fail_io False
-    io-0 flags 6 cmd 0
-    io-1 flags 6 cmd 0
-    io-2 flags 6 cmd 0
-    io-3 flags 80000001 cmd 0
-ubq: idx 1 flags 4e force_abort True canceling True fail_io False
-    io-0 flags 6 cmd 0
-    io-1 flags 6 cmd 0
-    io-2 flags 6 cmd 0
-    io-3 flags 6 cmd 0
-    request: tag 1 int_tag -1 rq_flags 100 cmd_flags 8801 state 0 ref {'counter': 1}
-    request: tag 2 int_tag -1 rq_flags 100 cmd_flags 0 state 0 ref {'counter': 1}
-ubq: idx 2 flags 4e force_abort True canceling True fail_io False
-    io-0 flags 80000001 cmd 0
-    io-1 flags 6 cmd 0
-    io-2 flags 6 cmd 0
-    io-3 flags 80000001 cmd 0
-    request: tag 0 int_tag -1 rq_flags 100 cmd_flags 8801 state 0 ref {'counter': 1}
-    request: tag 1 int_tag -1 rq_flags 100 cmd_flags 0 state 0 ref {'counter': 1}
-    request: tag 2 int_tag -1 rq_flags 100 cmd_flags 8801 state 0 ref {'counter': 1}
-    request: tag 3 int_tag -1 rq_flags 100 cmd_flags 0 state 0 ref {'counter': 1}
-ubq: idx 3 flags 4e force_abort True canceling True fail_io False
-    io-0 flags 6 cmd 0
-    io-1 flags 6 cmd 0
-    io-2 flags 6 cmd 0
-    io-3 flags e cmd 0
-    request: tag 0 int_tag -1 rq_flags 100 cmd_flags 8801 state 0 ref {'counter': 1}
-    request: tag 1 int_tag -1 rq_flags 100 cmd_flags 0 state 0 ref {'counter': 1}
-    request: tag 2 int_tag -1 rq_flags 100 cmd_flags 8801 state 0 ref {'counter': 1}
-    request: tag 3 int_tag -1 rq_flags 100 cmd_flags 0 state 0 ref {'counter': 1}
+# drgn dump_ublk.py 1
+ublk dev_info: id 0 state 1 flags 42 ub: state 3
+blk_mq: q(freeze_depth 0 quiesce_depth 0)
+ubq: idx 0 flags 42 force_abort False canceling 0 fail_io False
+    io-0 flags 1 cmd ffff8ab6500d6700 res (0,)
+    io-1 flags 1 cmd ffff8ab6500d6900 res (4096,)
+    io-2 flags 1 cmd ffff8ab6500d6d00 res (0,)
+    io-3 flags 1 cmd ffff8ab6500d7300 res (0,)
+ubq: idx 1 flags 42 force_abort False canceling 0 fail_io False
+    io-0 flags 1 cmd ffff8ab6500d3300 res (0,)
+    io-1 flags 1 cmd ffff8ab6500d2200 res (0,)
+    io-2 flags 1 cmd ffff8ab6500d3b00 res (0,)
+    io-3 flags 1 cmd ffff8ab6500d2000 res (0,)
 ```
+
 [ublk io hang analysis](https://ming1.github.io/tech/ublk-notes#io-hang-when-running-stress-remove-test-with-heavy-io)
 
 
@@ -220,13 +243,11 @@ done
 [<0>] ret_from_fork_asm+0x1a/0x30
 ```
 
-## use drgn to dump kernel internal info
+## use drgn to dump all ublk devices
 
 ```
 +ublk_index_idr = prog["ublk_index_idr"]
 +for i, ub in idr_for_each_entry(ublk_index_idr.address_of_(), "struct ublk_device"):
 +    dump_ub(ub)
-+    dump_blk_queues(ub)
-+    print("")
 ```
 
