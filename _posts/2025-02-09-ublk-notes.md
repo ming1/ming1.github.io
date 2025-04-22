@@ -557,6 +557,54 @@ unit_offset = (logic_offset / unit_size)  * unit_size   #unit_size may not be po
 
 - more efficient
 
+## selftest offload design
+
+### data structure
+
+- offload_ctx
+
+    - represents one pthread context for offloading IOs
+
+    - fields
+            - device
+
+            - io_uring
+
+            - need_exit
+
+            - pthread & thread_fn & default uring_fn
+
+            - sq instance (perf ctx)
+                evtfd
+
+            - cq references (per ublk_queue)
+                evtfd
+
+    - interfaces
+
+            - ctx = create_offload_ctx(device, thread_fn)
+
+            - destroy_offload_ctx(ctx)
+
+            - ublk_submit_offload_io(ctx, q, tag)
+            
+            - ublk_complete_offload_io(ctx, qid, tag, res)
+
+    - lifetime is aligned with device
+
+    - use read_mshot for accepting new events
+
+    - can accept IOs from all queues for this device
+
+- extra io support
+
+- init_queue & deinit_queue support
+
+### interface
+
+- add ->offload_io_done()?
+
+
 
 # Related io_uring patches
 
