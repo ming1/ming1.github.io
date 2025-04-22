@@ -604,6 +604,7 @@ unit_offset = (logic_offset / unit_size)  * unit_size   #unit_size may not be po
 
 - add ->offload_io_done()?
 
+- add ->offload_queue_io() & ->offload_io_done()
 
 
 # Related io_uring patches
@@ -852,6 +853,66 @@ extra wait time for nvme IO
     - inter-ring communication?
 
 - home node?
+
+## uring_cmd use-after-free between cancel_fn and normal completion 
+
+### report
+
+[canceling one done uring_cmd](https://lore.kernel.org/linux-block/d2179120-171b-47ba-b664-23242981ef19@nvidia.com/2-dmesg.202504221107)
+
+```
+[  847.239898] [ T109312] RIP: 0010:ublk_ch_uring_cmd+0x1be/0x1d0 [ublk_drv]
+[  847.239902] [ T109312] Code: e5 f6 e9 69 ff ff ff e8 a0 d9 80 f7 e9 5f ff ff ff 0f 0b 31 c0 e9 b6 fe ff ff 0f 0b 31 c0 e9 ad fe ff ff 0f 0b e9 32 ff ff ff <0f> 0b eb c4 e8 39 c2 7f f7 66 0f 1f 84 00 00 00 00 00 90 90 90 90
+[  847.239905] [ T109312] RSP: 0000:ffffb86bb2b0fc80 EFLAGS: 00010286
+[  847.239907] [ T109312] RAX: 00000000c0000000 RBX: 0000000000000801 RCX: 0000000000000000
+[  847.239909] [ T109312] RDX: 000000000000000a RSI: 0000000000000000 RDI: ffff98dd5ef7db00
+[  847.239911] [ T109312] RBP: ffffb86bb2b0fcd0 R08: 0000000000000000 R09: 0000000000000000
+[  847.239913] [ T109312] R10: 0000000000000000 R11: 0000000000000000 R12: ffff98dd50b180f0
+[  847.239914] [ T109312] R13: ffff98dd50b18000 R14: 0000000000000000 R15: ffff98dd447b8800
+[  847.239916] [ T109312] FS:  0000000000000000(0000) GS:ffff98e49f800000(0000) knlGS:0000000000000000
+[  847.239918] [ T109312] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+[  847.239920] [ T109312] CR2: 000051100082b000 CR3: 000000013da40006 CR4: 00000000003726f0
+[  847.239922] [ T109312] DR0: 0000000000000000 DR1: 0000000000000000 DR2: 0000000000000000
+[  847.239923] [ T109312] DR3: 0000000000000000 DR6: 00000000fffe0ff0 DR7: 0000000000000400
+[  847.239925] [ T109312] Call Trace:
+[  847.239927] [ T109312]  <TASK>
+[  847.239929] [ T109312]  ? show_regs+0x6c/0x80
+[  847.239935] [ T109312]  ? __warn+0x8d/0x150
+[  847.239940] [ T109312]  ? ublk_ch_uring_cmd+0x1be/0x1d0 [ublk_drv]
+[  847.239944] [ T109312]  ? report_bug+0x182/0x1b0
+[  847.239950] [ T109312]  ? handle_bug+0x6e/0xb0
+[  847.239954] [ T109312]  ? exc_invalid_op+0x18/0x80
+[  847.239958] [ T109312]  ? asm_exc_invalid_op+0x1b/0x20
+[  847.239964] [ T109312]  ? ublk_ch_uring_cmd+0x1be/0x1d0 [ublk_drv]
+[  847.239967] [ T109312]  ? sched_clock+0x10/0x30
+[  847.239970] [ T109312]  io_uring_try_cancel_uring_cmd+0xa6/0xe0
+[  847.239976] [ T109312]  io_uring_try_cancel_requests+0x2ee/0x3f0
+[  847.239979] [ T109312]  io_ring_exit_work+0xa4/0x500
+```
+
+The warning is triggered in `ublk_cancel_cmd()` before calling
+io_uring_cmd_done().
+
+### analysis
+
+- when to call io_uring_try_cancel_uring_cmd()?
+
+uring_cmd is removed from the cancel list until it is done.
+
+
+- ublk_cancel_cmd()
+
+only cancel uring_cmd iff UBLK_IO_FLAG_ACTIVE is set
+
+
+#### race between io_uring_cmd_complete_in_task() and io_uring_cmd_done()
+
+- how to solve?
+
+    - call io_uring_cmd_complete_in_task() in arbitrary context
+
+    - call io_uring_cmd_done() for canceling command in uring task context
+
 
 
 # Todo list
