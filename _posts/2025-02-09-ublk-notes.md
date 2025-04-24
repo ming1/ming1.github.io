@@ -907,12 +907,46 @@ only cancel uring_cmd iff UBLK_IO_FLAG_ACTIVE is set
 
 #### race between io_uring_cmd_complete_in_task() and io_uring_cmd_done()
 
-- how to solve?
+- request A has been scheduled via TW for dispatch, but the TW function isn't
+run yet
 
-    - call io_uring_cmd_complete_in_task() in arbitrary context
+- cancel_fn is called, and the queue's ->canceling is marked as true, but
+request A TW isn't dispatched yet, then the uring_cmd is canceled
 
-    - call io_uring_cmd_done() for canceling command in uring task context
+- io_uring_cmd_complete_in_task() is called in arbitrary context
 
+- io_uring_cmd_done() is always called from ublk queue contex, either for canceling
+or completing uring_cmd
+
+- queue quiesce can't avoid the race, because TW work can't be drained
+by queue quiesce
+
+
+[[PATCH 0/2] ublk: fix race between io_uring_cmd_complete_in_task and ublk_cancel_cmd](https://lore.kernel.org/linux-block/20250423092405.919195-1-ming.lei@redhat.com/)
+
+[[PATCH V2 0/2] ublk: fix race between io_uring_cmd_complete_in_task and ublk_cancel_cmd](https://lore.kernel.org/linux-block/20250425013742.1079549-1-ming.lei@redhat.com/)
+
+```
+Thinking of further, the added barrier is actually useless, because:
+
+- for any new coming request since ublk_start_cancel(), ubq->canceling is
+  always observed
+
+- this patch is only for addressing requests TW is scheduled before or
+  during quiesce, but not get chance to run yet
+
+The added single check of `req && blk_mq_request_started(req)` should be
+enough because:
+
+- either the started request is aborted via __ublk_abort_rq(), so the
+uring_cmd is canceled next time
+
+or
+
+- the uring cmd is done in TW function ublk_dispatch_req() because io_uring
+guarantees that it is called
+
+```
 
 
 # Todo list
