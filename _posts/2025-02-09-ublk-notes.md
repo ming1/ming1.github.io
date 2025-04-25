@@ -131,6 +131,13 @@ its lifetime is same with ublk queue.
 - call io_uring_cmd_done(io->cmd, UBLK_IO_RES_ABORT, ...)
 
 
+# ublk: RFC fetch_req_multishot
+
+## overview
+
+[ublk: RFC fetch_req_multishot](https://lore.kernel.org/linux-block/IA1PR12MB606744884B96E0103570A1E9B6852@IA1PR12MB6067.namprd12.prod.outlook.com/#t)
+
+
 # ublk error handling
 
 ## overview
