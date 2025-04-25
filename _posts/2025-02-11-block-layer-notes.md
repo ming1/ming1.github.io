@@ -46,6 +46,62 @@ Title: block layer notes
 >extents and zeroed data.
 
 
+# block layer flush machinery
+
+## overview
+
+### fq->flush_rq
+
+- allocation & release
+
+```
+blk_alloc_flush_queue()
+    blk_mq_alloc_hctx
+        blk_mq_alloc_and_init_hctx
+   
+blk_free_flush_queue
+    blk_mq_hw_sysfs_release
+        .release        = blk_mq_hw_sysfs_release
+            blk_mq_hw_ktype
+```
+
+- use: blk_kick_flush
+
+```
+blk_kick_flush
+    blk_flush_complete_seq
+        flush_end_io
+            flush_rq->end_io = flush_end_io
+                blk_kick_flush
+        mq_flush_data_end_io
+            rq->end_io = mq_flush_data_end_io
+                blk_rq_init_flush
+                    blk_insert_flush
+        blk_insert_flush
+```
+
+### flush sequence
+
+### data structure
+
+- fq->flush_rq
+
+only for running the FLUSH command
+
+internal pre-allocated request.
+
+- rq->flush.seq
+
+flush machinery sequence
+
+only used for normal request, not used by flush_rq
+
+- fq->flush_queue[fq->flush_running_idx]
+
+double list
+
+
+
 # blk-mq scheduler
 
 ## overview
