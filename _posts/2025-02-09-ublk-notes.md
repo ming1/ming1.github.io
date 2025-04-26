@@ -131,33 +131,11 @@ its lifetime is same with ublk queue.
 - call io_uring_cmd_done(io->cmd, UBLK_IO_RES_ABORT, ...)
 
 
-# ublk: RFC fetch_req_multishot
+## ublk error handling
 
-## overview
+### overview
 
-[ublk: RFC fetch_req_multishot](https://lore.kernel.org/linux-block/IA1PR12MB606744884B96E0103570A1E9B6852@IA1PR12MB6067.namprd12.prod.outlook.com/#t)
-
-
-# deliver io command & commit result via read/write
-
-## overview
-
-[deliver io command & commit result via read/write](https://lore.kernel.org/linux-block/aAscRPVcTBiBHNe7@fedora/)
-
-
-## key points
-
-### how to not break user copy
-
-
-### async read on ublk char device
-
-
-# ublk error handling
-
-## overview
-
-### basic functions
+#### basic functions
 
 - handle ublk server exception
 
@@ -168,17 +146,17 @@ its lifetime is same with ublk queue.
 - support recover feature
 
 
-### key points
+#### key points
 
 - provide forward progress guarantee
 
 
-### in-tree implementation
+#### in-tree implementation
 
 
-## two-stage canceling
+### two-stage canceling (merged to v6.15)
 
-### Uday's patch
+#### Uday's patch
 
 [[PATCH v3] ublk: improve detection and handling of ublk server exit](https://lore.kernel.org/linux-block/20250403-ublk_timeout-v3-1-aa09f76c7451@purestorage.com/)
 
@@ -186,12 +164,85 @@ its lifetime is same with ublk queue.
 
 - move request aborting into ublk char device ->release()
 
-### big improvement & cleanup
+#### big improvement & cleanup
 
 
-### issues
+#### issues
 
 - can't use ub->mutex in the two stages
+
+
+# ublk offload aio
+
+## overview
+
+- ublk queue pthread context is only for retrieving & completing io command
+
+- io command is handled in another pthread
+
+- communication is done via eventfd, which need to wakeup io_uring_enter()
+
+## races
+
+- io handing pthread is sending eventfd, however the ublk queue pthread
+  isn't in io_uring_enter()
+
+## use read mshot for getting eventfd notification
+
+[ublk.nfs: use read_mshort for getting eventfd notification](https://github.com/ublk-org/ublksrv/commit/38d5d19f28ff8c9f9f21bfd0f9ffc308ff072a1d)
+
+- avoids the above race
+
+- more efficient
+
+## selftest offload design
+
+### data structure
+
+- offload_ctx
+
+    - represents one pthread context for offloading IOs
+
+    - fields
+            - device
+
+            - io_uring
+
+            - need_exit
+
+            - pthread & thread_fn & default uring_fn
+
+            - sq instance (perf ctx)
+                evtfd
+
+            - cq references (per ublk_queue)
+                evtfd
+
+    - interfaces
+
+            - ctx = create_offload_ctx(device, thread_fn)
+
+            - destroy_offload_ctx(ctx)
+
+            - ublk_submit_offload_io(ctx, q, tag)
+            
+            - ublk_complete_offload_io(ctx, qid, tag, res)
+
+    - lifetime is aligned with device
+
+    - use read_mshot for accepting new events
+
+    - can accept IOs from all queues for this device
+
+- extra io support
+
+- init_queue & deinit_queue support
+
+### interface
+
+- add ->offload_io_done()?
+
+- add ->offload_queue_io() & ->offload_io_done()
 
 
 
@@ -385,6 +436,21 @@ for submitting IO, and it is natural zero-copy because bpf prog works in kernel 
 - add more ublk limits(segment, ...), for aligning with backing file
 
 
+## transparent zero copy
+
+### core idea
+
+- register request buffer automatically before delivering io command to ublk server
+
+- unregister request buffer automatically when handling UBLK_IO_COMMIT_AND_FETCH_REQ
+
+- require to reuse the current uring_cmd
+
+looks fine because both io_buffer_register_bvec() and io_buffer_unregister_bvec()
+only uses `cmd` to retrieve `struct io_ring_ctx` instance.
+
+
+
 # ublk/nbd
 
 ## design
@@ -554,93 +620,6 @@ unit_offset = (logic_offset / unit_size)  * unit_size   #unit_size may not be po
 #### how to calculate nr_iov for IO over backing file
 
 (end / unit_size) - (start / unit_size) + 1
-
-
-# ublk offload aio
-
-## overview
-
-- ublk queue pthread context is only for retrieving & completing io command
-
-- io command is handled in another pthread
-
-- communication is done via eventfd, which need to wakeup io_uring_enter()
-
-## races
-
-- io handing pthread is sending eventfd, however the ublk queue pthread
-  isn't in io_uring_enter()
-
-## use read mshot for getting eventfd notification
-
-[ublk.nfs: use read_mshort for getting eventfd notification](https://github.com/ublk-org/ublksrv/commit/38d5d19f28ff8c9f9f21bfd0f9ffc308ff072a1d)
-
-- avoids the above race
-
-- more efficient
-
-## selftest offload design
-
-### data structure
-
-- offload_ctx
-
-    - represents one pthread context for offloading IOs
-
-    - fields
-            - device
-
-            - io_uring
-
-            - need_exit
-
-            - pthread & thread_fn & default uring_fn
-
-            - sq instance (perf ctx)
-                evtfd
-
-            - cq references (per ublk_queue)
-                evtfd
-
-    - interfaces
-
-            - ctx = create_offload_ctx(device, thread_fn)
-
-            - destroy_offload_ctx(ctx)
-
-            - ublk_submit_offload_io(ctx, q, tag)
-            
-            - ublk_complete_offload_io(ctx, qid, tag, res)
-
-    - lifetime is aligned with device
-
-    - use read_mshot for accepting new events
-
-    - can accept IOs from all queues for this device
-
-- extra io support
-
-- init_queue & deinit_queue support
-
-### interface
-
-- add ->offload_io_done()?
-
-- add ->offload_queue_io() & ->offload_io_done()
-
-
-# transparent zero copy
-
-## core idea
-
-- register request buffer automatically before delivering io command to ublk server
-
-- unregister request buffer automatically when handling UBLK_IO_COMMIT_AND_FETCH_REQ
-
-- require to reuse the current uring_cmd
-
-looks fine because both io_buffer_register_bvec() and io_buffer_unregister_bvec()
-only uses `cmd` to retrieve `struct io_ring_ctx` instance.
 
 
 # issues
@@ -1043,6 +1022,28 @@ can be bound to one controller, and share the same tagset.
 ## ublk-bpf
 
 [RFC patch](https://lore.kernel.org/linux-block/20250107120417.1237392-1-tom.leiming@gmail.com/)
+
+
+## ublk: RFC fetch_req_multishot
+
+### overview
+
+[ublk: RFC fetch_req_multishot](https://lore.kernel.org/linux-block/IA1PR12MB606744884B96E0103570A1E9B6852@IA1PR12MB6067.namprd12.prod.outlook.com/#t)
+
+
+### deliver io command & commit result via read/write
+
+#### overview
+
+[deliver io command & commit result via read/write](https://lore.kernel.org/linux-block/aAscRPVcTBiBHNe7@fedora/)
+
+
+#### key points
+
+- how to not break user copy
+
+- async read on ublk char device
+
 
 
 # Ideas
