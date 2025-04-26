@@ -138,6 +138,21 @@ its lifetime is same with ublk queue.
 [ublk: RFC fetch_req_multishot](https://lore.kernel.org/linux-block/IA1PR12MB606744884B96E0103570A1E9B6852@IA1PR12MB6067.namprd12.prod.outlook.com/#t)
 
 
+# deliver io command & commit result via read/write
+
+## overview
+
+[deliver io command & commit result via read/write](https://lore.kernel.org/linux-block/aAscRPVcTBiBHNe7@fedora/)
+
+
+## key points
+
+### how to not break user copy
+
+
+### async read on ublk char device
+
+
 # ublk error handling
 
 ## overview
@@ -612,6 +627,20 @@ unit_offset = (logic_offset / unit_size)  * unit_size   #unit_size may not be po
 - add ->offload_io_done()?
 
 - add ->offload_queue_io() & ->offload_io_done()
+
+
+# transparent zero copy
+
+## core idea
+
+- register request buffer automatically before delivering io command to ublk server
+
+- unregister request buffer automatically when handling UBLK_IO_COMMIT_AND_FETCH_REQ
+
+- require to reuse the current uring_cmd
+
+looks fine because both io_buffer_register_bvec() and io_buffer_unregister_bvec()
+only uses `cmd` to retrieve `struct io_ring_ctx` instance.
 
 
 # Related io_uring patches
