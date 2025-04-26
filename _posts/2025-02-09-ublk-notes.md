@@ -643,7 +643,7 @@ looks fine because both io_buffer_register_bvec() and io_buffer_unregister_bvec(
 only uses `cmd` to retrieve `struct io_ring_ctx` instance.
 
 
-# Related io_uring patches
+# issues
 
 ## v5.14 `ublk del -a` hang and io_uring registered files leak
 
@@ -662,8 +662,6 @@ Turns out that it is caused by io_uring registered file leak bug:
 
 [\[PATCH\] io_uring: Fix registered ring file refcount leak](https://lore.kernel.org/lkml/173457120329.744782.1920271046445831362.b4-ty@kernel.dk/T/)
 
-
-# issues
 
 ## IO hang when running stress remove test with heavy IO
 
