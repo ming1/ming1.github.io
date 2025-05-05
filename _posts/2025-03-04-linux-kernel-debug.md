@@ -251,3 +251,34 @@ done
 +    dump_ub(ub)
 ```
 
+# lockdep
+
+## down_read_nested()
+
+```
+  /*
+   * nested locking. NOTE: rwsems are not allowed to recurse
+   * (which occurs if the same task tries to acquire the same
+   * lock instance multiple times), but multiple locks of the
+   * same lock class might be taken, if the order of the locks
+   * is always the same. This ordering rule can be expressed
+   * to lockdep via the _nested() APIs, but enumerating the
+   * subclasses that are used. (If the nesting relationship is
+   * static then another method for expressing nested locking is
+   * the explicit definition of lock class keys and the use of
+   * lockdep_set_class() at lock initialization time.
+   * See Documentation/locking/lockdep-design.rst for more details.)
+   */
+```
+
+### lockdep document about nested
+
+[Linus comment on recursive lock](https://yarchive.net/comp/linux/recursive_locks.html)
+
+[lockdep: Support deadlock detection for recursive read locks](https://lwn.net/Articles/732186/)
+
+[Runtime locking correctness: recursive read locks](https://docs.kernel.org/locking/lockdep-design.html#recursive-read-locks)
+
+[Runtime locking correctness: Exception: Nested data dependencies leading to nested locking](https://docs.kernel.org/locking/lockdep-design.html#exception-nested-data-dependencies-leading-to-nested-locking)
+
+
