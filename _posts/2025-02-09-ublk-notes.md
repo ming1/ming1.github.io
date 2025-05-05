@@ -182,10 +182,17 @@ its lifetime is same with ublk queue.
 
 - communication is done via eventfd, which need to wakeup io_uring_enter()
 
+- the offload pthread needs to be waken up for handling io command, still
+  use eventfd
+
 ## races
 
 - io handing pthread is sending eventfd, however the ublk queue pthread
   isn't in io_uring_enter()
+
+  Solved by using IORING_OP_READ_MULTISHOT to read eventfd automatically
+
+
 
 ## use read mshot for getting eventfd notification
 
@@ -199,7 +206,7 @@ its lifetime is same with ublk queue.
 
 ### data structure
 
-- offload_ctx
+- `struct ublk_offload_ctx`
 
     - represents one pthread context for offloading IOs
 
@@ -212,10 +219,10 @@ its lifetime is same with ublk queue.
 
             - pthread & thread_fn & default uring_fn
 
-            - sq instance (perf ctx)
+            - sq instance (perf ctx), owned by `ublk_offload_ctx`
                 evtfd
 
-            - cq references (per ublk_queue)
+            - cq references (per ublk_queue) owned by `ublk_queue`
                 evtfd
 
     - interfaces
@@ -234,17 +241,32 @@ its lifetime is same with ublk queue.
 
     - can accept IOs from all queues for this device
 
-- extra io support
+- `struct ublk_offload_queue`
+
+    - use READ_MULTISHOT to wakeup io_uring contex
+
+    - store tag or queue/tag in its ring buffer
+
+    - one by one push and pop all style
+
+
+- ->user_data encoding
+
+    - define generic EVENT_NOFIFY OP for receiving EVENT
+
+    - pass qid via tgt_data field of ->user_data
+
+    - use same encoding approach(build_user_data()) with non-offload handling
 
 - init_queue & deinit_queue support
 
+    - each ublk queue needs to setup ublk_offload_queue
+
 ### interface
 
-- add ->offload_io_done()?
+- add ->offload_queue_io() & ->offload_io_done() operation
 
-- add ->offload_queue_io() & ->offload_io_done()
-
-
+    - both two are completed in context pthread context
 
 
 # ublk zero copy
@@ -436,7 +458,7 @@ for submitting IO, and it is natural zero-copy because bpf prog works in kernel 
 - add more ublk limits(segment, ...), for aligning with backing file
 
 
-## transparent zero copy
+## automatic buffer register 
 
 ### core idea
 
@@ -449,6 +471,29 @@ for submitting IO, and it is natural zero-copy because bpf prog works in kernel 
 looks fine because both io_buffer_register_bvec() and io_buffer_unregister_bvec()
 only uses `cmd` to retrieve `struct io_ring_ctx` instance.
 
+### `io_uring_register_get_file()` can't be called in arbitrary context
+
+- should be easy to address
+
+
+### external context lock
+
+[Re: [RFC PATCH 3/7] io_uring: support to register bvec buffer to specified io_uring](https://lore.kernel.org/linux-block/0c542e65-d203-4a3e-b9fd-aa090c144afd@gmail.com/)
+
+```
+> We shouldn't be dropping the lock in random helpers, for example
+> it'd be pretty nasty suspending a submission loop with a submission
+> from another task.
+> 
+> You can try lock first, if fails it'll need a fresh context via
+> iowq to be task-work'ed into the ring. see msg_ring.c for how
+> it's done for files.
+```
+
+It can be re-tried in this way, however please keep in mind the
+taskwork vs cancel race.
+
+Need to understand msg_ring.c first.
 
 
 # ublk/nbd
