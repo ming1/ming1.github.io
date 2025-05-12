@@ -269,6 +269,116 @@ its lifetime is same with ublk queue.
     - both two are completed in context pthread context
 
 
+# relax ublk task context limitation
+
+## motivation/requirement
+
+- remove the ubq_daemon context limitation
+
+    - all uring_cmd can be submitted from different context
+
+    - task context for commiting uring_cmd result can be different with
+    the task context for submitting uring_cmd
+
+
+## design
+
+### based on Uday's patchset
+
+[[PATCH v5 0/4] ublk: decouple server threads from hctxs](https://lore.kernel.org/linux-block/20250416-ublk_task_per_io-v5-0-9261ad7bff20@purestorage.com/)
+
+### task contexts
+
+#### task context for issuing uring_cmd
+
+- fetching
+
+- committing result
+
+#### task contexts for canceling uring_cmd
+
+
+#### timeout context
+
+
+## implementation
+
+### cleanup all ubq_daemon references
+
+- timeout
+
+- cancel code path
+
+io_uring_cancel_generic() can be called from multiple pthread context at
+the same time
+
+### add per-io spinlock
+
+
+
+### ublk server
+
+#### offload abstract
+
+- use standalone io_uring for offloading
+
+- use eventfd for notification, offload pthread reads evevtfd
+via read_mshot()
+
+- add offload ring_buffer
+
+data is produced in ->queue_io(), and consumed in offload pthread
+context, notified by eventfd
+
+- add ->handle_io_bg()
+
+produce data for whole batch, and send it to offload pthread by single
+write(eventfd)
+
+- support back and forth
+
+    - notify queue task context if offload task is in full overload
+
+    - keep ->queue_io() work
+
+    - borrow Uday's design, and introduce 'task_context' structure
+
+- task_context
+
+    - io_uring
+
+    - accounting
+
+    - io_ring_buf
+
+    - eventfd
+
+    - only handle single queue IO or multiple queue IO?
+
+- migration logic
+
+    - what is the migrate logic?
+
+        - can be static mapping or dynamic balanceing
+
+    - check if the two side's IOPS is same, offload the one with higher IOPS
+
+    - dynamic load-balancing
+
+    - implement the migration logic in ->queue_io()
+
+
+#### add per-io lock
+
+- protect ublk_queue_io_cmd()
+
+#### updating q->cmd_inflight / q->io_inflight
+
+- convert to atomic variable
+
+#### clear SINGLE_ISSUER flag
+
+
 # ublk zero copy
 
 ## Requirements
