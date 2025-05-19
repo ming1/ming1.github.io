@@ -341,9 +341,9 @@ write(eventfd)
 
     - keep ->queue_io() work
 
-    - borrow Uday's design, and introduce 'task_context' structure
+    - borrow Uday's design, and introduce 'ublk_task_ctx' structure
 
-- task_context
+- ublk_task_ctx
 
     - io_uring
 
@@ -357,19 +357,23 @@ write(eventfd)
 
         - multiple queue's IO
         
-        - task_context is shared among ublk_device wide
+        - ublk_task_ctx is shared among ublk_device wide
 
-    - store task_context via pthread_key
+    - store ublk_task_ctx via pthread_key
+
+        no, pass it from function parameter directly
 
     - buffer index allocation
 
-    - task_context ID:
+    - ublk_task_ctx ID:
 
             - store in 'struct ublk_io'
 
-            - last task_context has higher priority if it isn't saturated
+            - last ublk_task_ctx has higher priority if it isn't saturated
 
-- wire sqe allocation with task_context
+    - pass `ublk_task_ctx *` to `->queue_io() & ->tgt_io_done() & ->handle_io_bg()`
+
+    - wire sqe allocation with ublk_task_ctx
 
 - migration logic
 
@@ -383,6 +387,21 @@ write(eventfd)
 
     - implement the migration logic in ->queue_io()
 
+    - get `voluntary context switches` from getrusage() provided by libc
+
+    - sample every 5 seconds, use IOPS to estimate time, or simply do it
+    every 100K syscalls
+
+    - or use multishot timer(IORING_TIMEOUT_MULTISHOT) which provides much
+      efficient way to use timer, 1sec timer? and migrate how many io commands?
+
+- how to deal with auto buffer register?
+
+    - add unregister_buffers uring_cmd
+
+    - add register_buffers uring_cmd
+
+    - flags?
 
 
 #### add per-io lock
@@ -392,6 +411,8 @@ write(eventfd)
 #### updating q->cmd_inflight / q->io_inflight
 
 - convert to atomic variable
+
+- more it to `ublk_task_ctx`
 
 #### clear SINGLE_ISSUER flag
 
