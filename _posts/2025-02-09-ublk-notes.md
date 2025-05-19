@@ -349,11 +349,27 @@ write(eventfd)
 
     - accounting
 
-    - io_ring_buf
+    - io_ring_buf for storing out/in IOs
 
-    - eventfd
+    - eventfd & read_mshot & event_buffer
 
     - only handle single queue IO or multiple queue IO?
+
+        - multiple queue's IO
+        
+        - task_context is shared among ublk_device wide
+
+    - store task_context via pthread_key
+
+    - buffer index allocation
+
+    - task_context ID:
+
+            - store in 'struct ublk_io'
+
+            - last task_context has higher priority if it isn't saturated
+
+- wire sqe allocation with task_context
 
 - migration logic
 
@@ -366,6 +382,7 @@ write(eventfd)
     - dynamic load-balancing
 
     - implement the migration logic in ->queue_io()
+
 
 
 #### add per-io lock
@@ -1114,6 +1131,40 @@ or
 - the uring cmd is done in TW function ublk_dispatch_req() because io_uring
 guarantees that it is called
 
+```
+
+### regression from this fix
+
+[Re: [PATCH V2 2/2] ublk: fix race between io_uring_cmd_complete_in_task and ublk_cancel_cmd](https://lore.kernel.org/linux-block/mruqwpf4tqenkbtgezv5oxwq7ngyq24jzeyqy4ixzvivatbbxv@4oh2wzz4e6qn/)
+
+
+#### problems
+
+- blktests: ./check ublk/002
+
+- observations
+
+    - drgn dump
+
+```
+    ublk dev_info: id 0 state 1 flags 42 ub: state 3
+    blk_mq: q(freeze_depth 1 quiesce_depth 0)
+    ubq: idx 0 flags 42 force_abort False canceling 0 fail_io False
+        request: tag 0 int_tag 236 rq_flags 131 cmd_flags 800 state 1 ref {'counter': 1}
+        ublk io: res 4096 flags 2 cmd 18446619973942735616
+
+        io->flags: UBLK_IO_FLAG_OWNED_BY_SRV    (without UBLK_IO_FLAG_ACTIVE)
+```
+
+    - io_uring is keeping canceling:
+```
+        io_uring_try_cancel_requests
+            io_uring_try_cancel_uring_cmd
+                ublk_cancel_cmd
+
+        so commands aren't completed? why? because of the added check,
+        which may not have request, but the same request may be re-cycled
+        for another slot
 ```
 
 
