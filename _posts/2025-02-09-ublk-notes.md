@@ -243,6 +243,8 @@ its lifetime is same with ublk queue.
 
     - need ublk server to co-operate
 
+    - all inflight uring_cmd needs to hold all io commands
+
 - can be issued from any task context
 
     - single task is the most typical implementation
@@ -250,6 +252,16 @@ its lifetime is same with ublk queue.
 - ublk driver has to store incoming io commands in driver internal fifo
 
     - ublk server can't guarantee that uring_cmd is queued always in time
+
+
+### UPDATE_CMD_PRIORITY
+
+- for load balancing
+
+
+### CANCEL_CMD
+
+- simplify cancel & stop disk & remove disk
 
 
 ### load balancing
