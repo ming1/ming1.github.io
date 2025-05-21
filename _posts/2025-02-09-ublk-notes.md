@@ -343,6 +343,18 @@ write(eventfd)
 
     - borrow Uday's design, and introduce 'ublk_task_ctx' structure
 
+    - if there exists balanced state? Essentially, no.
+
+    - good batch vs. saturation?
+
+        - how to make sure one batch requests stay in same task_context?
+        (good question)
+
+        - so io migration idea doesn't work
+
+        - we have to keep whole io batch in same task_context
+
+
 - ublk_task_ctx
 
     - io_uring
@@ -402,6 +414,9 @@ write(eventfd)
     - add register_buffers uring_cmd
 
     - flags?
+
+    - track `io_ring_ctx` to check if registered buffer can be unregistered
+      which is required for AUTO_BUF_REG too, can be one bug-fix too
 
 
 #### add per-io lock
