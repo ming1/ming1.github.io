@@ -172,7 +172,94 @@ its lifetime is same with ublk queue.
 - can't use ub->mutex in the two stages
 
 
-# ublk offload aio
+# **ublk2**
+
+## overview
+
+### batch delivery
+
+- one uring_cmd can deliver one batch of io commands
+
+- one uring_cmd can commit & deliver one batch of io commands
+
+### uring_cmd can be issued from any task context
+
+- uring_cmd is task-agnostic
+
+- requires ublk driver to cover multiple task situation
+
+## requirements
+
+### save uring_cmd cost
+
+- cost is big for each uring_cmd, especially securing_uring_cmd() 
+
+### support io command migration in easy way
+
+- single task may be not enough to provide best performance
+
+- the minimum migration unit should be one batch of IO commands
+
+
+## design
+
+### FETCH_AND_COMMIT_CMDS
+
+[design mind map](https://coggle.it/diagram/aByre8eQzBRMl405/t/ublk2)
+
+- carry buffer(IN/OUT direction)
+
+    - cover multiple IO commands, often one batch of IO commands
+    
+    - each IO takes fixed-length bytes
+
+    - buffer header:
+
+        - q_id
+
+        - flags
+
+        - nr_ios
+
+        - io_bytes
+            
+            - for FETCH, it is for storing:
+
+                - tag + buf_idx  (TI)
+
+                - tag + buffer_address (TB)
+
+            - for FETCH_COMMIT, it can be 
+
+                    - TI|TB|NONE + result (8bytes)
+
+                    - TI|TB|NONE + result + zoned_append_lba (16bytes)
+
+        - priority
+
+    - start with fixed buffer only, which is more efficient
+
+- try best to keep at least one such command in driver side anytime
+
+    - need ublk server to co-operate
+
+- can be issued from any task context
+
+    - single task is the most typical implementation
+
+- ublk driver has to store incoming io commands in driver internal fifo
+
+    - ublk server can't guarantee that uring_cmd is queued always in time
+
+
+### load balancing
+
+- when one task is saturated, wakeup new task to issue uring_cmd with higher priority
+
+- when the task becomes not saturated, reduce uring command priority issued from new task
+ 
+
+# *ublk offload aio*
 
 ## overview
 
@@ -269,7 +356,7 @@ its lifetime is same with ublk queue.
     - both two are completed in context pthread context
 
 
-# relax ublk task context limitation
+# *relax ublk task context limitation*
 
 ## motivation/requirement
 
