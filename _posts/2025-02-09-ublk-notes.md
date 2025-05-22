@@ -272,6 +272,57 @@ its lifetime is same with ublk queue.
 - when the task becomes not saturated, reduce uring command priority issued from new task
 
 
+# UBLK_F_QUIESCE_DEV
+
+## requirement
+
+[ublk server upgrade](https://lore.kernel.org/linux-block/DM4PR12MB63282BE4C94D28AA2E1CACA0A9B22@DM4PR12MB6328.namprd12.prod.outlook.com/)
+
+```
+I am seeking advice on whether it is possible to upgrade the ublksrv version
+without terminating the daemon abruptly. Specifically, I would like the daemon to
+exit gracefully, ensuring all necessary cleanups are performed.
+```
+
+## design
+
+[draft QUIESCE_DEV idea](https://lore.kernel.org/linux-block/DM4PR12MB632807AB7CDCE77D1E5AB7D0A9B92@DM4PR12MB6328.namprd12.prod.outlook.com/)
+
+```
+I think the requirement is reasonable, which could be one QUIESCE_DEV command:
+
+- only usable for UBLK_F_USER_RECOVERY
+
+- need ublk server cooperation for handling inflight IO command
+
+- fallback to normal cancel code path in case that io_uring is exiting
+
+The implementation shouldn't be hard:
+
+- mark ubq->canceling as ture
+        - freeze request queue
+        - mark ubq->canceling as true
+        - unfreeze request queue
+
+- canceling all uring_cmd with UBLK_IO_RES_ABORT (*)
+        - now there can't be new ublk IO request coming, and ublk server won't
+        send new uring_cmd too,
+
+        - the gatekeeper code of __ublk_ch_uring_cmd() should be reliable to prevent
+        any new uring_cmd from malicious application, maybe need audit & refactoring
+        a bit
+
+        - need ublk server to handle UBLK_IO_RES_ABORT correctly: release all
+          kinds resource, close ublk char device...
+
+- wait until ublk char device is released by checking UB_STATE_OPEN
+
+- now ublk state becomes UBLK_S_DEV_QUIESCED or UBLK_S_DEV_FAIL_IO,
+and userspace can replace the binary and recover device with new
+application via UBLK_CMD_START_USER_RECOVERY & UBLK_CMD_END_USER_RECOVERY
+```
+
+
 # UBLK_F_AUTO_BUF_REG
 
 ## overview
