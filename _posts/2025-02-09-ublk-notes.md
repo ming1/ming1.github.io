@@ -263,13 +263,49 @@ its lifetime is same with ublk queue.
 
 - simplify cancel & stop disk & remove disk
 
+### HOUSEKEEP_CMD
 
 ### load balancing
 
 - when one task is saturated, wakeup new task to issue uring_cmd with higher priority
 
 - when the task becomes not saturated, reduce uring command priority issued from new task
- 
+
+
+# UBLK_F_AUTO_BUF_REG
+
+## overview
+
+## problems
+
+### per-context buffer register
+
+- cross-context register/unregister
+
+[Caleb Sander Mateos's comment](https://lore.kernel.org/linux-block/CADUfDZoY7rC=SxpFnN6bqBg1SiBccSyYTsKAVe2Rx0wAxBdD6Q@mail.gmail.com/)
+
+```
+> True. I think it might be better to just skip the unregister if the
+> contexts don't match rather than returning -EINVAL. Then there is no
+> race. If userspace has already closed the old io_uring context,
+> skipping the unregister is the desired behavior. If userspace hasn't
+> closed the old io_uring, then that's a userspace bug and they get what
+> they deserve (a buffer stuck registered). If userspace wants to submit
+> the UBLK_IO_COMMIT_AND_FETCH_REQ on a different io_uring for some
+> reason, they can always issue an explicit UBLK_IO_UNREGISTER_IO_BUF on
+> the old io_uring to unregister the buffer.
+```
+
+[Two invariants](https://lore.kernel.org/linux-block/aC6N9w4ijVEkHN0l@fedora/)
+
+```
+- ublk_io_release() is always called once no matter if it is called
+from any thread context, request can't be completed until ublk_io_release()
+is called
+
+- new UBLK_IO_COMMIT_AND_FETCH_REQ can't be issued until old request
+is completed & new request comes
+```
 
 # *ublk offload aio*
 
