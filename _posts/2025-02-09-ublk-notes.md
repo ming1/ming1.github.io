@@ -205,7 +205,14 @@ its lifetime is same with ublk queue.
 
 - how to support IO migration by controlling uring_cmd's priority?
 
+    -- queue less uring_cmd if this task context is saturated, and queue
+    more if this task context isn't saturated any more
 
+    -- increase priority of uring_cmd in other task contexts
+
+### IO level ZC or buffer copy
+
+- needn't to be all or nothing
 
 ## design
 
@@ -228,18 +235,29 @@ its lifetime is same with ublk queue.
         - nr_ios
 
         - io_bytes
-            
-            - for FETCH, it is for storing:
+           
+        - io element
+ 
+            - for issuing FETCH only, it is for storing:
 
                 - tag + buf_idx  (TI)
 
                 - tag + buffer_address (TB)
 
-            - for FETCH_COMMIT, it can be 
+            - for issuing FETCH_COMMIT, it can be 
 
                     - TI|TB|NONE + result (8bytes)
 
                     - TI|TB|NONE + result + zoned_append_lba (16bytes)
+        
+            - for delivering IO commands
+
+                - hint: how many IO commands in queue, and need new command for fetch
+
+                - tag for each IO in this queue
+
+                - result: nr_io * 2
+
 
         - priority
 
@@ -259,6 +277,34 @@ its lifetime is same with ublk queue.
 
     - ublk server can't guarantee that uring_cmd is queued always in time
 
+- for addressing typical cases: deliver one batch io commands
+
+
+### ublk_queue_rq() change
+
+#### per-queue IO buffer
+
+- each element is for storing inflight request tag
+
+- all elements are flushed to uring_cmd together
+
+- in case of non-batch mode, one tag is added one time, but flushed to
+  uring_cmd once in .commit_rqs() if there are enough uring_cmds
+
+- in case of batch mode(ublk_queue_rqs()), tags are flushed to uring_cmd
+directly, if all tags can be held in pending uring_cmd
+
+
+### how to organize uring_cmds
+
+- priority table or queues
+
+- 4 or 8 priorities(0 ~ 3) or (0 ~ 7)
+
+- each priority has one linked list, stores uring_cmd
+
+- always pick high priority uring_cmd first
+
 
 ### UPDATE_CMD_PRIORITY
 
@@ -276,6 +322,45 @@ its lifetime is same with ublk queue.
 - when one task is saturated, wakeup new task to issue uring_cmd with higher priority
 
 - when the task becomes not saturated, reduce uring command priority issued from new task
+
+
+## implementation policy
+
+### new file_operations for ublk char device
+
+
+### new queue_rq() 
+
+
+
+
+## comments
+
+### extra complexity
+
+- maintaining per-queue fifo for holding inflight request tag
+
+- has to handle situation in which new inflight request comes but there
+  isn't uring_cmd for handling it
+
+### potential performance regression
+
+- no batched IO
+
+each uring_cmd just handles single request
+
+typical sequential IO use case
+
+
+### sys_ringbuffer
+
+[sys_ringbuffer wip](https://lore.kernel.org/all/ytprj7mx37dna3n3kbiskgvris4nfvv63u3v7wogdrlzbikkmt@chgq5hw3ny3r/#t)
+
+[sys_ringbufer patch v1](https://lore.kernel.org/all/20240603003306.2030491-1-kent.overstreet@linux.dev/)
+
+Essentially, it is same with nvme's SQ/CQ, so one ringbuffer between driver
+and application is more straightforward.
+
 
 
 # UBLK_F_QUIESCE_DEV
