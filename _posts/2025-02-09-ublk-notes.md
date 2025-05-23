@@ -194,11 +194,17 @@ its lifetime is same with ublk queue.
 
 - cost is big for each uring_cmd, especially securing_uring_cmd() 
 
+- focus on performance improvement on batched IO workload, not cause
+  regression on low batch IO workload
+
 ### support io command migration in easy way
 
 - single task may be not enough to provide best performance
 
 - the minimum migration unit should be one batch of IO commands
+
+- how to support IO migration by controlling uring_cmd's priority?
+
 
 
 ## design
@@ -321,6 +327,17 @@ The implementation shouldn't be hard:
 and userspace can replace the binary and recover device with new
 application via UBLK_CMD_START_USER_RECOVERY & UBLK_CMD_END_USER_RECOVERY
 ```
+
+## problems
+
+### what if there isn't any active uring_cmd?
+
+- it could be true if all inflight io command is handled by ublk server
+
+- wait until one request is completed
+
+- fail if timeout
+
 
 
 # UBLK_F_AUTO_BUF_REG
