@@ -1491,6 +1491,66 @@ guarantees that it is called
         for another slot
 ```
 
+### another observation
+
+#### core variables
+
+- request state is IN_FLIGHT
+
+- ACTIVE flag isn't cleared
+
+- during quiesce from stop_dev()
+
+- ->canceling is true
+
+#### questions
+
+- where is the request? TW work is lost?
+
+    Yeah, the tw work function isn't called, looks one io_uring issue
+
+
+```
+ublk dev_info: id 2 state 1 flags 18cb ub: state 3
+blk_mq: q(freeze_depth 0 quiesce_depth 1)
+ubq: idx 0 flags 18cb force_abort False canceling True fail_io False
+    request: tag 102 int_tag -1 rq_flags 100 cmd_flags 84700 state 0 ref {'counter': 1}
+    ublk io: res 131072 flags 80000001 cmd 18446613490881966592 idx (ptrdiff_t)102
+    request: tag 103 int_tag -1 rq_flags 100 cmd_flags 80700 state 0 ref {'counter': 1}
+    ublk io: res 131072 flags 80000001 cmd 18446613490881966848 idx (ptrdiff_t)103
+    request: tag 104 int_tag -1 rq_flags 100 cmd_flags 84700 state 1 ref {'counter': 1}
+    ublk io: res 131072 flags 1 cmd 18446613490881964544 idx (ptrdiff_t)104
+    request: tag 105 int_tag -1 rq_flags 100 cmd_flags 80700 state 1 ref {'counter': 1}
+    ublk io: res 131072 flags 1 cmd 18446613490881964800 idx (ptrdiff_t)105
+
+[root@ktest-40 linux]# ~/git/iot/drgn/show-iou-stack kublk
+pid 8381
+[<0>] io_wq_put_and_exit+0xca/0x260
+[<0>] io_uring_clean_tctx+0x82/0xb0
+[<0>] io_uring_cancel_generic+0x2a0/0x2e0
+[<0>] do_exit+0x116/0xa70
+[<0>] do_group_exit+0x30/0x80
+[<0>] get_signal+0x874/0x880
+[<0>] arch_do_signal_or_restart+0x3a/0x240
+[<0>] syscall_exit_to_user_mode+0x126/0x210
+[<0>] do_syscall_64+0x8e/0x170
+[<0>] entry_SYSCALL_64_after_hwframe+0x76/0x7e
+
+pid 8382
+[<0>] msleep+0x31/0x50
+[<0>] ublk_stop_dev_unlocked.part.0+0x11c/0x150 [ublk_drv]
+[<0>] ublk_stop_dev+0x2d/0x90 [ublk_drv]
+[<0>] ublk_ctrl_uring_cmd+0xb5b/0x1270 [ublk_drv]
+[<0>] io_uring_cmd+0xaa/0x140
+[<0>] __io_issue_sqe+0x3a/0x1b0
+[<0>] io_issue_sqe+0x39/0x4e0
+[<0>] io_wq_submit_work+0xbc/0x300
+[<0>] io_worker_handle_work+0x140/0x580
+[<0>] io_wq_worker+0xde/0x350
+[<0>] ret_from_fork+0x34/0x50
+[<0>] ret_from_fork_asm+0x1a/0x30
+```
+
 
 # Todo list
 
