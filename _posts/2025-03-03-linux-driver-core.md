@@ -1,5 +1,5 @@
 ---
-title: Linux kernel driver cover & sysfs note
+title: Linux kernel driver core & sysfs note
 category: tech
 tags: [linux kernel, driver core, sysfs]
 ---

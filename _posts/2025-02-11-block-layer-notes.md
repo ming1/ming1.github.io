@@ -15,8 +15,9 @@ Title: block layer notes
 
 [\[RFC PATCH -next v3 00/10\] fallocate: introduce FALLOC_FL_WRITE_ZEROES flag](https://lore.kernel.org/linux-block/20250318073545.3518707-1-yi.zhang@huaweicloud.com/)
 
-## ideas
+[[[RFC PATCH v4 00/11] fallocate: introduce FALLOC_FL_WRITE_ZEROES flag](https://lore.kernel.org/linux-block/20250421021509.2366003-1-yi.zhang@huaweicloud.com/)]
 
+## ideas
 
 >Currently, we can use the fallocate command to quickly create a
 >pre-allocated file. However, on most filesystems, such as ext4 and XFS,
