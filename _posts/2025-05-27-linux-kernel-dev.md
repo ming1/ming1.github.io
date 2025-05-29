@@ -53,7 +53,24 @@ title:  Linux kernel development note
 
 # Interested features
 
+## FALLOC_FL_WRITE_ZEROES
+
 [[RFC PATCH v4 00/11] fallocate: introduce FALLOC_FL_WRITE_ZEROES flag](https://lore.kernel.org/linux-block/20250421021509.2366003-1-yi.zhang@huaweicloud.com/)
 
+## block copy
+
 [[PATCH 0/5] block: another block copy offload](https://lore.kernel.org/linux-block/20250521223107.709131-1-kbusch@meta.com/)
+
+### basic things
+
+- single LUN/NS support, just copy inside one bvec
+
+- syn interface: ioctl
+
+- multiple source range vs. single destination range
+
+### use cases
+
+- FS: defragmentation and garbage collection
+
 
