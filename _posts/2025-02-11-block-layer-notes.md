@@ -9,6 +9,24 @@ Title: block layer notes
 * TOC
 {:toc}
 
+# IO accounting
+
+## io_ticks
+
+### update_io_ticks()
+
+```
+update_io_ticks()
+    bdev_start_io_acct
+    bdev_end_io_acct
+    blk_account_io_done
+    blk_account_io_start
+    part_stat_show
+    diskstats_show
+```
+
+
+
 # fallocate: introduce FALLOC_FL_WRITE_ZEROES flag
 
 [\[RFC PATCH v2 0/8\] fallocate: introduce FALLOC_FL_WRITE_ZEROES flag](https://lore.kernel.org/linux-block/20250115114637.2705887-1-yi.zhang@huaweicloud.com/)
