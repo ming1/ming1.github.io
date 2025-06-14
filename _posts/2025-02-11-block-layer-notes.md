@@ -9,6 +9,173 @@ Title: block layer notes
 * TOC
 {:toc}
 
+
+# block queue limits
+
+## virt_boundary
+
+### overview
+
+- except for the 1st and last page, other pages have to be one whole page
+
+- there isn't any virt gap between adjacent bvecs
+
+- can be mapped to one single virtual address range
+
+### virt_boundary vs. max segment size
+
+- why does virt_boundary imply that max segment size is unlimited
+
+```
+__blk_rq_map_sg() needs to build scatterlist with max_segment_size,
+then one virt segment may be splitted into multiple parts, which does
+break virt_boundary
+
+However, it is fine to set max_segment_size for logical block device,
+such as, dm, md, ...
+
+```
+
+- thinking from device viewpoint
+
+```
+iommu can map this single virt-segment into one real segment in device
+memory address space?
+```
+
+
+### how to use virt_boundary
+
+- io split
+
+```
+bvec_split_segs
+    bio_split_rw_at
+        blk_rq_append_bio
+        bio_split_rw
+            __bio_split_to_limits
+                bio_split_to_limits
+                    drbd_submit_bio
+                    pkt_submit_bio
+                    dm_split_and_process_bio
+                    md_submit_bio
+                    nvme_ns_head_submit_bio
+                blk_mq_submit_bio
+        bio_split_zone_append
+        btrfs_append_map_length
+        iomap_split_ioend
+        xfs_zone_gc_split_write
+    blk_recalc_rq_segments
+
+__bvec_gap_to_prev
+    bio_will_gap
+    bio_split_rw_at
+        bio_split_rw
+    integrity_req_gap_back_merge
+        blk_integrity_merge_rq
+            ll_merge_requests_fn
+    integrity_req_gap_front_merge
+        ll_front_merge_fn
+```
+
+Looks split side is good.
+
+
+- io merge
+
+```
+
+BIO_QOS_MERGED
+    bio_set_flag(bio, BIO_QOS_MERGED)
+        rq_qos_merge
+            bio_attempt_discard_merge
+            bio_attempt_back_merge
+            bio_attempt_front_merge
+
+
+bio_will_gap
+    req_gap_back_merge
+        ll_back_merge_fn
+            blk_rq_append_bio       //mergeable
+                bio_copy_user_iov
+                bio_map_user_iov
+                blk_rq_map_user_bvec
+                blk_rq_map_kern
+                nvmet_passthru_map_sg
+                pscsi_map_sg
+            bio_attempt_back_merge
+                blk_attempt_bio_merge
+                    blk_attempt_plug_merge
+                        blk_mq_attempt_bio_merge
+                            blk_mq_submit_bio
+                    blk_bio_list_merge
+                        blk_mq_sched_bio_merge
+                            blk_mq_attempt_bio_merge
+                                blk_mq_submit_bio
+                        kyber_bio_merge
+                blk_mq_sched_try_merge
+                    bfq_bio_merge
+                    dd_bio_merge
+                blk_zone_write_plug_init_request
+        ll_merge_requests_fn
+           attempt_merge
+                attempt_back_merge
+                    blk_mq_sched_try_merge
+                attempt_front_merge
+                    blk_mq_sched_try_merge
+                blk_attempt_req_merge
+                    elv_attempt_insert_merge
+                        blk_mq_sched_try_insert_merge
+                            bfq_insert_request
+                            dd_insert_request
+    req_gap_front_merge
+        ll_front_merge_fn
+            bio_attempt_front_merge
+                blk_attempt_bio_merge
+                blk_mq_sched_try_merge
+```
+
+```
+rq_mergeable
+    attempt_merge
+    blk_rq_merge_ok
+        blk_attempt_bio_merge
+        blk_zone_write_plug_init_request
+        elv_bio_merge_ok
+            bfq_request_merge
+            elv_merge
+                blk_mq_sched_try_merge
+            dd_request_merge
+    blk_mq_sched_try_insert_merge
+    elv_rqhash_find
+    bfq_insert_request
+    dd_insert_request
+```
+
+- map sg
+
+```
+__blk_rq_map_sg
+    blk_rq_map_sg
+        virtblk_map_data
+        blkif_queue_rw_req
+        mmc_queue_map_sg
+        nvme_map_data
+        nvme_rdma_dma_map_req
+        nvme_loop_queue_rq
+    scsi_alloc_sgtables
+        scsi_setup_scsi_cmnd
+            scsi_prepare_cmd
+                scsi_queue_rq
+        sr_init_command
+        sd_setup_read_write_cmnd
+            sd_init_command
+        sd_setup_unmap_cmnd
+        sd_setup_write_same10_cmnd
+        sd_setup_write_same16_cmnd
+```
+
+
 # IO accounting
 
 ## io_ticks
