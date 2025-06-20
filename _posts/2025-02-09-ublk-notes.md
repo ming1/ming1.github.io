@@ -172,6 +172,42 @@ its lifetime is same with ublk queue.
 - can't use ub->mutex in the two stages
 
 
+# iopolling support
+
+## use IOPOLL for polling backing IO
+
+- use one standalone io_uring for handling polling
+
+    - communication between the two rings?
+
+        use IORING_OP_POLL_ADD to add main ring FD into iopoll ring.
+
+    - F_AUTO_BUF_REG can't be used
+
+### ublk server side for IOPOLL
+
+- enter polling state if ->io_inflight is > 0 and IOPOLL feature is enabled
+
+- keep polling until ->io_inflight becomes zero
+
+
+## use single io_ring_ctx for both ublk commands and backing IO
+
+- can support auto buffer registration
+
+- easier implementation
+
+- add ->uring_cmd_iopoll() for ublk char device
+
+    - only support poll FETCH_IO_CMDS
+
+    - use BLK_POLL_ONESHOT to decide if sleep is needed
+
+### IOPOLL vs. MULTISHOT
+
+- does io_uring allow it?
+
+
 # **ublk2**
 
 ## overview
@@ -332,7 +368,64 @@ directly, if all tags can be held in pending uring_cmd
 ### new queue_rq() 
 
 
+## test result
 
+### trace fetch & submit batch
+
+```
+iops: 360K 
+
+@compl_batch: 
+[1]                56577 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@  |
+[2, 4)             39109 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@                  |
+[4, 8)             46358 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@           |
+[8, 16)            54855 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@    |
+[16, 32)           58525 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+[32, 64)            3251 |@@                                                  |
+
+@fetch_batch: 
+[1]                 1036 |                                                    |
+[2, 4)                 0 |                                                    |
+[4, 8)                 0 |                                                    |
+[8, 16)                0 |                                                    |
+[16, 32)            1103 |                                                    |
+[32, 64)           75445 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+[64, 128)             35 |                                                    |
+
+@nvme_irq[103]: 
+[4, 8)            180846 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+
+@nvme_irq[99]: 
+[0]              2036943 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+
+```
+
+```
+taskset -c 8
+iops: 398K
+
+@compl_batch: 
+[1]                 7292 |@@@@                                                |
+[2, 4)             20692 |@@@@@@@@@@@@@                                       |
+[4, 8)             27189 |@@@@@@@@@@@@@@@@@@                                  |
+[8, 16)            76082 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@  |
+[16, 32)           78166 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+[32, 64)             135 |                                                    |
+
+@fetch_batch: 
+[1]                 1330 |                                                    |
+[2, 4)                 0 |                                                    |
+[4, 8)                 0 |                                                    |
+[8, 16)                0 |                                                    |
+[16, 32)            1316 |                                                    |
+[32, 64)           83744 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+[64, 128)             31 |                                                    |
+[128, 256)             1 |                                                    |
+
+@nvme_irq[84]: 
+[16, 32)         1897544 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+
+```
 
 ## comments
 
