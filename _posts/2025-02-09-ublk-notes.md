@@ -1213,6 +1213,67 @@ unit_offset = (logic_offset / unit_size)  * unit_size   #unit_size may not be po
 
 # issues
 
+## io_uring panic when running ublksrv 'generic/002' test
+
+### overview
+
+[v6.16-rc report](https://lore.kernel.org/linux-block/CAGVVp+VN9QcpHUz_0nasFf5q9i1gi8H8j-G-6mkBoqa3TyjRHA@mail.gmail.com/)
+
+```
+[ 7044.064528] BUG: kernel NULL pointer dereference, address: 0000000000000001
+[ 7044.071507] #PF: supervisor read access in kernel mode
+[ 7044.076653] #PF: error_code(0x0000) - not-present page
+[ 7044.081801] PGD 462c42067 P4D 462c42067 PUD 462c43067 PMD 0
+[ 7044.087488] Oops: Oops: 0000 [#1] SMP NOPTI
+[ 7044.091685] CPU: 13 UID: 0 PID: 367 Comm: kworker/13:1H Not tainted
+6.16.0-rc2+ #1 PREEMPT(voluntary)
+[ 7044.100991] Hardware name: Dell Inc. PowerEdge R640/0X45NX, BIOS
+2.22.2 09/12/2024
+[ 7044.108565] Workqueue: kblockd blk_mq_requeue_work
+[ 7044.113374] RIP: 0010:__io_req_task_work_add+0x18/0x1f0
+```
+
+```
+(gdb) l *(__io_req_task_work_add+0x18)
+0xffffffff81907668 is in __io_req_task_work_add (io_uring/io_uring.c:1251).
+1246            io_fallback_tw(tctx, false);
+1247    }
+1248
+1249    void __io_req_task_work_add(struct io_kiocb *req, unsigned flags)
+1250    {
+1251            if (req->ctx->flags & IORING_SETUP_DEFER_TASKRUN)
+1252                    io_req_local_work_add(req, flags);
+1253            else
+1254                    io_req_normal_work_add(req);
+1255    }
+```
+
+```
+  struct io_ring_ctx {
+          /* const or read-mostly hot data */
+          struct {
+                  unsigned int            flags;
+```
+
+### analysis
+
+#### ublk issue?
+
+- looks yes, io->cmd is zeroed
+
+- triggered in case that '-g & killing daemon & null'
+
+- introduced in 9810362a57cb ("ublk: don't call ublk_dispatch_req() for NEED_GET_DATA")
+
+- UBLK_IO_NEED_GET_DATA becomes async without setting io->cmd
+
+[[PATCH] ublk: setup ublk_io correctly in case of ublk_get_data() failure](https://lore.kernel.org/linux-block/20250624022049.825370-1-ming.lei@redhat.com/)
+
+#### io_uring regression in v6.16-rc3?
+
+- not true
+
+
 ## v5.14 `ublk del -a` hang and io_uring registered files leak
 
 It is reported that `ublk del -a` may hang forever when running ublk
