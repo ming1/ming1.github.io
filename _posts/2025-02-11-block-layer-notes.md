@@ -9,6 +9,125 @@ Title: block layer notes
 * TOC
 {:toc}
 
+# FS use cases on block device
+
+## bdev's page cache
+
+[Why a lot of fses are using bdev's page cache to do super block read/write?](https://lore.kernel.org/linux-block/5459cd6d-3fdb-4a4e-b5c7-00ef74f17f7d@gmx.com/)
+
+- From Matthew Wilcox
+
+```
+Almost all filesystems use the page cache (sometimes the buffer cache
+which amounts to the exact same thing).  This is a good thing as many
+filesystems put their superblock in the same place, so scanning block
+devices to determine what filesystem they have results in less I/O.
+```
+
+- From "Darrick J. Wong"
+
+```
+As willy said, most filesystems use the bdev pagecache because then they
+don't have to implement their own (metadata) buffer cache.  The downside
+is that any filesystem that does so must be prepared to handle the
+buffer_head contents changing any time they cycle the bh lock because
+anyone can write to the block device of a mounted fs ala tune2fs.
+
+Effectively this means that you have to (a) revalidate the entire buffer
+contents every time you lock_buffer(); and (b) you can't make decisions
+based on superblock feature bits in the superblock bh directly.
+
+I made that mistake when adding metadata_csum support to ext4 -- we'd
+only connect to the crc32c "crypto" module if checksums were enabled in
+the ondisk super at mount time, but then there were a couple of places
+that looked at the ondisk super bits at runtime, so you could flip the
+bit on and crash the kernel almost immediately.
+
+Nowadays you could protect against malicious writes with the
+BLK_DEV_WRITE_MOUNTED=n so at least that's mitigated a little bit.
+Note (a) implies that the use of BH_Verified is a giant footgun.
+```
+
+
+# blk-mq tags management
+
+## tags->lock use cases
+
+### grabbed in blk_mq_find_and_get_req
+
+```
+spin_lock_irqsave(&tags->lock, flags)
+    blk_mq_find_and_get_req
+        bt_iter
+        bt_tags_iter
+```
+
+- why is the lock added to blk_mq_find_and_get_req()?
+
+[[PATCH V5 0/4] blk-mq: fix request UAF related with iterating over tagset requests](https://lore.kernel.org/linux-block/20210505145855.174127-1-ming.lei@redhat.com/)
+
+
+## tags->lock causes lockup issue
+
+### scsi use case
+
+```
+blk_mq_tagset_busy_iter
+    scsi_host_busy
+        scsi_host_queue_ready
+        scsi_dec_host_busy
+```
+
+It is called in IO fast path, so this use case looks too hard.
+
+
+- scsi run queue
+
+```
+scsi_starved_list_run
+    scsi_run_queue
+        scsi_requeue_run_queue
+            INIT_WORK(&sdev->requeue_work, scsi_requeue_run_queue)
+                kblockd_schedule_work(&sdev->requeue_work)
+                    scsi_run_queue_async
+                        scsi_end_request
+                        scsi_queue_rq
+        scsi_run_host_queues
+            scsi_restart_operations
+            scsi_ioctl_reset
+            scsi_unblock_requests
+
+scsi_host_is_busy
+    scsi_starved_list_run  /* break in case host is busy*/
+
+scsi_set_blocked
+    __scsi_queue_insert
+        scsi_queue_insert
+            scsi_complete
+                .complete       = scsi_complete
+            scmd_eh_abort_handler
+            scsi_eh_flush_done_q
+        scsi_io_completion_action
+            scsi_io_completion
+                scsi_finish_command
+                    scsi_complete
+                    scsi_eh_flush_done_q
+                    scmd_eh_abort_handler
+    scsi_queue_rq
+
+scsi_dec_host_busy
+    scsi_device_unbusy
+        scsi_finish_command
+```
+
+### root cause
+
+#### host_blocked
+
+- set in io done handler or error handler 
+
+- checked/consumed in scsi_queue_rq() in blind retrying
+
 
 # block queue limits
 
