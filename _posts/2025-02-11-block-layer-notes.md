@@ -304,11 +304,86 @@ __blk_rq_map_sg
 ```
 update_io_ticks()
     bdev_start_io_acct
+        bio_start_io_acct
+            drbd_request_prepare
+            md_clone_bio
+            zram_bio_read
+            zram_bio_write
+        dm_io_acct
+        nvme_mpath_start_request
     bdev_end_io_acct
+        bio_end_io_acct_remapped
+            bio_end_io_acct
+                drbd_req_complete
+                md_end_clone_io
+                md_free_cloned_bio
+        dm_io_acct
+        nvme_mpath_end_request
     blk_account_io_done
+        __blk_mq_end_request_acct
+        blk_insert_cloned_request
     blk_account_io_start
+        blk_execute_rq_nowait
+        blk_execute_rq
+        blk_mq_bio_to_request
+        blk_insert_cloned_request
     part_stat_show
     diskstats_show
+```
+
+- idle time is taken account into %util
+
+Queue is idle, two IOs come at the same time concurrently:
+
+1) bdev_start_io_acct() is run on IO 1, and update_io_ticks() is called,
+and try_cmpxchg() is successfully
+
+2) bdev_start_io_acct() is run on IO 2, and update_io_ticks() is called,
+and try_cmpxchg() fails, then part_stat_local_inc(bdev, in_flight[op_is_write(op)])
+is run
+
+3) for IO 1, the idle time is accounted, because IO 2 is accounted and
+bdev_count_inflight() return true 
+
+- other related reasons
+
+bdev_end_io_acct() can be called from irq context, so in_flight[] can be
+accounted wrong
+
+- how to sovle it
+
+    -- how to recoganize io or queue idle/busy boundary?
+
+### iostat utility
+
+```
+#define S_VALUE(m,n,p)          (((double) ((n) - (m))) / (p) * 100)
+
+/*
+ ***************************************************************************
+ * Compute "extended" device statistics (service time, etc.).
+ *
+ * IN:
+ * @sdc         Structure with current device statistics.
+ * @sdp         Structure with previous device statistics.
+ * @itv         Interval of time in 1/100th of a second.
+ *
+ * OUT:
+ * @xds         Structure with extended statistics.
+ ***************************************************************************
+*/
+void compute_ext_disk_stats(struct stats_disk *sdc, struct stats_disk *sdp,
+                            unsigned long long itv, struct ext_disk_stats *xds)
+{
+        xds->util  = S_VALUE(sdp->tot_ticks, sdc->tot_ticks, itv);
+        ...
+}
+
+tot_ticks: read from disk stat
+    /sys/block/$DISK/stat
+
+    tot_ticks is 'io_ticks'
+
 ```
 
 
