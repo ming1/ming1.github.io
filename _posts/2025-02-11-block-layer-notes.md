@@ -51,6 +51,25 @@ Note (a) implies that the use of BH_Verified is a giant footgun.
 
 # blk-mq tags management
 
+## overview
+
+[blk-mq tags vs. scheduler mindmap](https://coggle.it/diagram/aIwvJb0jyLIstOoE/t/blk-mq-tags-vs-scheduler-switch)
+
+Merged to v5.14
+
+[2f8f1336a48b blk-mq: always free hctx after request queue is freed](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=2f8f1336a48bd5186de3476da0a3e2ec06d0533a)
+
+Merged to v5.2, but request queue can be freed later.
+
+## solution
+
+- clearing stale request reference
+
+- defer freeing request pool & flush request in srcu callback
+
+- replace tags->lock with srcu read lock in tags iterator code
+
+
 ## tags->lock use cases
 
 ### grabbed in blk_mq_find_and_get_req
@@ -59,12 +78,48 @@ Note (a) implies that the use of BH_Verified is a giant footgun.
 spin_lock_irqsave(&tags->lock, flags)
     blk_mq_find_and_get_req
         bt_iter
+            bt_for_each
+                blk_mq_queue_tag_busy_iter
+                    blk_mq_in_driver_rw
+                        bdev_count_inflight_rw
+                            bdev_count_inflight
+                                update_io_ticks     /* fast io path */
+                                part_stat_show
+                                diskstats_show
+                                is_mddev_idle
+                            part_inflight_show
+                    blk_mq_queue_inflight
+                        dm_wait_for_completion
+                    blk_mq_timeout_work>>
         bt_tags_iter
+            bt_tags_for_each
+                __blk_mq_all_tag_iter
+                    blk_mq_all_tag_iter
+                        blk_mq_hctx_has_requests
+                    blk_mq_tagset_busy_iter
+                        scsi_host_busy
+                        nvme_cancel_tagset
+                        scsi_host_complete_all_commands
+                        ...
 ```
 
-- why is the lock added to blk_mq_find_and_get_req()?
+### Why is the lock added to blk_mq_find_and_get_req()?
 
 [[PATCH V5 0/4] blk-mq: fix request UAF related with iterating over tagset requests](https://lore.kernel.org/linux-block/20210505145855.174127-1-ming.lei@redhat.com/)
+
+- request may be allocated from scheduler
+
+But its reference can stay in driver tags->rqs[] after scheduler is
+switched out because we don't clear it in fast IO path
+
+- driver tags->rqs[] is walked from bt_iter()
+
+Do we need to hold tags->lock ins this code path? This scheduler can't be
+switched out, but other queue/lun's scheduler may be switched out.
+
+- driver tags->rqs[] is walked from bt_tags_iter()
+
+Any queue/lun's scheduler switch can happen during this iterator.
 
 
 ## tags->lock causes lockup issue
