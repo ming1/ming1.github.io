@@ -349,6 +349,95 @@ __blk_rq_map_sg
         sd_setup_write_same16_cmnd
 ```
 
+### New patchset for `remove virtual boundary` from Keith
+
+#### patchsets
+
+[V1: block: accumulate segment page gaps per bio](https://lore.kernel.org/linux-block/20250805195608.2379107-1-kbusch@meta.com/#t)
+
+[V2: [PATCHv2 0/2] block: replace reliance on virt boundary](https://lore.kernel.org/linux-block/20250806145136.3573196-1-kbusch@meta.com/#r)
+
+
+#### motivation
+
+
+[zero-copy receive buffers from a network device and directly using them for storage IO](https://lore.kernel.org/linux-block/aJNvCOZeiah3jeMR@kbusch-mbp/)
+
+```
+Patch 1 removes the reliance on the virt boundary for the IOMMU. This
+makes it possible for NVMe to use this optimization on ARM64 SMMU, which
+we saw earlier can come in a larger granularity than NVMe's. Without
+patch 1, NVMe could never use that optimization on such an architecture,
+but now it can applications that choose to subscribe to that alignment.
+
+This patch, though, is more about being able to utilize user space
+buffers directly that can not be split into any valid IO's. This is
+possible now with patch one not relying on the virt boundary for IOMMU
+optimizations. In truth, for my use case, the IOMMU is either set to off
+or passthrough, so that optimzation isn't reachable. The use case I'm
+going for is taking zero-copy receive buffers from a network device and
+directly using them for storage IO. The user data doesn't arrive in
+nicely aligned segments from there.
+```
+
+#### details
+
+- try to drop virt_boundary limit, meantime track each bvec's gap by adding
+
+`bio->page_gaps` and `req->__page_gaps`
+
+- how to use the accumulated gaps
+
+```
+/*
+ * The IOVA-based DMA API wants to be able to coalesce at the minimal IOMMU page
+ * size granularity (which is guaranteed to be <= PAGE_SIZE and usually 4k), so
+ * we need to ensure our segments are aligned to this as well.
+ *
+ * Note that there is no point in using the slightly more complicated IOVA based
+ * path for single segment mappings.
+ */
+ static inline bool blk_can_dma_map_iova(struct request *req,
+ 		struct device *dma_dev)
+ {
+-	return !((queue_virt_boundary(req->q) + 1) &
+-		dma_get_merge_boundary(dma_dev));
++	return !(blk_rq_page_gaps(req) & dma_get_merge_boundary(dma_dev));
+ }
+
+blk_can_dma_map_iova
+    blk_rq_dma_map_iter_start
+        nvme_map_data
+            nvme_prep_rq
+```
+
+- [PATCHv2 1/2] block: accumulate segment page gaps per bio
+
+```
+The nvme virtual boundary is only for the PRP format. Devices that can
+use the SGL format don't need it for IO queues. Drop reporting it for
+such PCIe devices; fabrics target will continue to use the limit.
+
+Applications can still continue to align to it for optimization
+purposes, and the driver will still decide whether to use the PRP format
+if the IO allows it.
+```
+
+NVMe PRP (Physical Region Page) vs. SGL (Scatter-Gather List)
+
+
+
+##### dma_get_merge_boundary
+
+```
+    unsigned long
+    dma_get_merge_boundary(struct device *dev);
+
+Returns the DMA merge boundary. If the device cannot merge any DMA address
+segments, the function returns 0. 
+
+```
+
 
 # IO accounting
 
