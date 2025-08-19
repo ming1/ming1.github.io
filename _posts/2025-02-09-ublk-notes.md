@@ -1705,6 +1705,39 @@ pid 8382
 [<0>] ret_from_fork_asm+0x1a/0x30
 ```
 
+# rublk2
+
+## Overview
+
+- completely async/.await APIs
+
+- thread contexts management is left to user totally, include the
+  sync/protection among thread contexts
+
+- improving async/.await runtime/executor support
+
+- only support main ublk features 
+
+
+## Requirements
+
+- easy to create many ublk devices in single contexts
+
+- simplify ublk target implementation, make code more readable & streamline
+
+- not affect performance
+
+- old interfaces will be retired
+
+
+## How to complete the task
+
+- rely on AI
+
+- learn more async/.await more, include tokio/tokio_uring/smol
+
+- refactor UblkCtrl implementation first
+
 
 # Todo list
 
