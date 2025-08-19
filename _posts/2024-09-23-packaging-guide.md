@@ -118,6 +118,99 @@ Submit a package update for the latest build, not necessary for rawhide.
 [koschei](https://koschei.fedoraproject.org/)
 
 
+# Fedora packaging utilities
+
+## /usr/lib/rpm/macros.d/
+
+/usr/lib/rpm/macros.d/macros.cargo
+
+
+# **Examples**
+
+## rust-rublk
+
+### Prepare
+
+- new upstream release, such as v0.2.10
+
+- checkout repo
+
+```
+fedpkg co rust-rublk
+cd rust-rublk
+```
+
+### Build sources and run local tests
+
+- build/get sources
+
+```
+rust2rpm -V ${crate_name}       #rust-rublk-0.2.10-vendor.tar.xz is generated
+
+gedit rust-rublk.spec for updating version 0.2.10
+
+spectool -g rust-rublk.sepc     #rust-rublk-0.2.10.crate is generated
+```
+
+Note, now you should to use mock to generate source RPM:
+
+```
+mock -r fedora-rawhide-x86_64 --buildsrpm --spec ${SPEC_FILE} --sources ./ --resultdir=./
+```
+
+And run local build test via mock or koji:
+
+```
+mock -r fedora-rawhide-x86_64 --spec ${SPEC_FILE} --resultdir=./  ${source_rpm}
+
+or
+
+koji build --scratch rawhide ${SRC_RPM}
+```
+
+### Commit to Fedora
+
+- add new sources
+
+```
+fedpkg new-sources rust-rublk-0.2.10-vendor.tar.xz rust-rublk-0.2.10.crate
+```
+
+source files are added to Fedora lookaside cache, and which is global.
+Meantime `sources` in the repo is automatically updated, since checksum
+has to be updated. New source files are added to `.gitignore` too.
+
+- commit meta files
+
+```
+gedit rust-rublk.spec
+
+git add rust-rublk.spec
+
+git add .gitignore
+
+fedpkg commit [-F <clog>] [-p]
+
+```
+
+- Do an 'official' build of the latest pushed changes
+
+```
+fedpkg build
+```
+
+- switch to other releases
+
+```
+fedpkg switch-branch (f42 | f43 | rawhide)
+
+commit meta files to each release
+
+Note: sources are global, which can be retrieved for any release, so just
+need to added to looaside cache once.
+
+```
+
 # Good References
 
 [Maintaining Packages in Fedora: Cheat Sheet](https://github.com/i386x/pubdocs/blob/main/fedpkg-HOWTO.md)
