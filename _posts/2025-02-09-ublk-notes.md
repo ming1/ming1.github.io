@@ -1040,6 +1040,46 @@ taskwork vs cancel race.
 Need to understand msg_ring.c first.
 
 
+## Race when unregistering buffer from io_sqe_buffers_unregister
+
+### timing
+
+- `io_sqe_buffers_unregister` stack trace
+
+```
+ublk_io_release+9
+io_free_rsrc_node+160
+io_rsrc_data_free+59
+io_sqe_buffers_unregister.cold+12
+io_ring_exit_work+625
+process_one_work+392
+worker_thread+599
+```
+
+- `ublk_ch_release` stack trace
+
+Could be from io_uring cancel code path too
+
+- io_sqe_buffers_unregister() can be called after files are unregistered 
+
+No.
+
+```
+do_exit()
+    ...
+    io_uring_files_cancel();
+    ...
+    exit_mm();
+    ...
+    exit_files(tsk);
+
+io_ring_exit_work()
+    io_ring_ctx_free
+        io_sqe_buffers_unregister
+        io_sqe_files_unregister
+```
+
+
 # ublk/nbd
 
 ## design
