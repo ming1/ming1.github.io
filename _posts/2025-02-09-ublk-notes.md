@@ -1077,6 +1077,12 @@ io_ring_exit_work()
     io_ring_ctx_free
         io_sqe_buffers_unregister
         io_sqe_files_unregister
+
+io_ring_ctx_free
+    io_ring_exit_work
+        queue_work(iou_wq, &ctx->exit_work)
+            io_ring_ctx_wait_and_kill
+                io_uring_release
 ```
 
 
