@@ -48,6 +48,178 @@ BLK_DEV_WRITE_MOUNTED=n so at least that's mitigated a little bit.
 Note (a) implies that the use of BH_Verified is a giant footgun.
 ```
 
+## bdev path & inode operations
+
+### overview
+
+bdev inode doesn't has its own path, which is actually from devtmpfs's,
+so any inode syscall may return wrong info for block/char device node, such
+as:
+
+```
+[root@ktest-40 linux]# stat /dev/sda
+  File: /dev/sda
+  Size: 0         	Blocks: 0          IO Block: 512    block special file
+```
+
+### one recent bug related with this implication
+
+[[bug report][regression] blktests loop/004 failed](https://lore.kernel.org/linux-block/CAHj4cs8+9S7_4H03_dcNS-wMrT_9iUpSWPF+ic5gRHmfC4dx+Q@mail.gmail.com/)
+
+Regression of `47b71abd5846 loop: use vfs_getattr_nosec for accurate file size`,
+and root cause is that inode related kapi or syscall can't be used for
+special device node(char, block), and only file operations are allowed:
+
+Typical block device creating kernel stack trace:
+
+```
+  init_special_inode
+  shmem_get_inode
+  shmem_mknod
+  vfs_mknod
+  devtmpfs_work_loop
+  devtmpfsd
+  kthread
+  ret_from_fork
+  ret_from_fork_asm
+```
+
+- Question: why is shmem mknod called for devtmpfs?
+
+- conclusions
+
+    -- file in bdev fs doesn't have path/dentry, which is owned by devtmpfs
+
+    -- bdev fs implements bdev file_operations & address_space_operations,
+    but not implements inode operations, turns out bdev inode operations is
+    simply devtmpfs(or tmpfs)'s inode operations
+
+### how is init_special_inode() called on devtmpfs node
+
+#### init_special_inode
+
+```
+void init_special_inode(struct inode *inode, umode_t mode, dev_t rdev)
+{
+        inode->i_mode = mode;
+        if (S_ISCHR(mode)) {
+                inode->i_fop = &def_chr_fops;
+                inode->i_rdev = rdev;
+        } else if (S_ISBLK(mode)) {
+                if (IS_ENABLED(CONFIG_BLOCK))
+                        inode->i_fop = &def_blk_fops;
+                inode->i_rdev = rdev;
+        } else if (S_ISFIFO(mode))
+                inode->i_fop = &pipefifo_fops;
+        else if (S_ISSOCK(mode))
+                ;       /* leave it no_open_fops */
+        else
+                printk(KERN_DEBUG "init_special_inode: bogus i_mode (%o) for"
+                                  " inode %s:%lu\n", mode, inode->i_sb->s_id,
+                                  inode->i_ino);
+}
+
+init_special_inode
+    __shmem_get_inode
+        shmem_get_inode
+
+shmem_init_fs_context
+    devtmpfs_init_fs_context
+    rootfs_init_fs_context
+
+inode->i_op = &shmem_dir_inode_operations
+    __shmem_get_inode
+        shmem_get_inode
+            shmem_mknod
+            shmem_tmpfile
+            shmem_symlink
+            shmem_fill_super
+            __shmem_file_setup
+                shmem_kernel_file_setup
+                shmem_file_setup
+                shmem_file_setup_with_mnt
+```
+
+#### How shmem_dir_inode_operations Gets Wired for devtmpfs
+
+```
+Here's the detailed sequence when devtmpfs uses shmem_init_fs_context:
+
+1. Filesystem Context Initialization
+
+// drivers/base/devtmpfs.c:69 (when CONFIG_TMPFS=y)
+static struct file_system_type internal_fs_type = {
+    .name = "devtmpfs",
+    .init_fs_context = shmem_init_fs_context,  // Sets up shmem context
+    .kill_sb = kill_litter_super,
+};
+
+2. Context Setup in shmem_init_fs_context
+
+// mm/shmem.c:5370-5388
+int shmem_init_fs_context(struct fs_context *fc)
+{
+    struct shmem_options *ctx = kzalloc(sizeof(struct shmem_options), GFP_KERNEL);
+    // ... initialize context ...
+    fc->fs_private = ctx;
+    fc->ops = &shmem_fs_context_ops;  // Key: sets shmem context operations
+    return 0;
+}
+
+3. Filesystem Mount via shmem_get_tree
+
+// mm/shmem.c:5196-5198
+static const struct fs_context_operations shmem_fs_context_ops = {
+    .get_tree = shmem_get_tree,  // This gets called during mount
+    // ...
+};
+
+// mm/shmem.c:5181-5184
+static int shmem_get_tree(struct fs_context *fc)
+{
+    return get_tree_nodev(fc, shmem_fill_super);  // Calls shmem_fill_super
+}
+
+4. Superblock Setup in shmem_fill_super
+
+// mm/shmem.c:5136
+sb->s_op = &shmem_ops;  // Sets shmem superblock operations
+
+// mm/shmem.c:5163-5164 - Creates root directory inode
+inode = shmem_get_inode(&nop_mnt_idmap, sb, NULL,
+                        S_IFDIR | sbinfo->mode, 0, VM_NORESERVE);
+
+5. Directory Inode Operations Assignment in shmem_get_inode
+
+// mm/shmem.c:3155-3162
+switch (mode & S_IFMT) {
+    case S_IFDIR:
+        inc_nlink(inode);
+        inode->i_size = 2 * BOGO_DIRENT_SIZE;
+        inode->i_op = &shmem_dir_inode_operations;  // *** THIS IS THE KEY LINE ***
+        inode->i_fop = &simple_offset_dir_operations;
+        break;
+    // ...
+}
+
+6. The Result: shmem_dir_inode_operations Structure
+
+// mm/shmem.c:5295-5305
+static const struct inode_operations shmem_dir_inode_operations = {
+    .create    = shmem_create,
+    .lookup    = simple_lookup,
+    .link      = shmem_link,
+    .unlink    = shmem_unlink,
+    .symlink   = shmem_symlink,
+    .mkdir     = shmem_mkdir,
+    .rmdir     = shmem_rmdir,
+    .mknod     = shmem_mknod,    // *** This is what gets called ***
+    .rename    = shmem_rename2,
+    // ...
+};
+
+```
+
 
 # blk-mq tags management
 
