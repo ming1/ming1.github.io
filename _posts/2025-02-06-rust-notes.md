@@ -3337,6 +3337,28 @@ a diﬀerent thread from the pool. If this is a problem, you should
 instead use task-local storage; see the async-std crate’s documentation
 for the task_local! macro for details.
 
+### Async Iterators (Streams)
+
+Async iterators in Rust are called "Streams" and are part of the futures crate. They're
+like regular iterators but for asynchronous operations.
+
+Stream Trait
+
+```
+use futures::stream::Stream;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+trait Stream {
+    type Item;
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>
+    ) -> Poll<Option<Self::Item>>;
+}
+```
+
+
 ### But Does Your Future Implement Send?
 
 There is one restriction spawn imposes that spawn_local does not. Since
@@ -3564,6 +3586,319 @@ to use the examples, and notes on conventions.
 [async/.await](https://os.phil-opp.com/async-await/)
 
 [futures](https://aturon.github.io/blog/2016/08/11/futures/)
+
+
+# smol
+
+## smol executor
+
+###  Core Architecture
+
+1. Main Components
+
+  The executor consists of four main types:
+  - Executor<'a> - Multi-threaded executor with work-stealing capabilities (src/lib.rs:91)
+  - LocalExecutor<'a> - Single-threaded executor (src/lib.rs:437)
+  - StaticExecutor - Leaked version of Executor optimized for static usage (src/static_executors.rs:138)
+  - StaticLocalExecutor - Leaked version of LocalExecutor (src/static_executors.rs:325)
+
+2. State Management
+
+  The core state is managed through a State struct (src/lib.rs:653) containing:
+  - Global queue: ConcurrentQueue<Runnable> for cross-thread task sharing
+  - Local queues: RwLock<Vec<Arc<ConcurrentQueue<Runnable>>>> for work-stealing optimization
+  - Notification system: AtomicBool and Mutex<Sleepers> for efficient wake-ups
+  - Active tasks: Mutex<Slab<Waker>> tracking running tasks
+
+###  Task Spawning and Scheduling
+
+  1. Task Creation Process
+
+  When spawning a task (src/lib.rs:165):
+  1. Future wrapping: The future is wrapped with AsyncCallOnDrop for cleanup
+  2. Task building: Uses async-task::Builder to create a (Runnable, Task) pair
+  3. Waker registration: Stores the task's waker in the active slab
+  4. Immediate scheduling: Calls runnable.schedule() to queue the task
+
+  2. Scheduling Strategy
+
+  The scheduler function (src/lib.rs:353) simply:
+  - Pushes runnables to the global queue via state.queue.push(runnable)
+  - Notifies sleeping threads through state.notify()
+
+###  Polling and Wake-up System
+
+  1. Ticker Architecture
+
+  The Ticker struct (src/lib.rs:832) handles individual task polling:
+  - Sleep management: Tracks sleeping state with unique IDs
+  - Notification handling: Manages waker registration/deregistration
+  - Task polling: Runs futures exactly once per tick
+
+  2. Runner Work-Stealing
+
+  The Runner struct (src/lib.rs:960) implements sophisticated work-stealing:
+  - Local-first: Always tries local queue first (src/lib.rs:997)
+  - Global stealing: Steals from global queue with batch optimization (src/lib.rs:1002-1004)
+  - Peer stealing: Randomly selects other runners to steal from (src/lib.rs:1008-1027)
+  - Fairness mechanism: Periodically steals from global queue every 64 ticks (src/lib.rs:1037-1040)
+
+  3. Notification System
+
+  The Sleepers struct (src/lib.rs:758) efficiently manages sleeping threads:
+  - ID-based tracking: Assigns unique IDs to sleeping tickers
+  - Batch notifications: Can wake multiple threads efficiently
+  - Memory optimization: Reuses IDs through a free list
+
+###  Thread Safety and Concurrency
+
+  1. Send/Sync Implementation
+
+  - Executor: Both Send and Sync - can be shared across threads (src/lib.rs:100-102)
+  - LocalExecutor: Neither Send nor Sync - confined to single thread (src/lib.rs:442)
+  - State sharing: All internal state uses appropriate synchronization primitives
+
+  2. Lock-Free Operations
+
+  - Queue operations: Uses concurrent-queue for lock-free push/pop
+  - Atomic notifications: AtomicBool for efficient wake-up coordination
+  - Minimal contention: Locks only held briefly for critical sections
+
+  3. Work-Stealing Synchronization
+
+  - Read-write locks: Local queue registration uses RwLock for concurrent access
+  - Atomic operations: State pointers managed with atomic compare-and-swap
+  - Randomized stealing: Reduces contention through random selection
+
+###  Execution Modes
+
+  1. Non-blocking Execution
+
+  - try_tick(): Polls one task if available, returns immediately (src/lib.rs:306)
+  - Immediate return: No waiting if no tasks are ready
+
+  2. Blocking Execution
+
+  - tick(): Waits for a task to become available, then polls once (src/lib.rs:329)
+  - run(): Executes tasks continuously until the provided future completes (src/lib.rs:348)
+
+  3. Execution Strategy in run()
+
+  The run() method (src/lib.rs:737) uses a sophisticated approach:
+  - Concurrent execution: Runs provided future alongside executor loop
+  - Batch processing: Processes 200 tasks before yielding (src/lib.rs:744)
+  - Cooperative yielding: Uses future::yield_now() to prevent starvation
+  - Early termination: Stops when the main future completes
+
+###  Memory Management and Optimization
+
+  1. State Allocation
+
+  - Lazy initialization: State allocated only when first accessed (src/lib.rs:366)
+  - Arc-based sharing: State shared through reference counting
+  - Pinned memory: State is pinned to prevent moves during async operations
+
+  2. Static Optimization
+
+  Static executors (src/static_executors.rs) provide optimizations:
+  - No drop overhead: Never deallocated, eliminating cleanup costs
+  - Direct state access: Avoids atomic pointer dereference
+  - Simplified scheduling: Fewer synchronization requirements
+
+  3. Task Cleanup
+
+  - Automatic cleanup: AsyncCallOnDrop ensures tasks are removed from active slab
+  - Waker management: Active wakers are properly cleaned up on executor drop
+  - Queue draining: Remaining tasks are drained during executor destruction
+
+###  Performance Characteristics
+
+  1. Scalability Features
+
+  - Work-stealing: Excellent load balancing across threads
+  - Lock-free queues: Minimal contention for task scheduling
+  - Local queues: Improved cache locality for single-threaded work
+
+  2. Fairness Mechanisms
+
+  - Global queue stealing: Prevents local queue starvation
+  - Random stealing: Distributes load evenly across runners
+  - Batch processing: Balances throughput with responsiveness
+
+  3. Memory Efficiency
+
+  - Slab allocation: Efficient waker storage with reused slots
+  - Bounded local queues: 512-task limit prevents unbounded growth
+  - Minimal metadata: Compact state representation
+
+  The smol executor achieves its "smol" nature through careful optimization of common cases while maintaining full async compatibility and excellent multi-threaded
+  performance characteristics.
+
+
+## smol task
+
+###  Overview
+
+  The async-task crate provides a foundational abstraction for building async executors. It implements a lightweight, efficient task system that separates the concerns of
+  task storage, scheduling, and execution.
+
+###  Core Architecture
+
+####  Key Components
+
+  1. Task (task.rs:49)
+  - A handle to a spawned future that can be awaited for its output
+  - Contains a raw pointer to the heap-allocated task data and metadata
+  - Implements Future trait to be awaitable
+  - Provides cancellation capabilities via cancel() and detach() methods
+
+  2. Runnable (runnable.rs:694)
+  - A handle that can execute a task by polling its future
+  - Only exists when the task is scheduled for running
+  - Calling run() polls the future once, then vanishes until rescheduled
+  - Contains the same raw pointer as Task but with different semantics
+
+  3. Header (header.rs:18)
+  - Stores task metadata and state in a heap-allocated structure
+  - Contains atomic state flags, awaiter waker, vtable, and user metadata
+  - Manages waker registration and notification through register() and notify()
+
+  4. RawTask (raw.rs:79)
+  - Low-level task representation with pointers to all task components
+  - Handles memory layout, allocation, and deallocation
+  - Implements the core task execution logic via vtable functions
+
+####  State Management (state.rs)
+
+  The system uses atomic bit flags for task state:
+
+  - SCHEDULED (bit 0): Task is scheduled for running
+  - RUNNING (bit 1): Task is currently executing
+  - COMPLETED (bit 2): Future returned Poll::Ready
+  - CLOSED (bit 3): Task is canceled or output consumed
+  - TASK (bit 4): Task handle still exists
+  - AWAITER (bit 5): Someone is waiting on the task
+  - REGISTERING (bit 6): Currently registering an awaiter
+  - NOTIFYING (bit 7): Currently notifying awaiters
+
+  Reference counting is stored in upper bits (starting at bit 8).
+
+####  Task Lifecycle
+
+  1. Creation (runnable.rs:362)
+
+  let (runnable, task) = async_task::spawn(future, schedule);
+
+  - Allocates heap memory for header, scheduler, and future
+  - Initializes state to SCHEDULED | TASK | REFERENCE
+  - Returns both Runnable and Task handles
+
+  2. Scheduling (runnable.rs:738)
+
+  runnable.schedule(); // Calls the user-provided schedule function
+
+  - Passes Runnable to the user's schedule function
+  - Schedule function typically adds it to an executor queue
+  - Does not modify task state, just dispatches for execution
+
+  3. Execution (raw.rs:484)
+
+  let woke_while_running = runnable.run();
+
+  Execution flow:
+  1. Create execution context with task's waker
+  2. Update state: SCHEDULED → RUNNING
+  3. Poll the future with Future::poll()
+  4. Handle result:
+    - Poll::Ready(output): Store output, mark COMPLETED
+    - Poll::Pending: Check if rescheduled while running
+
+  Key insight: If the task wakes itself during execution (yields), run() returns true and the task gets rescheduled immediately.
+
+  4. Completion/Cancellation
+
+  - Completion: Output stored, COMPLETED flag set, awaiters notified
+  - Cancellation: CLOSED flag set, future dropped, cleanup performed
+
+####  Memory Layout (raw.rs:106)
+
+  Tasks use a carefully designed memory layout:
+```
+  [ Header<M> ][ Schedule Function S ][ Union { Future F | Output T } ]
+```
+
+  The future and output share the same memory location since they're never needed simultaneously.
+
+  Waker Implementation (raw.rs:139)
+
+  Waker vtable operations:
+  - clone_waker: Increments reference count
+  - wake/wake_by_ref: Marks task as SCHEDULED, calls schedule function
+  - drop_waker: Decrements reference count, potentially triggers cleanup
+
+  Optimization: If task is already scheduled, waking just synchronizes memory without rescheduling.
+
+  Scheduling Integration
+
+  The design is executor-agnostic:
+
+```
+  let schedule = |runnable| queue.send(runnable).unwrap();
+  let (runnable, task) = async_task::spawn(future, schedule);
+```
+
+  - Users provide a schedule function that handles Runnable placement
+  - Can be a simple queue, priority queue, work-stealing deque, etc.
+  - Supports metadata for custom scheduling decisions
+
+###  Key Design Patterns
+
+  1. Zero-Cost Abstraction
+
+  - No runtime overhead when not used (scheduling info is zero-sized by default)
+  - Efficient atomic operations with minimal state transitions
+
+  2. Memory Safety
+
+  - Reference counting prevents use-after-free
+  - Careful state machine prevents race conditions
+  - Panic safety with guard structures
+
+  3. Flexibility
+
+  - Generic over future type, output type, scheduler, and metadata
+  - Supports both Send and !Send futures via spawn_local()
+  - Optional panic propagation with std feature
+
+  4. Performance Optimizations
+
+  - Futures ≥2KB allocated on heap automatically (runnable.rs:516)
+  - Waker optimizations for zero-sized schedule functions
+  - Lock-free atomic operations throughout
+
+###  Usage Example
+
+```
+  // Simple executor
+  let (sender, receiver) = flume::unbounded();
+  let schedule = move |runnable| sender.send(runnable).unwrap();
+
+  // Spawn task
+  let (runnable, task) = async_task::spawn(async { 42 }, schedule);
+  runnable.schedule();
+
+  // Execute tasks
+  while let Ok(runnable) = receiver.recv() {
+      runnable.run();
+  }
+
+  // Await result  
+  let result = smol::future::block_on(task); // 42
+```
+
+This design provides a solid foundation for async executors like smol, tokio, and others,
+offering efficient task management with flexible scheduling capabilities.
+
 
 
 # tokio vs. io_uring
