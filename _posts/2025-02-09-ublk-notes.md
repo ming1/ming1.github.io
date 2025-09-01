@@ -1751,6 +1751,91 @@ pid 8382
 [<0>] ret_from_fork_asm+0x1a/0x30
 ```
 
+# libublk-rs
+
+## async implementation
+
+### Q: Can you think about why 'while exe.try_tick()' is required in ublk_wait_and_handle_ios()? Is it possible to drop this line code?
+
+Answer from AI:
+
+```
+  Now I can see the code in question. Let me look at the specific function ublk_wait_and_handle_ios() and the line while exe.try_tick() {} on
+  line 239.
+
+  Looking at the code, I can see:
+
+  1. ublk_wait_and_handle_ios() is the main event loop driver for the ublk library
+  2. It has while exe.try_tick() {} at line 239 inside the main loop
+  3. This same pattern appears in several other functions like ublk_process_queue_io() (line 125), ublk_run_task() (line 140), 
+  ublk_run_ctrl_task() (line 182, 218)
+
+  Let me understand what exe.try_tick() does by looking at smol's documentation or understanding the async executor pattern.
+
+  The try_tick() method on smol's LocalExecutor attempts to run ready tasks without blocking. It returns true if it ran at least one task, 
+  and false if there were no ready tasks to run.
+
+  Now let me think about why this loop while exe.try_tick() {} is needed:
+
+  1. Task Scheduling: When ublk_wake_task() is called (line 112 in flush_and_wake_io_tasks), it wakes up futures by calling w.wake_by_ref() 
+  on their wakers. This marks those tasks as ready to run.
+  2. Executor Cooperation: The smol executor doesn't automatically run tasks when they become ready - it needs to be explicitly ticked. The 
+  while exe.try_tick() {} ensures that all newly-ready tasks get executed before the loop continues.
+  3. Preventing Task Starvation: Without this, tasks that become ready due to IO completions might not get executed until the next iteration 
+  of the main loop, potentially causing delays or starvation.
+
+  The cascading task wake-ups create a chain reaction where completing one async task triggers subsequent tasks. This mechanism ensures 
+  immediate processing of interconnected asynchronous operations, preventing potential scheduling delays or missed execution opportunities.
+
+  Removing this line could introduce significant performance and responsiveness issues in the async task management system. The executor 
+  needs this explicit ticking to guarantee timely task execution and prevent potential deadlocks or latency problems.
+
+● Looking at the ublk_wait_and_handle_ios() function in src/uring_async.rs:239, the while exe.try_tick() pattern serves a critical
+  purpose in the async execution model.
+
+  Why while exe.try_tick() is Required
+
+  The try_tick() loop is essential for cooperative task scheduling. Here's what happens:
+
+  1. IO Completion Flow:
+  // Line 240-241: IO completion wakes tasks
+  q.flush_and_wake_io_tasks(|data, cqe, _| ublk_wake_task(data, cqe), 1)
+  2. Task Wake-up Process:
+  // In ublk_wake_task() - line 90
+  if let Some(w) = &fd.waker {
+      w.wake_by_ref();  // Marks task as ready, but doesn't run it
+  }
+  3. Executor Cooperation:
+  while exe.try_tick() {}  // Actually runs all ready tasks
+
+  What try_tick() Does
+
+  try_tick() on smol's LocalExecutor:
+  - Returns true if it ran at least one ready task
+  - Returns false if no tasks were ready
+  - The loop continues until no more tasks can make progress
+
+  Why You Can't Drop This Line
+
+  Without while exe.try_tick():
+
+  1. Task Starvation: Tasks woken by IO completions wouldn't execute until the next loop iteration
+  2. Cascading Dependencies: If task A completes and wakes task B, which then wakes task C, only task A would run without the loop
+  3. Latency Issues: Ready tasks would sit idle, increasing response time
+  4. Potential Deadlocks: In complex scenarios, the system might hang waiting for tasks that never get scheduled
+
+  Evidence in the Codebase
+
+  This pattern appears throughout the codebase (ublk_process_queue_io:125, ublk_run_task:140, ublk_run_ctrl_task:182,218), indicating
+  it's a fundamental requirement for proper async task execution in this io_uring-based system.
+
+  Conclusion
+
+  No, you cannot drop this line. It's essential for ensuring that all ready async tasks execute immediately after IO completions,
+  maintaining the performance characteristics and correctness of the ublk async I/O system.
+```
+
+
 # rublk2
 
 ## Overview
