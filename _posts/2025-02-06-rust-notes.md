@@ -2875,6 +2875,60 @@ somewhere should return Ready, or at least make progress toward that
 goal. We’ll explain how this works in “Primitive Futures and Executors:
 When Is a Future Worth Polling Again?”.
 
+#### Where/How is Future variable allocated?
+
+From AI
+
+Rust Future variables for async/await are allocated in several different ways depending on the context:
+
+- Stack Allocation (Most Common)
+
+```
+async fn example() {
+    let future = some_async_function(); // Future allocated on stack
+    future.await;
+}
+```
+
+The Future state machine is typically allocated on the stack of the calling function.
+
+- Heap Allocation (When Boxed)
+
+```
+let boxed_future: Pin<Box<dyn Future<Output = ()>>> = Box::pin(async {
+    // Future state machine allocated on heap
+});
+```
+
+- Generator State Machine
+
+When you write an async function, the compiler transforms it into a state machine:
+
+```
+// This async function...
+async fn example() {
+    let x = 1;
+    some_async_call().await;
+    let y = 2;
+}
+
+// Becomes roughly equivalent to a state machine like:
+enum ExampleFuture {
+    Start,
+    WaitingForAsyncCall { x: i32 },
+    Finished,
+}
+```
+
+Key Points:
+    - Size: Future size is determined at compile time based on all variables that need to persist across await points
+    - Location: Usually stack-allocated unless explicitly boxed
+    - Lifetime: Tied to the scope where the Future is created
+    - Zero-cost: No additional heap allocation unless you explicitly box it
+
+```
+
+
 ### Async Functions and Await Expressions
 
 ```
