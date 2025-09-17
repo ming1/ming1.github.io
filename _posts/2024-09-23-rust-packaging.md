@@ -103,6 +103,14 @@ and build from all these source code directly.
 rust2rpm -V ${crate_name}
 ```
 
+Or
+
+```
+cd ${project_top}
+cargo vendor
+tar cJf ${package_name}-${version}-vendor.tar.xz vendor/
+```
+
 - Source in spec
 
 ```
@@ -111,6 +119,12 @@ Source:         ${package_name}-${version}-vendor.tar.xz
 ```
 
 # **Troubleshoot**
+
+## pass features
+
+```
+%cargo_build -- --features compress
+```
 
 ## cargo test with debug message
 
