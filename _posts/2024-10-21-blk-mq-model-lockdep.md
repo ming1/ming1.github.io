@@ -294,3 +294,81 @@ Fixed in the following patch [\[PATCH V2 3\/4\] block: always verify unfreeze lo
 [   74.373423] R13: 000056557b3dc7d0 R14: 00007fa3875245c0 R15: 0000000000000000
 [   74.373428]  </TASK>
 ```
+
+# Nested blk_enter_queue
+
+## nested blk_enter_queue: 
+
+```
+blk_zone_wplug_bio_work
+    ...
+    if (bdev_test_flag(bdev, BD_HAS_SUBMIT_BIO)) {
+            bdev->bd_disk->fops->submit_bio(bio);
+            blk_queue_exit(bdev->bd_disk->queue);
+    } else {
+            blk_mq_submit_bio(bio);
+    }
+    ...
+
+INIT_WORK(&zwplug->bio_work, blk_zone_wplug_bio_work);
+    disk_get_and_lock_zone_wplug()
+        blk_revalidate_seq_zone
+            blk_revalidate_zone_cb
+                blk_revalidate_disk_zones
+                    ublk_revalidate_disk_zones
+        blk_zone_wplug_handle_write
+            blk_zone_plug_bio
+
+queue_work(disk->zone_wplugs_wq, &zwplug->bio_work)
+    disk_zone_wplug_schedule_bio_work
+        disk_zone_wplug_add_bio
+            blk_zone_wplug_handle_write
+                blk_zone_plug_bio
+                    blk_mq_submit_bio
+                    dm_zone_plug_bio
+                        dm_split_and_process_bio
+        disk_zone_wplug_unplug_bio
+            blk_zone_write_plug_bio_endio
+                blk_zone_bio_endio
+                    bio_endio
+            blk_zone_write_plug_finish_request
+                blk_zone_finish_request
+                    blk_mq_finish_request
+```
+
+## stackable devices
+
+### raid
+
+- is there such risk for raid? No.
+
+```
+md_submit_bio
+    bio_split_to_limits
+        __bio_split_to_limits
+            bio_split_rw
+                bio_submit_split
+		            submit_bio_noacct(bio);
+                        submit_bio_noacct_nocheck
+
+
+submit_bio_noacct_nocheck()
+    ...
+	if (current->bio_list)
+		bio_list_add(&current->bio_list[0], bio);
+	else if (!bdev_test_flag(bio->bi_bdev, BD_HAS_SUBMIT_BIO))
+		__submit_bio_noacct_mq(bio);
+	else
+		__submit_bio_noacct(bio);
+    ...
+```
+
+### NVMe MPATH
+
+- no such issue because bio->bi_bdev is changed
+
+
+###
+
+
+
