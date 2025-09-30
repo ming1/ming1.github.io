@@ -664,7 +664,265 @@ erase-block size and garbage collection algorithm, then random writes will be
 as fast as sequential writes
 
 
-## JOURNALING FILE SYSTEMS
+# JOURNALING FILE SYSTEMS
+
+[JOURNALING FILE SYSTEMS](https://users.cms.caltech.edu/~donnie/cs124/lectures/CS124Lec24.pdf)
+
+## File System Robustness
+
+- The operating system keeps a cache of filesystem data
+
+    - Secondary storage devices are much slower than main memory
+
+    - Caching frequently-used disk blocks in memory yields significant performance improvements
+    by avoiding disk-IO operations
+
+- Problem 1: Operating systems crash. Hardware fails
+
+- Problem 2: Many filesystem operations involve multiple steps
+
+- Example: deleting a file minimally involves removing a directory entry, and updating the free map
+
+    - May involve several other steps depending on filesystem design
+
+- If only some of these steps are successfully written to disk, filesystem corruption is highly
+  likely
+
+- The OS should try to maintain the filesystem’s correctness
+    
+    - …at least, in some minimal way…
+
+- Example: ext2 filesystems maintain a “mount state” in the filesystem’s superblock on disk
+
+    - When filesystem is mounted, this value is set to indicate how the filesystem was
+    mounted (e.g. read-only, etc.)
+
+    - When the filesystem is cleanly unmounted, the mount-state is set to EXT2_VALID_FS to
+    record that the filesystem is trustworthy
+
+- When OS starts: if it sees an ext2 drive mount-state as not EXT2_VALID_FS, it knows
+something happened
+    - The OS can take steps to verify the filesystem, and fix it if needed
+
+- Typically, this involves running the fsck system utility
+
+    -  “File System Consistency checK”
+
+    - (Frequently, OSes also run scheduled filesystem checks too)
 
 
+## The fsck Utility
+
+- To verify the filesystem, must perform various exhaustive checks of the entire
+filesystem layout and data structures
+
+- E.g. for ext2 filesystems, must check these things:
+
+    • Verify that inode metadata (specifically, file size) matches the number of blocks
+    referenced(directly and indirectly) by the inode
+
+    • Verify that all directory entries reference inodes (and that active inodes are
+    referenced by directory entries)
+
+    • Verify that all directory entries are reachable from the device root
+
+    • Verify that inode reference-counts match how many directory entries reference them
+
+    • Verify that the set of blocks referenced by inodes actually matches up with the state
+    of the free-space map
+
+- Any errors along the way are fixed as best as fsck can
+
+## Improving File System Recovery
+
+- Of course, all these exhaustive checks are very slow…
+
+- As storage device sizes grew over the years, file-system consistency checks
+became extremely slow
+
+    - Would often take hours to complete
+
+- Needed to find a way to ensure filesystem robustness, without having to
+spend so much time on verification
+
+- Solution: record [some] filesystem operations in a journal on disk, before
+writing to the filesystem data structures
+
+- When system crash occurs, perform recovery from journal
+
+    -  Should restore the system to a known-good state, without requiring exhaustive
+    verification of the entire filesystem
+
+    - Recovering from the journal will be much faster – only need to consider logged
+    operations, not the entire filesystem structure
+
+## Filesystem Journaling
+
+- Certain operations must be performed atomically on the filesystem
+
+    - Either all of the operations are applied, or none are applied
+
+    - Examples: extending a file, deleting a file, moving a file, etc.
+
+    - All of these are comprised of multiple lower-level operations
+
+- The filesystem journal logs transactions against the filesystem
+
+    - Transactions can either include one atomic operation, or multiple atomic
+    operations, depending on filesystem design
+
+- Note: Not as sophisticated as database transactions!
+
+    - No ACID properties, no concurrency control (not actually needed)
+
+    - The filesystem simply attempts to maintain consistency by ensuring that
+    transactions are applied atomically
+
+- Like the free-map, the filesystem journal is a separate region of the disk volume,
+devoted to journaling
+
+    - Often implemented as a circular queue large enough to hold multiple transactions
+
+- What should be logged in a journal transaction?
+
+    - Filesystems differ in the actual details that are logged…
+
+- Many filesystems only journal changes to metadata
+
+    - i.e. changes to directory structures, file inode information, free space map, any
+    other structures the filesystem maintains on storage devices
+
+    - Changes to file data are not journaled! (This is mostly OK.)
+
+- After a crash, a given file’s contents might become corrupt, but the overall
+filesystem structure will stay correct
+
+    - Reason: writes to data and metadata might be interleaved
+
+    - Metadata-changes can hit the disk before data-changes do
+
+    - If a crash occurs between the two, the file will likely contain garbage
+
+- This issue can occur with operations that affect both a file’s data and metadata
+
+    - Primary scenario: file extension
+
+    - If file’s metadata was updated to indicate that it is extended, but the actual
+    data wasn’t written, the file will become corrupt
+
+- Can improve robustness by following an ordering rule:
+
+    - All data-changes must be written to disk before any metadata-changes are logged
+    to the journal
+
+    - Note: changes to file data are still not journaled
+
+- This primarily improves the robustness of file-extension operations (which
+occur very frequently)
+
+- Places an overhead on the filesystem implementation:
+
+    - Before journal records may be written to disk, the OS must make sure that all
+    corresponding data blocks have been written out
+
+- Finally, filesystems can log all data and metadata changes to the journal
+
+    - Imposes a significant space overhead on the journal, as well as a time overhead
+    
+    - All data ends up being written twice – once to journal, once to file
+
+    - Also is the best way to ensure that files cannot become corrupt
+
+- Modern journaling filesystems often support multiple levels of operation
+
+- Example: ext3/ext4 supports three journaling modes
+
+    -  “Writeback” only records metadata changes to the journal
+
+    - “Ordered” (default) records metadata changes to the journal, after the corresponding
+    data changes have been written to the device
+
+    - “Journal” records both data and metadata changes into the journal
+
+## Atomic Operations
+
+- Atomic operations generally correspond to the system calls that operate on
+the filesystem
+
+    -  Could be from many different processes, on behalf of various users
+
+- An atomic operation could be comprised of several writes to the filesystem
+
+- Example: append data to a file
+
+    - Modify free-space map to allocate data blocks for the new data
+
+    - Update file’s inode index (possibly including indirect blocks) to reference new
+    data blocks
+
+    - Write the data to the new data blocks
+
+    - Update file’s inode metadata with new file size, modification time
+
+- All of these writes must be performed, or none of them
+
+    - (with the possible exception of the data write, depending on the journaling
+    filesystem implementation and configuration)
+
+## Atomic Operations and Transactions
+
+- Since atomic operations correspond to system calls, will likely have a huge
+number of them…
+
+- For efficiency, Linux groups multiple atomic operations together into a single
+transaction
+
+- The entire transaction is treated as an atomic unit in the filesystem journal
+
+    - All atomic operations in the transaction are applied, or none are
+
+- The filesystem only maintains one “active” transaction at a time
+
+    -  The transaction that the filesystem is adding atomic operations to
+
+- (This is why concurrency control and isolation aren’t needed; there is only one
+active transaction at a time.)
+
+- As atomic operations are performed, they are added to the current transaction,
+until one of the following occurs:
+
+    - A fixed amount of time passes, e.g. 5 seconds
+
+    - The journal doesn’t have room to record another atomic operation
+
+- At this point, the filesystem will “lock” the transaction
+
+    - The transaction is closed
+
+    - Any new atomic operations are logged in the next “active” transaction
+
+- Of course, the transaction is still far from complete…
+
+    - The transaction’s logs may not yet be in the filesystem journal
+
+    - Changes recorded in logs may not be applied to the filesystem
+
+    - (In “ordered” mode, data changes may not yet be flushed to disk)
+
+- If a transaction’s logs haven’t been fully written to journal, it is in “flush” state
+
+    - A crash during this state means the txn is aborted during recovery 
+
+- Once transaction logs are fully written to the journal, it enters “commit” state
+
+    - All the logs are in the journal on disk, but the actual filesystem changes recorded
+    in those logs haven’t been completed
+
+- Once all changes specified in the transaction have been written to filesystem, it is “finished”
+
+    - The filesystem itself reflects all changes recorded in the txn logs…
+
+    - Don’t need to keep the transaction in the journal anymore!
+
+    - It is removed from the circular queue that holds the journal
 
