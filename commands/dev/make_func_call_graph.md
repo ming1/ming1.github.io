@@ -6,12 +6,13 @@ Generate function calling Graph
 
 Generate function calling Graph:
 
-- include all direct functions which calls the specified function from $ARGUMENTS
+- include all direct functions which call the specified function from $ARGUMENTS
 
 - include all function chains with depth 8, originated from the specified
   function
 
-- skip trivial or very simple functions
+- skip trivial or very simple functions or generic kernel APIs(such as,
+  kmalloc, submit_bio, ...)
 
 # motivation
 
