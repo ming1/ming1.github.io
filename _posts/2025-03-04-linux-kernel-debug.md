@@ -281,4 +281,6 @@ done
 
 [Runtime locking correctness: Exception: Nested data dependencies leading to nested locking](https://docs.kernel.org/locking/lockdep-design.html#exception-nested-data-dependencies-leading-to-nested-locking)
 
+# kernel bpftrace
 
+[bpftrace-mcp-server](https://github.com/eunomia-bpf/MCPtrace)
