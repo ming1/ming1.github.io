@@ -113,6 +113,110 @@ CPU 63:     2.95M IOPS
 
 ```
 
+## ublk/loop io perf
+
+### ublk/loop
+
+```
+# rublk add loop -f /dev/nvme1n1 -q 16 -d 256 -z
+
+dev id 0: nr_hw_queues 16 queue_depth 256 block size 512 dev_capacity 3907029168
+	max rq size 524288 daemon pid 13229 flags 0x6843 state LIVE
+	ublkc: 234:0 ublkb: 259:6 owner: 0:0
+	queue 0 tid: 13231 affinity(17)
+	queue 1 tid: 13232 affinity(19)
+	queue 2 tid: 13233 affinity(21)
+	queue 3 tid: 13234 affinity(55)
+	queue 4 tid: 13235 affinity(25)
+	queue 5 tid: 13236 affinity(27)
+	queue 6 tid: 13237 affinity(29)
+	queue 7 tid: 13238 affinity(63)
+	queue 8 tid: 13239 affinity(1)
+	queue 9 tid: 13240 affinity(35)
+	queue 10 tid: 13241 affinity(37)
+	queue 11 tid: 13242 affinity(39)
+	queue 12 tid: 13243 affinity(40)
+	queue 13 tid: 13244 affinity(42)
+	queue 14 tid: 13245 affinity(13)
+	queue 15 tid: 13246 affinity(15)
+	target {"dev_size":2000398934016,"name":"loop","type":0}
+	target_data {"loop":{"async_await":false,"back_file_path":"/dev/nvme1n1","direct_io":1,"no_discard":false}}
+	ublksrv_flags: 0x1000000000
+
+```
+
+### per-cpu IO perf
+
+```
+Running IO performance test on /dev/ublkb0 for 20 seconds per CPU...
+
+CPU  0:     1.28M IOPS
+CPU  1:     1.06M IOPS
+CPU  2:   839.60K IOPS
+CPU  3:   805.78K IOPS
+CPU  4:     1.35M IOPS
+CPU  5:     1.19M IOPS
+CPU  6:     1.36M IOPS
+CPU  7:     1.19M IOPS
+CPU  8:   728.72K IOPS
+CPU  9:   815.26K IOPS
+CPU 10:     1.20M IOPS
+CPU 11:     1.28M IOPS
+CPU 12:     1.37M IOPS
+CPU 13:     1.08M IOPS
+CPU 14:     1.37M IOPS
+CPU 15:     1.02M IOPS
+CPU 16:     1.30M IOPS
+CPU 17:     1.08M IOPS
+CPU 18:     1.29M IOPS
+CPU 19:     1.04M IOPS
+CPU 20:     1.29M IOPS
+CPU 21:     1.07M IOPS
+CPU 22:   796.59K IOPS
+CPU 23:   832.95K IOPS
+CPU 24:     1.29M IOPS
+CPU 25:     1.08M IOPS
+CPU 26:   851.65K IOPS
+CPU 27:   773.46K IOPS
+CPU 28:     1.37M IOPS
+CPU 29:     1.08M IOPS
+CPU 30:     1.39M IOPS
+CPU 31:     1.20M IOPS
+CPU 32:     1.28M IOPS
+CPU 33:     1.20M IOPS
+CPU 34:   845.68K IOPS
+CPU 35:   705.22K IOPS
+CPU 36:     1.26M IOPS
+CPU 37:   992.65K IOPS
+CPU 38:     1.27M IOPS
+CPU 39:     1.00M IOPS
+CPU 40:   699.55K IOPS
+CPU 41:   763.72K IOPS
+CPU 42:     1.09M IOPS
+CPU 43:     1.34M IOPS
+CPU 44:     1.27M IOPS
+CPU 45:     1.23M IOPS
+CPU 46:     1.26M IOPS
+CPU 47:     1.19M IOPS
+CPU 48:     1.30M IOPS
+CPU 49:     1.21M IOPS
+CPU 50:     1.28M IOPS
+CPU 51:     1.18M IOPS
+CPU 52:     1.29M IOPS
+CPU 53:     1.21M IOPS
+CPU 54:   797.58K IOPS
+CPU 55:   747.44K IOPS
+CPU 56:     1.30M IOPS
+CPU 57:     1.21M IOPS
+CPU 58:   810.77K IOPS
+CPU 59:   827.88K IOPS
+CPU 60:     1.28M IOPS
+CPU 61:     1.15M IOPS
+CPU 62:     1.29M IOPS
+CPU 63:     1.06M IOPS
+
+```
+
 ## nvme io perf
 
 ### nvme device
