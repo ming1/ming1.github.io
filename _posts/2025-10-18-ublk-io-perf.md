@@ -113,6 +113,42 @@ CPU 63:     2.95M IOPS
 
 ```
 
+### throughput
+
+#### without numa aware improvement
+
+- top throughput
+
+```
+# ./kublk add -t null -q 16 --auto_zc -d 256
+dev id 0: nr_hw_queues 16 queue_depth 256 block size 512 dev_capacity 524288000
+	max rq size 1048576 daemon pid 1975 flags 0x6842 state LIVE
+	queue 0: affinity(16 )
+	queue 1: affinity(18 )
+	queue 2: affinity(20 )
+	queue 3: affinity(22 )
+	queue 4: affinity(24 )
+	queue 5: affinity(26 )
+	queue 6: affinity(28 )
+	queue 7: affinity(30 )
+	queue 8: affinity(0 )
+	queue 9: affinity(2 )
+	queue 10: affinity(4 )
+	queue 11: affinity(6 )
+	queue 12: affinity(8 )
+	queue 13: affinity(10 )
+	queue 14: affinity(12 )
+	queue 15: affinity(14 )
+	home_numa_node: -1
+
+
+taskset -c 0-15,16-31 ~/git/fio/t/io_uring -p0 -n 16  /dev/ublkb0
+
+IOPS=35.90M, BW=140.24GiB/s, IOS/call=32/32
+
+```
+
+
 ## ublk/loop io perf
 
 ### ublk/loop
@@ -313,6 +349,31 @@ CPU 62:     2.36M IOPS
 CPU 63:     1.74M IOPS
 
 ```
+
+#### why is there so big iops difference?
+
+- too many Function call interrupts when running io on some cores
+
+```
+irqtop -s DELTA
+
+                 160             59611107               378250 IR-PCI-MSIX-0000:a1:00.0 7-edge nvme1q7
+                 CAL             49534262               304396 Function call interrupts
+
+```
+
+In case of high IOPS, not observe so many `Function call interrupts` on the
+CPU cores.
+
+- root cause
+
+More than one L3 groups are included in single hw queue cpus, there are 8
+L3 groups, see `hwloc-ls` info.
+
+- solution
+
+Improve group_cpus_evenly()
+
 
 
 ## machine info
