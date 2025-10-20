@@ -372,8 +372,11 @@ L3 groups, see `hwloc-ls` info.
 
 - solution
 
-Improve group_cpus_evenly()
+    - Improve group_cpus_evenly()
 
+    - update AMD 9004 BIOS setting to treat L3 LLC (Last Level Cache) as NUMA
+
+    [L3 LLC (Last Level Cache) as NUMA](https://techdocs.broadcom.com/us/en/storage-and-ethernet-connectivity/ethernet-nic-controllers/bcm957xxx/adapters/Tuning/bios-tuning/l3-llc-last-level-cache-as-numa.html)
 
 
 ## machine info
