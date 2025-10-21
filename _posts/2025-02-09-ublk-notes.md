@@ -250,6 +250,20 @@ its lifetime is same with ublk queue.
 
 - needn't to be all or nothing
 
+### UBLK_F_IOPOLL
+
+- key points
+
+    - io_uring multiqueue handling(ublk uring_cmd and backend io)
+
+    - need to stop polling if backend hasn't io for polling
+
+    - or need io_uring to ignore ublk uring_cmd wrt. iopoll
+
+- ideas
+
+    - add new ring for iopoll and register buffer to this dedicated poll ring(too complicated to deal with cross-rings)
+
 ## design
 
 ### FETCH_AND_COMMIT_CMDS
