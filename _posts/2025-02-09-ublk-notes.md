@@ -264,6 +264,19 @@ its lifetime is same with ublk queue.
 
     - add new ring for iopoll and register buffer to this dedicated poll ring(too complicated to deal with cross-rings)
 
+### batched request completion
+
+- use blk_mq_add_to_batch() and blk_mq_end_request_batch()
+
+- easy to apply it in case both ZERO_COPY and AUTO_BUF_REG are not enabled
+
+- for AUTO_BUF_REG(), ublk_io_release() is often called from io handle cqe
+  context because io_kiocb release can be re-ordered
+
+- another problem is that kernel doesn't support to per-task memory
+  allocator
+
+
 ## design
 
 ### FETCH_AND_COMMIT_CMDS
