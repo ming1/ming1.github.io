@@ -1738,111 +1738,6 @@ child enforces its own tasks, but their combined usage cannot exceed the parentâ
 ## Issues
 
 
-### fall back from direct to buffered I/O when stable writes are required
-
-[fall back from direct to buffered I/O when stable writes are required](https://lore.kernel.org/linux-block/20251029071537.1127397-1-hch@lst.de/)
-
-[btrfs: always fallback to buffered write if the inode requires checksum](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=968f19c5b1b7)
-
-[The intersection of unstable pages and direct I/O](https://lwn.net/Articles/1045006/)
-
-
-#### stable write
-
-```
-static inline bool bdev_stable_writes(struct block_device *bdev)
-{
-        struct request_queue *q = bdev_get_queue(bdev);
-
-        if (IS_ENABLED(CONFIG_BLK_DEV_INTEGRITY) &&
-            q->limits.integrity.csum_type != BLK_INTEGRITY_CSUM_NONE)
-                return true;
-        return q->limits.features & BLK_FEAT_STABLE_WRITES;
-}
-```
-
-```
-void bdev_add(struct block_device *bdev, dev_t dev)
-{
-    struct inode *inode = BD_INODE(bdev);
-    if (bdev_stable_writes(bdev))
-        mapping_set_stable_writes(bdev->bd_mapping);
-    ...
-}
-
-#define SB_I_STABLE_WRITES 0x00000008   /* don't modify blks until WB is done */
-int setup_bdev_super(struct super_block *sb, int sb_flags,
-    struct fs_context *fc)
-{
-    ...
-    if (bdev_stable_writes(bdev))
-        sb->s_iflags |= SB_I_STABLE_WRITES;
-    ...
-}
-
-static inline void xfs_update_stable_writes(struct xfs_inode *ip)
-{
-        if (bdev_stable_writes(xfs_inode_buftarg(ip)->bt_bdev))
-                mapping_set_stable_writes(VFS_I(ip)->i_mapping);
-        else
-                mapping_clear_stable_writes(VFS_I(ip)->i_mapping);
-}
-
-SWP_STABLE_WRITES = (1 << 11),  /* no overwrite PG_writeback pages */
-SYSCALL_DEFINE2(swapon, const char __user *, specialfile, int, swap_flags)
-{
-    ...
-    if (si->bdev && bdev_stable_writes(si->bdev))
-        si->flags |= SWP_STABLE_WRITES;
-    ...
-}
-
-
-    AS_STABLE_WRITES = 7,   /* must wait for writeback before modifying
-                               folio contents */
-static inline void mapping_set_stable_writes(struct address_space *mapping)
-{
-        set_bit(AS_STABLE_WRITES, &mapping->flags);
-}
-
-```
-
-#### related user cases
-
-- user updates direct IO buffer when the IO is inflight
-
-- RAID rebuild
-
-- FS checksum calculation
-
-- QEMU
-
-[The most common application to hit this is probably the most common use of O_DIRECT: qemu](https://lore.kernel.org/linux-block/20251030143324.GA31550@lst.de/)
-
-```
-The most common application to hit this is probably the most common
-use of O_DIRECT: qemu.  Look up for btrfs errors with PI, caused by
-the interaction of checksumming.  Btrfs finally fixed this a short
-while ago, and there are reports for other applications a swell.
-
-For RAID you probably won't see too many reports, as with RAID the
-problem will only show up as silent corruption long after a rebuild
-rebuild happened that made use of the racy data.  With checksums
-it is much easier to reproduce and trivially shown by various xfstests.
-With increasing storage capacities checksums are becoming more and
-more important, and I'm trying to get Linux in general and XFS
-specifically to use them well.  Right now I don't think anyone is
-using PI with XFS or any Linux file system given the amount of work
-I had to put in to make it work well, and how often I see regressions
-with it.
-```
-
-```
-Truns out it isn't related with qemu, just some buggy applications in VM
-overwrites inflight dio buffer.
-```
-
-
 
 ### bps throttle works too aggressively
 
@@ -2045,7 +1940,116 @@ your next great app.
 ## atomic write applications
 
 
+
+
+
 # Issues
+
+## Fall back from direct to buffered I/O when stable writes are required
+
+[fall back from direct to buffered I/O when stable writes are required](https://lore.kernel.org/linux-block/20251029071537.1127397-1-hch@lst.de/)
+
+[btrfs: always fallback to buffered write if the inode requires checksum](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=968f19c5b1b7)
+
+[The intersection of unstable pages and direct I/O](https://lwn.net/Articles/1045006/)
+
+
+### stable write
+
+```
+static inline bool bdev_stable_writes(struct block_device *bdev)
+{
+        struct request_queue *q = bdev_get_queue(bdev);
+
+        if (IS_ENABLED(CONFIG_BLK_DEV_INTEGRITY) &&
+            q->limits.integrity.csum_type != BLK_INTEGRITY_CSUM_NONE)
+                return true;
+        return q->limits.features & BLK_FEAT_STABLE_WRITES;
+}
+```
+
+```
+void bdev_add(struct block_device *bdev, dev_t dev)
+{
+    struct inode *inode = BD_INODE(bdev);
+    if (bdev_stable_writes(bdev))
+        mapping_set_stable_writes(bdev->bd_mapping);
+    ...
+}
+
+#define SB_I_STABLE_WRITES 0x00000008   /* don't modify blks until WB is done */
+int setup_bdev_super(struct super_block *sb, int sb_flags,
+    struct fs_context *fc)
+{
+    ...
+    if (bdev_stable_writes(bdev))
+        sb->s_iflags |= SB_I_STABLE_WRITES;
+    ...
+}
+
+static inline void xfs_update_stable_writes(struct xfs_inode *ip)
+{
+        if (bdev_stable_writes(xfs_inode_buftarg(ip)->bt_bdev))
+                mapping_set_stable_writes(VFS_I(ip)->i_mapping);
+        else
+                mapping_clear_stable_writes(VFS_I(ip)->i_mapping);
+}
+
+SWP_STABLE_WRITES = (1 << 11),  /* no overwrite PG_writeback pages */
+SYSCALL_DEFINE2(swapon, const char __user *, specialfile, int, swap_flags)
+{
+    ...
+    if (si->bdev && bdev_stable_writes(si->bdev))
+        si->flags |= SWP_STABLE_WRITES;
+    ...
+}
+
+
+    AS_STABLE_WRITES = 7,   /* must wait for writeback before modifying
+                               folio contents */
+static inline void mapping_set_stable_writes(struct address_space *mapping)
+{
+        set_bit(AS_STABLE_WRITES, &mapping->flags);
+}
+
+```
+
+### related user cases
+
+- user updates direct IO buffer when the IO is inflight
+
+- RAID rebuild
+
+- FS checksum calculation
+
+- QEMU
+
+[The most common application to hit this is probably the most common use of O_DIRECT: qemu](https://lore.kernel.org/linux-block/20251030143324.GA31550@lst.de/)
+
+```
+The most common application to hit this is probably the most common
+use of O_DIRECT: qemu.  Look up for btrfs errors with PI, caused by
+the interaction of checksumming.  Btrfs finally fixed this a short
+while ago, and there are reports for other applications a swell.
+
+For RAID you probably won't see too many reports, as with RAID the
+problem will only show up as silent corruption long after a rebuild
+rebuild happened that made use of the racy data.  With checksums
+it is much easier to reproduce and trivially shown by various xfstests.
+With increasing storage capacities checksums are becoming more and
+more important, and I'm trying to get Linux in general and XFS
+specifically to use them well.  Right now I don't think anyone is
+using PI with XFS or any Linux file system given the amount of work
+I had to put in to make it work well, and how often I see regressions
+with it.
+```
+
+```
+Truns out it isn't related with qemu, just some buggy applications in VM
+overwrites inflight dio buffer.
+```
+
+
 
 ## kobject of disk->queue_kobj isn't released
 
