@@ -11,6 +11,12 @@ tags: [linux kernel, filesystem, IO]
 Filesystem notes
 
 
+# Useful references
+
+
+[ZFS and Traditional File System Differences](https://illumos.org/books/zfs-admin/gbcik.html#gbcik)
+
+
 # Filesystems
 
 [Caltech Lecture](https://users.cms.caltech.edu/~donnie/cs124/lectures/)
