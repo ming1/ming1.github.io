@@ -1945,6 +1945,179 @@ your next great app.
 
 # Issues
 
+## loop IO deadlock from nested submit_bio()
+
+[[PATCH V2 0/3] loop: nowait aio bug fixes](https://lore.kernel.org/linux-block/20251119120937.3424475-1-ming.lei@redhat.com/)
+
+### observations
+
+#### IO hang stack & dumpped bio_list
+
+```
+process 125
+[<0>] rq_qos_wait+0xb3/0x150
+[<0>] wbt_wait+0xa5/0x100
+[<0>] __rq_qos_throttle+0x27/0x40
+[<0>] blk_mq_submit_bio+0x6eb/0x880
+[<0>] __submit_bio+0x74/0x280
+[<0>] submit_bio_noacct_nocheck+0x281/0x360
+[<0>] iomap_ioend_writeback_submit+0x4a/0x70
+[<0>] iomap_add_to_ioend+0x131/0x380
+[<0>] xfs_writeback_range+0x2d4/0x480 [xfs]
+[<0>] iomap_writeback_folio+0x257/0x690
+[<0>] iomap_writepages+0x5e/0xd0
+[<0>] xfs_vm_writepages+0x93/0x110 [xfs]
+[<0>] do_writepages+0xc8/0x170
+[<0>] __writeback_single_inode+0x41/0x340
+[<0>] writeback_sb_inodes+0x219/0x4e0
+[<0>] __writeback_inodes_wb+0x4c/0xf0
+[<0>] wb_writeback+0x1ab/0x330
+[<0>] wb_workfn+0x2ad/0x450
+[<0>] process_one_work+0x18b/0x340
+[<0>] worker_thread+0x257/0x3a0
+[<0>] kthread+0xfc/0x240
+[<0>] ret_from_fork+0x1c5/0x1f0
+[<0>] ret_from_fork_asm+0x1a/0x30
+
+```
+
+```
+====================================================================================================
+Task: PID=125 comm='kworker/u66:1'
+====================================================================================================
+Active bio_list: 0xffffd23d835eb7a0
+
+bio_list state:
+  head: 0xffff8ac699d93e50
+  tail: 0xffff8ac6846f71c0
+
+Bios in bio_list:
+     Bio                Op    Sector     Size   Bdev       Flags      end_io
+----------------------------------------------------------------------------------------------------
+  [ 0] bio=0xffff8ac699d93e50 WRITE sector=  12853952 size=16515072 bdev=loop0      flags=none       end_io=0xffffffffc0f5b100
+  [ 1] bio=0xffff8ac6846f6680 WRITE sector=  12820672 size=1310720 bdev=sda        flags=NOWAIT     end_io=0xffffffffbba55ad0
+  [ 2] bio=0xffff8ac6846f7800 WRITE sector=  12823232 size=1310720 bdev=sda        flags=NOWAIT     end_io=0xffffffffbba55ad0
+  [ 3] bio=0xffff8ac6846f7d00 WRITE sector=  12825792 size=1310720 bdev=sda        flags=NOWAIT     end_io=0xffffffffbba55ad0
+  [ 4] bio=0xffff8ac6846f7080 WRITE sector=  12828352 size=1310720 bdev=sda        flags=NOWAIT     end_io=0xffffffffbba55ad0
+  [ 5] bio=0xffff8ac6846f7300 WRITE sector=  12830912 size=1310720 bdev=sda        flags=NOWAIT     end_io=0xffffffffbba55ad0
+  [ 6] bio=0xffff8ac6846f6180 WRITE sector=  12833472 size=1310720 bdev=sda        flags=NOWAIT     end_io=0xffffffffbba55ad0
+  [ 7] bio=0xffff8ac6846f6e00 WRITE sector=  12836032 size=1310720 bdev=sda        flags=NOWAIT     end_io=0xffffffffbba55ad0
+  [ 8] bio=0xffff8ac6846f7a80 WRITE sector=  12838592 size=1310720 bdev=sda        flags=NOWAIT     end_io=0xffffffffbba55ad0
+  [ 9] bio=0xffff8ac6846f6cc0 WRITE sector=  12841152 size=1310720 bdev=sda        flags=NOWAIT     end_io=0xffffffffbba55ad0
+  [10] bio=0xffff8ac6846f6f40 WRITE sector=  12843712 size=1310720 bdev=sda        flags=NOWAIT     end_io=0xffffffffbba55ad0
+  [11] bio=0xffff8ac6846f71c0 WRITE sector=  12846272 size=1310720 bdev=sda        flags=NOWAIT     end_io=0xffffffffbba55ad0
+----------------------------------------------------------------------------------------------------
+Total: 12 bios in bio_list
+
+```
+
+### code paths
+
+#### submit_bio_noacct_nocheck
+
+```
+static void __submit_bio_noacct_mq(struct bio *bio)
+{
+        struct bio_list bio_list[2] = { };
+
+        current->bio_list = bio_list;
+
+        do {
+                __submit_bio(bio);
+        } while ((bio = bio_list_pop(&bio_list[0])));
+
+        current->bio_list = NULL;
+}
+
+```
+
+```
+void submit_bio_noacct_nocheck(struct bio *bio, bool split)
+{
+    ...
+    /*   
+     * We only want one ->submit_bio to be active at a time, else stack
+     * usage with stacked devices could be a problem.  Use current->bio_list
+     * to collect a list of requests submited by a ->submit_bio method while
+     * it is active, and then process them after it returned.
+     */
+    if (current->bio_list) {
+            if (split)
+                    bio_list_add_head(&current->bio_list[0], bio);
+            else
+                    bio_list_add(&current->bio_list[0], bio);
+    } else if (!bdev_test_flag(bio->bi_bdev, BD_HAS_SUBMIT_BIO)) {
+            __submit_bio_noacct_mq(bio);
+    } else {
+            __submit_bio_noacct(bio);
+    }
+    ...
+}
+```
+
+#### blk_mq_flush_plug_list
+
+- nested blk_mq_flush_plug_list() ?
+
+```
+  The Call Path:
+
+  1. submit_bio()                               # current->plug is SET
+  2.   blk_mq_submit_bio()
+  3.     blk_add_rq_to_plug(current->plug, rq)  # Add loop request to plug
+  4.       if (plug->rq_count >= max):
+  5.         blk_mq_flush_plug_list(plug, false) # FLUSH STARTS (plug is full)
+  6.           plug->rq_count = 0                # Clear count
+  7.           blk_mq_dispatch_list(&plug->mq_list, ...) # Iterate the list
+  8.             rq_list_pop(&plug->mq_list)     # Pop and process each request
+  9.               ... dispatch path ...
+  10.               loop_queue_rq()               # Loop's queue function
+  11.                 lo_rw_aio_nowait()         # NOWAIT path
+  12.                   file->f_op->write_iter() # Backing file IO
+  13.                     submit_bio()            # Backing file bio!
+  14.                       blk_mq_submit_bio()
+  15.                         current->plug is STILL SET!
+  16.                         blk_add_rq_to_plug(current->plug, backing_rq)
+  17.                           rq_list_add_tail(&plug->mq_list, backing_rq)  # CORRUPTION!
+  18.                           # We're adding to plug->mq_list while line 7-8 is iterating it!
+
+```
+
+
+- blk_mq_flush_plug_list
+
+```
+          /*
+           * We may have been called recursively midway through handling
+           * plug->mq_list via a schedule() in the driver's queue_rq() callback.
+           * To avoid mq_list changing under our feet, clear rq_count early and
+           * bail out specifically if rq_count is 0 rather than checking
+           * whether the mq_list is empty.
+           */
+          if (plug->rq_count == 0)
+                  return;
+          depth = plug->rq_count;
+          plug->rq_count = 0;
+  
+          if (!plug->has_elevator && !from_schedule) {
+                  if (plug->multiple_queues) {
+                          blk_mq_dispatch_multiple_queue_requests(&plug->mq_list);
+                          return;
+                  }
+  
+                  blk_mq_dispatch_queue_requests(&plug->mq_list, depth);
+                  if (rq_list_empty(&plug->mq_list))
+                          return;
+          }
+  
+          do {
+                  blk_mq_dispatch_list(&plug->mq_list, from_schedule);
+          } while (!rq_list_empty(&plug->mq_list));
+  }
+
+```
+
+
 ## Fall back from direct to buffered I/O when stable writes are required
 
 [fall back from direct to buffered I/O when stable writes are required](https://lore.kernel.org/linux-block/20251029071537.1127397-1-hch@lst.de/)
