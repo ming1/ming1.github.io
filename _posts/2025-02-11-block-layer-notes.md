@@ -2117,6 +2117,75 @@ void submit_bio_noacct_nocheck(struct bio *bio, bool split)
 
 ```
 
+- blk_add_rq_to_plug
+
+```
+static void blk_add_rq_to_plug(struct blk_plug *plug, struct request *rq)
+{
+        struct request *last = rq_list_peek(&plug->mq_list);
+
+        if (!plug->rq_count) {
+                trace_block_plug(rq->q);
+        } else if (plug->rq_count >= blk_plug_max_rq_count(plug) ||
+                   (!blk_queue_nomerges(rq->q) &&
+                    blk_rq_bytes(last) >= BLK_PLUG_FLUSH_SIZE)) {
+                blk_mq_flush_plug_list(plug, false);
+                last = NULL;
+                trace_block_plug(rq->q);
+        }
+  
+        if (!plug->multiple_queues && last && last->q != rq->q)
+                plug->multiple_queues = true;
+        /*
+         * Any request allocated from sched tags can't be issued to
+         * ->queue_rqs() directly
+         */
+        if (!plug->has_elevator && (rq->rq_flags & RQF_SCHED_TAGS))
+                plug->has_elevator = true;
+        rq_list_add_tail(&plug->mq_list, rq);
+        plug->rq_count++;
+}
+
+note:
+    - why is the plug list corrupted by nested blk_add_rq_to_plug()?
+
+        -- outer blk_add_rq_to_plug()
+
+        -- inner blk_add_rq_to_plug()
+
+```
+
+
+```
+plug->rq_count
+    blk_mq_flush_plug_list
+        __blk_flush_plug
+        blk_add_rq_to_plug
+            blk_execute_rq_nowait
+            blk_mq_submit_bio
+    blk_add_rq_to_plug
+        blk_execute_rq_nowait
+        blk_mq_submit_bio
+plug->has_elevator
+    blk_add_rq_to_plug
+    blk_mq_flush_plug_list
+plug->multiple_queues
+    blk_attempt_plug_merge
+        blk_mq_attempt_bio_merge
+            blk_mq_submit_bio
+    blk_plug_max_rq_count
+        blk_add_rq_to_plug
+    blk_add_rq_to_plug
+    blk_mq_flush_plug_list
+
+```
+
+### other ideas
+
+- loop dio over loop dio
+
+    stack is running out of.
+
 
 ## Fall back from direct to buffered I/O when stable writes are required
 
