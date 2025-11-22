@@ -1945,6 +1945,154 @@ your next great app.
 
 # Issues
 
+
+## Fix potential data loss and corruption due to Incorrect BIO Chain Handling
+
+[Fix potential data loss and corruption due to Incorrect BIO Chain Handling](https://lore.kernel.org/linux-block/20251121081748.1443507-1-zhangshida@kylinos.cn/)
+
+### overview
+
+```
+Environment:
+*   **Architecture:** arm64
+*   **Page Size:** 64KB
+*   **Filesystem:** XFS with a 4KB block size
+
+Scenario:
+The issue occurs while running a MySQL instance where one thread appends data 
+to a log file, and a separate thread concurrently reads that file to perform 
+CRC checks on its contents.
+
+Problem Description: 
+Occasionally, the reading thread detects data corruption. Specifically, it finds 
+that stale data has been exposed in the middle of the file. 
+
+We have captured four instances of this corruption in our production environment. 
+In each case, we observed a distinct pattern: 
+    The corruption starts at an offset that aligns with the beginning of an XFS extent. 
+    The corruption ends at an offset that is aligned to the system's `PAGE_SIZE` (64KB in our case). 
+
+Corruption Instances: 
+1.  Start:`0x73be000`, **End:** `0x73c0000` (Length: 8KB) 
+2.  Start:`0x10791a000`, **End:** `0x107920000` (Length: 24KB) 
+3.  Start:`0x14535a000`, **End:** `0x145b70000` (Length: 8280KB) 
+4.  Start:`0x370d000`, **End:** `0x3710000` (Length: 12KB) 
+
+After analysis, we believe the root cause is in the handling of chained bios, specifically 
+related to out-of-order io completion. 
+
+Consider a bio chain where `bi_remaining` is decremented as each bio in the chain completes. 
+
+For example, 
+if a chain consists of three bios (bio1 -> bio2 -> bio3) with 
+bi_remaining count: 
+1->2->2 
+if the bio completes in the reverse order, there will be a problem.  
+if bio 3 completes first, it will become: 
+1->2->1 
+then bio 2 completes: 
+1->1->0 
+
+Because `bi_remaining` has reached zero, the final `end_io` callback for the entire chain 
+is triggered, even though not all bios in the chain have actually finished processing. 
+This premature completion can lead to stale data being exposed, as seen in our case. 
+
+The core issue appears to be that `bio_chain_endio` does not check if the current bio's 
+`bi_remaining` count has reached zero before proceeding to the next I/O. 
+```
+
+### `->__bi_remaining`
+
+```
+atomic_set(&bio->__bi_remaining, 1);
+    bio_init
+```
+
+```
+atomic_inc(&bio->__bi_remaining)
+    bio_inc_remaining
+        break_up_discard_bio>>
+        dm_split_and_process_bio>>
+        md_flush_request>>
+        __add_stripe_bio>>
+        make_discard_request>>
+        btrfs_submit_mirrored_bio>>
+        bio_chain
+            bio_chain_and_submit
+                blk_next_bio
+                    blkdev_issue_secure_erase
+                __blkdev_issue_discard
+                blkdev_cmd_discard
+            bio_submit_split_bioset
+                bio_submit_split
+                linear_make_request
+                raid0_handle_discard
+            xfs_rw_bdev
+            xfs_buf_submit_bio
+            xlog_write_iclog
+```
+
+```
+atomic_dec_and_test(&bio->__bi_remaining)
+    bio_remaining_done
+        bio_endio
+```
+
+```
+static inline void bio_inc_remaining(struct bio *bio)
+{
+        bio_set_flag(bio, BIO_CHAIN);
+        smp_mb__before_atomic();
+        atomic_inc(&bio->__bi_remaining);
+}
+```
+
+```
+void bio_chain(struct bio *bio, struct bio *parent)
+{
+        BUG_ON(bio->bi_private || bio->bi_end_io);
+
+        bio->bi_private = parent;
+        bio->bi_end_io  = bio_chain_endio;
+        bio_inc_remaining(parent);
+}
+```
+
+```
+static struct bio *__bio_chain_endio(struct bio *bio)
+{
+        struct bio *parent = bio->bi_private;
+
+        if (bio->bi_status && !parent->bi_status)
+                parent->bi_status = bio->bi_status;
+        bio_put(bio);
+        return parent;
+}
+
+static void bio_chain_endio(struct bio *bio)
+{
+        bio_endio(__bio_chain_endio(bio));
+}
+
+void bio_endio(struct bio *bio)
+{
+again:
+	if (!bio_remaining_done(bio))
+		return;
+    ...
+	if (bio->bi_end_io == bio_chain_endio) {
+		bio = __bio_chain_endio(bio);
+		goto again;
+	}
+    ...
+}
+
+```
+
+So there shouldn't be such issue.
+
+
+
 ## loop IO deadlock from nested submit_bio()
 
 [[PATCH V2 0/3] loop: nowait aio bug fixes](https://lore.kernel.org/linux-block/20251119120937.3424475-1-ming.lei@redhat.com/)
