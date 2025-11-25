@@ -2097,6 +2097,21 @@ So there shouldn't be such issue.
 
 [[PATCH V2 0/3] loop: nowait aio bug fixes](https://lore.kernel.org/linux-block/20251119120937.3424475-1-ming.lei@redhat.com/)
 
+### Calling into FS IO handler from .queue_rq()
+
+[[PATCH V5 0/6] loop: improve loop aio perf by IOCB_NOWAIT](https://lore.kernel.org/linux-block/20251015110735.1361261-1-ming.lei@redhat.com/)
+
+[Re: [RFC PATCHv5 0/6] zram: introduce writeback bio batching](https://lore.kernel.org/all/8c596737-95c1-4274-9834-1fe06558b431@linux.alibaba.com/#t)
+
+
+#### per-task IO context
+
+- current->journal_info
+
+- current->blk_plug
+
+- current->bio_list
+
 ### observations
 
 #### IO hang stack & dumpped bio_list
