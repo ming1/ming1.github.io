@@ -1065,6 +1065,121 @@ It can't be annotated
     - remove elevator sysfs lock(???) 
 
 
+# blk-wbt
+
+## Overview
+
+
+## Data strcucture
+
+
+## Interfaces
+
+### wbt_is_tracked
+
+```
+static inline bool wbt_is_tracked(struct request *rq)
+{       
+    return rq->wbt_flags & WBT_TRACKED;
+}
+```
+
+```
+flags |= WBT_TRACKED
+    bio_to_wbt_flags
+        wbt_cleanup(bio)
+        wbt_wait(bio)
+        wbt_track(rq, bio)
+            rq_qos_track
+                blk_mq_submit_bio
+```
+    
+
+## Context
+
+### &rq_wait->inflight initialization
+
+```
+atomic_set(&rq_wait->inflight, 0)
+    rq_wait_init
+        wbt_init
+```
+
+### atomic_dec_return
+
+```
+atomic_dec_return
+    wbt_rqw_done
+        wbt_cleanup_cb
+            __wbt_wait
+                wbt_wait
+                    wbt_rqos_ops.throttle
+                        rq_qos_throttle
+                            blk_mq_get_new_requests
+                                blk_mq_submit_bio
+                            blk_mq_use_cached_rq
+                                blk_mq_submit_bio
+        __wbt_done
+            wbt_cleanup
+                rq_qos_cleanup
+                    blk_mq_get_new_requests
+            wbt_done
+                rq_qos_done
+                    blk_mq_free_request
+                    blk_mq_end_request_batch
+                    __blk_mq_end_request
+```
+
+### BIO_QOS_THROTTLED
+
+```
+BIO_QOS_THROTTLED
+    bio_set_flag(bio, BIO_QOS_THROTTLED)
+        rq_qos_throttle
+            blk_mq_get_new_requests
+                blk_mq_submit_bio
+            blk_mq_use_cached_rq
+                blk_mq_submit_bio
+    bio_flagged(bio, BIO_QOS_THROTTLED)
+        blkcg_iolatency_done_bio
+            .done_bio
+                rq_qos_done_bio
+                    bio_endio
+        rq_qos_done_bio
+```
+
+## Issues
+
+### Hang on wbt_wait()
+
+#### Descritption
+
+```
+rq_wait array (per-RWQ waiting):
+  rq_wait[0]:
+    inflight:             -1
+    has_waiters:        True
+  rq_wait[1]:
+    inflight:              0
+    has_waiters:       False
+```
+
+```
+Meantime not see any inflight IO.
+
+BLK_MQ_F_TAG_HCTX_SHARED & BLK_MQ_F_TAG_QUEUE_SHARED
+
+fio: io_uring, 8jobs, qd128, XFS, buffered write, none sched 
+
+8 nr_hw_queues, qd: 916
+
+```
+
+atomic_inc_below() doesn't support negative counter, so this hang is
+triggered.
+
+
+
 # blk-throttol
 
 ## Overview
