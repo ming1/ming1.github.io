@@ -1093,7 +1093,77 @@ flags |= WBT_TRACKED
             rq_qos_track
                 blk_mq_submit_bio
 ```
-    
+
+### wbt_done
+
+```
+static void wbt_done(struct rq_qos *rqos, struct request *rq)
+{
+	struct rq_wb *rwb = RQWB(rqos);
+
+	if (!wbt_is_tracked(rq)) {
+		if (wbt_is_read(rq)) {
+			if (rwb->sync_cookie == rq) {
+				rwb->sync_issue = 0;
+				rwb->sync_cookie = NULL;
+			}
+
+			wb_timestamp(rwb, &rwb->last_comp);
+		}
+	} else {
+		WARN_ON_ONCE(rq == rwb->sync_cookie);
+		__wbt_done(rqos, wbt_flags(rq));
+	}
+	wbt_clear_state(rq);
+}
+
+static void __wbt_done(struct rq_qos *rqos, enum wbt_flags wb_acct)
+{
+	struct rq_wb *rwb = RQWB(rqos);
+	struct rq_wait *rqw;
+
+	if (!(wb_acct & WBT_TRACKED))
+		return;
+
+	rqw = get_rq_wait(rwb, wb_acct);
+	wbt_rqw_done(rwb, rqw, wb_acct);
+}
+
+static void wbt_rqw_done(struct rq_wb *rwb, struct rq_wait *rqw,
+			 enum wbt_flags wb_acct)
+{
+	int inflight, limit;
+
+	inflight = atomic_dec_return(&rqw->inflight);
+
+	/*
+	 * For discards, our limit is always the background. For writes, if
+	 * the device does write back caching, drop further down before we
+	 * wake people up.
+	 */
+	if (wb_acct & WBT_DISCARD)
+		limit = rwb->wb_background;
+	else if (blk_queue_write_cache(rwb->rqos.disk->queue) &&
+		 !wb_recent_wait(rwb))
+		limit = 0;
+	else
+		limit = rwb->wb_normal;
+
+	/*
+	 * Don't wake anyone up if we are above the normal limit.
+	 */
+	if (inflight && inflight >= limit)
+		return;
+
+	if (wq_has_sleeper(&rqw->wait)) {
+		int diff = limit - inflight;
+
+		if (!inflight || diff >= rwb->wb_background / 2)
+			wake_up_all(&rqw->wait);
+	}
+}
+```
+
 
 ## Context
 
@@ -1126,8 +1196,18 @@ atomic_dec_return
             wbt_done
                 rq_qos_done
                     blk_mq_free_request
+                        blk_mq_put_rq_ref
+                        dd_bio_merge
+                            blk_mq_sched_bio_merge
+                                blk_mq_attempt_bio_merge
+                                    blk_mq_submit_bio
+                        blk_mq_submit_bio
+                        blk_mq_free_plug_rqs
+                            __blk_flush_plug
+                                blk_finish_plug
                     blk_mq_end_request_batch
                     __blk_mq_end_request
+                        scsi_end_request
 ```
 
 ### BIO_QOS_THROTTLED
@@ -1147,6 +1227,17 @@ BIO_QOS_THROTTLED
                     bio_endio
         rq_qos_done_bio
 ```
+
+### others
+
+```
+blk_mq_free_request
+    blk_mq_put_rq_ref
+        bt_iter
+        bt_tags_iter
+```
+
+
 
 ## Issues
 
@@ -1178,6 +1269,35 @@ fio: io_uring, 8jobs, qd128, XFS, buffered write, none sched 
 atomic_inc_below() doesn't support negative counter, so this hang is
 triggered.
 
+
+
+#### possible reasons
+
+- double `wbt_done()`
+
+- not increase counter in wbt_wait(), but wbt_done() does decrease the counter
+
+- blk-wbt disable & reenable for switching off bfq
+
+```
+wbt_enable_default
+    ioc_qos_write
+    blk_register_queue
+    elevator_change_done
+        elv_update_nr_hw_queues
+        elevator_change
+
+->enable_state
+    wbt_enable_default
+    wbt_disable_default
+    rwb_enabled
+        wb_timestamp
+        bio_to_wbt_flags
+        wbt_issue
+        wbt_disabled
+            queue_wb_lat_show
+        wbt_requeue
+```
 
 
 # blk-throttol
