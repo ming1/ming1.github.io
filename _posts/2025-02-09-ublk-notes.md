@@ -1286,6 +1286,105 @@ unit_offset = (logic_offset / unit_size)  * unit_size   #unit_size may not be po
 
 # issues
 
+## I/O hang triggered by a fio test #170
+
+
+### Overview
+
+[I/O hang triggered by a fio test #170](https://github.com/ublk-org/ublksrv/issues/170)
+
+
+- ublk.loop contexts
+
+```
+[Dec 5 12:42] INFO: task ublk.loop:3877 blocked for more than 122 seconds.
+[  +0.000015]       Not tainted 6.17.9-arch1-1 #1
+[  +0.000006] "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+[  +0.000003] task:ublk.loop       state:D stack:0     pid:3877  tgid:3862  ppid:3861   task_flags:0x400140 flags:0x00004002
+[  +0.000014] Call Trace:
+[  +0.000005]  
+[  +0.000008]  __schedule+0x418/0x1330
+[  +0.000018]  ? _raw_spin_unlock+0xe/0x30
+[  +0.000012]  schedule+0x27/0xd0
+[  +0.000007]  schedule_preempt_disabled+0x15/0x30
+[  +0.000008]  __mutex_lock.constprop.0+0x52a/0xa70
+[  +0.000012]  bdev_release+0x5a/0x1a0
+[  +0.000011]  blkdev_release+0x11/0x20
+[  +0.000006]  __fput+0xe6/0x2a0
+[  +0.000011]  task_work_run+0x5d/0x90
+[  +0.000013]  io_run_task_work+0x4e/0x150
+[  +0.000012]  io_cqring_wait+0x9c/0x6b0
+[  +0.000013]  __do_sys_io_uring_enter+0x531/0x7a0
+[  +0.000013]  do_syscall_64+0x81/0x970
+[  +0.000009]  ? __do_sys_io_uring_enter+0x531/0x7a0
+[  +0.000011]  ? exit_to_user_mode_loop+0xcf/0x150
+[  +0.000010]  ? do_syscall_64+0x229/0x970
+[  +0.000007]  ? schedule+0x27/0xd0
+[  +0.000007]  entry_SYSCALL_64_after_hwframe+0x76/0x7e
+```
+
+```
+@[kfunc:vmlinux:fput, ublkb20, ublk.loop, 
+    bpf_prog_772db7720b2728e9_sd_fw_ingress+30364
+    bpf_prog_772db7720b2728e9_sd_fw_ingress+30364
+    bpf_prog_772db7720b2728e9_sd_fw_ingress+30651
+    fput+9
+    aio_complete_rw+272
+    blkdev_bio_end_io_async+81
+    blk_update_request+415
+    ublk_ch_uring_cmd_local+572
+    io_uring_cmd+174
+    __io_issue_sqe+61
+    io_issue_sqe+57
+    io_submit_sqes+588
+    __do_sys_io_uring_enter+611
+    do_syscall_64+132
+    entry_SYSCALL_64_after_hwframe+118
+]: 20443
+```
+
+- udev-synth context
+
+```
+[  +0.001213] INFO: task ublk.loop:3877 is blocked on a mutex likely owned by task (udev-synth):4041.
+[  +0.000011] task:(udev-synth)    state:D stack:0     pid:4041  tgid:4041  ppid:299    task_flags:0x400140 flags:0x00004002
+[  +0.000011] Call Trace:
+[  +0.000004]  
+[  +0.000007]  __schedule+0x418/0x1330
+[  +0.000014]  ? __submit_bio+0x1ca/0x280
+[  +0.000009]  schedule+0x27/0xd0
+[  +0.000007]  io_schedule+0x46/0x70
+[  +0.000037]  folio_wait_bit_common+0x133/0x330
+[  +0.000013]  ? __pfx_wake_page_function+0x10/0x10
+[  +0.000012]  ? __pfx_blkdev_read_folio+0x10/0x10
+[  +0.000007]  filemap_read_folio+0x85/0xf0
+[  +0.000007]  do_read_cache_folio+0x94/0x3e0
+[  +0.000010]  ? prep_new_page+0xdd/0x1f0
+[  +0.000012]  ? get_page_from_freelist+0x390/0x1af0
+[  +0.000009]  read_part_sector+0x2f/0xd0
+[  +0.000041]  read_lba+0x86/0xf0
+[  +0.000012]  efi_partition+0xbe/0x990
+[  +0.000009]  ? vsnprintf+0x456/0x5c0
+[  +0.000020]  ? snprintf+0x52/0x70
+[  +0.000010]  ? __pfx_efi_partition+0x10/0x10
+[  +0.000010]  bdev_disk_changed+0x25d/0x360
+[  +0.000010]  blkdev_get_whole+0x67/0xe0
+[  +0.000012]  bdev_open+0x201/0x3d0
+[  +0.000007]  bdev_file_open_by_dev+0xc9/0x120
+[  +0.000032]  disk_scan_partitions+0x68/0xf0
+[  +0.000013]  blkdev_ioctl+0xbe/0x260
+[  +0.000013]  __x64_sys_ioctl+0x97/0xe0
+[  +0.000011]  do_syscall_64+0x81/0x970
+[  +0.000012]  ? do_syscall_64+0x81/0x970
+[  +0.000006]  ? count_memcg_events+0xc2/0x190
+[  +0.000009]  ? handle_mm_fault+0x1d7/0x2d0
+[  +0.000009]  ? do_user_addr_fault+0x21a/0x690
+[  +0.000013]  ? exc_page_fault+0x7e/0x1a0
+[  +0.000036]  entry_SYSCALL_64_after_hwframe+0x76/0x7e
+```
+
+
+
 ## io_uring panic when running ublksrv 'generic/002' test
 
 ### overview
