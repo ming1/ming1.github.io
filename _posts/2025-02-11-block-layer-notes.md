@@ -1289,7 +1289,12 @@ wbt_enable_default
 
 ->enable_state
     wbt_enable_default
+        elevator_change_done
+        ioc_qos_write
+        blk_register_queue
     wbt_disable_default
+        bfq_init_queue
+        ioc_qos_write
     rwb_enabled
         wb_timestamp
         bio_to_wbt_flags
