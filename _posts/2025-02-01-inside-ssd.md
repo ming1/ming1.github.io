@@ -212,6 +212,68 @@ Plane变现出和Die相同的特性，每个Plane可以独立执行读取命令�
 - IO command
 
 
+![NVMe_Intro_Fig1.png](/assets/images/NVMe_Intro_Fig1.png)
+
+
+## command sets
+
+### Admin
+
+- Create I/O Submission Queue
+
+- Delete I/O Submission Queue
+
+- Create I/O Completion Queue
+
+- Delete I/O Completion Queue
+
+- Identify
+
+- Get Features
+
+- Set Features
+
+- Get Log Page
+
+- Asynchronous Event Request
+
+- Abort
+
+- Firmware Image Download (Optional)
+
+- Firmware Activate (Optional)
+
+- I/O Command Set Specific Commands (Optional)
+
+- Vendor Specific Commands (Optional) 
+
+### IO
+
+- Read
+
+- Write
+
+- Flush
+
+- Write Uncorrectable (Optional)
+
+- Write Zeros (Optional)
+
+- Compare (Optional)
+
+- Dataset Management (Optional)
+
+- Reservation Acquire (Optional)
+
+- Reservation Register (Optional)
+
+- Reservation Release (Optional)
+
+- Reservation Report (Optional)
+
+- Vendor Specific Commands (Optional)
+
+
 ## SQ, CQ and DB
 
 - both SQ and CQ are allocated from host memory(could be SSD memory too)
@@ -250,6 +312,62 @@ Plane变现出和Die相同的特性，每个Plane可以独立执行读取命令�
 
 - when host updates CQ head DB, it is also telling SSD that the returned command
 completion status have been handled
+
+
+#### phrase tag
+
+```
+NVMe Completion Queue Phase Tag Mechanism
+
+  The phase tag (or phase bit) is an elegant mechanism NVMe uses to allow drivers to detect new completions without requiring the
+  controller to maintain additional state. Let me explain how it works, referencing the nvme_vfio.c implementation.
+
+  Why Phase Tags Exist
+
+  Traditional completion mechanisms require explicit valid/invalid flags that must be cleared after processing. NVMe's phase tag avoids
+  this by using a single bit that toggles on queue wraparound, eliminating the need for the driver to clear entries.
+
+  How the Controller Updates the Phase Bit
+
+  The NVMe controller follows this sequence:
+
+  1. Initial state: When a completion queue is created, all entries are zeroed, so the phase bit (bit 0 of the status field) is 0 for all
+   entries.
+  2. First pass through queue: As the controller completes commands, it writes completion entries with phase bit = 1.
+  3. Queue wraparound: When the controller wraps around to the beginning of the queue (head goes from qsize-1 to 0), it toggles the phase
+   bit to 0.
+  4. Subsequent passes: Each time the controller wraps around, it toggles the phase bit again (0→1→0→1...).
+
+  The controller writes completions in head pointer order, always at cq[controller_head], and the phase bit in that entry always matches
+  the controller's current phase.
+
+```
+
+```
+  Let's trace through a queue with size 4:
+
+  | Controller Head | Driver Head | Expected Phase | Entry 0 Phase | Entry 1 Phase | Entry 2 Phase | Entry 3 Phase |
+  |-----------------|-------------|----------------|---------------|---------------|---------------|---------------|
+  | 0               | 0           | 1              | 0 (old)       | 0 (old)       | 0 (old)       | 0 (old)       |
+  | 1               | 0           | 1              | 1 ✓           | 0 (old)       | 0 (old)       | 0 (old)       |
+  | 2               | 1           | 1              | 1             | 1 ✓           | 0 (old)       | 0 (old)       |
+  | 3               | 2           | 1              | 1             | 1             | 1 ✓           | 0 (old)       |
+  | 0 (wrap)        | 3           | 1              | 1             | 1             | 1             | 1 ✓           |
+  | 1               | 0 (wrap)    | 0              | 0 ✓           | 1 (old)       | 1 (old)       | 1 (old)       |
+
+  At the wraparound:
+  - Controller wraps from 3→0 and toggles phase to 0
+  - Driver wraps from 3→0 and toggles expected phase to 0
+  - Driver now looks for phase bit = 0 to detect new completions
+
+  Benefits of This Mechanism
+
+  1. No explicit clearing: Driver doesn't need to write to CQ entries
+  2. Race-free: Phase bit provides atomic indication of validity
+  3. Efficient: Single bit comparison determines if entry is new
+  4. Lockless: No synchronization needed between controller and driver for completion detection
+
+```
 
 
 ## PRP & SGL
