@@ -1,7 +1,7 @@
 ---
 title: Inside SSD
 category: tech
-tags: [storage, SSD, block]
+tags: [storage, SSD, block, NVMe, PCIe]
 ---
 
 title:  Inside SSD
@@ -12,7 +12,49 @@ title:  Inside SSD
 [深入浅出SSD：固态存储核心技术、原理与实战 第2版](https://yd.qq.com/web/bookDetail/d7332020813ab864fg0109a3)
 
 
-# Ch5 NAND flash
+# PCIe
+
+## overview
+
+![PCI Express topology](/assets/images/Example_PCI_Express_Topology.svg.png)
+
+PCI Express is based on point-to-point topology, with separate serial links connecting every device to
+the root complex (host).
+
+A PCI Express bus link supports full-duplex communication between any two endpoints, with no inherent 
+limitation on concurrent access across multiple endpoints.
+
+The PCI Express link between two devices can vary in size from one to 16 lanes. In a multi-lane link, 
+the packet data is **striped across lanes**, and peak data throughput scales with the overall link 
+width.
+
+The lane count is automatically negotiated during device initialization and can be restricted by 
+either endpoint. For example, a single-lane PCI Express (×1) card can be inserted into a multi-lane 
+slot (×4, ×8, etc.), and the initialization cycle auto-negotiates the highest mutually supported 
+lane count. The link can dynamically down-configure itself to use fewer lanes, providing a failure 
+tolerance in case bad or unreliable lanes are present. The PCI Express standard defines link widths 
+of ×1, ×2, ×4, ×8, and ×16. Up to and including PCIe 5.0, ×12, and ×32 links were defined as well 
+but virtually[clarification needed] never used.[9] This allows the PCI Express bus to serve both 
+cost-sensitive applications where high throughput is not needed, and performance-critical 
+applications such as 3D graphics, networking (10 Gigabit Ethernet or multiport Gigabit Ethernet), 
+and enterprise storage (SAS or Fibre Channel). Slots and connectors are only defined for a subset 
+of these widths, with link widths in between using the next larger physical slot size.
+
+### Lane
+
+A lane is composed of two differential signaling pairs, with one pair for receiving data and the 
+other for transmitting. Thus, each lane is composed of four wires or signal traces. Conceptually,  
+each lane is used as a full-duplex byte stream, transporting data packets in eight-bit "byte" 
+format simultaneously in both directions between endpoints of a link.[11] Physical PCI Express 
+links may contain 1, 4, 8 or 16 lanes.[12][6]: 4, 5 [10] Lane counts are written with an "x" 
+prefix (for example, "×8" represents an eight-lane card or slot), with ×16 being the largest 
+size in common use.[13] Lane sizes are also referred to via the terms "width" or "by" e.g., an 
+eight-lane slot could be referred to as a "by 8" or as "8 lanes wide."
+
+SSD usually supports 4 Lanes.
+
+
+# NAND flash
 
 [NAND Flash 101: An Introduction to NAND Flash and How to Design It In to Your Next Product](https://user.eng.umd.edu/~blj/CS-590.26/micron-tn2919.pdf)
 
@@ -135,7 +177,7 @@ Plane变现出和Die相同的特性，每个Plane可以独立执行读取命令�
 ## 3D闪存
 
 
-# Ch9 NVMe
+# NVMe-PCI Introduction
 
 ## From AHCI to NVMe
 
@@ -235,6 +277,62 @@ either one
 ### HMB
 
 - allow host memory used by SSD controller
+
+
+
+# libnvme
+
+[libnvme](https://github.com/linux-nvme/libnvme)
+
+## overview
+
+### headers
+
+[NVMe standard definitions](https://github.com/linux-nvme/libnvme/blob/master/src/nvme/types.h)
+
+[Fabrics-specific definitions](https://github.com/linux-nvme/libnvme/blob/master/src/nvme/fabrics.h)
+
+
+# NVMe SPEC
+## NVMe AWUPF
+
+### overview
+
+NVMe AWUPF (Atomic Write Unit Power Fail) is a critical parameter in NVMe SSDs that specifies the
+maximum data size guaranteed to be written atomically during a power failure.
+
+
+#### Technical Specification
+
+```
+0's Based Value: The value reported in the nvme id-ctrl output is 0's based. For example:
+
+AWUPF = 0 → Atomic write size = 1 logical block (e.g., 512B or 4KB).
+
+AWUPF = N → Atomic write size = (N + 1) logical blocks.
+
+Querying the Value: Use the NVMe CLI command:
+bash
+sudo nvme id-ctrl /dev/nvme0 | grep awupf
+
+This returns values like awupf : 0 (common in consumer drives).
+```
+
+`nvme format` may change logical block size, and nvme controller has fixed-length atomic
+write size
+
+#### Role in Power Loss Protection (PLP)
+
+Enterprise vs. Consumer SSDs:
+
+    Enterprise drives often implement PLP (e.g., capacitors) to flush cached data during
+    power loss. Here, AWUPF aligns with the drive's capability to commit atomic writes.
+
+    Consumer drives typically lack PLP. If AWUPF=0, only single-block writes are atomic;
+    larger writes risk corruption.
+
+    Write Cache Dependency: AWUPF assumes the drive's volatile write cache is enabled. If
+    disabled, all writes bypass the cache, making AWUPF irrelevant.
 
 
 # references
