@@ -54,6 +54,21 @@ eight-lane slot could be referred to as a "by 8" or as "8 lanes wide."
 SSD usually supports 4 Lanes.
 
 
+## More PCIe introductions 
+
+[PCI/PCIe(1): 基礎篇](https://hackmd.io/@RinHizakura/rklZtud9T)
+
+[PCI/PCIe(2): 電源管理](https://hackmd.io/@RinHizakura/SJpyFtOqT)
+
+[PCI/PCIe(3): Message Signaled Interrupt(MSI)](https://hackmd.io/@RinHizakura/Bk-s-EqZJl)
+
+[PCI/PCIe(4): Transaction Layer](https://hackmd.io/@RinHizakura/HyQ3pXm4ke)
+
+[PCI/PCIe(5): Latency Tolerance Reporting(LTR)](https://hackmd.io/@RinHizakura/rkzxuRMGle)
+
+[PCI/PCIe(6): PCIe Reset](https://hackmd.io/@RinHizakura/BydG_0ffxe)
+
+
 # NAND flash
 
 [NAND Flash 101: An Introduction to NAND Flash and How to Design It In to Your Next Product](https://user.eng.umd.edu/~blj/CS-590.26/micron-tn2919.pdf)
