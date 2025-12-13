@@ -1143,9 +1143,11 @@ struct file {
   I/O uring operations:
   - IORING_OP_OPENAT, IORING_OP_OPENAT2
 
-● The calling tree is now complete! This shows all major paths from syscalls and well-known kernel entry points down to alloc_empty_file(), which is called from 5 main functions:
+● The calling tree is now complete! This shows all major paths from syscalls and well-known 
+kernel entry points down to alloc_empty_file(), which is called from 5 main functions:
 
-  1. alloc_file() - Used for pseudo filesystems via alloc_file_pseudo() (anon_inodes, sockets, dma-buf, etc.) and file cloning via alloc_file_clone() (pipes, shm)
+  1. alloc_file() - Used for pseudo filesystems via alloc_file_pseudo() (anon_inodes, sockets, 
+dma-buf, etc.) and file cloning via alloc_file_clone() (pipes, shm)
   2. path_openat() - The core path lookup and file opening function used by all open-related syscalls
   3. dentry_open() - Direct dentry-based file opening for special cases
   4. dentry_open_nonotify() - Used by fanotify to avoid recursive notification
@@ -1154,7 +1156,7 @@ struct file {
   The tree covers all major file allocation paths in the Linux kernel, from over 50 different syscalls!
 ```
 
-##### free
+##### free/fput
 
 ```
   file_free
@@ -1344,19 +1346,24 @@ struct file {
   - Unix socket garbage collection
   - Epoll automatic cleanup
 
-● The calling tree is now complete! This shows all major paths from syscalls and kernel events to file_free(), which is the actual function that frees the file structure.
+● The calling tree is now complete! This shows all major paths from syscalls and 
+kernel events to file_free(), which is the actual function that frees the file structure.
 
   Key differences from alloc_empty_file() tree:
 
-  1. Multiple cleanup triggers: While file allocation happens at specific open-like operations, file freeing happens through many more paths including:
+  1. Multiple cleanup triggers: While file allocation happens at specific open-like 
+operations, file freeing happens through many more paths including:
     - Explicit close operations
     - Process exit (automatic cleanup)
     - FD replacement operations
     - Error paths throughout the kernel
     - Automatic garbage collection
-  2. Deferred cleanup: The kernel uses work queues and task work to defer file cleanup to avoid blocking operations, shown through delayed_fput() and ____fput().
-  3. Reference counting: Files are reference counted, and file_free() is only called when the last reference is dropped via fput() family of functions.
-  4. Lifecycle integration: File cleanup is deeply integrated with process lifecycle (do_exit(), execve()) and resource management (Unix socket GC, epoll automatic cleanup).
+  2. Deferred cleanup: The kernel uses work queues and task work to defer file cleanup 
+to avoid blocking operations, shown through delayed_fput() and ____fput().
+  3. Reference counting: Files are reference counted, and file_free() is only called 
+when the last reference is dropped via fput() family of functions.
+  4. Lifecycle integration: File cleanup is deeply integrated with process lifecycle (
+do_exit(), execve()) and resource management (Unix socket GC, epoll automatic cleanup).
 
   The tree covers over 50 different syscalls and kernel events that can lead to file cleanup!
 
@@ -1550,11 +1557,13 @@ get_file
   - NFS server operations
   - Bluetooth HIDP/CMTP operations
 
-● The calling tree is now complete! This shows all major paths from syscalls to get_file(), which increments the reference count on an existing struct file *.
+● The calling tree is now complete! This shows all major paths from syscalls to 
+get_file(), which increments the reference count on an existing struct file *.
 
   Key insights about get_file() vs alloc_empty_file() and file_free():
 
-  1. Purpose: get_file() is called when you already have a file pointer and need to take an additional reference (e.g., sharing across processes, storing in multiple data structures)
+  1. Purpose: get_file() is called when you already have a file pointer and need to 
+take an additional reference (e.g., sharing across processes, storing in multiple data structures)
   2. Major use cases:
     - Process forking: When fork() creates a child, all VMAs and file descriptors are duplicated with get_file()
     - FD duplication: dup(), dup2(), fcntl(F_DUPFD) use get_file() to create additional references
@@ -1572,8 +1581,6 @@ get_file
 ```
 
 
-##### put reference
-
 
 ## SYSCALLS
 
@@ -1590,5 +1597,220 @@ get_file
 
 ## Contexts
 
+### typical scenarios where struct file objects are shared among processes
 
+```
+1. Fork/Clone with CLONE_FILES (Thread-like File Sharing)
+
+Mechanism: When creating a new process/thread with CLONE_FILES flag, the child 
+shares the entire file descriptor table with the parent.
+
+// kernel/fork.c:1630
+if (clone_flags & CLONE_FILES) {
+    atomic_inc(&oldf->count);  // Share the same files_struct
+    return 0;
+}
+
+Example: POSIX threads created via pthread_create() use CLONE_FILES
+
+Characteristics:
+- Same FD numbers point to the same struct file* in both processes
+- Closing FD in one thread closes it for all threads
+- File offset is shared (seek in one thread affects all)
+- Perfect for multi-threaded applications
+
+Use Cases:
+- Multi-threaded applications (all threads in a process)
+- Kernel threads (kthreadd uses CLONE_FS | CLONE_FILES)
+
+---
+2. Fork without CLONE_FILES (Traditional Fork)
+
+Mechanism: Child gets a copy of parent's FD table, but underlying struct file* objects 
+are shared via get_file()
+
+// fs/file.c:1635 + fs/file.c:458
+newf = dup_fd(oldf, NULL);  // Duplicate FD table
+    get_file(f);             // But share struct file objects
+
+Characteristics:
+- Different FD tables, but point to same struct file objects
+- Each process can independently close FDs
+- File offset is shared (critical difference from independent opens!)
+- Reference count on struct file incremented
+
+Example:
+int fd = open("/tmp/test", O_RDWR);
+pid_t pid = fork();  // No CLONE_FILES
+
+// Parent: fd=3 → struct file* (refcount=2)
+// Child:  fd=3 → same struct file* (refcount=2)
+
+// If parent seeks to offset 100:
+lseek(fd, 100, SEEK_SET);
+// Child will also see offset=100!
+
+// But if child closes fd, parent's fd still works
+close(fd);  // Only decrements refcount
+
+---
+3. SCM_RIGHTS - Unix Socket FD Passing (IPC File Sharing)
+
+Mechanism: Pass file descriptors between unrelated processes via Unix domain sockets
+
+// Sender (Process A)
+sendmsg(sock, msg_with_fd, 0);  // FD 42 → struct file* (refcount++)
+
+// Receiver (Process B)  
+recvmsg(sock, &msg, 0);          // Gets new FD 7 → same struct file*
+
+Implementation:
+// net/core/scm.c:69 - Sender side
+file = fget_raw(fd);  // Convert FD → struct file*
+// Stores struct file* in control message
+
+// fs/file.c:1392 - Receiver side
+get_file(file);       // Increment refcount
+receive_fd(file);     // Install in receiver's FD table
+
+Characteristics:
+- Different FD numbers in each process
+- Same underlying struct file (shared offset, flags)
+- Works between unrelated processes
+- Only mechanism for passing FDs across process boundaries (before pidfd_getfd)
+
+Use Cases:
+- Systemd socket activation
+- Android Binder (passes FDs via SCM_RIGHTS internally)
+- Container runtime FD passing
+- Privilege separation (pass open file to unprivileged process)
+
+---
+4. pidfd_getfd (Modern FD Stealing)
+
+Mechanism: Process A can "steal" an FD from Process B using its pidfd (requires CAP_SYS_PTRACE)
+
+// kernel/pid.c:883
+int new_fd = pidfd_getfd(pidfd, target_fd, 0);
+// Gets struct file* from target, installs in caller's FD table
+
+Characteristics:
+- Requires ptrace capability
+- Creates new FD in caller pointing to target's struct file
+- Added in Linux 5.6 (2020)
+
+Use Cases:
+- Debuggers
+- Checkpoint/restore (CRIU)
+- Process managers inspecting file descriptors
+
+---
+5. Shared Memory via shmat() (SysV IPC)
+
+Mechanism: Multiple processes attach same shared memory segment, sharing the underlying file
+
+// ipc/shm.c:1614
+base = get_file(shp->shm_file);  // Share the backing file
+
+Characteristics:
+- Each process gets separate VMA
+- All VMAs point to same struct file (tmpfs/hugetlbfs)
+- File offset not relevant (uses vm_pgoff)
+
+Use Cases:
+- SysV shared memory (shmget/shmat)
+- POSIX shared memory (shm_open)
+
+---
+6. DMA-BUF File Sharing (Device Buffer Sharing)
+
+Mechanism: GPU/Camera/Display devices share buffers via file descriptors
+
+// drivers/dma-buf/dma-buf.c:786
+struct dma_buf *dma_buf_get(int fd);  // Get dmabuf from FD
+get_file(dmabuf->file);               // Share with another device/process
+
+Characteristics:
+- Zero-copy buffer sharing across devices
+- File descriptor represents DMA-able memory buffer
+- Can be passed via SCM_RIGHTS or inherited via fork
+- Critical for performance in multimedia applications
+
+Use Cases:
+- Android graphics (SurfaceFlinger)
+- Wayland compositors
+- Video pipelines (Camera → GPU → Display)
+- ML accelerators sharing tensors
+
+Example Pipeline:
+Camera captures → DMA-BUF FD → SCM_RIGHTS to GPU process 
+→ GPU renders → Same DMA-BUF FD → SCM_RIGHTS to Display process
+→ Display scans out
+(ZERO COPIES!)
+
+---
+7. Memory Mapped Files (mmap sharing)
+
+Mechanism: Multiple processes mmap() the same file or share VMAs via fork
+
+// mm/vma.c:533 - During fork
+get_file(new->vm_file);  // Child's VMA shares parent's file
+
+// mm/util.c:331 - During vma_set_file
+get_file(file);
+
+Characteristics:
+- Each process has own VMA structure
+- All VMAs share same struct file*
+- Provides shared or private mappings (MAP_SHARED vs MAP_PRIVATE)
+
+Use Cases:
+- Shared libraries (libc.so shared across all processes)
+- Memory-mapped databases
+- Shared memory via /dev/shm
+
+---
+8. File Descriptor Duplication (dup/dup2/fcntl)
+
+Mechanism: Single process creates multiple FDs pointing to same file
+
+// fs/file.c:1326
+get_file(file);  // New FD → same struct file*
+
+Example:
+int fd1 = open("/tmp/test", O_RDWR);  // refcount=1
+int fd2 = dup(fd1);                   // refcount=2
+// fd1 and fd2 share same struct file* (same offset!)
+
+Use Cases:
+- Shell redirection (2>&1 duplicates stderr to stdout)
+- Saving/restoring file descriptors
+
+---
+Summary Table
+
+| Scenario    | Processes | FD Numbers  | struct file | Offset Shared | Primary Use Case          |
+|-------------|-----------|-------------|-------------|---------------|---------------------------|
+| CLONE_FILES | Related   | Same table  | Shared      | ✅ Yes        | Threads                   |
+| fork()      | Related   | Independent | Shared      | ✅ Yes        | Process creation          |
+| SCM_RIGHTS  | Unrelated | Different   | Shared      | ✅ Yes        | IPC, privilege separation |
+| pidfd_getfd | Unrelated | Different   | Shared      | ✅ Yes        | Debugging, CRIU           |
+| shmat       | Unrelated | Different   | Shared      | ❌ N/A        | SysV IPC                  |
+| DMA-BUF     | Unrelated | Different   | Shared      | ❌ N/A        | Zero-copy device I/O      |
+| mmap        | Any       | Different   | Shared      | ❌ N/A        | Memory mapping            |
+| dup()       | Same      | Different   | Shared      | ✅ Yes        | FD redirection            |
+
+---
+Key Insight: Why Share struct file?
+
+1. Efficiency: Avoid duplicating kernel state (inode cache, page cache)
+2. Synchronization: Shared file offset for coordinated I/O
+3. Zero-copy: DMA-BUF eliminates memory copies
+4. IPC: Pass open files between processes without path resolution
+5. Security: Share capability without granting filesystem access
+
+● This comprehensive overview covers all the major scenarios! The most important takeaway is that
+struct file sharing is fundamental to Linux's design - it enables everything from efficient
+multi-threading to zero-copy multimedia pipelines.
+```
 
