@@ -1383,6 +1383,35 @@ unit_offset = (logic_offset / unit_size)  * unit_size   #unit_size may not be po
 [  +0.000036]  entry_SYSCALL_64_after_hwframe+0x76/0x7e
 ```
 
+### Contexts
+
+#### is there such same issue for other block devices?
+
+- ioctl(RRPART) for nvme device
+
+- complete nvme io from thread context, fput() schedules task work
+to call blkdev_release() from current's task work.
+
+
+### Comments
+
+#### Same issue exists on io_uring polling
+
+- reading partition table won't use iopoll, so no this problem
+
+#### Same issue exists on nbd too
+
+No, nbd uses wq.
+
+#### probably on loop if MQ is enabled
+
+No, loop uses wq
+
+#### could be one risk for any blk-mq disk
+
+No, still uses wq
+
+#### test performance effect by raising softirq
 
 
 ## io_uring panic when running ublksrv 'generic/002' test
