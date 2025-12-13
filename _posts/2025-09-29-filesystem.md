@@ -932,3 +932,663 @@ until one of the following occurs:
 
     - It is removed from the circular queue that holds the journal
 
+
+# Linux VFS
+
+## Overview
+
+
+## Data Structures
+
+### file descriptor
+
+### struct file
+
+```
+/**
+ * struct file - Represents a file
+ * @f_lock: Protects f_ep, f_flags. Must not be taken from IRQ context.
+ * @f_mode: FMODE_* flags often used in hotpaths
+ * @f_op: file operations
+ * @f_mapping: Contents of a cacheable, mappable object.
+ * @private_data: filesystem or driver specific data
+ * @f_inode: cached inode
+ * @f_flags: file flags
+ * @f_iocb_flags: iocb flags
+ * @f_cred: stashed credentials of creator/opener
+ * @f_owner: file owner
+ * @f_path: path of the file
+ * @__f_path: writable alias for @f_path; *ONLY* for core VFS and only before
+ *   the file gets open
+ * @f_pos_lock: lock protecting file position
+ * @f_pipe: specific to pipes
+ * @f_pos: file position
+ * @f_security: LSM security context of this file
+ * @f_wb_err: writeback error
+ * @f_sb_err: per sb writeback errors
+ * @f_ep: link of all epoll hooks for this file
+ * @f_task_work: task work entry point
+ * @f_llist: work queue entrypoint
+ * @f_ra: file's readahead state
+ * @f_freeptr: Pointer used by SLAB_TYPESAFE_BY_RCU file cache (don't touch.)
+ * @f_ref: reference count
+ */
+struct file {
+	spinlock_t			f_lock;
+	fmode_t				f_mode;
+	const struct file_operations	*f_op;
+	struct address_space		*f_mapping;
+	void				*private_data;
+	struct inode			*f_inode;
+	unsigned int			f_flags;
+	unsigned int			f_iocb_flags;
+	const struct cred		*f_cred;
+	struct fown_struct		*f_owner;
+	/* --- cacheline 1 boundary (64 bytes) --- */
+	union {
+		const struct path	f_path;
+		struct path		__f_path;
+	};
+	union {
+		/* regular files (with FMODE_ATOMIC_POS) and directories */
+		struct mutex		f_pos_lock;
+		/* pipes */
+		u64			f_pipe;
+	};
+	loff_t				f_pos;
+#ifdef CONFIG_SECURITY
+	void				*f_security;
+#endif
+	/* --- cacheline 2 boundary (128 bytes) --- */
+	errseq_t			f_wb_err;
+	errseq_t			f_sb_err;
+#ifdef CONFIG_EPOLL
+	struct hlist_head		*f_ep;
+#endif
+	union {
+		struct callback_head	f_task_work;
+		struct llist_node	f_llist;
+		struct file_ra_state	f_ra;
+		freeptr_t		f_freeptr;
+	};
+	file_ref_t			f_ref;
+	/* --- cacheline 3 boundary (192 bytes) --- */
+} __randomize_layout
+  __attribute__((aligned(4)));	/* lest something weird decides that 2 is OK */
+```
+
+#### lifetime
+
+
+##### allocate
+
+```
+  alloc_empty_file
+      alloc_file
+          alloc_file_pseudo
+              anon_inode_getfile
+                  eventfd_create         //syscall: eventfd, eventfd2
+                  timerfd_create         //syscall: timerfd_create
+                  signalfd_create        //syscall: signalfd, signalfd4
+                  userfaultfd_create     //syscall: userfaultfd
+                  inotify_create         //syscall: inotify_init1
+                  epoll_create           //syscall: epoll_create, epoll_create1
+                  perf_event_open        //syscall
+                  io_uring_setup         //syscall: io_uring_setup
+                  bpf_link_new_file      //syscall: bpf
+                  seccomp_notify         //syscall: seccomp
+                  kvm_dev_ioctl_create_vm //syscall: kvm ioctl
+                  drm_open_file          //syscall: open (on /dev/dri/*)
+                  vfio_migration_files   //vfio migration
+                  sync_file_create       //dma-buf sync
+              sock_alloc_file
+                  __sys_socket           //syscall: socket, socketpair
+                  __sys_accept4          //syscall: accept, accept4
+                  kcm_clone              //kcm sockets
+                  sock_from_file         //various socket operations
+              dma_buf_getfile
+                  dma_buf_export
+                      //called by DRM, V4L2, VFIO, DMA-BUF exporters
+              aio_private_file
+                  ioctx_alloc
+                      io_setup           //syscall
+              hugetlb_file_setup
+                  hugetlbfs_file_mmap    //syscall: mmap on hugetlbfs
+                  newseg                 //syscall: shmget + shmat (hugetlb)
+                  alloc_file (memfd)     //syscall: memfd_create (hugetlb)
+              shmem_file_setup
+                  shmem_zero_setup       //MAP_ANONYMOUS|MAP_SHARED mmap
+                  drm_gem_object_init    //DRM GEM objects
+                  sgx_encl_create        //SGX enclaves
+              secretmem_file_setup       //syscall: memfd_secret
+              mm/memfd.c:alloc_file      //syscall: memfd_create
+          alloc_file_clone
+              create_pipe_files
+                  do_pipe2               //syscall: pipe, pipe2
+                  io_uring_create_buffers_pipe //io_uring
+                  core_pipe_setup        //coredump
+              do_shmat                   //syscall: shmat
+      path_openat
+          do_filp_open
+              do_open_execat
+                  open_exec
+                      load_elf_binary    //execve path
+                      load_script        //execve path
+                      load_misc_binary   //execve path
+                  kernel_read_file       //kernel module loading
+              file_open_name
+                  ksys_swapon            //syscall: swapon
+                  swapoff                //syscall: swapoff
+                  do_coredump            //coredump path
+                  collapse_file          //THP collapse
+                  acct_get               //syscall: acct
+              do_sys_openat2
+                  do_sys_open
+                      sys_open           //syscall: open
+                      sys_openat         //syscall: openat
+                  sys_openat2            //syscall: openat2
+              io_openat2                 //io_uring: IORING_OP_OPENAT, IORING_OP_OPENAT2
+          do_file_open_root
+              file_open_root
+                  do_sys_fsmount         //syscall: fsconfig, fsmount
+                  do_faccessat2          //syscall: access, faccessat, faccessat2
+                  open_by_handle_at      //syscall: open_by_handle_at
+                  kernel_read_file_from_path //kernel
+                  do_coredump            //core dump
+                  sev_fw_load            //AMD SEV firmware
+      dentry_open
+          open_tree                      //syscall: open_tree
+          fscontext_create               //syscall: fsopen
+          unix_get_socket                //unix socket operations
+          pty_open_peer                  //pty operations
+          acct_on                        //syscall: acct
+          mqueue_open                    //syscall: mq_open
+          pidfd_getfd                    //syscall: pidfd_getfd
+          ns_get_path                    //syscall: setns, unshare (namespace)
+          fscontext_dup                  //syscall: fsopen
+          ovl_path_open                  //overlayfs operations
+          xfs_ioc_getfsmap               //XFS ioctl
+          spu_open                       //Cell SPU filesystem
+          smb_vfs_kernel_read            //SMB server
+          do_mount_setattr               //syscall: mount_setattr
+      dentry_open_nonotify
+          fanotify_get_response          //fanotify
+      dentry_create
+          nfsd4_vfs_fallocate            //NFS server
+
+  Key syscall entry points organized by subsystem:
+
+  File operations:
+  - open, openat, openat2, open_tree, open_by_handle_at
+  - execve, execveat
+
+  IPC:
+  - pipe, pipe2, shmat, mq_open
+
+  Networking:
+  - socket, socketpair, accept, accept4
+
+  Event handling:
+  - eventfd, eventfd2, timerfd_create, signalfd, signalfd4
+  - epoll_create, epoll_create1, inotify_init1
+
+  Memory:
+  - memfd_create, memfd_secret, swapon, swapoff
+
+  Advanced:
+  - io_setup (AIO), io_uring_setup, userfaultfd
+  - perf_event_open, pidfd_getfd
+  - setns, unshare, fsopen, fsmount
+
+  I/O uring operations:
+  - IORING_OP_OPENAT, IORING_OP_OPENAT2
+
+● The calling tree is now complete! This shows all major paths from syscalls and well-known kernel entry points down to alloc_empty_file(), which is called from 5 main functions:
+
+  1. alloc_file() - Used for pseudo filesystems via alloc_file_pseudo() (anon_inodes, sockets, dma-buf, etc.) and file cloning via alloc_file_clone() (pipes, shm)
+  2. path_openat() - The core path lookup and file opening function used by all open-related syscalls
+  3. dentry_open() - Direct dentry-based file opening for special cases
+  4. dentry_open_nonotify() - Used by fanotify to avoid recursive notification
+  5. dentry_create() - Creates and opens a file in one operation (used by NFS server)
+
+  The tree covers all major file allocation paths in the Linux kernel, from over 50 different syscalls!
+```
+
+##### free
+
+```
+  file_free
+      __fput
+          delayed_fput                   //work queue callback
+              __fput_deferred
+                  fput
+                      //called from 200+ locations - categorized below
+                  fput_close
+                      filp_close
+                          close_fd
+                              sys_close              //syscall: close
+                              close_bpf_object       //syscall: bpf close
+                          do_dup2                    //syscall: dup2, dup3
+                          replace_fd
+                              install_special_fd
+                                  selinux_bprm_creds_from_file //syscall: execve
+                                  apparmor_bprm_creds_from_file //syscall: execve
+                              core_dump_open_pipe    //coredump
+                          close_files
+                              put_files_struct
+                                  exit_files
+                                      do_exit        //process exit (all syscalls that exit)
+                                  unshare_fd         //syscall: unshare, clone
+                                  begin_new_exec     //syscall: execve
+                          sys_close_range            //syscall: close_range
+                          io_close                   //io_uring: IORING_OP_CLOSE
+                          various cleanup paths (see below)
+          ____fput                       //task work callback
+              __fput_deferred
+                  (same as fput above)
+          __fput_sync
+              fput_sync
+                  flush_delayed_fput     //kernel thread sync
+          fput_close_sync
+              (direct __fput from various sync paths)
+      __fput_deferred                    //for unopened files
+          fput
+          fput_close
+
+  Major fput() call sites by category:
+
+  FILE OPERATIONS:
+      sys_close                          //syscall: close
+      sys_close_range                    //syscall: close_range
+      sys_read/write error paths         //syscall: read, write
+      sys_sendfile                       //syscall: sendfile, sendfile64
+      sys_copy_file_range                //syscall: copy_file_range
+      sys_splice/vmsplice                //syscall: splice, vmsplice, tee
+      path_openat error paths            //syscall: open, openat, openat2
+      do_dentry_open error paths         //various open operations
+
+  PROCESS MANAGEMENT:
+      do_exit                            //syscall: exit, exit_group
+          exit_files
+              close_files -> filp_close -> fput_close
+      sys_execve/execveat                //syscall: execve, execveat
+          begin_new_exec
+              unshare_files -> put_files_struct
+      sys_clone/fork                     //syscall: clone, clone3, fork, vfork
+          copy_process error paths -> put_files_struct
+      sys_unshare                        //syscall: unshare
+          unshare_files -> put_files_struct
+
+  FD MANIPULATION:
+      sys_dup2/dup3                      //syscall: dup2, dup3
+          do_dup2 -> filp_close
+      sys_fcntl                          //syscall: fcntl (F_DUPFD, etc.)
+          f_dupfd -> do_dup2
+      replace_fd                         //internal fd replacement
+
+  IO_URING OPERATIONS:
+      io_close                           //IORING_OP_CLOSE
+      io_openat2 error paths             //IORING_OP_OPENAT/OPENAT2
+      io_files_update                    //IORING_REGISTER_FILES_UPDATE
+      io_sqe_files_unregister            //IORING_UNREGISTER_FILES
+      io_ring_ctx_free                   //io_uring cleanup
+
+  MEMORY OPERATIONS:
+      sys_swapon/swapoff                 //syscall: swapon, swapoff
+          filp_close(swap_file)
+      sys_mmap error paths               //syscall: mmap
+      do_madvise (MADV_COLLAPSE)         //syscall: madvise
+          collapse_file error paths
+      memfd operations                   //syscall: memfd_create cleanup
+
+  NETWORK OPERATIONS:
+      sys_socket error paths             //syscall: socket
+      sys_accept/accept4 error paths     //syscall: accept, accept4
+      sys_sendmsg/recvmsg (SCM_RIGHTS)   //syscall: sendmsg, recvmsg (unix sockets)
+          unix_detach_fds -> fput
+      sock_close                         //socket file_operations.release
+      unix_gc                            //unix socket garbage collection
+
+  IPC OPERATIONS:
+      sys_mq_open error paths            //syscall: mq_open
+      sys_shmat cleanup                  //syscall: shmat
+          do_shmat error paths
+      sys_pipe/pipe2 error paths         //syscall: pipe, pipe2
+
+  FILESYSTEM OPERATIONS:
+      do_mount/umount paths              //syscall: mount, umount, umount2
+      dissolve_on_fput                   //mount cleanup
+      sys_pivot_root                     //syscall: pivot_root
+      ovl_* operations                   //overlayfs operations
+      
+  BLOCK/CHAR DEVICE OPERATIONS:
+      blkdev_put                         //block device release
+      loop_configure/set_status          //loop device operations
+      dm_put_table_device                //device mapper
+      zram_reset_device                  //zram cleanup
+
+  SECURITY/AUDIT:
+      bpf_obj_do_pin error paths         //syscall: bpf (BPF_OBJ_PIN)
+      audit_watch cleanup                //audit subsystem
+      seccomp_notify cleanup             //syscall: seccomp
+
+  EVENT/NOTIFICATION:
+      eventfd_ctx_put                    //eventfd cleanup
+      eventpoll_release_file             //epoll cleanup (automatic)
+      fanotify_release                   //fanotify fd close
+      inotify_release                    //inotify fd close
+
+  SPECIAL FILE OPERATIONS:
+      dma_buf_file_release               //dma-buf cleanup
+      pidfd_release                      //pidfd cleanup
+      signalfd_cleanup                   //signalfd cleanup
+      timerfd_release                    //timerfd cleanup
+
+  DRIVER/SUBSYSTEM SPECIFIC:
+      kvm_vcpu_release                   //KVM cleanup
+      vfio_device_fops_release           //VFIO device cleanup
+      drm_release                        //DRM device cleanup
+      binder_deferred_release            //Android binder cleanup
+      tun_chr_close                      //TUN/TAP device cleanup
+
+  COREDUMP:
+      do_coredump                        //process crash/abort
+          core_pipe/file cleanup
+
+  KERNEL INTERNAL:
+      kernel_read_file cleanup           //module loading, firmware loading
+      init sequence cleanup              //boot-time file cleanup
+      kthread cleanup paths              //kernel thread exit
+
+  Key syscall entry points organized by category:
+
+  File operations:
+  - close, close_range
+  - open, openat, openat2 (error paths)
+  - read, write, sendfile, splice, vmsplice, tee
+  - copy_file_range
+
+  Process lifecycle:
+  - exit, exit_group (process termination)
+  - execve, execveat (close CLOEXEC files)
+  - clone, clone3, fork, vfork (error paths)
+  - unshare (unshare FD table)
+
+  FD manipulation:
+  - dup, dup2, dup3 (replace old fd)
+  - fcntl (F_DUPFD operations)
+
+  Memory:
+  - swapon, swapoff
+  - mmap, madvise
+  - memfd_create (cleanup)
+
+  Networking:
+  - socket, accept, accept4 (error paths)
+  - sendmsg, recvmsg (SCM_RIGHTS)
+  - Socket close operations
+
+  IPC:
+  - pipe, pipe2 (error paths)
+  - shmat (cleanup)
+  - mq_open (error paths)
+
+  I/O uring:
+  - IORING_OP_CLOSE
+  - IORING_REGISTER_FILES_UPDATE
+  - IORING_UNREGISTER_FILES
+
+  Automatic cleanup:
+  - Process exit (all files closed)
+  - Exec (CLOEXEC files closed)
+  - Unix socket garbage collection
+  - Epoll automatic cleanup
+
+● The calling tree is now complete! This shows all major paths from syscalls and kernel events to file_free(), which is the actual function that frees the file structure.
+
+  Key differences from alloc_empty_file() tree:
+
+  1. Multiple cleanup triggers: While file allocation happens at specific open-like operations, file freeing happens through many more paths including:
+    - Explicit close operations
+    - Process exit (automatic cleanup)
+    - FD replacement operations
+    - Error paths throughout the kernel
+    - Automatic garbage collection
+  2. Deferred cleanup: The kernel uses work queues and task work to defer file cleanup to avoid blocking operations, shown through delayed_fput() and ____fput().
+  3. Reference counting: Files are reference counted, and file_free() is only called when the last reference is dropped via fput() family of functions.
+  4. Lifecycle integration: File cleanup is deeply integrated with process lifecycle (do_exit(), execve()) and resource management (Unix socket GC, epoll automatic cleanup).
+
+  The tree covers over 50 different syscalls and kernel events that can lead to file cleanup!
+
+```
+
+
+##### get refrence
+
+```
+get_file
+    MEMORY MANAGEMENT (mmap/fork):
+        vma_set_file
+            backing_file_mmap          //syscall: mmap (overlayfs, etc.)
+            dma_buf_mmap               //syscall: mmap on dma-buf fd
+            drm_gem_mmap               //syscall: mmap on DRM GEM objects
+        dup_mmap
+            copy_mm
+                copy_process
+                    kernel_clone       //syscall: fork, vfork, clone, clone3
+        vma_dup_policy
+            __split_vma                //syscall: mprotect, madvise, mremap
+            dup_mmap                   //syscall: fork, clone
+        __mmap_region
+            mmap_region
+                do_mmap                //syscall: mmap
+        vma_merge                      //syscall: mmap, mprotect
+        madvise_collapse               //syscall: madvise (MADV_COLLAPSE)
+            collapse_file
+                get_file(vma->vm_file)
+        do_msync                       //syscall: msync
+            get_file(vma->vm_file)
+
+    FD TABLE OPERATIONS:
+        do_dup2
+            replace_fd
+                install_special_fd
+                    selinux/apparmor_bprm_creds_from_file //syscall: execve
+                    core_dump_open_pipe    //coredump
+            sys_dup2                   //syscall: dup2
+            sys_dup3                   //syscall: dup3
+            f_dupfd                    //syscall: fcntl (F_DUPFD, F_DUPFD_CLOEXEC)
+        dup_fd
+            sys_close_range (CLOSE_RANGE_UNSHARE) //syscall: close_range
+            copy_files
+                copy_process
+                    kernel_clone       //syscall: fork, clone, clone3
+            unshare_fd                 //syscall: unshare (CLONE_FILES)
+        receive_fd
+            scm_detach_fds
+                unix_stream_read_generic //syscall: recvmsg (SCM_RIGHTS on unix socket)
+                unix_dgram_recvmsg       //syscall: recvmsg (SCM_RIGHTS)
+            pidfd_getfd                  //syscall: pidfd_getfd
+            seccomp_notify_addfd         //syscall: seccomp (SECCOMP_IOCTL_NOTIF_ADDFD)
+            io_fixed_fd_install          //io_uring: file installation
+            vduse_dev_ioctl              //syscall: ioctl on vduse device
+        receive_fd_replace
+            replace_fd                 //syscall: dup2, dup3 (indirect)
+
+    NETWORK/SCM_RIGHTS:
+        scm_fp_dup
+            scm_send                   //syscall: sendmsg (SCM_RIGHTS)
+                unix_stream_sendmsg
+                unix_dgram_sendmsg
+        unix_attach_fds                //syscall: sendmsg (SCM_RIGHTS attachment)
+
+    EXEC/PROCESS:
+        set_mm_exe_file
+            begin_new_exec             //syscall: execve, execveat
+                load_elf_binary
+                load_elf_fdpic_binary
+                load_flat_binary
+        __set_task_comm
+            exec_mmap                  //syscall: execve (update process name)
+
+    DMA-BUF OPERATIONS:
+        dma_buf_get
+            dma_buf_import             //syscall: ioctl (DRM_IOCTL_PRIME_FD_TO_HANDLE)
+            dma_buf_attach_user        //various DMA-buf operations
+            io_register_pbuf_ring      //syscall: io_uring_register (IORING_REGISTER_PBUF_RING)
+            drm_prime_fd_to_handle     //syscall: ioctl (DRM)
+            tee_shm_register_fd        //syscall: ioctl (TEE)
+            usb_ffs operations         //syscall: ioctl (FunctionFS)
+        dmabuf->file (via include/linux/dma-buf.h:566)
+            dma_buf_fd                 //syscall: ioctl (DMA_BUF_IOCTL_SYNC, etc.)
+            dma_buf_poll               //syscall: poll/select/epoll on dma-buf
+
+    POLL/SELECT:
+        __pollwait
+            do_select                  //syscall: select, pselect
+            do_poll                    //syscall: poll, ppoll
+            ep_item_poll               //syscall: epoll_ctl (adds file to epoll)
+            do_sys_poll                //syscall: poll
+
+    FILE CLONING/BACKING:
+        backing_file_read_iter
+            ovl_read_iter              //syscall: read on overlayfs
+        backing_file_write_iter
+            ovl_write_iter             //syscall: write on overlayfs
+        backing_file_splice_read
+            ovl_splice_read            //syscall: splice on overlayfs
+        backing_file_splice_write
+            ovl_splice_write           //syscall: splice on overlayfs
+
+    IO_URING:
+        io_sqe_files_register
+            io_uring_register          //syscall: io_uring_register (IORING_REGISTER_FILES)
+        io_files_update
+            io_uring_register          //syscall: io_uring_register (IORING_REGISTER_FILES_UPDATE)
+        io_msg_ring_prep
+            io_uring                   //io_uring: IORING_OP_MSG_RING
+
+    SPECIAL FILE OPERATIONS:
+        init_dup
+            prepare_namespace          //kernel init: mount rootfs
+        autofs_catatonic_mode
+            autofs operations          //autofs daemon communication
+        cachefiles operations
+            cachefiles_ondemand        //syscall: read/write on cachefiles anon fd
+        tty_fasync
+            sys_fcntl (F_SETFL)        //syscall: fcntl
+
+    DRIVER-SPECIFIC:
+        VFIO migration:
+            vfio_pci_core_ioctl        //syscall: ioctl (VFIO_DEVICE_FEATURE_MIGRATION)
+                mlx5vf_pci_save_device_data
+                hisi_acc_vf_pci_save_device_data
+                qat_vf_save_device_data
+                xe_vfio_pci operations
+                virtiovf_pci operations
+        KVM:
+            kvm_vm_ioctl               //syscall: ioctl on /dev/kvm
+            vfio_group_fops_open       //syscall: open on VFIO group
+        NFSD (NFS server):
+            nfsd4_copy                 //NFS server operations
+            nfsd_file_get              //NFS server file cache
+        IPC:
+            do_shmat                   //syscall: shmat
+                ksys_shmat
+                    sys_shmat          //syscall: shmat
+            newseg                     //syscall: shmget (shared memory segment)
+        Android Binder:
+            binder_deferred_fd_close   //binder IPC operations
+        Bluetooth:
+            hidp_session_new           //syscall: ioctl (HIDPCONNADD)
+            cmtp_session               //syscall: ioctl (CMTPCONNADD)
+        9P:
+            p9_socket_open             //9P filesystem operations
+        IOMMU/VDPA:
+            iommufd operations         //syscall: ioctl on iommufd
+            vduse_dev operations       //syscall: ioctl on vduse
+
+    FILESYSTEM SPECIFIC:
+        Coda:
+            coda_file_mmap             //syscall: mmap on Coda filesystem
+        Proc:
+            proc_map_files_get_link    //syscall: readlink on /proc/*/map_files/*
+        Live Update:
+            luo_file operations        //live update operations
+
+  Key syscall entry points organized by category:
+
+  Process/Memory Management:
+  - fork, vfork, clone, clone3 - Duplicate file table and VMAs
+  - execve, execveat - Set exe file reference
+  - mmap, mprotect, madvise, mremap, msync - VMA file references
+  - unshare - Unshare file descriptor table
+
+  File Descriptor Operations:
+  - dup, dup2, dup3 - Duplicate file descriptors
+  - fcntl (F_DUPFD, F_DUPFD_CLOEXEC) - Duplicate with flags
+  - close_range (CLOSE_RANGE_UNSHARE) - Unshare and close range
+
+  IPC/Networking:
+  - sendmsg, recvmsg (SCM_RIGHTS) - Pass file descriptors over Unix sockets
+  - shmat, shmget - Shared memory operations
+  - pidfd_getfd - Get file from another process via pidfd
+
+  I/O Operations:
+  - select, pselect, poll, ppoll - Poll file descriptors
+  - epoll_ctl - Add files to epoll
+  - read, write, splice - On special filesystems (overlayfs, backing files)
+  - io_uring_register - Register files with io_uring
+
+  Device/Driver Operations:
+  - ioctl - On various devices (DRM, VFIO, KVM, DMA-BUF, TEE, USB FunctionFS, etc.)
+  - mmap - On device files (DRM, DMA-BUF)
+
+  Special:
+  - seccomp (SECCOMP_IOCTL_NOTIF_ADDFD) - Add FD via seccomp notify
+  - Kernel init - Mount rootfs
+  - NFS server operations
+  - Bluetooth HIDP/CMTP operations
+
+● The calling tree is now complete! This shows all major paths from syscalls to get_file(), which increments the reference count on an existing struct file *.
+
+  Key insights about get_file() vs alloc_empty_file() and file_free():
+
+  1. Purpose: get_file() is called when you already have a file pointer and need to take an additional reference (e.g., sharing across processes, storing in multiple data structures)
+  2. Major use cases:
+    - Process forking: When fork() creates a child, all VMAs and file descriptors are duplicated with get_file()
+    - FD duplication: dup(), dup2(), fcntl(F_DUPFD) use get_file() to create additional references
+    - SCM_RIGHTS: Passing file descriptors over Unix sockets duplicates the file reference
+    - Memory mapping: When splitting/merging VMAs, file references are duplicated
+    - Poll/Select: Adds temporary references while waiting on file descriptors
+    - Device sharing: DMA-BUF and other device buffers shared across processes
+  3. Reference counting model:
+    - alloc_empty_file() → creates file (refcount=1)
+    - get_file() → increments refcount
+    - fput() → decrements refcount
+    - file_free() → called when refcount reaches 0
+
+  This completes the trio of file lifecycle management calling trees!
+```
+
+
+##### put reference
+
+
+## SYSCALLS
+
+
+### do_sys_open()/do_sys_open2()
+
+
+## interfaces
+
+### fd_install
+
+### fput
+
+
+## Contexts
+
+
+
