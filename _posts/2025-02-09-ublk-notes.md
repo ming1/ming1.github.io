@@ -1393,6 +1393,176 @@ unit_offset = (logic_offset / unit_size)  * unit_size   #unit_size may not be po
 to call blkdev_release() from current's task work.
 
 
+#### disk->open_mutex
+
+```
+
+TREE 1: bdev_open() path (block/bdev.c:962)
+============================================
+
+1. bdev_open()                                    [grabs disk->open_mutex at block/bdev.c:962]
+   ├─ 2. blkdev_open()                            [block/fops.c:698] - file_operations->open
+   │     └─ 3. VFS: do_dentry_open()              [fs/open.c] - kernel VFS layer
+   │           └─ 4. vfs_open()                   [fs/open.c]
+   │                 ├─ 5. do_open()              [fs/namei.c]
+   │                 │     └─ 6. path_openat()    [fs/namei.c]
+   │                 │           └─ 7. do_filp_open() [fs/namei.c]
+   │                 │                 ├─ 8. sys_open()        [SYSCALL - STOP]
+   │                 │                 ├─ 8. sys_openat()      [SYSCALL - STOP]
+   │                 │                 └─ 8. sys_openat2()     [SYSCALL - STOP]
+   │                 └─ 5. do_open_execat()       [fs/exec.c]
+   │                       └─ 6. open_exec()
+   │                             └─ 7. sys_execve()           [SYSCALL - STOP]
+   └─ 2. bdev_file_open_by_dev()                  [block/bdev.c:1076]
+         └─ 3. [Various in-kernel block device openers - EXPORT_SYMBOL]
+
+
+TREE 2: bdev_release() path (block/bdev.c:1145)
+================================================
+
+1. bdev_release()                                 [grabs disk->open_mutex at block/bdev.c:1145]
+   └─ 2. blkdev_release()                         [block/fops.c:706] - file_operations->release
+         └─ 3. __fput()                           [fs/file_table.c]
+               └─ 4. fput()                       [fs/file_table.c]
+                     ├─ 5. sys_close()            [SYSCALL - STOP]
+                     ├─ 5. exit_files()           [Called during process exit]
+                     │     └─ 6. do_exit()        [kernel/exit.c]
+                     │           └─ 7. sys_exit() / sys_exit_group()  [SYSCALL - STOP]
+                     └─ 5. dup2/close path        [Various syscalls]
+
+
+TREE 3: bdev_fput() path (block/bdev.c:1186)
+=============================================
+
+1. bdev_fput()                                    [grabs disk->open_mutex at block/bdev.c:1186]
+                                                  [EXPORT_SYMBOL - STOP]
+   └─ Called by external modules/drivers who obtained bdev_file
+
+
+TREE 4: bdev_add_partition() path (block/partitions/core.c:433)
+================================================================
+
+1. bdev_add_partition()                           [grabs disk->open_mutex at block/partitions/core.c:433]
+   └─ 2. blkpg_do_ioctl()                         [block/ioctl.c:59]
+         └─ 3. blkpg_ioctl()                      [block/ioctl.c:76]
+               └─ 4. blkdev_common_ioctl()        [block/ioctl.c:572]
+                     └─ 5. blkdev_ioctl()         [block/ioctl.c:743] - file_operations->unlocked_ioctl
+                           └─ 6. vfs_ioctl()      [fs/ioctl.c]
+                                 └─ 7. do_vfs_ioctl() [fs/ioctl.c]
+                                       └─ 8. sys_ioctl()      [SYSCALL - STOP]
+
+
+TREE 5: bdev_del_partition() path (block/partitions/core.c:462)
+================================================================
+
+1. bdev_del_partition()                           [grabs disk->open_mutex at block/partitions/core.c:462]
+   └─ 2. blkpg_do_ioctl()                         [block/ioctl.c:39]
+         └─ 3. blkpg_ioctl()                      [block/ioctl.c:76]
+               └─ 4. blkdev_common_ioctl()        [block/ioctl.c:572]
+                     └─ 5. blkdev_ioctl()         [block/ioctl.c:743] - file_operations->unlocked_ioctl
+                           └─ 6. vfs_ioctl()      [fs/ioctl.c]
+                                 └─ 7. do_vfs_ioctl() [fs/ioctl.c]
+                                       └─ 8. sys_ioctl()      [SYSCALL - STOP]
+
+
+TREE 6: bdev_resize_partition() path (block/partitions/core.c:495)
+===================================================================
+
+1. bdev_resize_partition()                        [grabs disk->open_mutex at block/partitions/core.c:495]
+   └─ 2. blkpg_do_ioctl()                         [block/ioctl.c:61]
+         └─ 3. blkpg_ioctl()                      [block/ioctl.c:76]
+               └─ 4. blkdev_common_ioctl()        [block/ioctl.c:572]
+                     └─ 5. blkdev_ioctl()         [block/ioctl.c:743] - file_operations->unlocked_ioctl
+                           └─ 6. vfs_ioctl()      [fs/ioctl.c]
+                                 └─ 7. do_vfs_ioctl() [fs/ioctl.c]
+                                       └─ 8. sys_ioctl()      [SYSCALL - STOP]
+
+
+TREE 7: del_gendisk() path (block/genhd.c:710, 725)
+====================================================
+
+1. del_gendisk()                                  [grabs disk->open_mutex at block/genhd.c:710, 725]
+                                                  [EXPORT_SYMBOL - STOP]
+   └─ Called by block device drivers during device removal
+      (e.g., loop_remove, nvme_ns_remove, etc.)
+
+
+TREE 8: bd_link_disk_holder() path (block/holder.c:77)
+=======================================================
+
+1. bd_link_disk_holder()                          [grabs disk->open_mutex at block/holder.c:77]
+                                                  [EXPORT_SYMBOL_GPL - STOP]
+   └─ Called by stacking block drivers
+      (e.g., device-mapper, md/raid, bcache)
+
+
+TREE 9: sync_bdevs() path (block/bdev.c:1305)
+==============================================
+
+1. sync_bdevs()                                   [grabs disk->open_mutex at block/bdev.c:1305]
+   └─ 2. ksys_sync()                              [fs/sync.c]
+         └─ 3. sys_sync()                         [SYSCALL - STOP]
+
+
+ADDITIONAL PATHS (device-specific)
+===================================
+
+LOOP device path:
+-----------------
+1. loop_configure()                               [grabs lo->lo_disk->open_mutex at drivers/block/loop.c:447]
+   └─ 2. lo_ioctl()                               [drivers/block/loop.c] - LOOP_CONFIGURE ioctl
+         └─ 3. blkdev_ioctl()                     [via driver fops]
+               └─ 4. sys_ioctl()                  [SYSCALL - STOP]
+
+
+ZRAM device path:
+-----------------
+1. reset_store()                                  [grabs disk->open_mutex at drivers/block/zram/zram_drv.c:2824, 2839]
+   └─ 2. sysfs attribute write
+         └─ 3. kernfs_fop_write_iter()
+               └─ 4. sys_write()                  [SYSCALL - STOP]
+
+
+NVME multipath:
+---------------
+1. nvme_mpath_set_live()                          [grabs head->disk->open_mutex at drivers/nvme/host/multipath.c:660]
+   └─ 2. nvme_update_ns_ana_state()
+         └─ 3. nvme_parse_ana_log()
+               └─ 4. nvme_ana_work()              [workqueue handler]
+
+
+SUMMARY OF STOPPING POINTS
+===========================
+
+SYSCALLS (Primary user-space entry points):
+-------------------------------------------
+- sys_open() / sys_openat() / sys_openat2()  -> bdev_open path
+- sys_close()                                -> bdev_release path
+- sys_exit() / sys_exit_group()              -> bdev_release path (via process cleanup)
+- sys_ioctl()                                -> partition operations, device-specific ioctls
+- sys_sync()                                 -> sync_bdevs path
+- sys_write()                                -> sysfs attribute writes (device-specific)
+
+EXPORT_SYMBOL functions (Module/driver entry points):
+-----------------------------------------------------
+- del_gendisk()           [EXPORT_SYMBOL]      - Called by block drivers during cleanup
+- bd_link_disk_holder()   [EXPORT_SYMBOL_GPL]  - Called by stacking drivers (dm, md)
+- bdev_fput()             [EXPORT_SYMBOL]      - Called by code holding bdev_file references
+
+
+DEPTH ANALYSIS
+==============
+
+Deepest paths (syscall -> mutex acquisition):
+----------------------------------------------
+1. sys_ioctl() path:        8 levels (sys_ioctl -> ... -> bdev_add/del_partition)
+2. sys_open() path:         8 levels (sys_open -> ... -> bdev_open)
+3. sys_close() path:        5 levels (sys_close -> ... -> bdev_release)
+4. sys_sync() path:         3 levels (sys_sync -> ksys_sync -> sync_bdevs)
+5. EXPORT_SYMBOL paths:     1-2 levels (direct calls from drivers)
+```
+
+
 ### Comments
 
 #### Same issue exists on io_uring polling
