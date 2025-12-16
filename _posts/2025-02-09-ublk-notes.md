@@ -1383,7 +1383,38 @@ unit_offset = (logic_offset / unit_size)  * unit_size   #unit_size may not be po
 [  +0.000036]  entry_SYSCALL_64_after_hwframe+0x76/0x7e
 ```
 
+### Solutions
+
+#### Add PF_ASYNC_FILE_RELEASE
+
+
+#### release open_disk when reading partition table
+
+
+#### refactor bdev_release()
+
+- has to refactor the following things first
+
+```
+          bdev_yield_write_access(bdev_file);
+  
+          if (holder)
+                  bd_yield_claim(bdev_file);
+```
+
+which need disk->open_mutex.
+
+
 ### Contexts
+
+#### how to trigger this issue
+
+- submit AIO via libio & close FD & exit immediately
+ 
+
+#### understand story of delayed fput()
+
+[deferred fput](https://ming1.github.io/tech/filesystem#deferred-fput)
 
 #### is there such same issue for other block devices?
 
