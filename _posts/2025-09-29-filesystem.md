@@ -1597,6 +1597,153 @@ take an additional reference (e.g., sharing across processes, storing in multipl
 
 ## Contexts
 
+### deferred fput
+
+```
+  Main Motivation
+
+  The core problem: __fput() (fs/file_table.c:442) calls might_sleep() and performs 
+  operations that can sleep - fsnotify, eventpoll cleanup, locks removal, file_operations->release(), 
+  dput(), mntput(), etc. This means fput() cannot be called from atomic context (interrupt handlers, 
+  spinlocks held, etc.).
+
+  However, file references can be dropped from:
+  - Interrupt context (e.g., AIO completion, eventfd)
+  - Kernel threads
+  - Regular user process context
+
+  The delayed fput mechanism solves this by deferring the actual cleanup work to a safe context.
+
+  Why Delayed to Workqueue for in_interrupt() or PF_KTHREAD?
+
+  See __fput_deferred() at fs/file_table.c:518-540:
+
+  if (likely(!in_interrupt() && !(task->flags & PF_KTHREAD))) {
+      // Use task_work
+  } else {
+      // Use delayed workqueue
+      if (llist_add(&file->f_llist, &delayed_fput_list))
+          schedule_delayed_work(&delayed_fput_work, 1);
+  }
+
+  Workqueue is used when:
+  1. in_interrupt() - Can't use task_work infrastructure in interrupt context; there's no
+     "current task" to attach work to
+  2. PF_KTHREAD - Kernel threads may never return to userland, so task_work attached to
+  them might never run. The workqueue provides an independent execution context.
+
+  The workqueue (delayed_fput_work) runs delayed_fput() which processes all queued files via __fput().
+
+  Why Task Work for Regular Tasks?
+
+  For normal user processes (!in_interrupt() && !PF_KTHREAD):
+
+  init_task_work(&file->f_task_work, ____fput);
+  if (!task_work_add(task, &file->f_task_work, TWA_RESUME))
+      return;
+
+  Benefits of task_work approach (introduced in commit 4a9d4b024a31):
+
+  1. Synchronous guarantee: __fput() completes before returning to userland (or process exit). This is
+  important for:
+    - File consistency on program exit
+    - Avoiding delayed resource cleanup
+    - Proper ordering of filesystem operations
+  2. Better performance: Runs in process context immediately on return to userland, rather than waiting
+  for workqueue scheduling
+  3. Correct context: Executes in the context of the task that dropped the last reference, which can be 
+  important for credentials, namespaces, etc.
+  4. Fallback safety: If task_work_add() fails (task is exiting and already ran exit_task_work()), it 
+  falls through to the workqueue path to avoid leaking files
+
+  Related Mechanisms
+
+  - flush_delayed_fput() (fs/file_table.c:511): Forces completion of all delayed fputs; used during boot initialization
+  - __fput_sync() (fs/file_table.c:557): Synchronous fput for kernel threads that need guaranteed completion (e.g., to avoid umount deadlocks)
+
+  The design elegantly handles all contexts: immediate execution where safe, task_work for user processes, and workqueue as a universal fallback.
+
+```
+
+#### Motivation
+
+
+- The Commit That Introduced Delayed Fput
+
+[Commit: 4a9d4b024a31 ("switch fput to task_work_add")](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=4a9d4b024a3102fc083c925c242d98ac27b1c5f6)
+
+Author: Al Viro
+
+Date: June 24, 2012
+
+Kernel version: v3.6-rc1 (September 2012)
+
+- Motivation from the Commit
+
+```
+The Problem Before This Commit
+
+Before v3.6, fput() looked like this:
+
+void fput(struct file *file)
+{
+    if (atomic_long_dec_and_test(&file->f_count))
+        __fput(file);  // Called directly - problematic!
+}
+
+__fput() calls might_sleep() and performs many blocking operations (fsnotify, 
+eventpoll cleanup, locks removal, file->f_op->release(), dput(), mntput()). 
+This meant fput() could NOT be called from atomic context (interrupt handlers, 
+spinlocks held).
+```
+
+
+- Real-World Issues This Caused
+
+From the git history, I found two major problem areas:
+
+```
+1. AIO subsystem (fs/aio.c): Had to implement its own manual delayed fput mechanism with 
+fput_atomic(), fput_work, and aio_fput_routine() workqueue to defer fput from interrupt 
+context
+
+2. Eventfd (commit 87c3a86e1c22, March 2009): Had to work around "fput() call from possible 
+IRQ context" - the bug report noted this was conceptually problematic even if hard to trigger
+```
+
+- The Solution: task_work Infrastructure
+
+Al Viro leveraged the task_work infrastructure: 
+
+introduced by Oleg Nesterov in May 2012,  [commit e73f8959af04](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=e73f8959af0439d114847eab5a8a5ce48f1217c4)
+
+which provides "generic process-context callbacks" that run either: 
+
+- From do_notify_resume() when returning to userland
+
+- From do_exit() when process exits
+
+Benefits Stated in Commit Message
+
+From commit 4a9d4b024a31:
+
+```
+"... and schedule_work() for interrupt/kernel_thread callers(and yes, now it is OK to call from interrupt)."
+
+"We are guaranteed that __fput() will be done before we return to userland (or exit)."
+
+The commit immediately allowed removal of the AIO manual delayed fput workaround (commit 6c330bd4269f: "aio: now fput() is OK from interrupt context; get rid of
+manual delayed __fput()").
+```
+
+Summary
+
+The delayed fput mechanism was introduced to solve a fundamental problem: file cleanup requires 
+sleeping operations, but file references can be dropped from atomic context (interrupts, AIO 
+completion). The task_work infrastructure provided an elegant solution that runs cleanup in 
+the correct context automatically.
+
+
 ### typical scenarios where struct file objects are shared among processes
 
 ```
