@@ -9,6 +9,389 @@ Title: block layer notes
 * TOC
 {:toc}
 
+
+# Block Layer Integrity
+
+## What is Block integrity?
+
+Block integrity (also called "metadata" in some contexts, or "protection information" in NVMe/SCSI) 
+is additional data attached to each logical block that helps detect and correct data corruption. 
+This is critical for enterprise storage where data integrity is paramount.
+
+Key Components:
+
+1. Data Integrity Extensions (DIX/DIF)
+
+  - DIF (Data Integrity Field): Protection info attached to each sector by the storage device 
+
+  - DIX (Data Integrity Extensions): Extension allowing the host to generate/verify protection info 
+
+2. Protection Information (PI) Tuple Structure
+
+```
+A PI tuple typically contains:
+┌─────────────────┬──────────────┬──────────────┐
+│ Guard Tag (CRC) │ App Tag      │ Ref Tag      │
+│ 2 or 8 bytes    │ 2 bytes      │ 4 bytes      │
+└─────────────────┴──────────────┴──────────────┘
+
+- Guard Tag: CRC/checksum protecting the data block
+- Reference Tag: Incremental counter (often LBA-based)
+- Application Tag: Application-specific value
+
+Integrity Metadata Layout
+
+For a 512-byte sector with 8-byte PI:
+Data Block (512 bytes)     Metadata (e.g., 8 bytes)
+┌────────────────────┐    ┌──────────────────┐
+│                    │    │ Guard Tag (2B)   │
+│   User Data        │    │ App Tag (2B)     │
+│   (512 bytes)      │    │ Ref Tag (4B)     │
+│                    │    └──────────────────┘
+└────────────────────┘
+         OR with pi_offset:
+┌────────────────────┐    ┌──────┬──────────────────┐
+│                    │    │ Pad  │ Guard Tag (2B)   │
+│   User Data        │    │      │ App Tag (2B)     │
+│   (512 bytes)      │    │      │ Ref Tag (4B)     │
+│                    │    └──────┴──────────────────┘
+└────────────────────┘     ^
+                       pi_offset
+```
+
+## Interval
+
+```
+| Concept               | Explanation                                      |
+|-----------------------|--------------------------------------------------|
+| Interval              | The chunk size of data protected by one PI tuple |
+| interval_exp          | log₂(interval size), used for fast calculations  |
+| Why intervals?        | Localize corruption detection to specific chunks |
+| Common sizes          | 512 bytes (sector) or 4096 bytes (block)         |
+| Constraints           | Must be ≥512B and ≤logical_block_size            |
+| Metadata per interval | Defined by metadata_size field                   |
+| PI tuple location     | At offset pi_offset within metadata              |
+
+Key Formula:
+num_intervals = (data_size_in_bytes) / (1 << interval_exp)
+integrity_bytes = num_intervals × metadata_size
+
+The interval is the fundamental unit of data integrity protection—every interval 
+gets its own "seal of authenticity" in the form of a PI tuple!
+
+```
+
+### SCSI PI
+
+```
+The SCSI Block Commands (SBC) standard defines Protection Information with specific requirements:
+
+SCSI T10 DIF/DIX standard:
+- Protection Information Interval: FIXED at 512 bytes
+- Why? Historical compatibility with 512-byte sectors
+- Even on 4K logical block devices!
+
+SCSI device with 4K logical blocks:
+┌──────────────────────────────────────────────┐
+│  Logical Block: 4096 bytes                   │
+│  ├─ Interval 0: 512B + 8B PI                 │
+│  ├─ Interval 1: 512B + 8B PI                 │
+│  ├─ Interval 2: 512B + 8B PI                 │
+│  ├─ Interval 3: 512B + 8B PI                 │
+│  ├─ Interval 4: 512B + 8B PI                 │
+│  ├─ Interval 5: 512B + 8B PI                 │
+│  ├─ Interval 6: 512B + 8B PI                 │
+│  └─ Interval 7: 512B + 8B PI                 │
+└──────────────────────────────────────────────┘
+
+The protocol REQUIRES 512B intervals!
+
+
+SBC-3 supports 4096 interval, see [Data Integrity Field](https://en.wikipedia.org/wiki/Data_Integrity_Field)
+
+```
+
+[sd_dif_config_host()](https://github.com/torvalds/linux/blob/dd9b004b7ff3289fb7bae35130c0a5c0537266af/drivers/scsi/sd_dif.c#L27)
+
+
+### NVMe PI
+
+```
+Modern NVMe: Flexibility!
+
+NVMe is more flexible and DOES allow interval = block size:
+
+NVMe namespace configuration options:
+
+Option 1: LBA size = 512B, metadata = 8B
+  interval_exp = 9
+  ✓ Traditional approach
+  ✓ Maximum compatibility
+
+Option 2: LBA size = 4096B, metadata = 8B
+  interval_exp = 12
+  ✓ Less overhead (1 PI vs 8 PIs)
+  ✓ Requires 4K-native host
+
+Option 3: LBA size = 4096B, metadata = 64B
+  interval_exp = 12
+  metadata_size = 64
+  ✓ Extra space for application metadata
+  ✓ PI tuple is just part of the 64B
+
+Let me show you a real configuration:
+
+// Samsung PM9A3 NVMe SSD - supports multiple formats
+Format 0: LBA=512B,  metadata=0B  (no PI)
+Format 1: LBA=512B,  metadata=8B  (512B intervals with PI)
+Format 2: LBA=4096B, metadata=0B  (no PI)
+Format 3: LBA=4096B, metadata=8B  (4KB intervals with PI!) ← interval = block
+Format 4: LBA=4096B, metadata=64B (4KB intervals, extra app metadata)
+
+```
+
+[nvme_init_integrity()](https://github.com/torvalds/linux/blob/dd9b004b7ff3289fb7bae35130c0a5c0537266af/drivers/nvme/host/core.c#L1819)
+
+
+##  struct blk_integrity - The Core Structure
+
+```
+struct blk_integrity {
+    unsigned char flags;              // Capability and behavior flags
+    enum blk_integrity_checksum csum_type;  // Type of checksum
+    unsigned char metadata_size;      // Total metadata per interval
+    unsigned char pi_offset;          // Offset of PI tuple in metadata
+    unsigned char interval_exp;       // log2(interval size in bytes)
+    unsigned char tag_size;           // Application tag size
+    unsigned char pi_tuple_size;      // Size of PI tuple
+};
+```
+
+Field Explanations:
+
+```
+1. metadata_size (Total Metadata per Interval)
+- The total metadata bytes attached to each data interval
+- Example: 8 bytes for T10 DIF, 16 bytes for NVMe extended PI
+- Can include padding or additional metadata beyond the PI tuple
+
+2. pi_offset (Protection Information Offset)
+- Byte offset where the PI tuple starts within the metadata
+- Why it matters: Some formats put padding before the PI tuple
+- Example with 8-byte metadata and no offset:
+Metadata: [Guard:2B][App:2B][Ref:4B]
+          ^
+          pi_offset = 0
+- Example with padding:
+Metadata: [Pad:2B][Guard:2B][App:2B][Ref:4B]
+                  ^
+                  pi_offset = 2
+
+3. pi_tuple_size (PI Tuple Size)
+- Size of the Protection Information tuple itself
+- T10 PI (CRC16/IP): 8 bytes (2B guard + 2B app + 4B ref)
+- NVMe extended PI (CRC64): 16 bytes (8B guard + 2B app + 6B ref)
+
+4. interval_exp (Integrity Interval Exponent)
+- log₂ of the integrity interval size
+- interval_size = 1 << interval_exp
+- Common values:
+  - interval_exp = 9 → 512 bytes (1 sector)
+  - interval_exp = 12 → 4096 bytes (4K block)
+- Why exponent? Efficient bit-shifting for calculations
+
+5. csum_type (Checksum Type)
+enum blk_integrity_checksum {
+    BLK_INTEGRITY_CSUM_NONE   = 0,  // No checksum
+    BLK_INTEGRITY_CSUM_IP     = 1,  // IP checksum (T10 Type 1)
+    BLK_INTEGRITY_CSUM_CRC    = 2,  // CRC-16 T10DIF
+    BLK_INTEGRITY_CSUM_CRC64  = 3,  // CRC-64 (NVMe)
+};
+
+6. flags (Integrity Flags)
+enum blk_integrity_flags {
+    BLK_INTEGRITY_NOVERIFY        = 1 << 0,  // Don't verify
+    BLK_INTEGRITY_NOGENERATE      = 1 << 1,  // Don't generate
+    BLK_INTEGRITY_DEVICE_CAPABLE  = 1 << 2,  // HW can handle PI
+    BLK_INTEGRITY_REF_TAG         = 1 << 3,  // Use reference tag
+    BLK_INTEGRITY_STACKED         = 1 << 4,  // For dm/md
+};
+```
+
+```
+Important Calculations:
+
+Number of Integrity Intervals:
+
+    intervals = sectors >> (interval_exp - 9)
+    // Example: 8 sectors, interval_exp=9
+    // intervals = 8 >> (9-9) = 8 >> 0 = 8
+
+
+    Total Integrity Bytes:
+    integrity_bytes = intervals * metadata_size
+    // Example: 8 intervals, metadata_size=8
+    // integrity_bytes = 8 * 8 = 64 bytes
+```
+
+## Linux kernel implementation
+
+### READ verify
+
+The Linux kernel does verify that read data matches the PI (Protection Information) data, 
+but there are important nuances about when and how this happens.
+
+
+#### Model 1: Kernel-Side Verification (Default)
+
+This is the most common mode. The kernel automatically verifies PI on reads:
+
+```
+// block/bio-integrity-auto.c:79-94
+bool __bio_integrity_endio(struct bio *bio)
+{
+    struct bio_integrity_payload *bip = bio_integrity(bio);
+
+    if (bio_op(bio) == REQ_OP_READ && !bio->bi_status &&
+        bip_should_check(bip)) {
+        // VERIFICATION HAPPENS HERE!
+        INIT_WORK(&bid->work, bio_integrity_verify_fn);
+        queue_work(kintegrityd_wq, &bid->work);
+        return false;
+    }
+    // ...
+}
+
+Flow for a READ:
+1. User reads data from block device
+2. Device returns: [data] + [PI metadata]
+3. Kernel completion handler runs
+4. Verification dispatched to kintegrityd workqueue
+   (because CRC verification is CPU-intensive)
+5. blk_integrity_verify_iter() called
+6. For each interval:
+   a. Calculate CRC of data
+   b. Compare with guard tag in PI ✓
+   c. Check reference tag matches LBA ✓
+   d. Check application tag (if used) ✓
+7. If mismatch → bio->bi_status = BLK_STS_PROTECTION
+8. Error returned to application
+```
+
+####  Mode 2: Hardware Offload
+
+Some devices can verify PI in hardware:
+
+```
+// block/bio-integrity-auto.c:126-130
+case REQ_OP_READ:
+    if (bi->flags & BLK_INTEGRITY_NOVERIFY) {
+        if (bi_offload_capable(bi))
+            return true;  // Skip kernel verification
+        // ...
+    }
+
+When Used:
+- Device has BLK_INTEGRITY_DEVICE_CAPABLE flag set
+- Driver sets BLK_INTEGRITY_NOVERIFY flag
+- Device does verification in hardware and only returns data if PI matches
+
+Example: NVMe with End-to-End Protection
+NVMe Controller Configuration:
+- LBADS: 12 (4KB logical blocks)
+- MS: 8 (8 bytes metadata)
+- PI: Enabled (Type 1)
+- PRACT: 1 (Protection Information Action - strip on read)
+
+Flow:
+1. Read command sent with PI enabled
+2. Controller verifies PI internally
+3. If PI fails → returns error to host
+4. If PI passes → returns only data (PI stripped)
+5. Kernel never sees PI metadata
+```
+
+```
+static int blk_validate_integrity_limits(struct queue_limits *lim)
+{
+    struct blk_integrity *bi = &lim->integrity;
+    
+    if (!bi->metadata_size) {
+            if (bi->csum_type != BLK_INTEGRITY_CSUM_NONE ||
+                bi->tag_size || ((bi->flags & BLK_INTEGRITY_REF_TAG))) {
+                    pr_warn("invalid PI settings.\n");
+                    return -EINVAL;
+            }
+            bi->flags |= BLK_INTEGRITY_NOGENERATE | BLK_INTEGRITY_NOVERIFY;
+            return 0;
+    }
+    ...
+}
+```
+
+####  Mode 3: Passthrough (No Kernel Verification)
+
+For advanced use cases, PI can be passed through without kernel verification:
+
+```
+// User manually provides PI via io_uring with IORING_RW_ATTR_FLAG_PI
+// or via other PI-aware interfaces
+
+case REQ_OP_READ:
+    if (bi->flags & BLK_INTEGRITY_NOVERIFY) {
+        // Kernel skips verification
+        // Application handles PI data directly
+    }
+```
+
+Use Cases:
+
+- Database systems doing their own PI verification 
+
+- Backup/restore tools preserving PI for later verification 
+
+- Testing/debugging PI implementations 
+
+- ublk with integrity support (this patchset!) 
+
+### What Gets Checked?
+
+```
+The kernel verifies three components of the PI tuple:
+
+1. Guard Tag (Data CRC)
+
+Calculated: CRC16_T10DIF(data[0:511]) or CRC64(data[0:4095])
+Expected: pi->guard_tag
+
+Purpose: Detect bit flips, corruption during transfer
+
+2. Reference Tag (Logical Block Address)
+
+Calculated: Current LBA / sector number
+Expected: pi->ref_tag
+
+Purpose: Detect misdirected writes (data from wrong LBA)
+
+3. Application Tag (Optional)
+
+Expected: Application-specific value
+Special: 0xFFFF = escape value (skip check)
+
+Purpose: Application-defined integrity checks
+
+Flag Control:
+// block/bio-integrity-auto.c:161-167
+if (set_flags) {
+    if (bi->csum_type)
+        bid->bip.bip_flags |= BIP_CHECK_GUARD;    // Check CRC
+    if (bi->flags & BLK_INTEGRITY_REF_TAG)
+        bid->bip.bip_flags |= BIP_CHECK_REFTAG;   // Check LBA
+    // BIP_CHECK_APPTAG not currently auto-enabled
+}
+```
+
+
 # FS use cases on block device
 
 ## bdev's page cache
