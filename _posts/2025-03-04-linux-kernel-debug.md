@@ -48,6 +48,27 @@ Title: Linux kernel debug note
 
 ```
 
+## Scripted Inspection
+
+```
+  You can also create a gdb script to automatically print it:
+
+  # Create a file: inspect_t.gdb
+  set pagination off
+  set print pretty on
+  attach 46609
+  break ublk_process_io
+  commands
+    silent
+    printf "=== ublk_thread at %p ===\n", t
+    print *t
+    continue
+  end
+  continue
+
+  Then run:
+  gdb -x inspect_t.gdb
+```
 
 # crash tips
 
