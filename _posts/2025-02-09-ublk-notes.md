@@ -454,6 +454,54 @@ iops: 398K
 
 ```
 
+
+## Issues
+
+### Fetch commands silently done
+
+#### Overview
+
+##### how to reproduce
+
+- ./kublk add -t null -b -r 1 -d 8
+
+- fio/t/io_uring -p0 /dev/ublkb0 (run from another terminal)
+
+- kill -9 kublk
+
+- ./kublk recover -t null -b -r 1 -d 8 -n 0 --foreground
+
+It is observed that
+
+- IOPS becomes zero on `fio/t/io_uring` 
+
+- all fetch commands are done when dumping ublk driver state
+
+- not got failure code from kublk side
+
+    - t->cmd_inflight is wrong
+
+    - t->io_inflight is zero
+
+    - t->state is UBLKS_T_BATCH_IO, and UBLKS_T_STOPPING isn't set
+
+- the following log is found:
+
+```
+[root@ktest-40 ublk]# ./kublk recover -t null -b -r 1 -d 8 -n 0 --foreground
+ublk_batch_prepare: thread 1 commit(nr_bufs 2, buf_size 4096, start 2)
+ublk_batch_compl_cmd: got error -19
+ublk_batch_compl_cmd: got error -19
+ublk_batch_prepare: thread 0 commit(nr_bufs 2, buf_size 4096, start 2)
+dev id 0: nr_hw_queues 2 queue_depth 8 block size 512 dev_capacity 524288000
+	max rq size 1048576 daemon pid 47659 flags 0xd04a state LIVE
+	queue 0: affinity(0 )
+	queue 1: affinity(8 )
+```
+
+#### Observations
+
+
 ## comments
 
 ### extra complexity
