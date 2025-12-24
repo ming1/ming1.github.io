@@ -10,6 +10,45 @@ Title: Linux kernel debug note
 {:toc}
 
 
+# use gdb to investigate userspace
+
+## commands
+
+```
+  Attach to Running Process
+
+  # Attach gdb to the running kublk process
+  sudo gdb -p 46609
+
+  # Or if you know the binary path
+  sudo gdb /path/to/kublk 46609
+
+  Common gdb Commands Once Attached
+
+  # Get backtrace of all threads
+  (gdb) thread apply all bt
+
+  # List threads
+  (gdb) info threads
+
+  # Switch to specific thread
+  (gdb) thread <num>
+
+  # Select the frame in current thread
+  (gdb) frame <number>
+
+  # Print variables
+  (gdb) print <variable_name>
+
+  # Continue execution
+  (gdb) continue
+
+  # Detach without killing process
+  (gdb) detach
+
+```
+
+
 # crash tips
 
 ## basic
