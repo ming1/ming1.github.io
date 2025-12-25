@@ -457,6 +457,36 @@ iops: 398K
 
 ## Issues
 
+
+### IOPOLLL performance
+
+- not observe obvious performance improvement 
+
+
+### IOPOLL failure
+
+#### overview
+
+- create 2 queue loop backed by nvme
+
+./kublk add -t loop -q 2 -d 4 -p --auto_zc -b --foreground --debug_mask 0xffff /dev/nvme0n1
+
+- running IO
+
+fio/t/io_uring -p0 /dev/ublkb0 (run from another terminal)
+
+- kublk failure triggered:
+
+```
+ublk_handle_cqe: res -16 (thread 1 qid 1 tag 4 cmd_op 26 data 100000001260004 target 0/1) stopping 0
+ublk_batch_compl_commit_cmd 419: assert!
+```
+
+- not observe such issue in case of single queue
+
+- not observer this issue after retrieving ubq from pdu directly
+
+
 ### Fetch commands silently done
 
 #### Overview
@@ -471,11 +501,13 @@ iops: 398K
 
 - ./kublk recover -t null -b -r 1 -d 8 -n 0 --foreground
 
-It is observed that
+
+#### Observations
 
 - IOPS becomes zero on `fio/t/io_uring` 
 
-- all fetch commands are done when dumping ublk driver state
+- all fetch commands are done when dumping ublk driver state, however they
+are not completed from __io_uring_cmd_done()
 
 - not got failure code from kublk side
 
@@ -499,7 +531,13 @@ dev id 0: nr_hw_queues 2 queue_depth 8 block size 512 dev_capacity 524288000
 	queue 1: affinity(8 )
 ```
 
-#### Observations
+#### comments
+
+- cqe is missed?
+
+No.
+
+- one pthread is done because of `ublk_batch_compl_cmd: got error -19`
 
 
 ## comments
