@@ -10,6 +10,13 @@ Title: Linux kernel debug note
 {:toc}
 
 
+# kernel internal debug
+
+## dump block layer request/bio/bvec/sg
+
+[__blk_rq_map_sg DEBUG DUMP](https://lore.kernel.org/linux-block/aWD7j3NR_m6EyZv1@fedora/)
+
+
 # use gdb to investigate userspace
 
 ## commands
