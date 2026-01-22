@@ -10,6 +10,129 @@ Title: block layer notes
 {:toc}
 
 
+# IOPOLL
+
+## one scheduler related issue in passthrough request iopoll
+
+### overview
+
+[[bug report] nvme-tcp poll queue causes busy loop and 100% CPU in nvme_tcp_poll() on the latest linux-block/for-next](https://lore.kernel.org/linux-block/aXGd9vPeFOBgyrrG@fedora/T/#m529dc59dc1c9f1f91bd3bf8b919bbc6a4fb21e32)
+
+blktests nvme/047 takes >100sec or more to complete during the busy spin.
+
+[[PATCH] blk-mq: use BLK_POLL_ONESHOT for synchronous poll completion](https://lore.kernel.org/linux-block/20260122042858.1877497-1-ming.lei@redhat.com/)
+
+
+### further thinking
+
+#### cond_resched()
+
+```
+#if !defined(CONFIG_PREEMPTION) || defined(CONFIG_PREEMPT_DYNAMIC)
+int __sched __cond_resched(void)
+{
+        if (should_resched(0) && !irqs_disabled()) {
+                preempt_schedule_common();
+                return 1;
+        }
+        /*
+         * In PREEMPT_RCU kernels, ->rcu_read_lock_nesting tells the tick
+         * whether the current CPU is in an RCU read-side critical section,
+         * so the tick can report quiescent states even for CPUs looping
+         * in kernel context.  In contrast, in non-preemptible kernels,
+         * RCU readers leave no in-memory hints, which means that CPU-bound
+         * processes executing in kernel context might never report an
+         * RCU quiescent state.  Therefore, the following code causes
+         * cond_resched() to report a quiescent state, but only when RCU
+         * is in urgent need of one.
+         * A third case, preemptible, but non-PREEMPT_RCU provides for
+         * urgently needed quiescent states via rcu_flavor_sched_clock_irq().
+         */
+#ifndef CONFIG_PREEMPT_RCU
+        rcu_all_qs();
+#endif
+        return 0;
+}
+
+#define cond_resched() ({                       \
+         __might_resched(__FILE__, __LINE__, 0); \
+         _cond_resched();                        \
+})      
+```
+
+#### need_resched()
+
+```
+  need_resched()                                                                                                                                                                                         
+                                                                                                                                                                                                         
+  What it is: A check for the TIF_NEED_RESCHED flag.                                                                                                                                                     
+                                                                                                                                                                                                         
+  // include/linux/sched.h                                                                                                                                                                               
+  static inline int need_resched(void)                                                                                                                                                                   
+  {                                                                                                                                                                                                      
+      return unlikely(tif_need_resched());                                                                                                                                                               
+  }                                                                                                                                                                                                      
+                                                                                                                                                                                                         
+  // Checks thread_info flags                                                                                                                                                                            
+  #define tif_need_resched() test_thread_flag(TIF_NEED_RESCHED)                                                                                                                                          
+                                                                                                                                                                                                         
+  When TIF_NEED_RESCHED gets set:                                                                                                                                                                        
+  ┌───────────────┬────────────────────────┬───────────────────────────────────────┐                                                                                                                     
+  │     Event     │      Who sets it       │                 When                  │                                                                                                                     
+  ├───────────────┼────────────────────────┼───────────────────────────────────────┤                                                                                                                     
+  │ Timer tick    │ scheduler_tick()       │ Time slice expired                    │                                                                                                                     
+  ├───────────────┼────────────────────────┼───────────────────────────────────────┤                                                                                                                     
+  │ Wake up       │ wake_up_process()      │ Higher priority task becomes runnable │                                                                                                                     
+  ├───────────────┼────────────────────────┼───────────────────────────────────────┤                                                                                                                     
+  │ Yield request │ set_tsk_need_resched() │ Explicit request                      │                                                                                                                     
+  ├───────────────┼────────────────────────┼───────────────────────────────────────┤                                                                                                                     
+  │ Preemption    │ preempt_schedule()     │ On preemptible kernels                │                                                                                                                     
+  └───────────────┴────────────────────────┴───────────────────────────────────────┘                                                                                                                     
+  What it does NOT do:                                                                                                                                                                                   
+  - Does NOT actually reschedule                                                                                                                                                                         
+  - Does NOT yield CPU                                                                                                                                                                                   
+  - Just returns true/false      
+```
+
+#### cpu_relax()
+
+```
+● cpu_relax()                                                                                                                                                                                            
+                                                                                                                                                                                                         
+  What it is: A CPU hint, not a scheduling function.                                                                                                                                                     
+                                                                                                                                                                                                         
+  // arch/x86/include/asm/vdso/processor.h                                                                                                                                                               
+  static inline void cpu_relax(void)                                                                                                                                                                     
+  {                                                                                                                                                                                                      
+      asm volatile("rep; nop" ::: "memory");  // PAUSE instruction                                                                                                                                       
+  }                                                                                                                                                                                                      
+                                                                                                                                                                                                         
+  What it does:                                                                                                                                                                                          
+  - Inserts PAUSE instruction (~10-100 CPU cycles delay)                                                                                                                                                 
+  - Hints to CPU: "I'm spinning, save power"                                                                                                                                                             
+  - Allows hyper-thread sibling to use execution resources                                                                                                                                               
+  - Acts as a memory barrier (prevents speculative reads from being hoisted)                                                                                                                             
+                                                                                                                                                                                                         
+  What it does NOT do:                                                                                                                                                                                   
+  - Does NOT yield CPU to other tasks                                                                                                                                                                    
+  - Does NOT check for pending signals                                                                                                                                                                   
+  - Does NOT enable preemption                                                                                                                                                                           
+  - Does NOT interact with scheduler at all                                                                                                                                                              
+                                                                                                                                                                                                         
+  cpu_relax() timeline:                                                                                                                                                                                  
+  ┌──────────────────────────────────────────────────────┐                                                                                                                                               
+  │ Task A (running)                                     │                                                                                                                                               
+  │ ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐                      │                                                                                                                                               
+  │ │poll │ │relax│ │poll │ │relax│ ...continues...     │                                                                                                                                                
+  │ └─────┘ └─────┘ └─────┘ └─────┘                      │                                                                                                                                               
+  │   1μs    0.1μs   1μs    0.1μs                        │                                                                                                                                               
+  │                                                      │                                                                                                                                               
+  │ Task B (runnable but waiting) - NEVER gets CPU      │                                                                                                                                                
+  └──────────────────────────────────────────────────────┘ 
+```
+
+
+
 # Block Layer Integrity
 
 ## What is Block integrity?
