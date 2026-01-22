@@ -19,6 +19,12 @@ Title: Linux kernel debug note
 
 # use gdb to investigate userspace
 
+## deal with libtool
+
+```
+libtool --mode=execute gdb --args ./ublk.null add
+```
+
 ## commands
 
 ```
