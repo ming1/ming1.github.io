@@ -76,6 +76,20 @@ its lifetime is same with ublk queue.
 
     - is it possible to run from fallback wq?
 
+
+## use cases
+
+[SNIA SDC 2025 - Optimizing Hyperscale Flash Storage: Efficient QLC, Infinite Scale](https://www.snia.org/sniadeveloper/session/19357)
+
+[UBLK Frontend Support for SUSE Storage (Longhorn) v2 Data Engine](<https://www.suse.com/c/ublk-frontend-support-for-suse-storage-longhorn-v2-data-engine/)
+
+[Android OTA](https://android.googlesource.com/platform/system/core/+/refs/heads/android16-qpr2-release/fs_mgr/libsnapshot/snapuserd/ublk_block_server.cpp)
+
+[SPDK](https://spdk.io/doc/ublk.html)
+
+[Multikernel: Isolating Storage Queues With ublk (LPC2025)](https://lpc.events/event/19/contributions/2074/attachments/1776/3957/Multikernel-LPC2025.pdf)
+
+
 ## cancel code path
 
 ### three related variables
