@@ -751,3 +751,110 @@ root@localhost:~/git/fio# lshw -C memory
           clock: 1305MHz (0.8ns)
 ```
 
+# nvme perf
+
+## observation
+
+- latency: 75us(vfio/dma_zc) vs. 64us(raw nvme)
+
+## nvme-vfio with dma zc
+
+```
+root@tomsrv:~/git/ublksrv# ./ublk.nvme_vfio add -q 8 -d 256 --pci 0000:01:00.0 --dma_zc -b
+nvme_vfio: DMA pool: hugepage_size=2048KB, total_size=1034MB, extra_hugepages=517
+nvme_vfio: DMA pool layout: queue[0-3a000) prp[3a000-83a000) io_buf[83a000-4083a000) identify[4083a000-4083b000)
+nvme_vfio: Controller: VWC=yes, MDTS=7 (512KB), SGL=no
+nvme_vfio: Namespace 1: size=2000398934016 bytes, LBA size=512 bytes
+nvme_vfio: Initializing VFIO NVMe target for 0000:01:00.0 (numa node 3)
+nvme_vfio: For good performance, start via: taskset -c 12-15,44-47(numa node 3)
+dev id 0: nr_hw_queues 8 queue_depth 256 block size 512 dev_capacity 3907029168
+        max rq size 524288 daemon pid 2662 state LIVE
+        flags 0x12c0c2 [ URING_CMD_COMP_IN_TASK CMD_IOCTL_ENCODE USER_COPY BUF_REG_OFF_DAEMON BATCH_IO SAFE_STOP_DEV DMA_ZC ]
+        ublkc: 239:0 ublkb: 259:1 owner: 0:0
+        queue 0: tid 2678 affinity(34 )
+        queue 1: tid 2679 affinity(39 )
+        queue 2: tid 2680 affinity(40 )
+        queue 3: tid 2681 affinity(44 )
+        queue 4: tid 2682 affinity(18 )
+        queue 5: tid 2683 affinity(52 )
+        queue 6: tid 2684 affinity(58 )
+        queue 7: tid 2685 affinity(28 )
+        target {"dev_size":2000398934016,"name":"nvme_vfio","pci_addr":"0000:01:00.0","type":0}
+
+root@tomsrv:~# ~/git/tools/test/func/run-io  /dev/ublkb0 randread 4k 1 20
+grep: warning: stray \ before =
+Running test randread over /dev/ublkb0, scheduler: [none] mq-deadline kyber bfq , NR_REQ: 256, HW_TAGS: depth=256
+min_shallow_depth=4294967295
+/dev/ublkb0-test-randread: (g=0): rw=randread, bs=(R) 4096B-4096B, (W) 4096B-4096B, (T) 4096B-4096B, ioengine=libaio, iodepth=64
+fio-3.37
+Starting 1 process
+Jobs: 1 (f=1): [r(1)][100.0%][r=3042MiB/s][r=779k IOPS][eta 00m:00s]
+/dev/ublkb0-test-randread: (groupid=0, jobs=1): err= 0: pid=4412: Tue Mar  3 16:48:23 2026
+  read: IOPS=777k, BW=3037MiB/s (3184MB/s)(59.3GiB/20001msec)
+    slat (usec): min=27, max=510, avg=35.62, stdev= 3.04
+    clat (usec): min=6, max=511, avg=39.87, stdev=11.52
+     lat (usec): min=57, max=680, avg=75.49, stdev=11.96
+    clat percentiles (usec):
+     |  1.00th=[   31],  5.00th=[   35], 10.00th=[   36], 20.00th=[   37],
+     | 30.00th=[   37], 40.00th=[   37], 50.00th=[   37], 60.00th=[   38],
+     | 70.00th=[   39], 80.00th=[   40], 90.00th=[   41], 95.00th=[   81],
+     | 99.00th=[   86], 99.50th=[   87], 99.90th=[  103], 99.95th=[  130],
+     | 99.99th=[  135]
+   bw (  MiB/s): min= 2941, max= 3323, per=100.00%, avg=3037.09, stdev=69.88, samples=40
+   iops        : min=752896, max=850816, avg=777494.40, stdev=17889.25, samples=40
+  lat (usec)   : 10=0.01%, 20=0.01%, 50=93.49%, 100=6.40%, 250=0.11%
+  lat (usec)   : 500=0.01%, 750=0.01%
+  cpu          : usr=15.20%, sys=38.92%, ctx=242978, majf=1, minf=2285
+  IO depths    : 1=0.0%, 2=0.0%, 4=0.0%, 8=0.0%, 16=0.0%, 32=0.0%, >=64=100.0%
+     submit    : 0=0.0%, 4=0.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=100.0%, >=64=0.0%
+     complete  : 0=0.0%, 4=0.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=100.0%, >=64=0.0%
+     issued rwts: total=15549888,0,0,0 short=0,0,0,0 dropped=0,0,0,0
+     latency   : target=0, window=0, percentile=100.00%, depth=64
+
+Run status group 0 (all jobs):
+   READ: bw=3037MiB/s (3184MB/s), 3037MiB/s-3037MiB/s (3184MB/s-3184MB/s), io=59.3GiB (63.7GB), run=20001-20001msec
+
+Disk stats (read/write):
+  ublkb0: ios=15468895/3, sectors=123750321/0, merge=1/0, ticks=775845/0, in_queue=775846, util=83.27%
+```
+
+## raw nvme perf
+
+```
+root@tomsrv:~# ~/git/tools/test/func/run-io  /dev/nvme1n1 randread 4k 1 20
+grep: warning: stray \ before =
+Running test randread over /dev/nvme1n1, scheduler: [none] mq-deadline kyber bfq , NR_REQ: 1023, HW_TAGS: depth=1023
+min_shallow_depth=4294967295
+/dev/nvme1n1-test-randread: (g=0): rw=randread, bs=(R) 4096B-4096B, (W) 4096B-4096B, (T) 4096B-4096B, ioengine=libaio, iodepth=64
+fio-3.37
+Starting 1 process
+Jobs: 1 (f=1): [r(1)][100.0%][r=3446MiB/s][r=882k IOPS][eta 00m:00s]
+/dev/nvme1n1-test-randread: (groupid=0, jobs=1): err= 0: pid=4552: Tue Mar  3 16:49:03 2026
+  read: IOPS=900k, BW=3515MiB/s (3685MB/s)(68.6GiB/20001msec)
+    slat (usec): min=28, max=509, avg=41.96, stdev= 3.72
+    clat (nsec): min=1030, max=183530, avg=22037.34, stdev=9482.38
+     lat (usec): min=49, max=549, avg=64.00, stdev=10.29
+    clat percentiles (nsec):
+     |  1.00th=[17536],  5.00th=[17792], 10.00th=[18048], 20.00th=[18560],
+     | 30.00th=[19072], 40.00th=[19072], 50.00th=[19328], 60.00th=[19584],
+     | 70.00th=[19840], 80.00th=[22144], 90.00th=[24192], 95.00th=[46848],
+     | 99.00th=[68096], 99.50th=[68096], 99.90th=[70144], 99.95th=[71168],
+     | 99.99th=[73216]
+   bw (  MiB/s): min= 3335, max= 3745, per=100.00%, avg=3514.77, stdev=110.42, samples=40
+   iops        : min=853760, max=958848, avg=899782.40, stdev=28268.10, samples=40
+  lat (usec)   : 2=0.01%, 4=0.01%, 10=0.01%, 20=73.70%, 50=22.68%
+  lat (usec)   : 100=3.62%, 250=0.01%
+  cpu          : usr=18.61%, sys=53.35%, ctx=281202, majf=1, minf=3446
+  IO depths    : 1=0.0%, 2=0.0%, 4=0.0%, 8=0.0%, 16=0.0%, 32=0.0%, >=64=100.0%
+     submit    : 0=0.0%, 4=0.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=100.0%, >=64=0.0%
+     complete  : 0=0.0%, 4=0.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=100.0%, >=64=0.0%
+     issued rwts: total=17995648,0,0,0 short=0,0,0,0 dropped=0,0,0,0
+     latency   : target=0, window=0, percentile=100.00%, depth=64
+
+Run status group 0 (all jobs):
+   READ: bw=3515MiB/s (3685MB/s), 3515MiB/s-3515MiB/s (3685MB/s-3685MB/s), io=68.6GiB (73.7GB), run=20001-20001msec
+
+Disk stats (read/write):
+  nvme1n1: ios=17898110/0, sectors=143184896/0, merge=2/0, ticks=717819/0, in_queue=717819, util=76.15%
+```
+
