@@ -1,0 +1,126 @@
+VFS Call Graph - Function Notes
+================================
+
+DATA FLOW OVERVIEW
+------------------
+  Userspace buffer (char __user *buf)
+      |
+  sys_read/sys_write
+      |
+  vfs_read/vfs_write  -- validates access, checks f_mode
+      |
+  f_op->read_iter / f_op->write_iter  -- filesystem dispatch
+      |
+  Page Cache (struct address_space / folios)
+      |
+  a_ops->readahead / a_ops->writepages  -- filesystem I/O
+      |
+  submit_bio()  -- block I/O
+      |
+  Block device driver
+
+
+OPEN PATH
+---------
+do_sys_openat2():  Entry point for all open variants.
+  - Converts user flags to struct open_flags via build_open_flags()
+  - Calls do_file_open() for the actual path walk + open
+
+do_file_open():  Sets up nameidata, calls path_openat() with RCU first.
+  - Retries without RCU on -ECHILD, with LOOKUP_REVAL on -ESTALE
+
+path_openat():  Core open logic.
+  1. alloc_empty_file() - allocate struct file
+  2. path_init() - set starting point (cwd or root)
+  3. link_path_walk() - resolve each path component via i_op->lookup()
+  4. open_last_lookups() - resolve final component, may call i_op->create()
+  5. do_open() -> vfs_open() -> do_dentry_open()
+
+do_dentry_open():  Connects file to inode.
+  - Sets f_op = inode->i_fop  (THE key polymorphism point)
+  - Calls f_op->open() for FS-specific initialization
+  - Sets FMODE_CAN_READ / FMODE_CAN_WRITE based on available ops
+
+link_path_walk():  Walks "/" separated components.
+  - Calls i_op->lookup() for each directory component
+  - Handles "." and ".." specially
+  - Crosses mount points via lookup_mnt()
+
+
+READ PATH
+---------
+vfs_read():  Main read entry from syscall.
+  - Checks FMODE_READ, FMODE_CAN_READ, access_ok()
+  - Dispatches to f_op->read (legacy) or new_sync_read() (modern)
+
+new_sync_read():  Bridges old read(buf,len) to modern read_iter(kiocb,iov_iter).
+  - Creates kiocb + iov_iter from user buffer
+  - Calls f_op->read_iter()
+
+generic_file_read_iter():  Standard page-cache-based read (mm/filemap.c).
+  - For O_DIRECT: calls mapping->a_ops->direct_IO()
+  - For buffered: calls filemap_read()
+
+filemap_read():  The page cache read loop.
+  - Looks up folios in page cache via filemap_get_pages()
+  - On cache miss: triggers readahead -> a_ops->readahead()
+  - Copies data to userspace via copy_folio_to_iter()
+
+
+WRITE PATH
+----------
+vfs_write():  Main write entry from syscall.
+  - Calls file_start_write() for freeze protection
+  - Dispatches to f_op->write or new_sync_write()
+
+generic_file_write_iter():  Standard page-cache-based write.
+  - Takes inode lock, updates file size
+  - Calls generic_perform_write() for the actual copy
+
+generic_perform_write():  The write loop (per-page):
+  1. a_ops->write_begin() - get/create folio, may read from disk
+  2. copy_page_from_iter_atomic() - copy user data into folio
+  3. a_ops->write_end() - mark folio dirty, update inode size
+  4. balance_dirty_pages_ratelimited() - throttle if too many dirty pages
+
+
+WRITEBACK PATH (dirty pages -> disk)
+-------------------------------------
+Dirty pages are written back by:
+  - Periodic writeback (wb_workfn)
+  - Sync syscalls (fsync -> file_write_and_wait_range)
+  - Memory pressure (balance_dirty_pages)
+
+writeback_single_inode():
+  - Calls a_ops->writepages() to write dirty pages
+  - Common implementation: mpage_writepages() builds bios from dirty pages
+  - Submits bios via submit_bio() to block layer
+
+
+CLOSE PATH
+----------
+sys_close():  Entry point for close(fd).
+  - file_close_fd() removes fd from the process fd table
+  - filp_flush() calls f_op->flush() and removes POSIX locks
+  - fput_close_sync() drops the file reference
+
+__fput():  Called when file refcount reaches 0 (fs/file_table.c:443).
+  - fsnotify_close() - notify watchers
+  - eventpoll_release() - remove from epoll
+  - locks_remove_file() - remove all locks
+  - f_op->release() - FS-specific cleanup (THE key close callback)
+  - dput(dentry) - release dentry reference (may evict from dcache)
+  - mntput(mnt) - release mount reference
+  - file_free() - free the struct file
+
+Key: flush vs release:
+  - flush() is called on EVERY close(fd), even if file is still open elsewhere
+  - release() is called only when the LAST reference is dropped
+
+
+READDIR PATH
+------------
+iterate_dir():  Called by sys_getdents64().
+  - Takes inode->i_rwsem shared
+  - Calls f_op->iterate_shared() with a dir_context
+  - dir_context has an actor function called per-entry
