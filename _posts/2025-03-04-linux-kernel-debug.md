@@ -357,3 +357,18 @@ done
 # kernel bpftrace
 
 [bpftrace-mcp-server](https://github.com/eunomia-bpf/MCPtrace)
+
+
+# Use virtme(virtme-ng) to test kernel change
+
+```
+DISK=/tmp/test-disk.img
+QEMU_EXTRA="-device virtio-scsi-pci,id=scsi_extra,num_queues=32 -device scsi-hd,drive=extra_hd,bus=scsi_extra.0 -drive if=none,id=extra_hd,file=${DISK},format=raw"
+vng --run . --force-9p \
+  --cpus 32 --memory 4G \
+  --exec /usr/bin/false \
+  --verbose \
+  "--qemu-opts=${QEMU_EXTRA}"
+```
+
+test script can be passed via `--exec`, which is handy for running git-bisect.
