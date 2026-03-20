@@ -1330,7 +1330,318 @@ this via a separate P2P flag:
 On Grace Hopper, storage DMA can target GPU memory through the unified C2C
 address space, potentially avoiding BAR1 limitations entirely.
 
-## 14. cuObject: Object Storage Extension
+## 14. Upstream Linux P2PDMA: The Kernel-Native Alternative
+
+Starting with Linux 5.8 (practical from 6.2+), the upstream kernel has its own
+framework for peer-to-peer DMA between PCIe devices — **without** needing
+nvidia-fs.ko or any out-of-tree module. Understanding how P2PDMA works reveals
+both the elegance of the upstream approach and why nvidia-fs had to invent its
+shadow buffer trick in the first place.
+
+### 14.1 Do P2PDMA Pages Have `struct page`?
+
+**Yes.** This is a common question because P2PDMA pages represent memory on a
+PCIe device (e.g., GPU BAR1, NVMe CMB), not system RAM. The kernel creates real
+`struct page` descriptors for them using the `ZONE_DEVICE` memory hotplug
+infrastructure.
+
+The creation chain from `drivers/pci/p2pdma.c`:
+
+```
+  pci_p2pdma_add_resource(pdev, bar, size, offset)
+       │
+       │  pgmap->range.start = pci_resource_start(pdev, bar) + offset
+       │  pgmap->type = MEMORY_DEVICE_PCI_P2PDMA
+       │
+       ▼
+  devm_memremap_pages(&pdev->dev, pgmap)        [mm/memremap.c]
+       │
+       │  pgprot = pgprot_noncached()   ← uncacheable MMIO mapping
+       │
+       ▼
+  arch_add_memory(nid, range->start, range_len, params)
+       │
+       │  This is the MEMORY HOTPLUG path — the same mechanism
+       │  used for adding new RAM DIMMs at runtime, but here
+       │  it creates sparse memory sections for BAR addresses
+       │
+       ▼
+  Sparse memory sections allocated for the BAR address range.
+  Each section gets a vmemmap area with struct page descriptors.
+       │
+       ▼
+  move_pfn_range_to_zone(ZONE_DEVICE, start_pfn, nr_pages)
+       │
+       ▼
+  memmap_init_zone_device(zone, start_pfn, nr_pages, pgmap)
+       │                                          [mm/mm_init.c:1086]
+       ▼
+  FOR EACH pfn in the BAR range:
+       │
+       struct page *page = pfn_to_page(pfn);    ← real struct page!
+       __init_single_page(page, pfn, ZONE_DEVICE, nid);
+       __SetPageReserved(page);
+       page_folio(page)->pgmap = pgmap;          ← back-pointer
+       set_page_count(page, 0);                  ← refcount starts at 0
+```
+
+### 14.2 Where the `struct page` Memory Lives
+
+The `struct page` descriptors are in **system RAM** (vmemmap), but they
+**describe** physical addresses on the PCIe device:
+
+```
+  PCIe BAR (on device)                System RAM (vmemmap)
+  ──────────────────────              ────────────────────────────
+
+  BAR1: 0x23_8000_0000                vmemmap:
+    ┌──────────────┐                    ┌──────────────────────┐
+    │  Page 0      │◄──────────────────│ struct page [pfn=N]  │
+    │  (64KB)      │                    │  .flags → ZONE_DEVICE│
+    ├──────────────┤                    │  .pgmap → pgmap      │
+    │  Page 1      │◄──────────────────│ struct page [pfn=N+1]│
+    │  (64KB)      │                    │  .pgmap → pgmap      │
+    ├──────────────┤                    ├──────────────────────┤
+    │  ...         │                    │  ...                 │
+    └──────────────┘                    └──────────────────────┘
+
+  Physical memory on the               struct page descriptors
+  PCIe device (NOT system RAM)          in system RAM (vmemmap)
+
+  pfn_to_phys(page_to_pfn(page)) = BAR physical address
+  ← This is the key: PFN directly encodes BAR address
+```
+
+### 14.3 How P2PDMA Pages Are Identified
+
+The kernel identifies P2PDMA pages using zone and pgmap type checks — no
+`page->index` hijacking needed:
+
+```c
+// include/linux/mmzone.h — check zone bits in page->flags
+static inline bool is_zone_device_page(const struct page *page)
+{
+    return page_zonenum(page) == ZONE_DEVICE;
+}
+
+// include/linux/mmzone.h — get the dev_pagemap back-pointer
+static inline struct dev_pagemap *page_pgmap(const struct page *page)
+{
+    return page_folio(page)->pgmap;
+}
+
+// include/linux/memremap.h — the P2PDMA check
+static inline bool is_pci_p2pdma_page(const struct page *page)
+{
+    return IS_ENABLED(CONFIG_PCI_P2PDMA) &&
+        is_zone_device_page(page) &&
+        page_pgmap(page)->type == MEMORY_DEVICE_PCI_P2PDMA;
+}
+```
+
+The `folio->pgmap` pointer is stored in the union that overlaps with
+`folio->lru` — ZONE_DEVICE pages are never on LRU lists, so this union field
+is available.
+
+### 14.4 How NVMe Uses P2PDMA Pages Natively
+
+The upstream NVMe driver (`drivers/nvme/host/pci.c`) handles P2PDMA pages
+without any out-of-tree patches:
+
+```
+  NVMe: nvme_map_data(req)                    [pci.c:1218]
+       │
+       ▼
+  blk_rq_dma_map_iter_start(req, dev, &state, &iter)
+       │
+       │  Internally checks: is_pci_p2pdma_page(bv.bv_page)?
+       │       │
+       │       ├── NO  → normal DMA mapping (dma_map_sg)
+       │       │
+       │       └── YES → pci_p2pdma_map_type(provider, dev)
+       │                      │
+       │                      ├── PCI_P2PDMA_MAP_BUS_ADDR
+       │                      │   GPU and NVMe share same PCIe
+       │                      │   switch → use PCIe bus address
+       │                      │   directly (no IOMMU translation)
+       │                      │
+       │                      └── PCI_P2PDMA_MAP_THRU_HOST_BRIDGE
+       │                          Must route through CPU host bridge
+       │                          → use DMA mapping with MMIO attr
+       │
+       ▼
+  switch (iter.p2pdma.map) {
+  case PCI_P2PDMA_MAP_BUS_ADDR:
+      iod->flags |= IOD_DATA_P2P;          // direct bus address
+      break;
+  case PCI_P2PDMA_MAP_THRU_HOST_BRIDGE:
+      iod->flags |= IOD_DATA_MMIO;         // routed through host
+      break;
+  }
+       │
+       ▼
+  NVMe command built with DMA addresses pointing to GPU BAR
+  → NVMe controller DMAs directly to/from GPU memory
+```
+
+The P2PDMA framework also performs **topology validation** at setup time
+(`pci_p2pdma_distance_many()`), checking whether the PCIe topology allows
+P2P transfers between the GPU and storage device. This is the upstream
+equivalent of nvidia-fs's `nvfs_get_gpu2peer_distance()`.
+
+### 14.5 NVMe CMB: An Existing P2PDMA User
+
+The NVMe Controller Memory Buffer (CMB) is already an upstream P2PDMA user.
+When an NVMe drive has a CMB, the driver registers it:
+
+```c
+// drivers/nvme/host/pci.c:2473
+if (pci_p2pdma_add_resource(pdev, bar, size, offset)) {
+    dev_warn(dev->ctrl.device, "failed to register the CMB\n");
+    return;
+}
+```
+
+This proves the P2PDMA infrastructure works end-to-end for device BAR memory
+already in the upstream kernel.
+
+### 14.6 nvidia-fs Shadow Buffers vs Upstream ZONE_DEVICE Pages
+
+The two approaches solve the same problem — getting GPU BAR addresses into
+the storage stack — but in fundamentally different ways:
+
+```
+  nvidia-fs.ko (shadow buffer)         Upstream P2PDMA (ZONE_DEVICE)
+  ─────────────────────────────         ──────────────────────────────
+
+  Page created by:                      Page created by:
+    alloc_page(GFP_USER)                  arch_add_memory() / memremap
+    (normal page allocator)               (memory hotplug for BAR range)
+
+  Page zone:                            Page zone:
+    ZONE_NORMAL                           ZONE_DEVICE
+
+  PFN maps to:                         PFN maps to:
+    System RAM (shadow buf)               BAR physical address
+    (nothing to do with GPU)              (IS the device memory)
+
+  GPU address obtained via:             GPU address obtained via:
+    hash lookup → nvfs_mgroup             pfn_to_phys(page_to_pfn(page))
+    → gpu_info->page_table                (direct — PFN encodes BAR addr)
+    → pages[i]->physical_address
+    (3 levels of indirection)
+
+  Identified by:                        Identified by:
+    page->mapping == NULL AND             is_zone_device_page() AND
+    page->index ≥ (1UL << 32)            pgmap->type == PCI_P2PDMA
+    (hack: hijacks page metadata)         (proper kernel API)
+
+  DMA address:                          DMA address:
+    nvidia_p2p_dma_map_pages()            PCIe bus addr (P2P same switch)
+    (proprietary per-device mapping)      or dma_map via host bridge
+                                          (standard kernel DMA API)
+
+  Storage driver changes:               Storage driver changes:
+    Must export nvfs callback symbols     NONE (upstream support built-in)
+    (out-of-tree patches required)
+
+  GPU driver requirement:               GPU driver requirement:
+    nvidia_p2p_get_pages() API            pci_p2pdma_add_resource()
+    (proprietary, always available)       (must register BAR with kernel)
+```
+
+### 14.7 Complete Stack Comparison
+
+```
+  nvidia-fs.ko path:                    Upstream P2PDMA path:
+  ──────────────────                    ──────────────────────
+
+  cuFileRead()                          (application uses P2PDMA pages)
+       │                                     │
+  libcufile.so                          Standard I/O (read/write/io_uring)
+       │                                     │
+  ioctl(NVFS_IOCTL_READ)               VFS layer
+       │                                     │
+  nvfs_direct_io()                      Filesystem (ext4, XFS)
+  wraps shadow buf in iov_iter               │
+       │                                bio with ZONE_DEVICE pages
+  VFS + FS: sees normal pages                │
+       │                                Block layer
+  bio with shadow pages                      │
+       │                                blk_rq_dma_map_iter_start()
+  Block layer                           recognizes ZONE_DEVICE pages
+       │                                     │
+  nvfs_blk_rq_map_sg()  ◄── patched    Standard blk_rq_map_sg()
+  detects via page->index hack               │
+       │                                NVMe driver
+  nvfs_dma_map_sg_attrs()  ◄── patched  checks is_pci_p2pdma_page()
+  nvidia_p2p_dma_map_pages()            uses PCIe bus address directly
+       │                                     │
+  NVMe HW: DMA to GPU BAR              NVMe HW: DMA to GPU BAR
+
+  Requires:                             Requires:
+  - nvidia-fs.ko                        - Kernel ≥ 6.2
+  - Patched NVMe/FS drivers             - GPU driver calls
+  - CUDA toolkit                          pci_p2pdma_add_resource()
+  - Kernel ≥ 4.15                       - Nothing else
+```
+
+### 14.8 ZONE_DEVICE Memory Types at a Glance
+
+P2PDMA is one of several ZONE_DEVICE memory types. They all share the same
+`struct page` creation mechanism but serve different purposes:
+
+```
+  ┌───────────────────────┬────────────────────────────────────────────┐
+  │ Memory Type           │ Purpose                                    │
+  ├───────────────────────┼────────────────────────────────────────────┤
+  │ MEMORY_DEVICE_PRIVATE │ GPU memory not CPU-accessible              │
+  │                       │ (HMM: migrate_to_ram on CPU page fault)    │
+  │                       │ Used by: nouveau, amdgpu                   │
+  ├───────────────────────┼────────────────────────────────────────────┤
+  │ MEMORY_DEVICE_COHERENT│ Device memory CPU-accessible (coherent)    │
+  │                       │ Used by: AMD APUs, CXL                     │
+  ├───────────────────────┼────────────────────────────────────────────┤
+  │ MEMORY_DEVICE_FS_DAX  │ Persistent memory (PMEM/NVDIMM)           │
+  │                       │ Direct-access filesystem pages              │
+  ├───────────────────────┼────────────────────────────────────────────┤
+  │ MEMORY_DEVICE_GENERIC │ Generic CPU-accessible device memory       │
+  │                       │ (DAX character devices)                     │
+  ├───────────────────────┼────────────────────────────────────────────┤
+  │ MEMORY_DEVICE_PCI_    │ PCIe BAR memory for peer-to-peer DMA      │
+  │ P2PDMA                │ Used by: NVMe CMB, GPU BAR (CUDA 12.8+)   │
+  └───────────────────────┴────────────────────────────────────────────┘
+
+  All share: ZONE_DEVICE zone, struct page via memremap_pages(),
+             folio->pgmap back-pointer, refcount managed by driver
+```
+
+### 14.9 Why nvidia-fs Couldn't Use Upstream P2PDMA (Historically)
+
+nvidia-fs was created around 2020 (CUDA 11.4) when:
+
+1. **The NVIDIA proprietary driver didn't register BAR with the kernel.**
+   `pci_p2pdma_add_resource()` requires the GPU driver to register its BAR
+   memory, which the proprietary nvidia.ko didn't do.
+
+2. **P2PDMA only supports local PCIe P2P.** nvidia-fs also needs RDMA paths
+   (Lustre, WekaFS, NFS) which the upstream P2PDMA framework doesn't cover.
+
+3. **The P2PDMA framework was immature.** Linux 5.8 had basic support, but
+   robust DMA mapping iteration (`blk_rq_dma_map_iter_start`) came later.
+
+4. **Kernel version requirements.** Many enterprise distros ran kernels older
+   than 5.8. nvidia-fs works on kernels as old as 4.15.
+
+**CUDA 12.8+ (OpenRM 570.x+) bridges the gap for NVMe**: the open-source NVIDIA
+kernel modules now call `pci_p2pdma_add_resource()` to register GPU BAR memory,
+enabling the upstream P2PDMA path. nvidia-fs.ko is no longer needed for local
+NVMe I/O on kernel ≥ 6.2.
+
+For RDMA-based distributed filesystems (Lustre, WekaFS), nvidia-fs.ko is still
+required because the upstream P2PDMA framework doesn't handle network storage.
+
+## 15. cuObject: Object Storage Extension
 
 Beyond file-based I/O, GDS also provides **cuObject** APIs for object storage
 (S3-compatible):
@@ -1342,7 +1653,7 @@ This extends the GDS paradigm to cloud-native storage, where data lives in
 object stores rather than POSIX filesystems. cuObject is a separate component
 with its own API specification and release cycle.
 
-## 15. Comparison with Other Approaches
+## 16. Comparison with Other Approaches
 
 ```
 ┌──────────────────┬─────────────┬──────────────┬──────────────────┐
