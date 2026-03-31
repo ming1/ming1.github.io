@@ -290,6 +290,68 @@ These two write seals have an important behavioral difference:
   its existing mapping while preventing the receiver from opening new writable
   access
 
+### Sealing and GUP (Get User Pages)
+
+#### What Is FOLL_WRITE?
+
+GUP (Get User Pages) is the kernel mechanism that lets drivers and subsystems
+obtain direct references to userspace pages. When calling `pin_user_pages_fast()`
+or `get_user_pages()`, callers pass flags to describe the intended access:
+
+| Flag | Meaning |
+|------|---------|
+| `FOLL_WRITE` | Pages will be written to; break COW, require write permission |
+| `FOLL_LONGTERM` | Pages pinned for extended time (DMA); must not be in movable zones |
+| `FOLL_PIN` | Use pin refcount (implied by `pin_user_pages*()` family) |
+| `FOLL_FORCE` | Bypass `VM_WRITE` check, but still requires `VM_MAYWRITE` |
+
+`FOLL_WRITE` has two effects:
+
+1. **Permission check**: GUP validates against the VMA — requires `VM_WRITE`
+   (or `VM_MAYWRITE` with `FOLL_FORCE`). Without either, GUP returns `-EFAULT`.
+
+2. **COW (Copy-On-Write) breaking**: For `MAP_PRIVATE` mappings, `FOLL_WRITE`
+   triggers a write fault to allocate a private copy of the page. Without it,
+   GUP returns the shared COW page, and writing through it would corrupt data
+   visible to other processes. The infamous CVE-2016-5195 ("Dirty COW") was a
+   race condition in exactly this COW-breaking logic.
+
+#### How Seals Block GUP Writes
+
+Write seals block `pin_user_pages_fast(FOLL_WRITE)` and all other GUP
+write paths. When a write seal is active, new mmaps are either blocked
+(`PROT_WRITE | MAP_SHARED` returns `-EPERM`) or downgraded (read-only mappings
+get `VM_MAYWRITE` cleared). The GUP slow path in `mm/gup.c` checks both flags:
+
+```c
+/* mm/gup.c:check_vma_flags() */
+if (write) {
+    if (!(vm_flags & VM_WRITE)) {
+        if (!(gup_flags & FOLL_FORCE))
+            return -EFAULT;
+        /* Even FOLL_FORCE cannot override — VM_MAYWRITE was cleared */
+        if (!(vm_flags & VM_MAYWRITE))
+            return -EFAULT;
+    }
+}
+```
+
+This means drivers cannot use GUP to bypass seal restrictions — if the VMA is
+read-only due to sealing, `pin_user_pages_fast(FOLL_WRITE)` fails in the fast
+path (PTE has no write bit) and in the slow path (VMA has neither `VM_WRITE`
+nor `VM_MAYWRITE`).
+
+The exception is `F_SEAL_FUTURE_WRITE`: writable mmaps that existed **before**
+the seal was set retain `VM_WRITE`, so `pin_user_pages_fast(FOLL_WRITE)` still
+succeeds through those pre-existing VMAs. This is intentional —
+`F_SEAL_FUTURE_WRITE` only blocks new writable access, not existing ones.
+
+| Seal | Existing writable mmap | New writable mmap | GUP write (existing VMA) | GUP write (new VMA) |
+|------|----------------------|-------------------|-------------------------|---------------------|
+| `F_SEAL_WRITE` | Must not exist (seal fails otherwise) | Blocked | N/A | Blocked |
+| `F_SEAL_FUTURE_WRITE` | Retained | Blocked | Succeeds | Blocked |
+| None | Allowed | Allowed | Succeeds | Succeeds |
+
 ### Using Seals via fcntl
 
 ```c
