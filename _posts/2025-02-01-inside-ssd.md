@@ -274,105 +274,337 @@ Plane变现出和Die相同的特性，每个Plane可以独立执行读取命令�
 - Vendor Specific Commands (Optional)
 
 
-## SQ, CQ and DB
+## SW/HW interface(SQ, CQ and DB)
 
-- both SQ and CQ are allocated from host memory(could be SSD memory too)
+NVMe uses a **producer-consumer ring buffer** model for communication between the
+host (driver) and the NVMe controller (hardware). There are two types of queues:
 
-- SQ is for storing commands, CQ is for storing command completion status
+- **Submission Queue (SQ)**: Host → Controller. The driver writes commands here.
+- **Completion Queue (CQ)**: Controller → Host. The controller writes completion entries here.
 
-- Admin queue is only for storing admin SQ/CQ, and same for I/O queue
+Basic properties:
 
+- Both SQ and CQ are allocated from host memory (could be SSD memory too via CMB)
+- Admin queue is only for admin commands; I/O queues are for I/O commands
 - I/O SQ and CQ can be 1:1, or N:1
+- Max I/O queue depth is 64K, max admin queue depth is 4K
+- SQE (command) is 64 bytes, CQE (completion) is 16 bytes
+- Priority can be assigned to each I/O SQ
 
-- max I/O queue depth is 64K, max admin queue depth is 4K
+### Protocol Overview
 
-- command length is 64B, command completion state is 16B
-
-- priority can be assigned to each I/O SQ
-
-- DB: DoorBell register
-
-### DB purpose
-
-#### SQ
-
-- SSD is consumer, host is producer
-
-- SQ head DB is maintained by SSD, and SQ tail DB is updated by host
-
-- SSD knows how many commands to be handled
-
-#### CQ
-
-- SSD is producer of command completion status, and host is consumer
-
-#### notification
-
-- When host updates SQ tail DB, it is telling SSD that new commands are coming
-
-- when host updates CQ head DB, it is also telling SSD that the returned command
-completion status have been handled
-
-
-#### phrase tag
+The overall protocol between host driver and NVMe controller:
 
 ```
-NVMe Completion Queue Phase Tag Mechanism
-
-  The phase tag (or phase bit) is an elegant mechanism NVMe uses to allow drivers to detect new 
-  completions without requiring the controller to maintain additional state. Let me explain how it 
-  works, referencing the nvme_vfio.c implementation.
-
-  Why Phase Tags Exist
-
-  Traditional completion mechanisms require explicit valid/invalid flags that must be cleared after 
-  processing. NVMe's phase tag avoids this by using a single bit that toggles on queue wraparound, 
-  eliminating the need for the driver to clear entries.
-
-  How the Controller Updates the Phase Bit
-
-  The NVMe controller follows this sequence:
-
-  1. Initial state: When a completion queue is created, all entries are zeroed, so the phase bit (bit 0 
-  of the status field) is 0 for all entries.
-
-  2. First pass through queue: As the controller completes commands, it writes completion entries with 
-  phase bit = 1.
-
-  3. Queue wraparound: When the controller wraps around to the beginning of the queue (head goes from 
-  qsize-1 to 0), it toggles the phase bit to 0.
-
-  4. Subsequent passes: Each time the controller wraps around, it toggles the phase bit again (0→1→0→1...).
-
-  The controller writes completions in head pointer order, always at cq[controller_head], and the phase 
-  bit in that entry always matches the controller's current phase.
-
+ Host (driver)                          NVMe Controller
+ ─────────────                          ───────────────
+ 1. Write command to SQ[sq_tail]
+ 2. Advance sq_tail (wrap at qsize)
+ 3. Ring SQ doorbell (write sq_tail)  →  Controller sees new sq_tail
+                                         4. Reads commands from SQ[sq_head..sq_tail)
+                                         5. Processes commands (DMA read/write data)
+                                         6. Writes CQE to CQ[cq_tail] with phase bit
+                                         7. Generates interrupt (or host polls in polled mode)
+ 8. Poll CQ[cq_head] for phase flip  ←
+ 9. Read CQE fields (status, cid)
+10. Advance cq_head (flip phase at wrap)
+11. Ring CQ doorbell (write cq_head) →   Controller frees SQ entries up to sq_head
 ```
 
+### Circular Buffer Semantics
+
+Both SQ and CQ are circular buffers. For an SQ of size N:
+
+- The driver **produces** entries at `sq_tail` and advances it
+- The controller **consumes** from `sq_head` and advances it
+- The SQ is **full** when `(sq_tail + 1) % N == sq_head` (one slot is always wasted)
+- The SQ is **empty** when `sq_tail == sq_head`
+
+### SQE — Submission Queue Entry Format (64 bytes)
+
+Every NVMe command is exactly **64 bytes** (configured via `CC.IOSQES = 6`, meaning
+2^6 = 64). The first bytes are common to all commands; the rest is command-specific.
+
 ```
-  Let's trace through a queue with size 4:
+Byte Offset   Field              Size    Description
+──────────────────────────────────────────────────────────────
+ 0x00         Opcode (OPC)       1B      Command opcode (Read=0x02, Write=0x01, Flush=0x00...)
+ 0x01         Flags (FUSE/PSDT)  1B      Bit 7:6=Fused op, Bit 5:4=PRP/SGL selector
+ 0x02         Command ID (CID)   2B      Unique ID — returned in CQE to correlate completion
+ 0x04         Namespace ID       4B      Target namespace (usually 1)
+ 0x08         Reserved           8B
+ 0x10         Metadata Ptr       8B      Metadata buffer address (if applicable)
+ 0x18         Data Ptr 1 (PRP1)  8B      First data pointer (PRP Entry 1 or SGL descriptor)
+ 0x20         Data Ptr 2 (PRP2)  8B      Second data pointer (PRP Entry 2 or PRP List address)
+ 0x28         CDW10-CDW15        24B     Command-specific parameters
+```
 
-  | Controller Head | Driver Head | Expected Phase | Entry 0 Phase | Entry 1 Phase | Entry 2 Phase | Entry 3 Phase |
-  |-----------------|-------------|----------------|---------------|---------------|---------------|---------------|
-  | 0               | 0           | 1              | 0 (old)       | 0 (old)       | 0 (old)       | 0 (old)       |
-  | 1               | 0           | 1              | 1 ✓           | 0 (old)       | 0 (old)       | 0 (old)       |
-  | 2               | 1           | 1              | 1             | 1 ✓           | 0 (old)       | 0 (old)       |
-  | 3               | 2           | 1              | 1             | 1             | 1 ✓           | 0 (old)       |
-  | 0 (wrap)        | 3           | 1              | 1             | 1             | 1             | 1 ✓           |
-  | 1               | 0 (wrap)    | 0              | 0 ✓           | 1 (old)       | 1 (old)       | 1 (old)       |
+**For a Read/Write command**, CDW10-CDW15 carry:
 
-  At the wraparound:
-  - Controller wraps from 3→0 and toggles phase to 0
-  - Driver wraps from 3→0 and toggles expected phase to 0
-  - Driver now looks for phase bit = 0 to detect new completions
+```
+ 0x28  CDW10-11: Starting LBA (SLBA)    8B    Which LBA to read/write from
+ 0x30  CDW12:    bits [15:0] = NLB       4B    Number of Logical Blocks - 1 (0-based)
+                 bits [31:16]= flags           (FUA at bit 30, etc.)
+ 0x34  CDW13:    DSM hints              4B
+ 0x38  CDW14:    Reference Tag          4B
+ 0x3C  CDW15:    App Tag + Mask         4B
+                                        ────
+                                  Total: 64 bytes
+```
 
-  Benefits of This Mechanism
+Key fields:
 
-  1. No explicit clearing: Driver doesn't need to write to CQ entries
-  2. Race-free: Phase bit provides atomic indication of validity
-  3. Efficient: Single bit comparison determines if entry is new
-  4. Lockless: No synchronization needed between controller and driver for completion detection
+- **Command ID (CID)** is the linchpin connecting submissions to completions. The
+  driver sets a unique CID per in-flight command. When a CQE arrives, the driver reads
+  `cqe->command_id` to correlate which command completed.
 
+- **PRP1/PRP2** carry the DMA addresses (IOVAs) of the data buffer. For small I/O
+  (≤ 1 page), only PRP1 is needed. For 2-page I/O, PRP2 holds the second page address.
+  For larger I/O, PRP2 points to a **PRP List** — a page filled with 8-byte physical
+  page addresses.
+
+A concrete example — a 4KB read at LBA 1000:
+
+```
+Byte  Value                 Meaning
+────  ────────────────────  ──────────────────────────
+0x00  0x02                  Opcode = NVM Read
+0x01  0x00                  Flags = PRP mode (no SGL)
+0x02  0x0005                CID = 5
+0x04  0x00000001            NSID = 1
+0x18  0x0000000140000000    PRP1 = IOVA of data buffer
+0x20  0x0000000000000000    PRP2 = 0 (single page, not needed)
+0x28  0x00000000000003E8    SLBA = 1000
+0x30  0x0000                Length = 0 (means 1 logical block, NLB is 0-based)
+0x32  0x0000                Control = 0 (no FUA)
+```
+
+### CQE — Completion Queue Entry Format (16 bytes)
+
+Every CQE is exactly **16 bytes** (configured via `CC.IOCQES = 4`, meaning 2^4 = 16).
+The controller writes this to CQ memory:
+
+```
+Byte Offset   Field              Size   Description
+──────────────────────────────────────────────────────────────
+ 0x00         Command Specific   4B     Command-specific result (DW0)
+ 0x04         Reserved           4B
+ 0x08         SQ Head Pointer    2B     Where the controller's SQ head is now
+ 0x0A         SQ Identifier      2B     Which SQ this completion is for
+ 0x0C         Command ID (CID)   2B     Matches the CID from the SQE
+ 0x0E         Status Field       2B     Bit 0 = Phase Tag (P)
+                                        Bits 15:1 = Status Code
+```
+
+The status field layout:
+
+```
+ 15                                    1   0
+┌──────────────────────────────────────┬───┐
+│     Status (DNR, M, SCT, SC)        │ P │
+└──────────────────────────────────────┴───┘
+  Bit 0:      Phase Tag (P) — flips each time CQ wraps
+  Bits 8:1:   Status Code (SC) — 0 = success
+  Bits 11:9:  Status Code Type (SCT)
+  Bits 13:12: Command Retry Delay (CRD)
+  Bit 14:     More (M) — more status available
+  Bit 15:     Do Not Retry (DNR)
+```
+
+Key fields:
+
+- **Phase bit (P)** is bit 0 of the status field — by design it sits in the last
+  field the controller writes. Combined with a DMA read barrier, this guarantees: if
+  you see the phase bit flip, all other CQE fields are valid.
+
+- **SQ Head** tells the driver how far the controller has consumed from the SQ.
+  The driver can use this for SQ flow control, though it can also rely on
+  external mechanisms (e.g., ublk tag-based flow control).
+
+A concrete CQE for the read command above:
+
+```
+Byte  Value          Meaning
+────  ───────────    ──────────────────────────
+0x00  0x00000000     Result = 0
+0x04  0x00000000     Reserved
+0x08  0x0006         SQ Head = 6 (controller consumed up to slot 6)
+0x0A  0x0001         SQ ID = 1 (I/O queue 1)
+0x0C  0x0005         Command ID = 5 ← matches CID 5 from the SQE
+0x0E  0x0001         Status = 0x0001
+                       Bit 0 (Phase) = 1 (matches expected phase)
+                       Bits 15:1 = 0x0000 → Status Code = 0 = Success
+```
+
+### Doorbells
+
+Each queue pair has two 32-bit doorbell registers in the controller's BAR0 MMIO space:
+
+- **SQ Tail Doorbell**: Driver writes new `sq_tail` → tells controller "I have new
+  commands up to here"
+- **CQ Head Doorbell**: Driver writes new `cq_head` → tells controller "I've consumed
+  entries up to here, you can reuse those CQ slots"
+
+Doorbell register offsets from BAR0:
+
+```
+SQ y Doorbell = 0x1000 + (2y × doorbell_stride)
+CQ y Doorbell = 0x1000 + ((2y+1) × doorbell_stride)
+```
+
+Where `doorbell_stride = 4 × 2^CAP.DSTRD` (most controllers use DSTRD=0, so stride=4
+bytes).
+
+#### Doorbell layout example (DSTRD=0, stride=4 bytes)
+
+```
+BAR0 + 0x0000 ┌─────────────────────────┐
+              │  Controller Registers    │  (CAP, VS, CC, CSTS, AQA, ASQ, ACQ...)
+              │  (0x000 - 0xFFF)         │
+BAR0 + 0x1000 ├─────────────────────────┤
+              │  SQ 0 Tail Doorbell      │  ← Admin SQ (driver writes sq_tail here)
+BAR0 + 0x1004 │  CQ 0 Head Doorbell      │  ← Admin CQ (driver writes cq_head here)
+BAR0 + 0x1008 │  SQ 1 Tail Doorbell      │  ← I/O SQ 1
+BAR0 + 0x100C │  CQ 1 Head Doorbell      │  ← I/O CQ 1
+BAR0 + 0x1010 │  SQ 2 Tail Doorbell      │  ← I/O SQ 2
+BAR0 + 0x1014 │  CQ 2 Head Doorbell      │  ← I/O CQ 2
+              │  ...                      │
+              └─────────────────────────┘
+```
+
+For **I/O Queue 1** (qid=1):
+
+```
+SQ 1 Doorbell = BAR0 + 0x1000 + (2 × 1 × 4) = BAR0 + 0x1008
+CQ 1 Doorbell = BAR0 + 0x1000 + ((2×1+1) × 4) = BAR0 + 0x100C
+```
+
+#### Doorbell batching
+
+Doorbell writes are MMIO writes — they are expensive (uncacheable posted writes
+that serialize the CPU pipeline). Drivers can batch multiple command submissions
+before writing the doorbell once, amortizing the cost.
+
+A concrete submission sequence with an SQ of qsize=4:
+
+```
+Time   SQ Buffer (host memory)           Doorbell Write   What Happens
+────   ──────────────────────            ──────────────   ────────────
+       [0:empty] [1:empty] [2:empty] [3:empty]
+       sq_tail=0
+
+ T1    [0:READ ] [1:empty] [2:empty] [3:empty]           Driver writes cmd to slot 0
+       sq_tail=1
+       (doorbell deferred — batching)
+
+ T2    [0:READ ] [1:WRITE] [2:empty] [3:empty]           Driver writes cmd to slot 1
+       sq_tail=2
+       ──── wmb() ────
+       doorbell ← 2                      writel(2, SQ_DB) Controller sees 2 new cmds
+
+ T3    Controller processes slot 0, slot 1                Controller advances its
+       Controller writes CQE for each                     internal sq_head to 2
+```
+
+### Phase Tag
+
+The phase bit solves the "is the CQ entry new?" problem without the driver
+needing to clear CQ entries after processing:
+
+- The driver initializes all CQ entries to 0 and expects phase bit = **1**
+- When the controller writes a CQE, it sets the phase bit to **1** (first pass)
+- When `cq_head` wraps around to 0, the expected phase flips to **0**
+- The controller also flips its phase bit on wrap-around
+- This way, the driver can distinguish new entries from stale ones by a single bit
+  comparison
+
+Trace through a queue with size 4:
+
+| Controller Tail | Driver Head | Expected Phase | Entry 0 | Entry 1 | Entry 2 | Entry 3 |
+|:---------------:|:-----------:|:--------------:|:-------:|:-------:|:-------:|:-------:|
+| 0               | 0           | 1              | 0 (old) | 0 (old) | 0 (old) | 0 (old) |
+| 1               | 0           | 1              | **1** ✓ | 0 (old) | 0 (old) | 0 (old) |
+| 2               | 1           | 1              | 1       | **1** ✓ | 0 (old) | 0 (old) |
+| 3               | 2           | 1              | 1       | 1       | **1** ✓ | 0 (old) |
+| 0 (wrap)        | 3           | 1              | 1       | 1       | 1       | **1** ✓ |
+| 1               | 0 (wrap)    | **0**          | **0** ✓ | 1 (old) | 1 (old) | 1 (old) |
+
+At the wraparound:
+- Controller wraps from 3→0 and toggles its phase to 0
+- Driver wraps from 3→0 and toggles expected phase to 0
+- Driver now looks for phase bit = 0 to detect new completions
+
+Benefits:
+
+1. **No explicit clearing**: Driver doesn't need to write to CQ entries after reading
+2. **Race-free**: Phase bit provides atomic indication of validity
+3. **Efficient**: Single bit comparison determines if entry is new
+4. **Lockless**: No synchronization needed between controller and driver
+
+### Memory Ordering Requirements
+
+This is critical for correctness on modern CPUs:
+
+- **Before SQ doorbell write**: A **write memory barrier (wmb)** ensures the command
+  data in the SQ buffer is visible to the device before the doorbell write triggers
+  the controller to read it
+
+- **After CQ phase bit check**: A **DMA read memory barrier (dma_rmb)** ensures that
+  after observing the phase bit flip, all other CQE fields (status, command_id) are
+  read fresh from memory, not from a stale cache or reorder buffer
+
+On x86, `dma_rmb()` is just a compiler barrier (no hardware fence needed) because x86
+guarantees loads are not reordered with other loads. On ARM64, it becomes `dmb oshld`.
+
+### Complete I/O Lifecycle Example
+
+```
+  Host Driver (CPU)                      NVMe Controller (PCIe device)
+  ─────────────────                      ─────────────────────────────
+
+  ┌─ SUBMIT ──────────────────┐
+  │ 1. Build SQE on stack:    │
+  │    opcode=0x02 (Read)     │
+  │    cid=5, nsid=1          │
+  │    prp1=0x140000000       │
+  │    slba=1000, nlb=0       │
+  │                           │
+  │ 2. memcpy → SQ[tail=3]    │
+  │    (64 bytes to DMA mem)  │
+  │                           │
+  │ 3. sq_tail = 4            │
+  │                           │
+  │ 4. wmb()  ← ensures SQE   │
+  │    is in memory            │
+  │                           │
+  │ 5. writel(4, SQ_doorbell) ────────→  Controller sees tail=4
+  └───────────────────────────┘         │
+                                        │ 6. Reads SQ[3] (64B DMA read)
+                                        │ 7. Parses: Read 1 LB at LBA 1000
+                                        │ 8. DMA writes 4KB to host at PRP1
+                                        │ 9. Builds CQE:
+                                        │    cid=5, status=0x0001 (success, phase=1)
+                                        │ 10. DMA writes CQE → CQ[tail=2]
+                                        │
+  ┌─ COMPLETE ────────────────┐   ←─────┘
+  │ 11. Poll: CQ[2].status    │
+  │     READ_ONCE → 0x0001    │
+  │     phase bit = 1         │
+  │     matches cq_phase=1 ✓  │
+  │                           │
+  │ 12. dma_rmb()  ← ensures  │
+  │     all CQE fields fresh  │
+  │                           │
+  │ 13. cid=5, status=0       │
+  │     → success, tag=5      │
+  │                           │
+  │ 14. cq_head = 3           │
+  │     (no phase flip yet)   │
+  │                           │
+  │ 15. writel(3, CQ_doorbell)────────→  Controller knows CQ[0..2] are free
+  │                           │
+  │ 16. Complete host IO #5   │
+  └───────────────────────────┘
 ```
 
 
