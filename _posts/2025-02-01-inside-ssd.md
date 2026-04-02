@@ -967,7 +967,7 @@ for I/O commands.
 [Fabrics-specific definitions](https://github.com/linux-nvme/libnvme/blob/master/src/nvme/fabrics.h)
 
 
-# NVMe SPEC
+# NVMe features
 ## NVMe AWUPF
 
 ### overview
