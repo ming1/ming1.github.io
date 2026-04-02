@@ -319,27 +319,33 @@ completion status have been handled
 ```
 NVMe Completion Queue Phase Tag Mechanism
 
-  The phase tag (or phase bit) is an elegant mechanism NVMe uses to allow drivers to detect new completions without requiring the
-  controller to maintain additional state. Let me explain how it works, referencing the nvme_vfio.c implementation.
+  The phase tag (or phase bit) is an elegant mechanism NVMe uses to allow drivers to detect new 
+  completions without requiring the controller to maintain additional state. Let me explain how it 
+  works, referencing the nvme_vfio.c implementation.
 
   Why Phase Tags Exist
 
-  Traditional completion mechanisms require explicit valid/invalid flags that must be cleared after processing. NVMe's phase tag avoids
-  this by using a single bit that toggles on queue wraparound, eliminating the need for the driver to clear entries.
+  Traditional completion mechanisms require explicit valid/invalid flags that must be cleared after 
+  processing. NVMe's phase tag avoids this by using a single bit that toggles on queue wraparound, 
+  eliminating the need for the driver to clear entries.
 
   How the Controller Updates the Phase Bit
 
   The NVMe controller follows this sequence:
 
-  1. Initial state: When a completion queue is created, all entries are zeroed, so the phase bit (bit 0 of the status field) is 0 for all
-   entries.
-  2. First pass through queue: As the controller completes commands, it writes completion entries with phase bit = 1.
-  3. Queue wraparound: When the controller wraps around to the beginning of the queue (head goes from qsize-1 to 0), it toggles the phase
-   bit to 0.
+  1. Initial state: When a completion queue is created, all entries are zeroed, so the phase bit (bit 0 
+  of the status field) is 0 for all entries.
+
+  2. First pass through queue: As the controller completes commands, it writes completion entries with 
+  phase bit = 1.
+
+  3. Queue wraparound: When the controller wraps around to the beginning of the queue (head goes from 
+  qsize-1 to 0), it toggles the phase bit to 0.
+
   4. Subsequent passes: Each time the controller wraps around, it toggles the phase bit again (0→1→0→1...).
 
-  The controller writes completions in head pointer order, always at cq[controller_head], and the phase bit in that entry always matches
-  the controller's current phase.
+  The controller writes completions in head pointer order, always at cq[controller_head], and the phase 
+  bit in that entry always matches the controller's current phase.
 
 ```
 
