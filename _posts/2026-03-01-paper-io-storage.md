@@ -9,6 +9,240 @@ title: Note on IO storage papers
 * TOC
 {:toc}
 
+# A Wake-Up Call for Kernel-Bypass on Modern Hardware
+
+## Overview
+
+[A Wake-Up Call for Kernel-Bypass on Modern Hardware](https://doi.org/10.1145/3736227.3736235)
+Matthias Jasny, Muhammad El-Hindi, Tobias Ziegler, Carsten Binnig (TU Darmstadt, TU München, DFKI).
+DaMoN '25 (21st International Workshop on Data Management on New Hardware), June 2025.
+
+This paper argues that kernel-bypass is **no longer an optional optimization** but a **necessary
+architectural strategy** for I/O-heavy applications like database systems. The motivation comes
+from two converging trends: stagnating CPU performance (Moore's Law reaching its limits) and
+rapidly accelerating I/O hardware (800 Gbit/s NICs, SSDs exceeding 12M IOPS). The authors
+systematically evaluate modern 400 Gbit NICs and PCIe Gen5 SSD arrays to show that kernel-based
+I/O stacks cannot saturate modern hardware, while kernel-bypass technologies (DPDK, RDMA, SPDK)
+can — often with 100x fewer CPU cycles.
+
+---
+
+## 1. The Problem: CPU Can't Keep Up with I/O Hardware
+
+### The Core Issue
+
+Using I/O devices requires the CPU to orchestrate operations. Traditional kernel-based I/O stacks
+increasingly become **CPU-bound** as hardware gets faster. Prior work already showed that the kernel
+stack for networking consumes roughly **40% of CPU cycles** in OLTP workloads. This paper shows the
+situation is even more severe on modern hardware: **the overhead of the kernel stack prevents modern
+hardware from being utilized to its full potential**.
+
+### CPU Budget Analysis
+
+For a Mellanox ConnectX-7 NIC at 400 Gbit/s handling 64-byte messages:
+
+- Message rate: **280 million** 64-byte messages per second
+- On a 3 GHz CPU with 64 cores: **686 CPU cycles per message** budget
+
+```
+CPU budget = (3e9 cycles x 64 cores) / (280e6 messages) = 686 cycles/message
+```
+
+But what does the kernel stack actually cost?
+
+### Kernel Stack Cost Breakdown (64-byte UDP transfer via `perf`)
+
+| Component | Cycles   | Percent |
+|-----------|----------|---------|
+| Driver    | 549.56   | 13.63%  |
+| IP        | 703.99   | 17.46%  |
+| UDP       | 1,439.02 | 35.69%  |
+| Sockets   | 883.81   | 21.92%  |
+| App       | 31.44    | 0.78%   |
+| Other     | 455.62   | 11.30%  |
+| **Total** | **4,032**| **100%**|
+
+`Nearly every component exceeds the theoretical CPU budget (686 cycles) on its own.`
+
+There is no single bottleneck to fix — the overhead is **distributed across the entire stack**.
+UDP processing alone requires ~1,500 cycles, much of which stems from memory allocations,
+virtual memory manipulation, and data copies.
+
+### Why Incremental Kernel Optimizations Fail
+
+Even advanced kernel interfaces like **io_uring** still cost **3,885 cycles** per message — over
+**5x the budget**. Utilizing the NIC with kernel stacks would require increasing the CPU budget
+sixfold (64 to 320 cores), which is **infeasible** with current hardware.
+
+Meanwhile, kernel-bypass libraries like DPDK and RDMA process messages in approximately
+**40 cycles** — roughly **100x fewer** than the kernel, leaving ample CPU cycles for actual
+application work like hash table lookups (~582 cycles).
+
+### The Trend Gets Worse
+
+With 800 Gbit NICs already available and 1.6 Tbit NICs emerging, stagnating CPU frequencies
+will further shrink the per-message CPU budget. Kernel-bypass becomes even more essential as
+I/O hardware continues to outpace CPU improvements.
+
+---
+
+## 2. Key Findings: Networking
+
+### 2.1 Throughput and Core Scaling
+
+**Experimental setup**: Single-socket AMD EPYC 9554P (64 cores, up to 3.75 GHz), 768 GiB RAM,
+PCIe5 Nvidia ConnectX-7 MT2910 RDMA NIC, connected to a 400 Gbit Intel Tofino2 switch via RoCE.
+
+#### Small messages (64B) — Message-Rate Bound
+
+| Stack       | Cores to saturate 400G link |
+|-------------|----------------------------|
+| DPDK        | **4 cores**                |
+| Kernel      | **Cannot saturate** (even with 64 cores) |
+
+For small messages, fully utilizing the packet rate of modern 400 Gbit NICs is **infeasible**
+with kernel-based networking. DPDK achieves full saturation with just 4 cores.
+
+#### Large messages (8KiB) — Bandwidth Bound
+
+Bandwidth becomes the limiting factor. Kernel stack can eventually utilize the link, but requires
+**16x more cores** than DPDK. Considering ongoing hardware advancements, NICs with 800 Gbit/s
+would require approximately **32 CPU cores**, while a 1.6 Tbit/s link could potentially consume
+**all 64 cores** for kernel-based networking.
+
+### 2.2 Latency
+
+Latency matters for database workloads, particularly OLTP transactions. The paper breaks down
+end-to-end latency into sender, wire, and receiver components using ConnectX-7's hardware
+timestamping.
+
+#### Latency Breakdown (end-to-end, one-way)
+
+| Stack       | Sender  | Wire   | Receiver | **Total**  |
+|-------------|---------|--------|----------|------------|
+| Kernel      | 3.58 us | 1.22 us| 8.97 us  | **13.7 us**|
+| DPDK        | 1.22 us | 1.42 us| ~0.86 us | **3.5 us** |
+| RDMA Write  | ~0.3 us | 1.22 us| ~0.29 us | **1.81 us**|
+
+Key observations:
+
+- **Wire latency is only ~1.2 us** — software processing is the dominant factor
+- Kernel software overhead is **nearly 10x the wire latency**
+- Sender and receiver processing are **unevenly distributed** in the kernel (receiver is 2.5x sender)
+- DPDK reduces total latency to 3.5 us; RDMA to 1.81 us
+- Kernel latency is consistently **up to 10x that of RDMA** across all message sizes
+- The relative overhead of each stack remains **constant and independent of message size** —
+  software processing overhead does not scale with payload
+
+### 2.3 TCP Overhead
+
+TCP is more widely used than UDP in database systems (transactions, client-server communication).
+But TCP adds its own significant overhead on top of the kernel stack.
+
+- **Kernel TCP**: saturating a 400 Gbit link requires nearly **all 64 cores**
+- **F-Stack** (TCP on top of DPDK): despite using kernel-bypass underneath, F-Stack performs
+  similarly to kernel TCP — TCP itself is a major overhead source
+- Optimized TCP implementations like **TAS** still cost ~**2,000 CPU cycles/packet**, which is
+  prohibitive for high-performance databases
+
+`Do databases actually need all TCP/IP guarantees (strict ordering, etc.)? Or can more efficient,`
+`application-specific protocols be designed using database semantics?`
+
+---
+
+## 3. Key Findings: Storage
+
+### 3.1 CPU Cost per I/O
+
+**Setup**: Eight PCIe5 NVMe SSDs (Kioxia KCMY1RUG7T68), each capable of 2.45M random read IOPS,
+aggregating to **19.6M IOPS** (measured 20.65M IOPS). 75 GiB/s storage bandwidth.
+
+#### Theoretical CPU Budget
+
+```
+CPU budget per I/O = (3e9 cycles x 64 cores) / (21.6e6 IOs) = 8,889 cycles/IO
+```
+
+#### Measured CPU Cycles per 4KiB Read I/O
+
+| I/O Stack              | Cycles/IO  | vs Budget  |
+|------------------------|------------|------------|
+| Theoretical budget     | 8,889      | —          |
+| pread                  | **17,493** | 2.0x over  |
+| libaio                 | **10,734** | 1.2x over  |
+| io_uring               | **9,524**  | 1.1x over  |
+| io_uring* (optimized)  | **3,623**  | within     |
+| SPDK                   | **294**    | **30x under** |
+| Custom SPDK            | **183**    | **49x under** |
+
+`* io_uring with buffer registration and fixed file-descriptors enabled`
+
+All kernel-based stacks — pread, libaio, and io_uring — **exceed the theoretical budget** and
+cannot saturate the SSD bandwidth. Even with io_uring optimizations (buffer registration, fixed
+file-descriptors), the kernel stack is still an **order of magnitude** less performant than
+user-space SPDK.
+
+SPDK and a minimal custom SPDK variant complete read I/Os in as few as **294 and 183 cycles**
+respectively — well below the theoretical threshold.
+
+### 3.2 SSD Throughput Scaling
+
+Random read throughput across storage stacks, scaling from 1 to 64 cores with 8 PCIe5 SSDs:
+
+| Stack          | Cores to reach ~21M IOPS | Peak IOPS     |
+|----------------|--------------------------|---------------|
+| SPDK           | **1-2 cores**            | ~21M IOPS     |
+| Custom SPDK    | **1-2 cores**            | ~21M IOPS     |
+| io_uring*      | ~8 cores                 | ~21M IOPS     |
+| io_uring       | ~16 cores                | ~21M IOPS     |
+| libaio         | ~32 cores                | ~18M IOPS     |
+| pread          | 64 cores                 | **never saturates** |
+
+Kernel-bypass storage drivers (SPDK) achieve the SSDs' full IOPS capacity with just 1-2 cores.
+Kernel stacks require many more cores to approach saturation, and `pread` **never reaches the
+hardware limit** even with all 64 cores.
+
+`User-space storage drivers are the only viable option for saturating modern high-performance SSDs.`
+
+---
+
+## 4. Implications and Conclusion
+
+### For Database Systems
+
+Both networking and storage overheads in kernel-based approaches consume substantial CPU resources
+that could otherwise be dedicated to **query processing**. As hardware advances with faster
+networks and storage devices, these overheads become increasingly problematic. Modern database
+systems must adopt kernel-bypass techniques that **minimize per-I/O overhead**, particularly for:
+
+- **Analytical workloads** (OLAP) that process large volumes of data
+- **Latency-critical transactional workloads** (OLTP) where I/O latency directly impacts query performance
+
+### A Call to the Database Community
+
+The paper urges the research community to prioritize kernel-bypass technologies. Current adoption
+is limited — only a few database systems use kernel-bypass effectively:
+
+- **ScyllaDB** — uses Seastar framework with DPDK
+- **Yellowbrick** — elastic data warehouse on Kubernetes
+- **Oracle Exadata** — uses RDMA for storage networking
+
+### Challenges
+
+1. **NIC implementation complexity**: NVMe provides a standardized protocol for SSDs, but NICs
+   lack a universal specification. Each NIC requires custom user-space driver solutions, making
+   kernel-bypass networking harder to implement than storage bypass.
+
+2. **Protocol overhead**: UDP lacks reliability guarantees needed for databases. TCP is robust
+   but expensive even in user-space (~2,000 cycles/packet). Custom application-specific protocols
+   may be needed.
+
+3. **Virtualized NICs as a path forward**: The increasing prevalence of virtualized NICs in the
+   cloud may offer a promising avenue — developing lightweight user-space network libraries
+   tailored to a limited set of standardized virtualized NICs.
+
+---
+
 # BypassD: Enabling fast userspace access to shared SSDs
 
 ## overview
