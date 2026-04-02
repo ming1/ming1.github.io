@@ -610,16 +610,319 @@ guarantees loads are not reordered with other loads. On ARM64, it becomes `dmb o
 
 ## PRP & SGL
 
-### PRP vs. SGL
+Every NVMe I/O command must tell the controller **where the data lives in host
+memory**. The SQE has two 8-byte pointer fields for this purpose — `PRP1` (offset
+0x18) and `PRP2` (offset 0x20) in the command's Data Pointer (DPTR). NVMe defines
+two mechanisms to describe these data buffers: **PRP** and **SGL**.
 
-- PRP describes physical page
+### PRP (Physical Region Page)
 
-- SGL describes segment, introduced after NVMe1.1
+PRP is the original NVMe data pointer mechanism. It works in units of **memory
+pages** (typically 4KB). A PRP entry is simply a 64-bit page-aligned physical
+address (the low bits below the page size encode the offset within the page, but
+only PRP1 may have a non-zero offset).
 
-- NVMe PCIe: Admin command only supports PRP, and I/O command may support
-either one
+The SQE has two PRP fields. How they are used depends on the transfer size:
 
-- NVMe over Fabrics: all commands can only support SGL
+#### Case 1: Transfer fits in one page (≤ 4KB)
+
+Only `PRP1` is needed. `PRP2` is unused.
+
+```
+SQE Command (64 bytes)
+┌─────────────────────────────────────────┐
+│ ...                                     │
+│ PRP1 = 0x0000_0001_4000_0000  ──────────┼──→  [  4KB data page  ]
+│ PRP2 = 0 (unused)                       │
+│ ...                                     │
+└─────────────────────────────────────────┘
+```
+
+Example: a 4KB read. `PRP1` points directly to the single data page.
+
+#### Case 2: Transfer spans two pages (4KB < size ≤ 8KB)
+
+`PRP1` points to the first page, `PRP2` points to the second page.
+
+```
+SQE Command
+┌─────────────────────────────────────────┐
+│ ...                                     │
+│ PRP1 = 0x0000_0001_4000_0000  ──────────┼──→  [  page 0 (4KB)  ]
+│ PRP2 = 0x0000_0001_4000_1000  ──────────┼──→  [  page 1 (4KB)  ]
+│ ...                                     │
+└─────────────────────────────────────────┘
+```
+
+Note: `PRP1` may have a non-zero page offset (e.g., `0x...0800` for a
+2KB-offset start), in which case the first page contributes fewer than
+4KB. `PRP2` must always be page-aligned.
+
+#### Case 3: Transfer spans more than two pages (size > 8KB)
+
+Two PRP entries are not enough. `PRP2` now points to a **PRP List** — a
+page-aligned buffer in host memory containing an array of 8-byte PRP entries,
+each pointing to one data page.
+
+```
+SQE Command                          PRP List (in host memory)
+┌──────────────────────────┐         ┌────────────────────────────┐
+│ ...                      │         │ PRP entry 0 → page 1 addr │──→ [page 1]
+│ PRP1 = page 0 addr ─────┼──→      │ PRP entry 1 → page 2 addr │──→ [page 2]
+│ PRP2 = PRP list addr ───┼─────→   │ PRP entry 2 → page 3 addr │──→ [page 3]
+│ ...                      │         │ ...                        │
+└──────────────────────────┘         │ PRP entry N → page N addr  │──→ [page N]
+                                     └────────────────────────────┘
+ [page 0] ← PRP1 points here directly
+```
+
+`PRP1` still points directly to the first data page. The PRP List in `PRP2`
+describes pages 1 through N. A single 4KB PRP List page can hold 512 entries
+(512 × 8B = 4096B), supporting transfers up to **512 × 4KB = 2MB** (plus
+the first page from PRP1).
+
+Concrete example — a 16KB read at IOVA `0x1_4000_0000`:
+
+```
+SQE:
+  PRP1 = 0x1_4000_0000     → first 4KB data page
+  PRP2 = 0x1_3FFF_F000     → PRP List page
+
+PRP List at 0x1_3FFF_F000:
+  [0] = 0x1_4000_1000      → second 4KB data page
+  [1] = 0x1_4000_2000      → third 4KB data page
+  [2] = 0x1_4000_3000      → fourth 4KB data page
+```
+
+#### PRP constraints
+
+- All PRP entries except `PRP1` must be **page-aligned** (low bits = 0),
+  **including the last page**. The last page doesn't need to be *full* —
+  the controller knows the total transfer length from the NLB field and
+  only reads/writes the required bytes — but its address must still be
+  page-aligned. For example, a 5KB read: `PRP1 = 0x1_4000_0000` (full
+  4KB), `PRP2 = 0x1_4000_1000` (only 1KB used, but page-aligned address).
+- `PRP1` may have a non-zero offset within the page (the transfer starts
+  at this offset)
+- The PRP List buffer itself must be page-aligned
+- Pages don't need to be physically contiguous (that's the whole point)
+- Maximum transfer size is limited by MDTS (Maximum Data Transfer Size) from
+  the Identify Controller data
+
+> **Linux kernel implication: `virt_boundary_mask`**
+>
+> Because every PRP entry (except PRP1) must be page-aligned, the block
+> layer must ensure that **no bio segment crosses a page boundary** — otherwise
+> a single segment would need two PRP entries, breaking the 1:1 mapping.
+> The Linux NVMe driver sets `queue_limits.virt_boundary_mask = PAGE_SIZE - 1`
+> to enforce this: the block layer will split any segment that would cross
+> a page boundary before it reaches the driver. Without this, multi-page I/O
+> requests could contain segments like `[0x...0800, 0x...1800)` spanning two
+> pages, which cannot be described by a single PRP entry.
+>
+> SGL mode does **not** need `virt_boundary_mask` because each SGL descriptor
+> carries an explicit length and can describe arbitrary byte ranges regardless
+> of page boundaries.
+
+### SGL (Scatter Gather List)
+
+SGL was introduced in NVMe 1.1 as a more flexible alternative to PRP. Instead
+of working in fixed page units, SGL describes arbitrary **byte-range segments**
+with explicit address and length.
+
+An SGL descriptor is 16 bytes:
+
+```
+Byte Offset   Field       Size   Description
+─────────────────────────────────────────────────
+ 0x00         Address     8B     Starting address of the data segment
+ 0x08         Length      4B     Length in bytes (not limited to page size)
+ 0x0C         Reserved    3B
+ 0x0F         Type        1B     [7:4] = descriptor type, [3:0] = subtype
+```
+
+Descriptor types (bits 7:4):
+
+| Type value | Name              | Description                           |
+|:----------:|:-----------------:|:--------------------------------------|
+| 0x0        | Data Block        | Points directly to a data buffer      |
+| 0x2        | Segment           | Points to another SGL segment list (chained) |
+| 0x3        | Last Segment      | Points to the last SGL segment list   |
+
+Descriptor subtypes (bits 3:0):
+
+| Subtype value | Name               | Description                                      |
+|:-------------:|:------------------:|:-------------------------------------------------|
+| 0x0           | Address            | `addr` field contains a memory address            |
+| 0x1           | Offset             | `addr` field contains an offset (for in-capsule data in Fabrics) |
+
+The full type byte is `(type << 4) | subtype`. For example, a Data Block
+descriptor with Address subtype has type byte = `(0x0 << 4) | 0x0 = 0x00`,
+and a Last Segment descriptor has type byte = `(0x3 << 4) | 0x0 = 0x30`.
+
+To use SGL mode, the command sets bit 6 of the `flags` field (PSDT = 01b),
+which tells the controller to interpret DPTR as SGL descriptors instead of
+PRP entries.
+
+#### Case 1: Single contiguous buffer
+
+The 16-byte DPTR in the SQE (PRP1 + PRP2 fields, reinterpreted) holds one
+**Data Block** descriptor directly — no indirection needed.
+
+```
+SQE Command (DPTR reinterpreted as SGL)
+┌──────────────────────────────────────────────┐
+│ ...                                          │
+│ DPTR (16B) = SGL Data Block descriptor:      │
+│   addr   = 0x0000_0001_4000_0000             │──→ [  16KB contiguous buffer  ]
+│   length = 16384 (0x4000)                    │
+│   type   = 0x00 (Data Block)                 │
+│ ...                                          │
+└──────────────────────────────────────────────┘
+```
+
+This is the key advantage over PRP: a single descriptor can describe the
+entire transfer regardless of page boundaries. No PRP List needed.
+
+#### Case 2: Non-contiguous buffer (SGL segment list)
+
+When the data buffer is not physically contiguous (e.g., spans a hugepage
+boundary in noiommu mode), a single Data Block descriptor cannot cover the
+entire transfer. The DPTR instead holds a **Last Segment** descriptor that
+points to a list of **Data Block** descriptors in host memory.
+
+Why **Last Segment** and not another type?
+
+- **Data Block** won't work — it points directly to data, but the data is
+  split across non-contiguous memory regions, so one descriptor can't
+  describe it all.
+- **Segment** is for chaining — it implies there's *another* segment list
+  after this one. Wrong here because one list is enough.
+- **Last Segment** is correct — it tells the controller "this is the final
+  (and only) list, no more chaining."
+
+The list address (`0x1_3FFF_E000` below) is the IOVA of a pre-allocated,
+DMA-mapped buffer where the driver writes the Data Block descriptors. In
+the nvme_vfio driver, each in-flight I/O tag has a dedicated 4KB page for
+this purpose (the same page used for PRP Lists in PRP mode).
+
+```
+SQE Command (DPTR)                    SGL Segment List at 0x1_3FFF_E000
+┌──────────────────────────┐          ┌──────────────────────────────────────────┐
+│ ...                      │          │ Descriptor 0 (Data Block):               │
+│ DPTR = Last Segment desc:│          │   addr   = 0x1_4000_0000                 │
+│   addr = 0x1_3FFF_E000 ──┼─────→    │   length = 3072 (3KB)                    │
+│   length = 32 (2 × 16B)  │          │   type   = 0x00 (Data Block | Address)───┼──→ [3KB data]
+│   type = 0x30            │          │                                          │
+│   (Last Segment|Address) │          │ Descriptor 1 (Data Block):               │
+│ ...                      │          │   addr   = 0x1_4200_0000                 │
+└──────────────────────────┘          │   length = 13312 (13KB)                  │
+                                      │   type   = 0x00 (Data Block | Address)───┼──→ [13KB data]
+                                      └──────────────────────────────────────────┘
+```
+
+Type byte breakdown for each descriptor:
+
+| Descriptor          | Type (7:4) | Subtype (3:0) | Type byte | Meaning                              |
+|:--------------------|:----------:|:-------------:|:---------:|:-------------------------------------|
+| DPTR (in SQE)       | 0x3        | 0x0           | **0x30**  | Last Segment, addr = memory address  |
+| List entry 0        | 0x0        | 0x0           | **0x00**  | Data Block, addr = memory address    |
+| List entry 1        | 0x0        | 0x0           | **0x00**  | Data Block, addr = memory address    |
+
+The **Last Segment** descriptor in the DPTR tells the controller: "my `addr`
+points to the final segment list, and `length` is the total size of that list
+in bytes (number of descriptors × 16)." The controller reads the list and
+follows each Data Block descriptor to the actual data buffers.
+
+This example shows a 16KB transfer split across a hugepage boundary:
+the first 3KB is at the end of one hugepage, the remaining 13KB is at
+the start of the next hugepage (at a different physical address).
+
+#### Case 3: Chained SGL segment lists (Segment descriptor)
+
+When the number of non-contiguous data segments exceeds what a single
+segment list can hold, SGL lists can be **chained** using the **Segment**
+descriptor (type byte `0x20`).
+
+The key rule: a list pointed to by a **Segment** descriptor is not the
+final list, so its last entry **must** be a chaining descriptor (Segment
+or Last Segment) to continue the chain. A list pointed to by a **Last
+Segment** descriptor is the final list, so it must contain **only** Data
+Block descriptors — no further chaining.
+
+Example — a 64KB transfer split across 4 non-contiguous 16KB segments,
+with at most 3 descriptors per list:
+
+```
+SQE Command (DPTR)
+┌──────────────────────────┐
+│ DPTR = Segment desc:     │         List A at 0x1_3FFF_E000 (3 entries, 48 bytes)
+│   addr = 0x1_3FFF_E000 ──┼─────→  ┌──────────────────────────────────────────┐
+│   length = 48 (3 × 16B)  │        │ [0] Data Block:                          │
+│   type = 0x20            │        │     addr=0x1_4000_0000, len=16KB    ─────┼──→ [seg 0]
+│   (Segment | Address)    │        │ [1] Data Block:                          │
+└──────────────────────────┘        │     addr=0x1_4400_0000, len=16KB    ─────┼──→ [seg 1]
+                                    │ [2] Last Segment:                        │
+                                    │     addr=0x1_3FFF_D000, len=32 (2×16B)   │
+                                    │     type=0x30 (Last Segment | Address) ──┼──┐
+                                    └──────────────────────────────────────────┘  │
+                                                                                  │
+                                     List B at 0x1_3FFF_D000 (2 entries, 32 bytes)│
+                                    ┌──────────────────────────────────────────┐  │
+                                    │ [0] Data Block:                          │←─┘
+                                    │     addr=0x1_4800_0000, len=16KB    ─────┼──→ [seg 2]
+                                    │ [1] Data Block:                          │
+                                    │     addr=0x1_4C00_0000, len=16KB    ─────┼──→ [seg 3]
+                                    └──────────────────────────────────────────┘
+```
+
+Type byte breakdown:
+
+| Descriptor             | Type (7:4) | Subtype (3:0) | Type byte | Role                   |
+|:-----------------------|:----------:|:-------------:|:---------:|:-----------------------|
+| DPTR (in SQE)          | 0x2        | 0x0           | **0x20**  | Segment — not the last list, chaining continues |
+| List A [0]             | 0x0        | 0x0           | **0x00**  | Data Block — actual data |
+| List A [1]             | 0x0        | 0x0           | **0x00**  | Data Block — actual data |
+| List A [2]             | 0x3        | 0x0           | **0x30**  | Last Segment — points to the final list |
+| List B [0]             | 0x0        | 0x0           | **0x00**  | Data Block — actual data |
+| List B [1]             | 0x0        | 0x0           | **0x00**  | Data Block — actual data |
+
+Why **Segment** in the DPTR (not Last Segment)? Because List A is not
+the final list — its last entry chains to List B. The DPTR must use
+Segment (`0x20`) to tell the controller: "this list may contain further
+chaining descriptors, keep following." List A's last entry then uses
+Last Segment (`0x30`) to point to List B, telling the controller:
+"List B is the final list, all entries there are Data Blocks."
+
+If there were three or more lists, the intermediate lists would each
+end with a Segment descriptor pointing to the next list, and only the
+very last list would be pointed to by a Last Segment descriptor.
+
+### PRP vs. SGL comparison
+
+| Aspect              | PRP                                | SGL                                   |
+|:---------------------|:------------------------------------|:--------------------------------------|
+| Granularity         | Fixed page size (e.g., 4KB)        | Arbitrary byte ranges                 |
+| Descriptor size     | 8 bytes (just an address)          | 16 bytes (address + length + type)    |
+| Alignment           | Page-aligned (except PRP1)         | No alignment requirement              |
+| Multi-page I/O      | Requires PRP List                  | Single descriptor if contiguous       |
+| Page boundary       | Every page needs its own entry     | One segment can span pages            |
+| Introduced          | NVMe 1.0                           | NVMe 1.1                             |
+| Admin commands      | Required (PRP only)                | Not supported                         |
+| NVMe PCIe I/O       | Always supported                   | Optional (check Identify Controller)  |
+| NVMe over Fabrics   | Not supported                      | Required (SGL only)                   |
+
+### When to use which
+
+- **Admin commands**: PRP only (NVMe spec requirement)
+- **NVMe PCIe I/O commands**: PRP is always supported; SGL is optional and
+  must be checked via the `SGLS` field in Identify Controller data
+- **NVMe over Fabrics**: SGL only (all commands)
+
+For PCIe I/O, SGL is preferred when available because it avoids the PRP List
+overhead for multi-page transfers and handles non-page-aligned buffers more
+naturally. However, many NVMe SSDs (especially older ones) only support PRP
+for I/O commands.
 
 
 ## NVMe over Fabrics
