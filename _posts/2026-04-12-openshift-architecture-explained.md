@@ -13,6 +13,7 @@ tags: [openshift, kubernetes, containers, gpu, llm, inference, vllm, kserve, ai,
 > - **Sections 2-7** cover OpenShift fundamentals (architecture, nodes, operators, networking, security)
 > - **Sections 8-9** cover OpenShift AI for Large Model Inference (KServe, vLLM, GPU Operator, autoscaling)
 > - **Sections 10-11** walk through a complete deployment example with multi-GPU support
+> - **Section 15** shows how to run OpenShift locally on a Fedora VM (MicroShift, CRC, OKD)
 > - If you already know Kubernetes, skip to **Section 6.4 (Operators)** — that's where OpenShift diverges.
 > - If you only care about LLM serving, skip to **Section 8**.
 
@@ -1511,7 +1512,268 @@ it uses RDMA over InfiniBand (high-bandwidth network) to minimize latency.
 
 ---
 
-## 15. References
+## 15. Appendix: Running OpenShift Locally on Fedora
+
+You don't need a data center to try OpenShift. Here are three ways to run it
+on a single Fedora machine, from lightest to heaviest.
+
+### 15.1 Choosing the Right Option
+
+```
+  ┌──────────────────────────────────────────────────────────────────┐
+  │               Which Local OpenShift Is Right for You?             │
+  │                                                                   │
+  │  Feature              MicroShift       CRC (OpenShift)  CRC (OKD) │
+  │  ──────────           ──────────       ───────────────  ───────── │
+  │  Min RAM              2 GB             9 GB             9 GB      │
+  │  Min CPU              2 cores          4 cores          4 cores   │
+  │  Min Disk             ~2 GB            35 GB            35 GB     │
+  │  Runs in VM?          No (on host)     Yes (libvirt)    Yes       │
+  │  Red Hat account?     No               Yes (free)       No        │
+  │  Web Console?         No               Yes              Yes       │
+  │  OperatorHub / OLM?   No               Yes              Yes       │
+  │  Full OpenShift API?  Subset (core)    Full             Full      │
+  │  Startup time         ~1-2 min         ~15-20 min       ~15-20 min│
+  │  Best for             Edge, learning   Full dev/test    Dev/test  │
+  │                       basic K8s        with operators   no sub    │
+  └──────────────────────────────────────────────────────────────────┘
+```
+
+**Decision guide:**
+- Just want to learn pods/deployments/services? → **MicroShift**
+- Need the full web console, OperatorHub, or to test KServe/vLLM? → **CRC (OpenShift)**
+- Same as above but no Red Hat account? → **CRC (OKD)**
+
+### 15.2 Option A: MicroShift (Lightest)
+
+MicroShift packages the Kubernetes API server, etcd, kubelet, and CRI-O into
+a **single systemd service**. It runs directly on the host — no nested VM.
+
+> **Note**: MicroShift is officially supported on RHEL 9. On Fedora, it runs
+> via community COPR builds or the upstream quick-install script. It works
+> well but is not covered by Red Hat support.
+
+**Install on Fedora:**
+
+```bash
+# Method 1: Upstream quick-install script (recommended)
+# Detects your Fedora version automatically
+curl -s https://microshift-io.github.io/microshift/quickrpm.sh | sudo bash
+
+# Method 2: COPR repository (if Method 1 doesn't work)
+# Check https://copr.fedorainfracloud.org/coprs/g/redhat-et/microshift/
+# for available Fedora versions before enabling
+sudo dnf copr enable -y @redhat-et/microshift
+sudo dnf install -y microshift openshift-clients
+```
+
+**Configure firewall:**
+
+```bash
+# Allow pod and service network traffic
+sudo firewall-cmd --permanent --zone=trusted --add-source=10.42.0.0/16
+sudo firewall-cmd --permanent --zone=trusted --add-source=10.43.0.0/16
+
+# Allow API server, HTTP, and HTTPS
+sudo firewall-cmd --permanent --add-port=6443/tcp
+sudo firewall-cmd --permanent --add-port=80/tcp
+sudo firewall-cmd --permanent --add-port=443/tcp
+sudo firewall-cmd --reload
+```
+
+**Start and verify:**
+
+```bash
+# Start MicroShift
+sudo systemctl enable --now microshift
+
+# Watch startup progress (Ctrl+C to exit)
+sudo journalctl -u microshift -f
+
+# Set up kubeconfig for your user
+mkdir -p ~/.kube
+sudo cp /var/lib/microshift/resources/kubeadmin/kubeconfig ~/.kube/config
+sudo chown $USER:$USER ~/.kube/config
+chmod 600 ~/.kube/config
+
+# Verify — wait 1-2 minutes for all pods to start
+oc get nodes
+oc get pods -A
+```
+
+**Expected output when ready:**
+
+```
+  $ oc get nodes
+  NAME        STATUS   ROLES                         AGE   VERSION
+  fedora-vm   Ready    control-plane,master,worker    3m    v1.28.x
+
+  $ oc get pods -A
+  NAMESPACE                  NAME                         READY   STATUS
+  openshift-dns              dns-default-xxxxx            2/2     Running
+  openshift-dns              node-resolver-xxxxx          1/1     Running
+  openshift-ingress          router-default-xxxxx         1/1     Running
+  openshift-ovn-kubernetes   ovnkube-master-xxxxx         4/4     Running
+  openshift-ovn-kubernetes   ovnkube-node-xxxxx           1/1     Running
+  openshift-service-ca       service-ca-xxxxx             1/1     Running
+```
+
+**Deploy a test app:**
+
+```bash
+# Create a project and deploy nginx
+oc new-project test
+oc create deployment hello --image=nginx --port=80
+oc expose deployment hello --port=80
+oc expose service hello --hostname=hello.test.example.com
+
+# Verify
+oc get pods -n test
+curl -H "Host: hello.test.example.com" http://localhost
+```
+
+### 15.3 Option B: OpenShift Local / CRC (Full OpenShift)
+
+CRC runs a **full single-node OpenShift cluster** inside a libvirt VM.
+You get the web console, OperatorHub, and the complete OpenShift API.
+
+> **Requirements**: 4 CPU cores, 9 GB free RAM (16 GB total recommended),
+> 35 GB disk, and a free [Red Hat Developer account](https://developers.redhat.com)
+> for the pull secret.
+
+**Install on Fedora:**
+
+```bash
+# Step 1: Install virtualization dependencies
+sudo dnf install -y libvirt NetworkManager qemu-kvm
+
+# Step 2: Download CRC from Red Hat Console
+#   Go to: https://console.redhat.com/openshift/create/local
+#   Download:
+#     - crc-linux-amd64.tar.xz   (the tool)
+#     - pull-secret.txt           (click "Copy pull secret")
+
+# Step 3: Extract and install
+cd ~/Downloads
+tar xvf crc-linux-amd64.tar.xz
+mkdir -p ~/.local/bin
+install crc-linux-*-amd64/crc ~/.local/bin/crc
+
+# Make sure ~/.local/bin is in PATH
+export PATH="$HOME/.local/bin:$PATH"
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+```
+
+**Setup and start:**
+
+```bash
+# One-time setup: configures libvirt, downloads VM image (~4 GB)
+crc setup
+
+# Start the cluster (takes ~15-20 minutes first time)
+# Paste your pull secret when prompted
+crc start
+
+# After startup, CRC prints login credentials:
+#   developer / developer  (regular user)
+#   kubeadmin / <random>    (admin user)
+```
+
+**Access the cluster:**
+
+```bash
+# Set up oc CLI
+eval $(crc oc-env)
+
+# Login as developer
+oc login -u developer -p developer \
+  https://api.crc.testing:6443
+
+# Login as admin
+oc login -u kubeadmin -p $(crc console --credentials \
+  | grep kubeadmin | awk -F"'" '{print $2}') \
+  https://api.crc.testing:6443
+
+# Open web console in browser
+crc console
+```
+
+**Lifecycle commands:**
+
+```bash
+crc stop       # Shut down the VM (preserves state)
+crc start      # Restart (much faster after first time)
+crc delete     # Delete the VM entirely
+crc status     # Check if running
+```
+
+### 15.4 Option C: OKD via CRC (No Red Hat Subscription)
+
+OKD is the **community distribution** of OpenShift, built on Fedora CoreOS.
+Same CRC tool, but uses the `okd` preset — no pull secret needed.
+
+```bash
+# Install CRC (same as Option B steps 1-3 above)
+sudo dnf install -y libvirt NetworkManager qemu-kvm
+# ... download and extract crc as shown in Option B ...
+
+# Set OKD preset BEFORE running setup
+crc config set preset okd
+
+# Optional: disable telemetry
+crc config set consent-telemetry no
+
+# Setup and start (no pull secret needed)
+crc setup
+crc start
+
+# Access
+eval $(crc oc-env)
+oc login -u developer -p developer https://api.crc.testing:6443
+```
+
+### 15.5 Comparison: What Runs Where
+
+```
+  What's Inside Each Option:
+  ──────────────────────────
+
+  MicroShift                    CRC (OpenShift / OKD)
+  ──────────                    ─────────────────────
+  ┌──────────────────────┐      ┌──────────────────────────────┐
+  │  Your Fedora Host     │      │  Your Fedora Host             │
+  │                       │      │                               │
+  │  ┌─────────────────┐  │      │  ┌───────────────────────┐    │
+  │  │ microshift.service│  │      │  │  libvirt VM (RHCOS)    │   │
+  │  │                  │  │      │  │                        │   │
+  │  │ • API server     │  │      │  │  • Full control plane  │   │
+  │  │ • etcd           │  │      │  │  • etcd (3-member sim) │   │
+  │  │ • kubelet        │  │      │  │  • Web console         │   │
+  │  │ • CRI-O          │  │      │  │  • OperatorHub / OLM   │   │
+  │  │ • OVN networking │  │      │  │  • Image registry      │   │
+  │  │ • CoreDNS        │  │      │  │  • Prometheus/Grafana   │   │
+  │  │                  │  │      │  │  • Router (HAProxy)    │   │
+  │  │ No: OLM, console,│  │      │  │  • CRI-O + kubelet     │   │
+  │  │ registry, Prom.  │  │      │  │                        │   │
+  │  └─────────────────┘  │      │  └───────────────────────┘    │
+  └──────────────────────┘      └──────────────────────────────┘
+
+  ~200 MB memory overhead         ~8 GB memory overhead
+```
+
+### 15.6 Troubleshooting
+
+| Problem | Cause | Fix |
+|---------|-------|-----|
+| MicroShift COPR: "Chroot not found" | COPR doesn't have a build for your Fedora version | Use the quick-install script instead: `curl -s https://microshift-io.github.io/microshift/quickrpm.sh \| sudo bash` |
+| MicroShift: pods stuck in `ContainerCreating` | CRI-O can't pull images from `registry.redhat.io` | Trust the GPG key: `sudo podman image trust set -f /etc/pki/rpm-gpg/RPM-GPG-KEY-redhat-release registry.access.redhat.com` |
+| CRC: `crc start` hangs | Not enough RAM available | Close other apps; ensure 9 GB free RAM; check with `free -h` |
+| CRC: libvirt permission denied | User not in libvirt group | `sudo usermod -aG libvirt $USER` then log out and back in |
+| CRC: DNS not resolving `*.crc.testing` | NetworkManager not managing DNS | Ensure NetworkManager is running: `sudo systemctl enable --now NetworkManager` |
+
+---
+
+## 16. References
 
 - [Red Hat OpenShift Architecture Documentation](https://docs.redhat.com/en/documentation/openshift_container_platform/4.14/pdf/architecture/OpenShift_Container_Platform-4.14-Architecture-en-US.pdf)
 - [OpenShift AI — Serving Large Models](https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/2.22/html/serving_models/serving-large-models_serving-large-models)
@@ -1523,6 +1785,11 @@ it uses RDMA over InfiniBand (high-bandwidth network) to minimize latency.
 - [NVIDIA GPU Architecture on OpenShift](https://docs.redhat.com/en/documentation/openshift_container_platform/4.16/html/hardware_accelerators/nvidia-gpu-architecture)
 - [OpenShift AI with vLLM and Spring AI](https://piotrminkowski.com/2025/05/12/openshift-ai-with-vllm-and-spring-ai/)
 - [OpenShift AI MLPerf Benchmarks](https://www.redhat.com/en/blog/accelerating-generative-ai-adoption-red-hat-openshift-ai-achieves-impressive-results-mlperf-inference-benchmarks-vllm-runtime)
+- [MicroShift Upstream — GitHub](https://github.com/microshift-io/microshift)
+- [Run MicroShift on Fedora — ComputingForGeeks](https://computingforgeeks.com/run-microshift-rhel-fedora/)
+- [CRC Installation Documentation](https://crc.dev/docs/installing/)
+- [OKD on Fedora with CRC — Fedora Magazine](https://fedoramagazine.org/okd-on-fedora-workstation-with-crc/)
+- [Red Hat OpenShift Local](https://developers.redhat.com/products/openshift-local)
 
 ---
 
