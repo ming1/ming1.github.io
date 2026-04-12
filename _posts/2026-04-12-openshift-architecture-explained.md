@@ -8,13 +8,196 @@ tags: [openshift, kubernetes, containers, gpu, llm, inference, vllm, kserve, ai,
 {:toc}
 
 > **How to read this article:**
-> - **Sections 1-6** cover OpenShift fundamentals (architecture, nodes, operators, networking, security)
-> - **Sections 7-8** cover OpenShift AI for Large Model Inference (KServe, vLLM, GPU Operator, autoscaling)
-> - **Sections 9-10** walk through a complete deployment example with multi-GPU support
-> - If you already know Kubernetes, skip to **Section 5.4 (Operators)** — that's where OpenShift diverges.
-> - If you only care about LLM serving, skip to **Section 7**.
+> - **Section 0** defines all key terms used throughout
+> - **Section 1** explains Kubernetes — the foundation OpenShift is built on
+> - **Sections 2-7** cover OpenShift fundamentals (architecture, nodes, operators, networking, security)
+> - **Sections 8-9** cover OpenShift AI for Large Model Inference (KServe, vLLM, GPU Operator, autoscaling)
+> - **Sections 10-11** walk through a complete deployment example with multi-GPU support
+> - If you already know Kubernetes, skip to **Section 6.4 (Operators)** — that's where OpenShift diverges.
+> - If you only care about LLM serving, skip to **Section 8**.
 
-## 1. What Is OpenShift? (The 30-Second Version)
+## 0. Glossary: Key Terms
+
+Before diving in, here are the main terms used throughout this article:
+
+### Platform & Infrastructure
+
+| Term | What It Is | Analogy |
+|------|-----------|---------|
+| **Kubernetes (K8s)** | Open-source system that automates deploying, scaling, and managing containers across a cluster of machines | A robot factory manager that decides which machine runs which task |
+| **OpenShift** | Red Hat's enterprise Kubernetes distribution — K8s + security + tooling + support | Kubernetes in a hardened, ready-to-use package |
+| **Container** | A lightweight, isolated process that bundles an application with its dependencies | A shipping container — same box runs anywhere |
+| **Pod** | The smallest deployable unit in Kubernetes; one or more containers sharing network and storage | An apartment — containers are the rooms inside |
+| **Node** | A physical or virtual machine in the cluster that runs pods | A server in the data center |
+| **Cluster** | A set of nodes managed together by Kubernetes | The entire data center, managed as one unit |
+| **Namespace** | A virtual partition inside a cluster for isolating resources | A folder that keeps one team's work separate from another |
+
+### OpenShift-Specific
+
+| Term | What It Is |
+|------|-----------|
+| **RHCOS** | Red Hat Enterprise Linux CoreOS — an immutable, container-optimized OS on every OpenShift node |
+| **CRI-O** | Container Runtime Interface for OCI — the lightweight container runtime OpenShift uses (replaces Docker) |
+| **Operator** | A custom controller that automates the management of an application or platform component using the Watch → Compare → Act loop |
+| **CVO** | Cluster Version Operator — manages OpenShift cluster upgrades |
+| **MCO** | MachineConfig Operator — manages OS-level configuration across all nodes |
+| **OLM** | Operator Lifecycle Manager — installs, upgrades, and manages operators |
+| **SCC** | Security Context Constraints — OpenShift's rules for what a container is allowed to do (run as root, access host network, etc.) |
+| **Route** | OpenShift's way to expose a service to the internet with TLS termination (similar to Kubernetes Ingress) |
+| **ImageStream** | An OpenShift abstraction that tracks container image tags and can trigger rebuilds/redeployments on change |
+
+### AI / LLM Inference
+
+| Term | What It Is |
+|------|-----------|
+| **LLM** | Large Language Model — an AI model (like Llama, GPT) trained on text to generate human-like responses |
+| **Inference** | Using a trained model to generate predictions or responses (as opposed to training it) |
+| **vLLM** | A high-performance LLM inference engine; the default serving runtime in OpenShift AI |
+| **KServe** | A Kubernetes-native platform for serving ML models; orchestrates model deployment, scaling, and routing |
+| **Knative** | A Kubernetes framework for serverless workloads; provides scale-to-zero and autoscaling for KServe |
+| **Istio** | A service mesh that handles traffic routing, mTLS encryption, and observability between services |
+| **KEDA** | Kubernetes Event-Driven Autoscaling — scales pods based on custom metrics (e.g., inference latency) |
+| **InferenceService** | A KServe custom resource (CR) that defines WHAT model to serve and WHERE to find it |
+| **ServingRuntime** | A KServe custom resource (CR) that defines HOW to serve a model (which engine, what arguments) |
+
+### GPU & Hardware
+
+| Term | What It Is |
+|------|-----------|
+| **GPU** | Graphics Processing Unit — specialized hardware for parallel computation; essential for LLM inference |
+| **NVIDIA GPU Operator** | An operator that automates GPU driver installation, device plugin, and monitoring on OpenShift |
+| **NFD** | Node Feature Discovery — scans node hardware and labels nodes (e.g., "this node has an NVIDIA GPU") |
+| **DCGM** | Data Center GPU Manager — NVIDIA's tool for GPU monitoring; exports metrics to Prometheus |
+| **MIG** | Multi-Instance GPU — hardware-level GPU partitioning (A100/H100+) for true memory isolation |
+| **NCCL** | NVIDIA Collective Communications Library — handles GPU-to-GPU data transfer for multi-GPU inference |
+| **NVLink** | High-speed GPU-to-GPU interconnect within a single node |
+| **Tensor Parallelism (TP)** | Splitting each model layer across multiple GPUs — each GPU holds a slice of every layer |
+| **Pipeline Parallelism (PP)** | Splitting model layers across GPUs — each GPU holds entire layers but only a subset |
+
+### Model Precision
+
+| Term | What It Is |
+|------|-----------|
+| **FP32** | 32-bit floating point — full precision, 4 GB per billion parameters |
+| **FP16 / BF16** | 16-bit floating point — half precision, 2 GB per billion parameters, negligible quality loss |
+| **INT8** | 8-bit integer quantization — 1 GB per billion parameters, minimal quality loss |
+| **INT4 (GPTQ/AWQ)** | 4-bit integer quantization — 0.5 GB per billion parameters, noticeable loss on hard tasks |
+| **PagedAttention** | vLLM's memory management technique — allocates GPU memory in small pages (like OS virtual memory) instead of large contiguous blocks, reducing waste from ~60% to ~5% |
+| **KV-cache** | Key-Value cache — stores intermediate attention computation results so the model doesn't recompute them for each new token |
+| **Continuous Batching** | Processing inference requests as they arrive rather than waiting for a fixed batch to fill — keeps GPUs busy |
+
+---
+
+## 1. Kubernetes: The Foundation
+
+Before understanding OpenShift, you need to understand **Kubernetes** — the
+open-source project that OpenShift is built on.
+
+### 1.1 The Problem Kubernetes Solves
+
+Imagine you have an application packaged as a container. Running one container
+on one machine is easy. But in production you need:
+
+- Multiple copies for high availability
+- Spread across machines in case one fails
+- Automatic restarts when a container crashes
+- Rolling updates without downtime
+- Resource limits so one app doesn't starve another
+
+Doing all this by hand is error-prone. Kubernetes automates it.
+
+### 1.2 Core Idea: Desired State
+
+Kubernetes is a **desired-state system**. You tell it *what you want* (not
+*how to do it*), and it figures out the rest:
+
+```
+  You say:                         Kubernetes does:
+  ─────────                        ─────────────────
+  "Run 3 copies of my app"        Find 3 nodes with enough CPU/memory
+                                   Start containers on them
+                                   Monitor them forever
+
+  "Expose it on port 443"         Create a load balancer
+                                   Route traffic to healthy pods
+
+  "Update to version 2.0"         Start new pods with v2.0
+                                   Wait until healthy
+                                   Stop old v1.0 pods
+                                   (zero-downtime rolling update)
+```
+
+### 1.3 Architecture in One Diagram
+
+```
+  ┌──────────────────────────────────────────────────────────────┐
+  │                   Kubernetes Cluster                          │
+  │                                                               │
+  │  ┌─────────────────── Control Plane ───────────────────────┐  │
+  │  │                                                          │  │
+  │  │  ┌────────────┐  ┌──────┐  ┌───────────┐  ┌──────────┐  │  │
+  │  │  │ API Server  │  │ etcd │  │ Scheduler  │  │Controller│  │  │
+  │  │  │ (front door)│  │(state│  │(picks nodes│  │ Manager  │  │  │
+  │  │  │             │  │ store│  │ for pods)  │  │(fix drift│  │  │
+  │  │  │             │  │  )   │  │            │  │  )       │  │  │
+  │  │  └────────────┘  └──────┘  └───────────┘  └──────────┘  │  │
+  │  └──────────────────────────────────────────────────────────┘  │
+  │                             │                                  │
+  │                   "run this pod"                                │
+  │                             │                                  │
+  │         ┌───────────────────┼───────────────────┐              │
+  │         ▼                   ▼                   ▼              │
+  │  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐        │
+  │  │ Worker Node  │    │ Worker Node  │    │ Worker Node  │       │
+  │  │              │    │              │    │              │       │
+  │  │ ┌─────────┐  │    │ ┌─────────┐  │    │ ┌─────────┐  │      │
+  │  │ │ kubelet  │  │    │ │ kubelet  │  │    │ │ kubelet  │  │     │
+  │  │ └─────────┘  │    │ └─────────┘  │    │ └─────────┘  │      │
+  │  │ ┌────┐┌────┐ │    │ ┌────┐┌────┐ │    │ ┌────┐       │      │
+  │  │ │PodA││PodB│ │    │ │PodC││PodD│ │    │ │PodE│       │      │
+  │  │ └────┘└────┘ │    │ └────┘└────┘ │    │ └────┘       │      │
+  │  └─────────────┘    └─────────────┘    └─────────────┘        │
+  └──────────────────────────────────────────────────────────────┘
+```
+
+### 1.4 Key Kubernetes Objects
+
+| Object | What It Does | Example |
+|--------|-------------|---------|
+| **Pod** | Runs one or more containers | A vLLM inference server |
+| **Deployment** | Manages N replicas of a pod, handles updates | "Run 3 copies of my web app" |
+| **Service** | Stable network endpoint for a set of pods | Internal load balancer at `my-app:8080` |
+| **Ingress** | Exposes a Service to outside traffic | Route `api.example.com` → Service |
+| **ConfigMap** | Key-value config injected into pods | Database URLs, feature flags |
+| **Secret** | Like ConfigMap but for sensitive data | Passwords, API keys, TLS certs |
+| **Namespace** | Isolates resources between teams | `team-a` can't see `team-b`'s pods |
+| **PersistentVolume (PV)** | Storage that outlives a pod | Database files, model weights |
+| **Custom Resource (CR)** | User-defined object type — extends the API | `InferenceService`, `MachineConfig` |
+
+### 1.5 What Kubernetes Does NOT Give You
+
+Kubernetes is powerful but deliberately minimal. Out of the box, it does **not**
+provide:
+
+```
+  What's Missing in Vanilla K8s        Who Fills the Gap
+  ─────────────────────────────        ──────────────────
+  An operating system for nodes         → RHCOS (OpenShift)
+  A container image registry            → Quay / OpenShift Registry
+  A web console / UI                    → OpenShift Console
+  CI/CD pipelines                       → Tekton / OpenShift Pipelines
+  OAuth / enterprise authentication     → OpenShift OAuth
+  Automated cluster upgrades            → CVO Operator (OpenShift)
+  GPU driver management                 → NVIDIA GPU Operator
+  AI model serving framework            → KServe / OpenShift AI
+  Security defaults (non-root, SCCs)    → OpenShift SCCs
+```
+
+This is exactly why OpenShift exists — it fills these gaps.
+
+---
+
+## 2. What Is OpenShift?
 
 **OpenShift** is Red Hat's enterprise Kubernetes platform. Think of it as
 **Kubernetes + batteries included**: it takes the raw power of Kubernetes and
@@ -50,9 +233,9 @@ reliably at scale from day one.
 
 ---
 
-## 2. Motivation: Why OpenShift?
+## 3. Motivation: Why OpenShift?
 
-### 2.1 The Problem
+### 3.1 The Problem
 
 Running containers in production is hard. A typical team faces:
 
@@ -64,7 +247,7 @@ Running containers in production is hard. A typical team faces:
 | **Consistency** | Dev, staging, prod must behave the same |
 | **GPU/AI Workloads** | How do you schedule LLMs onto GPU nodes efficiently? |
 
-### 2.2 OpenShift's Answer
+### 3.2 OpenShift's Answer
 
 OpenShift solves these by providing an **integrated, self-managing platform**:
 
@@ -93,7 +276,7 @@ OpenShift solves these by providing an **integrated, self-managing platform**:
 
 ---
 
-## 3. Architecture Overview: The Layer Cake
+## 4. Architecture Overview: The Layer Cake
 
 OpenShift is built in layers. Each layer builds on the one below it:
 
@@ -146,7 +329,7 @@ OpenShift is built in layers. Each layer builds on the one below it:
 
 ---
 
-## 4. Node Types
+## 5. Node Types
 
 An OpenShift cluster has different kinds of machines:
 
@@ -198,9 +381,9 @@ cluster but still want OpenShift's operator-driven management.
 
 ---
 
-## 5. Building Blocks: Deep Dive
+## 6. Building Blocks: Deep Dive
 
-### 5.1 RHCOS — Red Hat Enterprise Linux CoreOS
+### 6.1 RHCOS — Red Hat Enterprise Linux CoreOS
 
 **What**: An immutable, container-optimized Linux OS that runs on every node.
 
@@ -252,7 +435,7 @@ package, changes a config, forgets to document it. RHCOS prevents this:
   Move to next node
 ```
 
-### 5.2 CRI-O — Container Runtime
+### 6.2 CRI-O — Container Runtime
 
 **What**: The container runtime that actually runs containers on each node.
 
@@ -281,7 +464,7 @@ standard gRPC API that kubelet uses to:
      │  "Stop container Z"   │
 ```
 
-### 5.3 Kubernetes Core Components
+### 6.3 Kubernetes Core Components
 
 These are the "brain" running on control plane nodes:
 
@@ -317,7 +500,7 @@ These are the "brain" running on control plane nodes:
 | **kube-scheduler** | Assigns pods to nodes | Considers CPU, memory, GPU, affinity, taints |
 | **kube-controller-manager** | Reconciliation loops | "Desired state → Actual state" for deployments, replicasets, etc. |
 
-### 5.4 Operators — The Heart of OpenShift
+### 6.4 Operators — The Heart of OpenShift
 
 **What**: An Operator is a custom controller that watches a Custom Resource (CR)
 and takes action to make the real world match the desired state.
@@ -401,7 +584,7 @@ follow the same Watch → Compare → Act loop.
 | **OpenShift AI Operator** | AI/ML platform (KServe, model serving) |
 | **Operator Lifecycle Manager (OLM)** | Installs and manages other operators |
 
-### 5.5 Networking
+### 6.5 Networking
 
 OpenShift networking handles three types of traffic:
 
@@ -435,7 +618,7 @@ exposes a Service to the outside world with TLS termination:
   └──────────────┘     └─────────────┘     └──────────┘
 ```
 
-### 5.6 Image Registry
+### 6.6 Image Registry
 
 OpenShift includes a built-in container image registry:
 
@@ -462,7 +645,7 @@ OpenShift includes a built-in container image registry:
 **ImageStreams** are another OpenShift-specific concept: they track image tags
 and can trigger builds/deployments when a new image is pushed.
 
-### 5.7 Security Model
+### 6.7 Security Model
 
 OpenShift has a layered security model:
 
@@ -495,7 +678,7 @@ and your *application* pods (e.g., vLLM) still run as non-root.
 
 ---
 
-## 6. Observability Stack
+## 7. Observability Stack
 
 OpenShift ships with integrated monitoring — you don't install Prometheus
 separately; it's there from day one.
@@ -525,11 +708,11 @@ separately; it's there from day one.
 the NVIDIA DCGM Exporter feeds GPU metrics (utilization, memory, temperature,
 power) into Prometheus, and vLLM exposes inference-specific metrics (tokens/sec,
 queue depth, latency). Both are visible in Grafana dashboards out of the box.
-This is what makes SLO-driven autoscaling (Section 8) possible.
+This is what makes SLO-driven autoscaling (Section 9) possible.
 
 ---
 
-## 7. OpenShift AI: The AI/ML Platform Layer
+## 8. OpenShift AI: The AI/ML Platform Layer
 
 OpenShift AI (formerly Red Hat OpenShift Data Science) adds an AI/ML platform
 on top of OpenShift. This is where Large Model Inference lives.
@@ -547,7 +730,7 @@ OpenShift AI provides **two model serving platforms**:
        └── This article focuses on single-model serving
 ```
 
-### 7.1 OpenShift AI Architecture (Single-Model Serving)
+### 8.1 OpenShift AI Architecture (Single-Model Serving)
 
 ```
   ┌──────────────────────────────────────────────────────────────────┐
@@ -604,7 +787,7 @@ OpenShift AI provides **two model serving platforms**:
   └──────────────────────────────────────────────────────────────────┘
 ```
 
-### 7.2 Key Components for LLM Inference
+### 8.2 Key Components for LLM Inference
 
 #### KServe — Model Serving Orchestrator
 
@@ -775,7 +958,7 @@ When you don't need a full GPU per workload:
   └──────────────────────────────────────────────────────────────┘
 ```
 
-### 7.3 GPU Memory Sizing Guide
+### 8.3 GPU Memory Sizing Guide
 
 ```
   Model Size         GPU Memory Needed         Example GPU
@@ -791,7 +974,7 @@ When you don't need a full GPU per workload:
 roughly **2 GB of GPU memory** just for weights. Add 20-50% overhead for
 KV-cache and runtime.
 
-### 7.4 Quantization: Trading Precision for Speed
+### 8.4 Quantization: Trading Precision for Speed
 
 You can shrink a model to fit on fewer GPUs using **quantization** — reducing
 the number of bits per weight:
@@ -817,12 +1000,12 @@ model (e.g., GPTQ or AWQ format) and add `--quantization gptq` or
 
 ---
 
-## 8. Autoscaling for LLM Inference
+## 9. Autoscaling for LLM Inference
 
 Traditional autoscaling (CPU %, request count) doesn't work well for LLMs
 because GPU utilization and token throughput are what matter.
 
-### 8.1 KEDA vs Knative Autoscaling
+### 9.1 KEDA vs Knative Autoscaling
 
 **KEDA** (Kubernetes Event-Driven Autoscaling) is an autoscaler that can scale
 based on custom metrics — not just CPU/memory. For LLMs, this means scaling
@@ -851,7 +1034,7 @@ based on actual inference quality metrics from vLLM.
   └──────────────────────────────────────────────────────────────┘
 ```
 
-### 8.2 Autoscaling Flow
+### 9.2 Autoscaling Flow
 
 ```
   User request ──► Istio Gateway ──► KServe InferenceService
@@ -879,12 +1062,12 @@ based on actual inference quality metrics from vLLM.
 
 ---
 
-## 9. End-to-End Example: Deploying Llama 3 on OpenShift AI
+## 10. End-to-End Example: Deploying Llama 3 on OpenShift AI
 
 Let's walk through a real scenario: deploying **Meta Llama 3 8B** for inference
 on OpenShift AI with vLLM.
 
-### 9.1 The Problem We're Solving
+### 10.1 The Problem We're Solving
 
 A company wants to:
 - Host their own LLM (not send data to OpenAI) for **data privacy**
@@ -892,7 +1075,7 @@ A company wants to:
 - **Auto-scale** based on demand (scale down at night, up during business hours)
 - **Monitor** GPU utilization and response latency
 
-### 9.2 Prerequisites
+### 10.2 Prerequisites
 
 ```
   What You Need:
@@ -917,7 +1100,7 @@ A company wants to:
   └─────────────────────────────────────────────────────────────┘
 ```
 
-### 9.3 Step-by-Step Deployment
+### 10.3 Step-by-Step Deployment
 
 ```
   Step 1: Install NFD → Labels GPU nodes
@@ -1017,7 +1200,7 @@ spec:
           cpu: "8"
 ```
 
-### 9.4 What Happens After You Apply
+### 10.4 What Happens After You Apply
 
 ```
   You run: oc apply -f inferenceservice.yaml
@@ -1047,7 +1230,7 @@ spec:
   Ready to serve!
 ```
 
-### 9.5 Using the Deployed Model
+### 10.5 Using the Deployed Model
 
 The model exposes an OpenAI-compatible API:
 
@@ -1069,7 +1252,7 @@ Because vLLM exposes an **OpenAI-compatible API**, any existing application
 that calls OpenAI can switch to your self-hosted model by just changing the
 base URL — no code changes needed.
 
-### 9.6 Complete Data Flow
+### 10.6 Complete Data Flow
 
 ```
   ┌──────────────────────────────────────────────────────────────────┐
@@ -1131,7 +1314,7 @@ base URL — no code changes needed.
   └──────────────────────────────────────────────────────────────────┘
 ```
 
-### 9.7 Monitoring the Deployment
+### 10.7 Monitoring the Deployment
 
 ```
   Prometheus Metrics from vLLM + DCGM:
@@ -1153,7 +1336,7 @@ base URL — no code changes needed.
 
 ---
 
-## 10. Multi-GPU and Multi-Node Inference
+## 11. Multi-GPU and Multi-Node Inference
 
 For models larger than a single GPU (e.g., 70B+ parameters), vLLM supports
 two strategies for splitting a model:
@@ -1219,7 +1402,7 @@ it uses RDMA over InfiniBand (high-bandwidth network) to minimize latency.
 
 ---
 
-## 11. Knowledge Graph: How Everything Connects
+## 12. Knowledge Graph: How Everything Connects
 
 ```
   ┌──────────────────────────────────────────────────────────────────┐
@@ -1270,7 +1453,7 @@ it uses RDMA over InfiniBand (high-bandwidth network) to minimize latency.
   └──────────────────────────────────────────────────────────────────┘
 ```
 
-### 11.1 Dependency Map (What Installs Before What)
+### 12.1 Dependency Map (What Installs Before What)
 
 ```
   Install Order for LLM Inference on OpenShift:
@@ -1299,7 +1482,7 @@ it uses RDMA over InfiniBand (high-bandwidth network) to minimize latency.
 
 ---
 
-## 12. Common Pitfalls When Deploying LLMs on OpenShift
+## 13. Common Pitfalls When Deploying LLMs on OpenShift
 
 | Pitfall | What Happens | How to Avoid |
 |---------|-------------|--------------|
@@ -1312,7 +1495,7 @@ it uses RDMA over InfiniBand (high-bandwidth network) to minimize latency.
 
 ---
 
-## 13. Summary: Choosing the Right Pieces
+## 14. Summary: Choosing the Right Pieces
 
 | What You Want | What You Use | Why |
 |---------------|-------------|-----|
@@ -1328,7 +1511,7 @@ it uses RDMA over InfiniBand (high-bandwidth network) to minimize latency.
 
 ---
 
-## 14. References
+## 15. References
 
 - [Red Hat OpenShift Architecture Documentation](https://docs.redhat.com/en/documentation/openshift_container_platform/4.14/pdf/architecture/OpenShift_Container_Platform-4.14-Architecture-en-US.pdf)
 - [OpenShift AI — Serving Large Models](https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/2.22/html/serving_models/serving-large-models_serving-large-models)
