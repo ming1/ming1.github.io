@@ -9,6 +9,205 @@ title: Note on IO storage papers
 * TOC
 {:toc}
 
+# UnICom: A Universally High-Performant I/O Completion Mechanism for Modern Computer Systems
+
+## Overview
+
+[UnICom: A Universally High-Performant I/O Completion Mechanism for Modern Computer Systems](https://www.usenix.org/conference/fast26/presentation/pan)
+Riwei Pan (City University of Hong Kong), Yu Liang (ETH Zurich & Inria-Paris), Sam H. Noh (Virginia Tech),
+Lei Li, Nan Guan (City University of Hong Kong), Tei-Wei Kuo (Delta Electronics & National Taiwan University),
+Chun Jason Xue (MBZUAI).
+FAST'26 (24th USENIX Conference on File and Storage Technologies), February 2026.
+
+This paper proposes **UnICom (Universal I/O Completion)**, an in-kernel I/O completion mechanism
+that bridges the gap between polling and interrupts. Existing I/O completion approaches each excel
+only in limited scenarios: polling (e.g., BypassD) delivers low latency under low CPU utilization
+but wastes CPU cycles and degrades compute-thread (C-thread) performance under high CPU load;
+interrupts (e.g., ext4) are less sensitive to CPU load but incur substantial per-I/O software
+overhead from interrupt handling, context switching, and sleep/wake-up operations. UnICom
+achieves universally high I/O performance across all CPU utilization levels by introducing three
+core techniques — **TagSched**, **TagPoll**, and **SKIP** — and consistently outperforms ext4, BypassD,
+and io_uring across microbenchmarks, macrobenchmarks, and RocksDB YCSB workloads.
+
+---
+
+## 1. The Problem: No I/O Completion Mechanism Works Well Everywhere
+
+### The Core Issue
+
+Modern NVMe SSDs (especially low-latency devices like Intel Optane P5800X with sub-10us
+latency) have made the **software overhead** in the I/O stack a dominant fraction of total I/O
+latency — up to **50%** of end-to-end latency. Two I/O completion mechanisms exist:
+
+- **Interrupts** (ext4 default): The device signals I/O completion via an interrupt. The OS
+  deactivates the waiting thread, context-switches, and reactivates it. Sleep and wake-up
+  overhead accounts for **~33% of total latency** for a 4KB read on ext4 (710ns deactivation +
+  980ns context switch + 1240ns reactivation = 2930ns out of 8730ns total).
+
+- **Polling** (BypassD): The application busy-waits on the NVMe completion queue. This
+  eliminates interrupt overhead and achieves the lowest latency when CPU resources are
+  plentiful, but **wastes CPU cycles** that could be used by compute threads.
+
+### The Fundamental Trade-off
+
+The paper demonstrates this trade-off empirically with multi-threaded random read benchmarks
+(Figures 1-2 in the paper):
+
+| Scenario | Polling (BypassD) | Interrupt (ext4) |
+|----------|-------------------|------------------|
+| I/O only, low thread count | **Best** — 62.9% higher IOPS than ext4 for ≤8 threads | Moderate — limited by interrupt overhead |
+| I/O only, device saturated | Latency explodes (36us → 587us busy-wait) | Comparable IOPS, stable latency |
+| Mixed I/O + compute threads | C-thread perf drops to **39.1% of ext4** at 32 threads | C-thread performance degrades gracefully |
+
+`Neither mechanism provides universally good performance. Polling wins under low CPU utilization;`
+`interrupts win under high CPU utilization. Neither is optimal across the board.`
+
+The situation with **io_uring** (with SQ_POLL mode) is also unsatisfying: it centralizes polling
+into a dedicated submission thread, but (1) requires asynchronous I/O paradigm changes in
+applications, (2) operates per-instance preventing cross-process polling consolidation, and
+(3) its submission thread merely forwards requests — throughput remains comparable to ext4.
+
+---
+
+## 2. Key Insight and UnICom Design
+
+### The Key Insight
+
+The latency of a **syscall for user-kernel mode switching** is only ~150ns — which is **negligible**
+compared to the SSD device latency (~4000ns for 4KB read). This means the I/O completion
+mechanism can live **inside the kernel**, leveraging existing kernel infrastructure (scheduler,
+file permission checks, NVMe driver interfaces) while still bypassing most of the kernel I/O
+stack's overhead.
+
+### Three Core Techniques
+
+UnICom introduces a centralized **kernel-level I/O completion thread** with three schemes:
+
+#### TagSched: Tag-guided In-Queue Scheduling
+
+Instead of the traditional sleep/wake-up cycle (deactivate → remove from run queue → context
+switch → reactivate → re-insert into run queue), TagSched adds a lightweight **tag** to each
+thread's Process Control Block (PCB):
+
+- `IO-NORMAL` (tag ≥ 0): thread is schedulable normally
+- `IO-WAIT` (tag = -1): thread is waiting for I/O, skipped by scheduler but **stays in the run queue**
+
+This eliminates the deactivation/reactivation overhead (~22% of total latency). When an I/O
+completes, the completion thread simply flips the tag back to `IO-NORMAL` and sends an IPI
+(inter-processor interrupt) to preempt any C-thread running on that CPU, allowing immediate
+rescheduling of the I/O thread.
+
+Race condition handling: `IO-WAIT` is a decrement, `IO-NORMAL` is an increment. If an I/O
+completes before the tag is set to `IO-WAIT`, the increment and decrement balance out, keeping
+the tag at `IO-NORMAL` — the thread is never stuck sleeping.
+
+#### TagPoll: Tag-notify Centralized Polling
+
+A single **dedicated kernel-level completion thread** polls NVMe completion queues on behalf of
+all I/O threads across all processes. This:
+
+- Consolidates busy-wait into one thread (vs. per-thread polling in BypassD)
+- Uses TagSched's tag mechanism for efficient wake-up (just a tag flip + IPI)
+- Implements an **adaptive I/O completion policy**: checks the number of tasks in each I/O
+  thread's run queue — if the thread exclusively occupies a CPU, it instructs the thread to
+  poll directly (eliminating context-switch overhead); otherwise, it uses TagSched+TagPoll
+  for efficient CPU sharing
+
+The completion thread can process an I/O in ~550ns, yielding a maximum completion rate of
+~1820 KIOPS. For higher throughput needs, multiple completion threads can be deployed.
+
+#### SKIP: Shortcut Kernel I/O Path
+
+A kernel driver module (**UnIDrv**) that enables direct I/O submission to hardware NVMe queues
+while remaining inside the kernel (unlike BypassD which maps queues to user space). Key features:
+
+- **Dynamic NVMe queue management**: maintains a queue pool in the kernel, assigns queues to
+  threads by PID hashing — avoids BypassD's static allocation problem where limited hardware
+  queues are wasted or over-contended
+- **Per-file extent tree**: maps file offsets to Physical Block Addresses (PBAs) using a compact
+  12-byte extent entry (4B block-aligned offset + 4B PBA + 4B length). This replaces BypassD's
+  `fmap` which uses a full page-table-sized mapping (~0.2% of file size), reducing memory by
+  **>99.9%** and mapping latency by **71.2%**
+- **Ulib**: a user-space shim library (via `LD_PRELOAD`) that intercepts file operations and
+  forwards them to UnIDrv via a `user_io_submit` ioctl — transparent to applications
+
+---
+
+## 3. Evaluation Results
+
+### Experimental Setup
+
+Ubuntu 20.04, Linux kernel 6.5.1, Intel Core i9-14900K (8 P-cores at 3.2GHz + 16 E-cores at
+2.4GHz, experiments use the 16 E-cores only), 32GB RAM, 400GB Intel Optane SSD P5801x,
+1TB Kingston NV3 (consumer SSD).
+
+### Microbenchmark Results (4KB random read, I/O threads only)
+
+| Metric | ext4 (IRQ) | BypassD (Poll) | io_uring | **UnICom** |
+|--------|-----------|----------------|----------|-----------|
+| IOPS (1 thread) | ~700 | ~1300 | ~700-800 | **~1300** |
+| IOPS (32 threads) | ~1600 | ~1550 | ~1500 | **~1700** |
+| Avg latency (1 thread) | ~9us | ~5us | ~9-10us | **~5us** |
+| P99 latency (1 thread) | ~10us | ~5us | ~9-10us | **~5us** |
+
+UnICom matches BypassD's polling performance under low load and matches or exceeds ext4 under
+high load — achieving the "best of both worlds."
+
+### Mixed Workload Results (I/O + 16 C-threads, 4KB random read)
+
+| Threads | ext4 IOPS | BypassD IOPS | **UnICom IOPS** | UnICom vs ext4 | UnICom vs BypassD |
+|---------|----------|-------------|----------------|---------------|------------------|
+| 1-8 | baseline | highest | **matches BypassD** | +39.4% avg | comparable |
+| 16-32 | moderate | degrades | **best overall** | +88.8% avg | +82.7% (32 threads) |
+
+C-thread performance under UnICom: consistently higher than BypassD (which wastes CPU on
+busy-waiting), comparable to ext4. UnICom achieves **33.2% average C-thread improvement** over
+ext4 and **82.7% over BypassD** at 32 C-threads.
+
+### Consumer SSD (Kingston NV3)
+
+On consumer SSDs where device latency is higher, the performance bottleneck shifts from I/O
+stack to device latency. UnICom shows a modest 5.3% IOPS improvement over ext4 but
+**outperforms BypassD by 79.4%** with C-threads, because busy-waiting is especially wasteful
+when the device is slower.
+
+### Macrobenchmark (Destor file restore + stress-ng matrix computation)
+
+Under high CPU utilization (16 stress-ng threads):
+- UnICom outperforms BypassD by **52.3%** on restore bandwidth (avg across all restore thread counts)
+- UnICom improves stress-ng performance over BypassD by **22.5-45.7%** (16 and 32 restore threads)
+
+### Real-world Application (RocksDB with YCSB)
+
+- UnICom outperforms ext4 by **24% (64-byte values)** and **28% (200-byte values)** with 1 thread
+- At 32 threads, UnICom outperforms BypassD by **34% (64-byte)** and **56% (200-byte)**
+- UnICom consistently delivers the best performance across nearly all thread counts and value sizes
+
+---
+
+## 4. Conclusion
+
+UnICom demonstrates that a **kernel-level I/O completion mechanism** can achieve universally high
+performance by combining three complementary techniques:
+
+1. **TagSched** eliminates expensive sleep/wake-up overhead by keeping I/O threads in the run queue
+   with lightweight tag-based scheduling
+2. **TagPoll** consolidates polling into a single kernel completion thread, avoiding per-thread
+   CPU waste while maintaining low-latency responsiveness
+3. **SKIP** provides direct SSD access through a kernel driver that bypasses most of the I/O stack
+   while preserving kernel security and multi-process safety
+
+The fundamental trade-off: dedicating a fixed CPU resource (one core for the completion thread)
+enables (1) significantly better small I/O performance than ext4 while maintaining comparable
+C-thread efficiency, and (2) prevents the continuous degradation of C-thread performance and
+CPU waste exhibited by BypassD during large I/O operations.
+
+`UnICom shows that the "bypass everything" approach (SPDK, BypassD) is not the only path to`
+`high I/O performance. A carefully designed kernel-based mechanism can match polling's latency`
+`while avoiding its CPU waste — a more practical solution for real-world mixed workloads.`
+
+---
+
 # A Wake-Up Call for Kernel-Bypass on Modern Hardware
 
 ## Overview
