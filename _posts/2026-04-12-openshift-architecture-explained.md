@@ -1608,7 +1608,9 @@ func (r *MyAppReconciler) Reconcile(
 
 ### 6.5 Networking
 
-OpenShift networking handles three types of traffic:
+OpenShift networking has several layers, each solving a different problem.
+
+#### The Big Picture: Three Types of Traffic
 
 ```
   ┌──────────────────────────────────────────────────────────────┐
@@ -1618,26 +1620,299 @@ OpenShift networking handles three types of traffic:
   │     ┌──────┐  overlay network  ┌──────┐                       │
   │     │Pod A │◄─────────────────►│Pod B │                       │
   │     └──────┘   (OVN-Kubernetes)└──────┘                       │
+  │     Even across different nodes — pods talk directly.          │
   │                                                               │
   │  2. External-to-Pod (North-South)                             │
   │     Internet ──► Route ──► Service ──► Pod                    │
+  │     Users access your app from outside the cluster.            │
   │                                                               │
   │  3. Pod-to-External                                           │
   │     Pod ──► Service ──► Egress ──► External API               │
+  │     Your app calls an external database or API.                │
   └──────────────────────────────────────────────────────────────┘
 ```
 
-**Routes** are an OpenShift concept (not in vanilla Kubernetes). A Route
-exposes a Service to the outside world with TLS termination:
+#### Layer 1: Pod Network (OVN-Kubernetes)
+
+Every pod gets its own IP address. Pods can talk to any other pod in the
+cluster directly by IP — even across nodes. This "flat network" is created
+by **OVN-Kubernetes**, the default network plugin since OpenShift 4.12.
 
 ```
-  https://myapp.apps.cluster.example.com
+  How OVN-Kubernetes creates the pod network:
+  ────────────────────────────────────────────
+
+  Node 1 (10.128.0.0/24)            Node 2 (10.128.1.0/24)
+  ┌─────────────────────┐           ┌─────────────────────┐
+  │  Pod A: 10.128.0.5   │           │  Pod C: 10.128.1.8   │
+  │  Pod B: 10.128.0.12  │           │  Pod D: 10.128.1.15  │
+  │          │            │           │          │            │
+  │          ▼            │           │          ▼            │
+  │  ┌──────────────┐    │           │  ┌──────────────┐    │
+  │  │ Open vSwitch  │    │           │  │ Open vSwitch  │    │
+  │  │ (OVS bridge)  │    │           │  │ (OVS bridge)  │    │
+  │  └──────┬───────┘    │           │  └──────┬───────┘    │
+  └─────────┼────────────┘           └─────────┼────────────┘
+            │                                   │
+            └──── Geneve tunnel ────────────────┘
+                 (encapsulates pod traffic
+                  across the physical network)
+```
+
+**Key concepts:**
+- Each node gets a subnet (e.g., 10.128.0.0/24) from the cluster CIDR
+- OVN assigns each pod an IP from the node's subnet
+- **Geneve tunnels** encapsulate pod traffic between nodes — the physical
+  network only sees node-to-node traffic, not pod-to-pod
+- **Open vSwitch (OVS)** on each node does the actual packet forwarding
+  using OpenFlow rules programmed by OVN
+
+```
+  Why Geneve instead of VXLAN?
+  ────────────────────────────
+  OpenShift 3.x used VXLAN (via OpenShift SDN).
+  OpenShift 4.12+ uses Geneve (via OVN-Kubernetes).
+
+  Geneve advantages:
+  • Variable-length headers → can carry more metadata
+  • Better hardware offload support
+  • Supports IPv6, dual-stack, and network policies natively
+  • Required for advanced features like EgressIP and hybrid networking
+```
+
+#### Layer 2: Services (Stable Endpoints)
+
+Pods are ephemeral — they come and go, their IPs change. A **Service** gives
+a group of pods a stable IP address and DNS name:
+
+```
+  Without Service:                   With Service:
+  ────────────────                   ─────────────
+  Client must know pod IPs:          Client uses one stable address:
+  10.128.0.5 (might die)
+  10.128.0.12 (might move)           web-svc.my-app.svc:8080
+  10.128.1.8 (might scale away)          │
+                                         ▼
+  Client must track changes          ┌──────────────┐
+  and load-balance itself.           │   Service     │
+                                     │  (ClusterIP)  │
+                                     │ 172.30.45.67  │
+                                     └──────┬───────┘
+                                            │ round-robin
+                                     ┌──────┼──────┐
+                                     ▼      ▼      ▼
+                                   Pod A  Pod B  Pod C
+```
+
+**Service types:**
+
+```
+  Type          Scope              How It Works
+  ────          ─────              ────────────
+  ClusterIP     Inside cluster     Virtual IP, only reachable from pods
+                only               (default)
+
+  NodePort      Outside cluster    Opens a port (30000-32767) on every
+                (basic)            node — external clients hit
+                                   <nodeIP>:<nodePort>
+
+  LoadBalancer  Outside cluster    Provisions a cloud load balancer
+                (cloud)            (AWS ELB, GCP LB, etc.)
+                                   that routes to NodePort
+
+  In OpenShift, you rarely use NodePort or LoadBalancer directly.
+  Instead, you use Routes (see below).
+```
+
+#### Layer 3: Routes (OpenShift's Ingress)
+
+A **Route** exposes a Service to the internet with a hostname and TLS.
+Routes are an OpenShift concept — vanilla Kubernetes uses Ingress instead.
+
+```
+  How a Route works:
+  ──────────────────
+
+  User: curl https://myapp.apps.cluster.example.com
        │
        ▼
-  ┌──────────────┐     ┌─────────────┐     ┌──────────┐
-  │   HAProxy     │────►│   Service    │────►│   Pod     │
-  │   Router      │     │  (ClusterIP) │     │  (app)    │
-  └──────────────┘     └─────────────┘     └──────────┘
+  DNS resolves *.apps.cluster.example.com
+  → Load Balancer IP (or node IP)
+       │
+       ▼
+  ┌───────────────────────────────────────────────┐
+  │  HAProxy Router Pod (runs on infra/worker node)│
+  │                                                │
+  │  Listens on port 80 and 443                    │
+  │  Reads the Host header to decide routing:      │
+  │                                                │
+  │  "myapp.apps.cluster.example.com"              │
+  │       │                                        │
+  │       │  matches Route "myapp"                 │
+  │       │  in namespace "my-project"             │
+  │       ▼                                        │
+  │  Forward to Service "myapp-svc"                │
+  │       │                                        │
+  │       ▼                                        │
+  │  Service load-balances to Pods                 │
+  └───────────────────────────────────────────────┘
+```
+
+**Route TLS options:**
+
+```
+  TLS Mode              What It Does
+  ────────              ────────────
+  Edge                  Router terminates TLS, talks plain HTTP to pod
+                        (most common — router handles certs for you)
+
+  Passthrough           Router passes TLS directly to pod (pod does TLS)
+                        (use when pod needs to see the client cert)
+
+  Re-encrypt            Router terminates TLS, then opens a NEW TLS
+                        connection to pod (encrypted end-to-end,
+                        but router can inspect traffic)
+```
+
+**Route vs Ingress:**
+
+```
+  OpenShift Route                     Kubernetes Ingress
+  ───────────────                     ──────────────────
+  oc expose svc/web                   Create Ingress YAML
+  Automatic TLS termination           Need cert-manager or similar
+  Supports passthrough + re-encrypt   HTTP/HTTPS only (basic)
+  HAProxy-based (built-in)            Needs an Ingress Controller
+                                      (nginx, traefik, etc.)
+  OpenShift-specific resource         Standard K8s resource
+
+  In OpenShift, Ingress resources are automatically converted
+  to Routes by the Ingress Operator — so both work.
+```
+
+#### Layer 4: Network Policies (Pod-to-Pod Firewall)
+
+By default, all pods can talk to all other pods. **NetworkPolicy** lets you
+restrict this:
+
+```
+  Example: Only allow web pods to talk to the database:
+  ─────────────────────────────────────────────────────
+
+  Without NetworkPolicy:           With NetworkPolicy:
+
+  ┌─────┐    ┌─────┐              ┌─────┐    ┌─────┐
+  │ web  │───►│ db   │              │ web  │───►│ db   │
+  └─────┘    └─────┘              └─────┘    └─────┘
+  ┌─────┐    │                    ┌─────┐    │
+  │ hack │───►│ (anyone can       │ hack │──✗──│ (blocked by
+  └─────┘    │  reach the db)    └─────┘    │  NetworkPolicy)
+```
+
+```yaml
+# Allow only pods with label "app: web" to reach the db
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: db-allow-web-only
+spec:
+  podSelector:
+    matchLabels:
+      app: db
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: web
+      ports:
+        - port: 5432
+```
+
+#### Layer 5: DNS (CoreDNS)
+
+Every Service automatically gets a DNS name inside the cluster:
+
+```
+  DNS naming pattern:
+  ───────────────────
+
+  <service-name>.<namespace>.svc.cluster.local
+
+  Examples:
+  web.my-app.svc.cluster.local          → Service "web" in "my-app"
+  llama3-8b.ai-project.svc.cluster.local → LLM service in "ai-project"
+  kubernetes.default.svc.cluster.local   → The API server itself
+
+  Short names also work within the same namespace:
+  curl http://web:8080      (from any pod in "my-app" namespace)
+```
+
+#### Putting It All Together: Full Network Path
+
+```
+  External user → your LLM inference API:
+  ────────────────────────────────────────
+
+  curl https://llama3.apps.cluster.example.com/v1/chat/completions
+       │
+       ▼
+  ① DNS: *.apps.cluster.example.com → Load Balancer IP
+       │
+       ▼
+  ② Load Balancer → HAProxy Router (port 443)
+       │
+       ▼
+  ③ Router: TLS termination, reads Host header,
+     matches Route "llama3" in namespace "ai-project"
+       │
+       ▼
+  ④ Service "llama3-svc" (ClusterIP 172.30.x.x)
+     round-robins to healthy pods
+       │
+       ▼
+  ⑤ OVN-Kubernetes routes packet to correct node
+     via Geneve tunnel if pod is on a different node
+       │
+       ▼
+  ⑥ OVS on target node delivers packet to pod's
+     network namespace (veth pair)
+       │
+       ▼
+  ⑦ vLLM pod receives request, generates response
+       │
+       ▼
+  ⑧ Response travels back: Pod → OVS → Geneve → Router → User
+```
+
+#### CRC Networking (Local Development)
+
+On CRC, networking is simplified — everything runs in one VM:
+
+```
+  CRC Host Machine
+  ┌──────────────────────────────────────────────┐
+  │                                               │
+  │  NetworkManager configures DNS:               │
+  │  *.apps-crc.testing → CRC VM IP              │
+  │  api.crc.testing    → CRC VM IP              │
+  │                                               │
+  │  ┌─────────────────────────────────┐          │
+  │  │  CRC VM (single node)           │          │
+  │  │                                  │          │
+  │  │  HAProxy Router (:80, :443)      │          │
+  │  │       │                          │          │
+  │  │       ▼                          │          │
+  │  │  Services → Pods                 │          │
+  │  │                                  │          │
+  │  │  API Server (:6443)              │          │
+  │  └─────────────────────────────────┘          │
+  │                                               │
+  │  To access from host:                          │
+  │  curl http://myapp.apps-crc.testing            │
+  │                                               │
+  │  To access from other machines:                │
+  │  Need port forwarding (see Section 15)         │
+  └──────────────────────────────────────────────┘
 ```
 
 ### 6.6 Image Registry
@@ -1697,6 +1972,152 @@ configure PodSecurityStandards.
 SCC because they load kernel modules (GPU drivers). This is a controlled
 exception — the GPU Operator runs in its own namespace with restricted RBAC,
 and your *application* pods (e.g., vLLM) still run as non-root.
+
+### 6.8 CLI Tools: How You Talk to the Cluster
+
+OpenShift provides several command-line tools. Here are the main executables:
+
+```
+  ┌──────────────────────────────────────────────────────────────────┐
+  │                    OKD / OpenShift CLI Tools                      │
+  │                                                                   │
+  │  Tool               Audience         What It Does                 │
+  │  ────               ────────         ────────────                 │
+  │                                                                   │
+  │  oc                 Everyone         Primary CLI. Superset of     │
+  │                                      kubectl — does everything    │
+  │                                      kubectl does PLUS OpenShift- │
+  │                                      specific commands (routes,   │
+  │                                      builds, image streams)       │
+  │                                                                   │
+  │  kubectl            K8s users        Standard Kubernetes CLI.     │
+  │                                      Works, but doesn't know      │
+  │                                      OpenShift-specific resources.│
+  │                                      Bundled together with oc.    │
+  │                                                                   │
+  │  crc                Developers       Runs a local single-node     │
+  │                                      OpenShift/OKD cluster in a   │
+  │                                      VM on your laptop.           │
+  │                                                                   │
+  │  openshift-install  Cluster admins   Deploys full production      │
+  │                                      clusters on AWS, GCP, Azure, │
+  │                                      bare metal. Generates        │
+  │                                      Ignition configs, creates    │
+  │                                      infrastructure, bootstraps.  │
+  │                                                                   │
+  │  odo (deprecated)   Developers       Developer-focused rapid      │
+  │                                      iteration CLI. Being replaced│
+  │                                      by oc + devfile workflows.   │
+  └──────────────────────────────────────────────────────────────────┘
+```
+
+#### `oc` vs `kubectl` — What's the Difference?
+
+`oc` is a **superset** of `kubectl`. When you install `oc`, you get all
+`kubectl` commands plus OpenShift-specific ones:
+
+```
+  oc-only commands (not in kubectl):
+  ──────────────────────────────────
+
+  oc login              Log in with OAuth (kubectl uses kubeconfig only)
+  oc new-project        Create a project (namespace + RBAC in one step)
+  oc new-app            Create app from source code, Dockerfile, or image
+  oc start-build        Trigger a BuildConfig
+  oc expose             Create a Route to expose a service externally
+  oc adm upgrade        Upgrade the entire cluster
+  oc adm top images     Show image storage usage
+  oc debug node/X       Open a debug shell on a node (no SSH needed)
+  oc whoami             Show current user / token
+  oc projects           List all projects you have access to
+
+  Commands that work in BOTH oc and kubectl:
+  ──────────────────────────────────────────
+  get, describe, apply, delete, logs, exec, port-forward,
+  create, edit, patch, scale, rollout, label, annotate...
+```
+
+#### Everyday `oc` Cheat Sheet
+
+```bash
+# ── Authentication ──
+oc login https://api.crc.testing:6443 -u developer -p developer
+oc whoami                        # who am I?
+oc projects                      # list my projects
+
+# ── Create and deploy an app ──
+oc new-project my-app            # create a project (namespace)
+oc new-app nginx --name=web      # deploy nginx
+oc expose svc/web                # create a Route (external URL)
+oc get routes                    # show the URL
+
+# ── Debugging ──
+oc get pods                      # list pods
+oc logs pod/web-xyz              # view logs
+oc exec -it pod/web-xyz -- bash  # shell into a pod
+oc debug node/worker-1           # shell on a node (no SSH!)
+oc describe pod/web-xyz          # detailed pod info
+
+# ── Cluster admin ──
+oc adm upgrade                   # check/apply cluster upgrades
+oc get nodes                     # list all nodes
+oc describe node worker-1        # node details (CPU, GPU, memory)
+oc adm top nodes                 # live CPU/memory usage per node
+oc get clusterversion            # current cluster version
+```
+
+#### How to Install `oc`
+
+```bash
+# Method 1: Bundled with CRC (if you use CRC)
+eval $(crc oc-env)
+
+# Method 2: Direct download
+wget https://mirror.openshift.com/pub/openshift-v4/clients/ocp/latest/openshift-client-linux.tar.xz
+tar xvf openshift-client-linux.tar.xz
+sudo install oc kubectl /usr/local/bin/
+oc version
+```
+
+#### `openshift-install` — Cluster Deployment
+
+This tool is for deploying **full production clusters**, not for local
+development (use `crc` for that):
+
+```
+  What openshift-install does:
+  ────────────────────────────
+
+  $ openshift-install create cluster --dir=my-cluster
+       │
+       ▼
+  1. Reads install-config.yaml
+     (platform, region, node count, network CIDR...)
+       │
+       ▼
+  2. Generates Ignition configs for each node
+     (bootstrap, control plane, worker)
+       │
+       ▼
+  3. Creates infrastructure (VMs, DNS, load balancers)
+     on your chosen platform (AWS, GCP, Azure, bare metal)
+       │
+       ▼
+  4. Boots a bootstrap node that installs the control plane
+       │
+       ▼
+  5. Control plane takes over, bootstrap is removed
+       │
+       ▼
+  6. Workers join the cluster
+       │
+       ▼
+  7. Cluster is ready (~30-45 minutes)
+
+  Supported platforms:
+  AWS, GCP, Azure, VMware vSphere, OpenStack, bare metal,
+  IBM Cloud, IBM Power, IBM Z, Nutanix
+```
 
 ---
 
@@ -2662,20 +3083,28 @@ You get the web console, OperatorHub, and the complete OpenShift API.
 > 35 GB disk, and a free [Red Hat Developer account](https://developers.redhat.com)
 > for the pull secret.
 
+> **Why can't I just `dnf install crc`?** CRC is not packaged as an RPM
+> in any Fedora/RHEL repo. It's distributed as a standalone binary tarball.
+> This is because CRC bundles a pre-built VM image (~4 GB) that contains
+> a complete RHCOS + OpenShift install — it's not a normal application,
+> it's a tool that manages a VM. You can download it directly from the
+> OpenShift mirror without browsing the Red Hat console.
+
 **Install on Fedora:**
 
 ```bash
 # Step 1: Install virtualization dependencies
 sudo dnf install -y libvirt NetworkManager qemu-kvm
 
-# Step 2: Download CRC from Red Hat Console
-#   Go to: https://console.redhat.com/openshift/create/local
-#   Download:
-#     - crc-linux-amd64.tar.xz   (the tool)
-#     - pull-secret.txt           (click "Copy pull secret")
+# Step 2: Download CRC binary directly
+#   Method A: Direct download from OpenShift mirror (no login needed)
+wget https://mirror.openshift.com/pub/openshift-v4/clients/crc/latest/crc-linux-amd64.tar.xz
+
+#   Method B: Or download from Red Hat Console (login required,
+#   but also gives you the pull secret for the OpenShift preset):
+#   https://console.redhat.com/openshift/create/local
 
 # Step 3: Extract and install
-cd ~/Downloads
 tar xvf crc-linux-amd64.tar.xz
 mkdir -p ~/.local/bin
 install crc-linux-*-amd64/crc ~/.local/bin/crc
@@ -2683,6 +3112,9 @@ install crc-linux-*-amd64/crc ~/.local/bin/crc
 # Make sure ~/.local/bin is in PATH
 export PATH="$HOME/.local/bin:$PATH"
 echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+
+# Verify
+crc version
 ```
 
 **Setup and start:**
