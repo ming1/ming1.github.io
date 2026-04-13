@@ -332,7 +332,41 @@ OpenShift is built in layers. Each layer builds on the one below it:
 
 ## 5. Node Types
 
-An OpenShift cluster has different kinds of machines:
+### 5.1 What Is a Node?
+
+A **node** is a single machine — physical server or virtual machine — that
+participates in the OpenShift cluster. Every node runs:
+
+```
+  ┌───────────────────────────────────────┐
+  │         What Every Node Has           │
+  │                                       │
+  │  RHCOS          Immutable Linux OS    │
+  │  CRI-O          Container runtime     │
+  │  kubelet         Agent that receives  │
+  │                  orders from the       │
+  │                  control plane         │
+  │  OVN-Kubernetes  Network plugin        │
+  └───────────────────────────────────────┘
+```
+
+**Simple analogy**: If the cluster is a restaurant, each node is a person
+working in it. The *control plane node* is the manager (decides what happens),
+*worker nodes* are the cooks (do the actual work), and *infra nodes* are the
+dishwashers and cleaners (keep the restaurant running but don't cook food).
+
+```
+  Relationship: Cluster → Node → Pod → Container
+
+  Cluster          "the whole restaurant"
+    └── Node       "one person / one machine"
+         └── Pod   "one task that person is doing"
+              └── Container   "the specific process running"
+```
+
+### 5.2 Node Roles
+
+An OpenShift cluster has different kinds of nodes, each with a specific role:
 
 ```
   ┌────────────────────────────────────────────────────────────────┐
@@ -367,18 +401,97 @@ An OpenShift cluster has different kinds of machines:
   └────────────────────────────────────────────────────────────────┘
 ```
 
-| Node Type | Purpose | Minimum Count |
-|-----------|---------|---------------|
-| **Control Plane** | Runs API server, etcd, scheduler. The brain. | 3 (for HA) |
-| **Worker** | Runs user applications. The muscle. | 2+ |
-| **GPU Worker** | Worker with NVIDIA/AMD GPU for AI workloads | 1+ (for AI) |
-| **Infra** | Runs platform services (router, monitoring, registry) | Optional |
+| Node Type | Role | What Runs on It | Minimum Count |
+|-----------|------|-----------------|---------------|
+| **Control Plane** | The brain — decides where pods go | API server, etcd, scheduler, controllers | 3 (for HA) |
+| **Worker** | The muscle — runs your applications | User pods, app containers | 2+ |
+| **GPU Worker** | Worker with accelerator hardware | GPU device plugin, vLLM / AI pods | 1+ (for AI) |
+| **Infra** | The plumbing — runs platform services | Router, monitoring, logging, registry | Optional |
 
-**Special case — Single Node OpenShift (SNO):** For edge deployments or small
-AI inference setups, OpenShift can run on a single machine. One server acts as
-both control plane and worker. This is useful for running an LLM at a remote
-location (e.g., a factory or retail store) where you can't afford a full
-cluster but still want OpenShift's operator-driven management.
+### 5.3 How the Control Plane Talks to Nodes
+
+The kubelet on each worker node maintains a constant connection to the API
+server. This is how pods get scheduled:
+
+```
+  ┌─────────────────────────────┐
+  │       Control Plane          │
+  │                              │
+  │  Scheduler: "Pod X needs     │
+  │  2 CPU + 1 GPU. Node 5 has   │
+  │  room. Send it there."       │
+  └──────────────┬───────────────┘
+                 │
+                 │  "Run Pod X"
+                 ▼
+  ┌─────────────────────────────┐
+  │     Worker Node 5 (GPU)      │
+  │                              │
+  │  kubelet receives order       │
+  │       │                      │
+  │       ▼                      │
+  │  CRI-O pulls image           │
+  │       │                      │
+  │       ▼                      │
+  │  Container starts on GPU     │
+  │       │                      │
+  │       ▼                      │
+  │  kubelet reports back:       │
+  │  "Pod X is Running"          │
+  └─────────────────────────────┘
+```
+
+The kubelet also continuously monitors its pods. If a container crashes,
+kubelet detects it and restarts it automatically. It reports node health
+(CPU, memory, GPU availability) back to the control plane every few seconds,
+so the scheduler always knows which nodes have room for new pods.
+
+### 5.4 Node Lifecycle
+
+Nodes are not static — OpenShift manages their lifecycle:
+
+```
+  Add a Node               Remove a Node
+  ──────────               ─────────────
+  1. New machine boots     1. Mark node as
+     with RHCOS               unschedulable
+                               (cordon)
+  2. Ignition config       2. Move pods to
+     applied (network,        other nodes
+     disk, kubelet)            (drain)
+
+  3. kubelet contacts      3. Delete node
+     API server               from cluster
+     ("I'm ready")
+
+  4. Node appears in       4. Machine can be
+     "oc get nodes"           repurposed or
+                              decommissioned
+```
+
+### 5.5 Special Case: Single Node OpenShift (SNO)
+
+For edge deployments or small AI inference setups, OpenShift can run on a
+**single machine**. One server acts as both control plane and worker:
+
+```
+  Full Cluster (6+ machines)     Single Node OpenShift (1 machine)
+  ──────────────────────────     ────────────────────────────────
+
+  ┌────┐┌────┐┌────┐             ┌────────────────────────────┐
+  │ CP ││ CP ││ CP │             │  Single Node               │
+  └────┘└────┘└────┘             │                            │
+  ┌────┐┌────┐┌────┐             │  Control Plane roles       │
+  │ W1 ││ W2 ││ W3 │             │  + Worker roles            │
+  └────┘└────┘└────┘             │  + Infra roles             │
+                                  │  All on one machine        │
+  HA: Yes                        └────────────────────────────┘
+  Cost: High
+                                  HA: No (single point of failure)
+                                  Cost: Low
+                                  Good for: Edge AI, factory,
+                                  retail store, dev/test
+```
 
 ---
 
