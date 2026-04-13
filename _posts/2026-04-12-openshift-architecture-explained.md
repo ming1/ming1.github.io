@@ -607,6 +607,157 @@ These are the "brain" running on control plane nodes:
   └──────────────────────────────────────────────────────────┘
 ```
 
+#### kube-apiserver — The Front Door
+
+The API server is the **only** component that talks to etcd. Everything else
+— the CLI, the web console, operators, kubelet — talks through it.
+
+```
+  Who Talks to the API Server:
+  ────────────────────────────
+
+  oc get pods ─────────────────────────────────────────┐
+  Web Console ─────────────────────────────────────────┤
+  Operators ───────────────────────────────────────────┤
+  kubelet (every node) ────────────────────────────────┤
+  kube-scheduler ──────────────────────────────────────┤
+  kube-controller-manager ─────────────────────────────┤
+                                                       ▼
+                                              ┌──────────────┐
+                                              │ kube-apiserver│
+                                              │              │
+                                              │ 1. Authenticate│
+                                              │    (who are you?)│
+                                              │ 2. Authorize  │
+                                              │    (can you do │
+                                              │     this?)     │
+                                              │ 3. Admission  │
+                                              │    (is it valid?│
+                                              │     mutate it?) │
+                                              │ 4. Persist    │
+                                              │    (write to   │
+                                              │     etcd)      │
+                                              └──────────────┘
+```
+
+Every request goes through three gates before it reaches etcd:
+- **Authentication**: Are you who you claim to be? (OAuth token, certificate, service account)
+- **Authorization**: Are you allowed to do this? (RBAC rules)
+- **Admission**: Is this request valid? Should we modify it? (e.g., inject default SCCs, add labels)
+
+#### etcd — The Cluster Memory
+
+etcd is a **distributed key-value store** that holds the entire cluster state.
+If etcd is lost and has no backup, the cluster is gone.
+
+```
+  What etcd Stores (examples):
+  ────────────────────────────
+
+  Key                                    Value
+  ───                                    ─────
+  /registry/pods/my-ns/web-app-xyz       {image: nginx, replicas: 3, ...}
+  /registry/nodes/worker-1               {status: Ready, cpu: 16, mem: 64Gi}
+  /registry/secrets/my-ns/db-password    {data: base64-encoded-secret}
+  /registry/deployments/my-ns/llama3     {replicas: 1, gpu: 1, ...}
+```
+
+**Key facts:**
+- Runs as 3 replicas on the 3 control plane nodes (Raft consensus — 2 of 3
+  must agree for any write, so the cluster survives losing 1 node)
+- Stores both the **desired state** (what you asked for) and the **actual
+  state** (what currently exists) — controllers compare the two
+- Performance-sensitive: etcd latency directly affects how fast the cluster
+  responds. OpenShift recommends SSD/NVMe storage for etcd
+
+```
+  How Raft Consensus Works (simplified):
+  ───────────────────────────────────────
+
+  etcd-1 (Leader)     etcd-2              etcd-3
+  ───────────────     ──────              ──────
+  "Write X=5"  ──────► "I agree" ──┐
+       │                            │
+       │               "I agree" ──┘
+       │                     ▲
+       └─────────────────────┘
+  Result: 2/3 agree → Write committed
+  (works even if etcd-3 is temporarily down)
+```
+
+#### kube-scheduler — The Matchmaker
+
+When a new pod needs to run, the scheduler decides **which node** gets it.
+It doesn't just pick a random node — it runs through a scoring algorithm:
+
+```
+  New pod arrives: "I need 4 CPU, 32Gi RAM, 1 nvidia.com/gpu"
+       │
+       ▼
+  Phase 1: FILTER (eliminate nodes that can't work)
+       │
+       ├── Node 1: 8 CPU, 16Gi RAM, no GPU  → ✗ not enough RAM, no GPU
+       ├── Node 2: 16 CPU, 64Gi RAM, no GPU → ✗ no GPU
+       ├── Node 3: 16 CPU, 64Gi RAM, 1 GPU  → ✓ passes
+       └── Node 4: 32 CPU, 128Gi RAM, 4 GPU → ✓ passes
+       │
+       ▼
+  Phase 2: SCORE (rank the surviving nodes)
+       │
+       ├── Node 3: score 60 (tight fit, less room for future pods)
+       └── Node 4: score 85 (more headroom, better balanced)
+       │
+       ▼
+  Result: Pod assigned to Node 4
+```
+
+**Factors the scheduler considers:**
+- Resource requests (CPU, memory, GPU)
+- Node affinity / anti-affinity ("put me near X" / "keep me away from Y")
+- Taints and tolerations ("only GPU pods go on GPU nodes")
+- Pod topology spread ("spread replicas across failure zones")
+- Priority classes ("high-priority pods can preempt low-priority ones")
+
+#### kube-controller-manager — The Fixer
+
+The controller manager runs dozens of **reconciliation loops** — each one
+watches a specific resource type and fixes any drift between desired and actual
+state.
+
+```
+  Examples of Controllers Inside kube-controller-manager:
+  ──────────────────────────────────────────────────────
+
+  ReplicaSet Controller
+  ─────────────────────
+  Desired: 3 replicas        Actual: 2 running
+  Action: "Start 1 more pod"
+
+  Node Controller
+  ───────────────
+  Desired: all nodes healthy  Actual: Node 5 hasn't
+                               reported in 5 minutes
+  Action: "Mark Node 5 as NotReady,
+           reschedule its pods elsewhere"
+
+  Job Controller
+  ──────────────
+  Desired: run batch job      Actual: job completed
+  Action: "Clean up pod, mark job as Succeeded"
+
+  Endpoint Controller
+  ───────────────────
+  Desired: Service points     Actual: Pod C crashed,
+           to Pods A, B, C    only A, B running
+  Action: "Remove Pod C from the Service's
+           endpoint list so traffic stops going to it"
+```
+
+**How it relates to Operators**: The kube-controller-manager handles
+*built-in* Kubernetes objects (Deployments, ReplicaSets, Nodes, Jobs).
+Operators (Section 6.4) extend this same pattern to *custom* objects like
+`InferenceService`, `MachineConfig`, or `ClusterVersion`.
+
 | Component | Job | Key Detail |
 |-----------|-----|------------|
 | **kube-apiserver** | Front door for all requests | Every `oc` command, every operator, hits this API |
