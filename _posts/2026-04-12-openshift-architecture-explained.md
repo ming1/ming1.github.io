@@ -838,16 +838,350 @@ images. The MCO watches for MachineConfig changes. The GPU Operator watches
 for nodes with GPUs. KServe watches for InferenceService objects. They all
 follow the same Watch → Compare → Act loop.
 
-**Critical OpenShift Operators:**
+#### Concrete Example: NVIDIA GPU Operator in Action
 
-| Operator | What It Manages |
-|----------|----------------|
-| **Cluster Version Operator (CVO)** | Upgrades the entire cluster |
-| **MachineConfig Operator (MCO)** | OS configuration on all nodes |
-| **Ingress Operator** | External traffic routing |
-| **NVIDIA GPU Operator** | GPU drivers, device plugin, monitoring |
-| **OpenShift AI Operator** | AI/ML platform (KServe, model serving) |
-| **Operator Lifecycle Manager (OLM)** | Installs and manages other operators |
+Let's trace exactly what happens when you install the GPU Operator on a cluster
+that has a node with an NVIDIA GPU:
+
+```
+  Before GPU Operator                After GPU Operator
+  ───────────────────                ──────────────────
+  GPU node exists but                GPU is fully usable
+  Kubernetes can't see               by pods:
+  the GPU:
+                                     $ oc describe node gpu-1
+  $ oc describe node gpu-1           Allocatable:
+  Allocatable:                         cpu: 16
+    cpu: 16                            memory: 64Gi
+    memory: 64Gi                       nvidia.com/gpu: 1  ← NEW
+    (no GPU listed)
+```
+
+**Step by step — what the Operator did automatically:**
+
+```
+  1. GPU Operator installed via OLM
+       │
+       ▼
+  2. Operator sees NFD labeled node:
+     "feature.node.kubernetes.io/pci-10de.present=true"
+       │
+       ▼
+  3. Deploys NVIDIA driver container on that node
+     (builds kernel module matching the node's kernel)
+       │
+       ▼
+  4. Deploys nvidia-container-toolkit
+     (configures CRI-O to use NVIDIA runtime)
+       │
+       ▼
+  5. Deploys GPU device-plugin pod
+     (tells Kubernetes: "this node has 1 nvidia.com/gpu")
+       │
+       ▼
+  6. Deploys GPU Feature Discovery pod
+     (labels node with GPU model, memory, driver version)
+       │
+       ▼
+  7. Deploys DCGM Exporter pod
+     (sends GPU temperature, utilization, power to Prometheus)
+       │
+       ▼
+  8. Operator keeps watching:
+     • New GPU node added?  → repeat steps 3-7
+     • Driver needs update? → rolling update, node by node
+     • Pod crashed?         → restart it
+```
+
+Without the Operator, a human would need to SSH into each GPU node, install
+drivers, configure the runtime, deploy the device plugin, and repeat every
+time a node is added or a driver update is released. The Operator does all
+of this automatically, forever.
+
+#### Concrete Example: Cluster Version Operator (CVO) Upgrade
+
+When Red Hat releases OpenShift 4.16.5, the CVO automates the entire upgrade:
+
+```
+  Admin runs: oc adm upgrade --to=4.16.5
+       │
+       ▼
+  CVO downloads new release payload
+  (a container image listing all component versions)
+       │
+       ▼
+  CVO reads the payload: "kube-apiserver should be v1.29.3,
+  etcd should be v3.5.12, ingress-operator should be v4.16.5..."
+       │
+       ▼
+  CVO updates each component one by one:
+       │
+       ├── 1. Update etcd (rolling restart, maintain quorum)
+       ├── 2. Update kube-apiserver
+       ├── 3. Update kube-controller-manager
+       ├── 4. Update kube-scheduler
+       ├── 5. Update ingress operator
+       ├── 6. Update monitoring stack
+       ├── 7. ... (dozens more components)
+       └── 8. Signal MCO to update RHCOS on each node
+              (MCO does cordon → drain → reboot → uncordon)
+       │
+       ▼
+  CVO reports: "Cluster updated to 4.16.5"
+  (entire process is automated, no SSH, no manual steps)
+```
+
+#### Concrete Example: How You Deploy Your Own App with an Operator
+
+Operators aren't just for platform components — you can use them for your
+own applications. For example, the **Prometheus Operator** lets you create
+monitoring rules with a YAML file:
+
+```yaml
+  # Without Operator: manually edit prometheus.yml,
+  # restart Prometheus, hope you didn't break the config.
+
+  # With Operator: declare what you want, Operator handles it.
+  apiVersion: monitoring.coreos.com/v1
+  kind: PrometheusRule
+  metadata:
+    name: gpu-alerts
+  spec:
+    groups:
+    - name: gpu
+      rules:
+      - alert: GPUTemperatureTooHigh
+        expr: DCGM_FI_DEV_GPU_TEMP > 85
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "GPU on {{ $labels.node }} is overheating"
+```
+
+```
+  What happens when you apply this YAML:
+
+  You: oc apply -f gpu-alerts.yaml
+       │
+       ▼
+  API Server stores the PrometheusRule CR in etcd
+       │
+       ▼
+  Prometheus Operator sees the new CR
+       │
+       ▼
+  Operator generates the correct prometheus.yml config
+       │
+       ▼
+  Operator reloads Prometheus with the new rule
+       │
+       ▼
+  Prometheus now fires an alert if any GPU exceeds 85°C
+  for 5 minutes — all without touching Prometheus directly
+```
+
+**The pattern is always the same**: you declare *what you want* in a CR,
+the Operator figures out *how to make it happen*.
+
+#### Critical OpenShift Operators
+
+| Operator | What It Watches | What It Does When Things Change |
+|----------|----------------|--------------------------------|
+| **Cluster Version Operator (CVO)** | `ClusterVersion` CR | Downloads new release, updates all cluster components one by one |
+| **MachineConfig Operator (MCO)** | `MachineConfig` CR | Rolls out OS-level changes: cordon → drain → apply → reboot → uncordon |
+| **Ingress Operator** | `IngressController` CR | Deploys/updates HAProxy routers, manages TLS certificates |
+| **NVIDIA GPU Operator** | Nodes with GPU labels | Installs drivers, device plugin, DCGM exporter on each GPU node |
+| **OpenShift AI Operator** | `DataScienceCluster` CR | Configures KServe, Knative, Istio, dashboard for model serving |
+| **Operator Lifecycle Manager (OLM)** | `Subscription` CR | Installs operators from OperatorHub, handles upgrades |
+
+#### Where Operators Live: OperatorHub
+
+OpenShift includes **OperatorHub** — a catalog of pre-built operators you
+can install with one click from the web console:
+
+```
+  OperatorHub Categories:
+  ───────────────────────
+
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  Red Hat Operators   │ Certified Operators │ Community Operators  │
+  │  (Red Hat built       │ (partner built,      │ (best-effort,       │
+  │   and supported)      │  Red Hat certified)  │  no guarantees)     │
+  │                       │                      │                     │
+  │  • OpenShift AI       │ • NVIDIA GPU         │ • Prometheus        │
+  │  • Service Mesh       │   Operator           │ • Grafana           │
+  │  • Serverless         │ • NVIDIA NFD         │ • Strimzi (Kafka)   │
+  │  • Logging (Loki)     │ • Crunchy Postgres   │ • ArgoCD            │
+  │  • NFD (Red Hat)      │ • MongoDB            │ • Cert-Manager      │
+  │  • Pipelines          │ • Redis Enterprise   │ • MinIO (S3)        │
+  └──────────────────────────────────────────────────────────────────┘
+
+  Who publishes what:
+  • Red Hat Operators    — built by Red Hat, included with subscription
+  • Certified Operators  — built by partners (NVIDIA, MongoDB, etc.),
+                           tested and certified to work on OpenShift
+  • Community Operators  — open-source, community-maintained, no SLA
+
+  Install flow:
+  OperatorHub → Click "Install" → OLM creates Subscription CR
+  → OLM downloads and deploys the Operator → Operator starts
+  watching for its CRs
+```
+
+#### How Operators Are Built
+
+You don't write an Operator from scratch — the [Operator SDK](https://sdk.operatorframework.io/)
+scaffolds the boilerplate so you only write the business logic.
+
+**Three ways to build an Operator (easiest → most powerful):**
+
+```
+  ┌─────────────────────────────────────────────────────────────────┐
+  │                  Operator SDK Options                            │
+  │                                                                  │
+  │  Helm-based            Ansible-based          Go-based           │
+  │  ──────────            ─────────────          ────────           │
+  │  Wrap an existing      Write Ansible          Write Go code      │
+  │  Helm chart as an      playbooks that         with full access   │
+  │  Operator. Zero code.  run on reconcile.      to Kubernetes API. │
+  │                                                                  │
+  │  Good for:             Good for:              Good for:          │
+  │  Simple stateless      Day-2 ops (backup,     Complex stateful   │
+  │  app deployment        config, upgrades)      apps (databases,   │
+  │                                               GPU operators)     │
+  │                                                                  │
+  │  Effort: Hours         Effort: Days           Effort: Weeks      │
+  │  Capability: Level 1   Capability: Level 1-3  Capability: 1-5    │
+  └─────────────────────────────────────────────────────────────────┘
+```
+
+**Walkthrough: build a simple Go-based Operator**
+
+```bash
+# Step 1: Scaffold the project
+operator-sdk init --domain example.com \
+  --repo github.com/you/my-operator
+
+# Step 2: Create a Custom Resource + Controller
+operator-sdk create api \
+  --group app --version v1 --kind MyApp \
+  --resource --controller
+```
+
+This generates two key files:
+
+```
+  my-operator/
+  ├── api/v1/myapp_types.go              ← Define your CR fields
+  └── controllers/myapp_controller.go    ← Write your reconcile logic
+```
+
+**File 1: Define the Custom Resource** (`api/v1/myapp_types.go`)
+
+This is where you define *what the user can ask for*:
+
+```go
+type MyAppSpec struct {
+    // How many replicas the user wants
+    Replicas int32  `json:"replicas"`
+    // Which container image to run
+    Image    string `json:"image"`
+}
+
+type MyAppStatus struct {
+    // How many replicas are actually running
+    ReadyReplicas int32 `json:"readyReplicas"`
+}
+```
+
+This lets users write YAML like:
+
+```yaml
+apiVersion: app.example.com/v1
+kind: MyApp
+metadata:
+  name: hello
+spec:
+  replicas: 3
+  image: nginx:latest
+```
+
+**File 2: The Reconcile Loop** (`controllers/myapp_controller.go`)
+
+This is where you write the Watch → Compare → Act logic:
+
+```go
+func (r *MyAppReconciler) Reconcile(
+    ctx context.Context, req ctrl.Request,
+) (ctrl.Result, error) {
+
+    // ── WATCH: fetch the CR from etcd ──
+    var app appv1.MyApp
+    if err := r.Get(ctx, req.NamespacedName, &app); err != nil {
+        return ctrl.Result{}, err
+    }
+
+    // ── COMPARE: does a Deployment exist? ──
+    var deploy appsv1.Deployment
+    err := r.Get(ctx, req.NamespacedName, &deploy)
+
+    if err != nil {
+        // Deployment doesn't exist yet → create it
+        deploy = buildDeployment(app)   // helper function
+        r.Create(ctx, &deploy)          // ── ACT: create ──
+        return ctrl.Result{}, nil
+    }
+
+    // Deployment exists — is replica count correct?
+    if *deploy.Spec.Replicas != app.Spec.Replicas {
+        deploy.Spec.Replicas = &app.Spec.Replicas
+        r.Update(ctx, &deploy)          // ── ACT: update ──
+    }
+
+    // Update status
+    app.Status.ReadyReplicas = deploy.Status.ReadyReplicas
+    r.Status().Update(ctx, &app)
+
+    return ctrl.Result{}, nil
+}
+```
+
+```
+  What this code does:
+  ────────────────────
+
+  User applies:  MyApp { replicas: 3, image: "nginx" }
+       │
+       ▼
+  Reconcile() runs:
+       │
+       ├── Does a Deployment exist for this MyApp?
+       │     No  → Create a Deployment with 3 nginx replicas
+       │     Yes → Is replicas == 3?
+       │              No  → Update Deployment to 3 replicas
+       │              Yes → Do nothing (already in sync)
+       │
+       ▼
+  Update MyApp.status.readyReplicas from Deployment status
+       │
+       ▼
+  Return (Kubernetes calls Reconcile again on any change)
+```
+
+**Operator Capability Levels:**
+
+```
+  Level 1: Basic Install           "Deploy my app"
+  Level 2: Seamless Upgrades       "Upgrade v1 → v2 without downtime"
+  Level 3: Full Lifecycle           "Backup, restore, failure recovery"
+  Level 4: Deep Insights            "Custom metrics, alerts, dashboards"
+  Level 5: Auto Pilot               "Self-tuning, auto-scale, auto-heal"
+
+  Helm Operator    ──── Level 1
+  Ansible Operator ──── Level 1-3
+  Go Operator      ──── Level 1-5 (GPU Operator, CVO are Level 5)
+```
 
 ### 6.5 Networking
 
