@@ -22,6 +22,9 @@ tags: [openshift, kubernetes, containers, gpu, llm, inference, vllm, kserve, ai,
 > - If you already know Kubernetes, skip to **Section 6.4 (Operators)** — that's where OpenShift diverges.
 > - If you only care about LLM serving, skip to **Section 8**.
 
+
+[OKD Documentation](https://docs.okd.io/latest/welcome/index.html)
+
 ## 0. Glossary: Key Terms
 
 Before diving in, here are the main terms used throughout this article:
