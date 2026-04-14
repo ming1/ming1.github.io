@@ -295,6 +295,87 @@ Every modern LLM is a stack of identical transformer blocks (layers). A Llama 3 
  Repeat × 32 blocks (for Llama 3 8B)
 ```
 
+### From 32 Blocks to One Token: The Full Pipeline
+
+The 32 blocks are a **sequential pipeline** — the output of block 1 feeds into block 2, block
+2 into block 3, and so on. Each block refines the representation. But how does the output of
+block 32 become an actual word?
+
+```
+ Input text: "The cat sat on the"
+                │
+                ▼
+ ┌──────────────────────┐
+ │  Embedding Layer     │  ← convert each token ID to a vector
+ │  (vocab_size × 4096) │     e.g., "the" → [0.12, -0.34, 0.56, ...]
+ │                      │     output: (seq_len × 4096) matrix
+ └──────────┬───────────┘
+            │
+            ▼
+ ┌──────────────────────┐
+ │  Block 1             │  ← early layers: learn syntax, grammar
+ └──────────┬───────────┘     "the" is a determiner, "cat" is a noun
+            ▼
+ ┌──────────────────────┐
+ │  Block 2 ... 16      │  ← middle layers: learn relationships
+ └──────────┬───────────┘     "cat" is the subject, "sat on" is the action
+            ▼
+ ┌──────────────────────┐
+ │  Block 17 ... 31     │  ← later layers: learn semantics
+ └──────────┬───────────┘     context suggests a location word comes next
+            ▼
+ ┌──────────────────────┐
+ │  Block 32            │  ← final block output: (seq_len × 4096)
+ └──────────┬───────────┘     a refined hidden state for each position
+            │
+            ▼ take the LAST token's hidden state (position of "the")
+ ┌──────────────────────┐
+ │  Layer Norm          │  ← final normalization
+ └──────────┬───────────┘
+            │
+            ▼
+ ┌──────────────────────┐
+ │  LM Head             │  ← linear projection: (4096 → 128,256)
+ │  (4096 × vocab_size) │     one score per word in vocabulary
+ └──────────┬───────────┘
+            │
+            ▼
+ ┌──────────────────────┐
+ │  Softmax + Sampling  │  ← convert scores to probabilities
+ │                      │     "mat"  → 0.35   ← highest
+ │  temperature, top_p  │     "bed"  → 0.15
+ │  control randomness  │     "roof" → 0.10
+ │                      │     "floor"→ 0.08
+ │                      │     ...128,252 other words
+ └──────────┬───────────┘
+            │
+            ▼
+    Output token: "mat"     ← sampled from the distribution
+```
+
+Three key stages after the 32 blocks:
+
+1. **Take the last position**: only the hidden state at the **last token position** matters for
+   predicting the next token. The other positions were needed for attention context but are not
+   used for the final prediction. (Their K,V values are stored in the KV cache for future steps.)
+
+2. **LM Head (language model head)**: a single matrix multiplication that projects the 4096-dim
+   hidden state into a vector of size `vocab_size` (128,256 for Llama 3). Each entry is a
+   **logit** — an unnormalized score for how likely that word is to come next.
+
+3. **Sampling**: the logits are converted to probabilities (via softmax), then a token is
+   **sampled** from the distribution. The `temperature` parameter controls randomness:
+   - temperature=0: always pick the highest-probability token (greedy, deterministic)
+   - temperature=1: sample proportionally to probabilities (creative, varied)
+   - top_p=0.9: only consider tokens whose cumulative probability reaches 90% (nucleus sampling)
+
+`The 32 blocks transform "what words are here" into "what word should come next."`
+`The LM Head + sampling turn that understanding into an actual token choice.`
+
+This entire pipeline — embedding → 32 blocks → LM head → sample — runs **once per output
+token** during decode. For a 200-token response, it runs 200 times, each time appending the
+new token and reading it back through the KV cache.
+
 ### Prefill vs. Decode: Two Very Different Workloads
 
 LLM inference has two distinct phases:
