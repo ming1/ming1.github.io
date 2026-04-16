@@ -2537,3 +2537,90 @@ provide irq register/unregister kfunc
 - rust binding vs. bpf kfunc
 
 
+# nvme vfio target
+
+## hugepage DMA safety on daemon crash
+
+Hugepage is used by the nvme vfio target for DMA. The NVMe device reads/writes
+hugepage-backed memory autonomously via IOVAs (or physical addresses in noiommu
+mode). If the daemon crashes while DMA is in-progress, the device doesn't know
+and keeps DMAing.
+
+### what happens when the daemon crashes mid-DMA
+
+1. The NVMe device has active DMA operations — it's reading from or writing to
+   hugepage-backed memory.
+
+2. The daemon is killed (e.g., SIGKILL, segfault) — the cleanup path
+   `nvme_vfio_cleanup()` may **not run**, meaning:
+   - No `nvme_shutdown_controller()` → the NVMe controller stays active
+   - No `nvme_delete_io_queue()` → submission/completion queues stay live
+   - No `IOMMU_IOAS_UNMAP` → DMA mappings persist (in IOMMU mode)
+   - No `munmap()` of the hugepage pool
+
+3. The hugepages get freed when the process dies (kernel reclaims the mmap),
+   but the device may still be DMAing to those physical pages.
+
+### IOMMU mode (iommufd) — safer
+
+When the process dies, the kernel cleans up the iommufd file descriptors. The
+IOMMU driver will:
+
+- Tear down the IOAS (IO Address Space)
+- Remove IOVA→physical mappings from the IOMMU page table
+- Subsequent DMA from the device will be **blocked by the IOMMU** (IOMMU fault)
+
+There is a small **race window** between the crash and the kernel's fd cleanup.
+During that window, in-flight DMA can still land. But the IOMMU guarantees that:
+
+- DMA is confined to the originally mapped regions (no wild writes)
+- Once the fd is closed, new DMA transactions are faulted
+
+The IOMMU acts as a hardware firewall — this is the primary safety mechanism.
+
+### noiommu mode — dangerous
+
+This is where the real risk lives. DMA uses **raw physical addresses** obtained
+from `/proc/self/pagemap` — no IOMMU protection:
+
+- If the daemon crashes, the NVMe device continues DMAing to those physical
+  pages
+- The kernel may **reallocate those physical pages** to another process
+- Result: **memory corruption** of arbitrary processes, potential security
+  vulnerability
+
+### risk summary
+
+| Scenario | IOMMU Mode | NoIOMMU Mode |
+|----------|-----------|--------------|
+| Daemon crash, DMA in-flight | Brief race window, then IOMMU faults DMA | Device keeps DMAing to freed physical pages |
+| Pages reallocated to other process | Blocked by IOMMU | Silent memory corruption |
+| Device keeps submitting I/O | Controller stays active until IOMMU teardown | Controller stays active indefinitely |
+| Security impact | Low (IOMMU-contained) | Critical (arbitrary physical memory access) |
+
+### no crash-safety mechanisms in current code
+
+- No `signal()` or `sigaction()` handlers for SIGSEGV/SIGBUS/SIGABRT
+- No `atexit()` registration
+- No kernel-side device reset triggered by process death (in noiommu mode)
+
+The cleanup in `nvme_vfio_deinit_tgt()` only runs during **graceful** shutdown
+via the ublksrv framework lifecycle.
+
+### possible mitigations
+
+1. **Always prefer IOMMU mode** — it's the primary safety net
+2. **Register signal handlers** for SIGSEGV/SIGABRT/SIGTERM to attempt
+   `nvme_shutdown_controller()` before dying
+3. **Use `atexit()`** to register cleanup for normal exit paths
+4. **Kernel-side reset**: the VFIO subsystem could trigger a PCI FLR (Function
+   Level Reset) when the group fd is closed — worth verifying this happens in
+   the kernel's vfio-pci driver
+5. For noiommu: consider **pinning hugepages** (`mlock`) and keeping them
+   reserved even after crash (though this leaks memory)
+
+The IOMMU mode is the architecturally correct answer — it's why IOMMU exists.
+NoIOMMU mode is inherently unsafe for production use, which is why the kernel
+requires `CAP_SYS_RAWIO` and marks it as dangerous.
+
+
