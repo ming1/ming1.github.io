@@ -351,8 +351,123 @@ Defined in `include/linux/fs.h:1926`. Handles I/O on open files.
 | `mmap` | `(struct file *, struct vm_area_struct *)` | Memory-map a file |
 | `fsync` | `(struct file *, loff_t start, loff_t end, int datasync)` | Sync file to disk |
 | `splice_read` | `(struct file *, loff_t *, struct pipe_inode_info *, size_t, unsigned int)` | Zero-copy read to pipe |
+| `splice_write` | `(struct file *, loff_t *, struct pipe_inode_info *, size_t, unsigned int)` | Zero-copy write from pipe |
 | `fallocate` | `(struct file *, int mode, loff_t offset, loff_t len)` | Pre-allocate space |
+| `copy_file_range` | `(struct file *in, loff_t, struct file *out, loff_t, size_t, unsigned int)` | Server-side file copy |
 | `uring_cmd` | `(struct io_uring_cmd *, unsigned int)` | io_uring passthrough |
+
+#### Pipe and Splice-Based Zero-Copy
+
+Several of the above callbacks — `splice_read`, `splice_write`, and
+`copy_file_range` — participate in the kernel's **pipe-based zero-copy**
+framework. This framework avoids copying data by passing page references
+through pipes instead of copying bytes between buffers.
+
+**The core idea:** A pipe is not just a byte stream — internally it is a
+circular array of `struct pipe_buffer`, each holding a reference to a
+`struct page` plus an offset and length. Zero-copy works by moving these
+page references between producers and consumers, rather than `memcpy`-ing
+the page contents.
+
+```c
+/* include/linux/pipe_fs_i.h — the pipe buffer is a page reference, not a copy */
+struct pipe_buffer {
+    struct page *page;                     /* the actual data page (not a copy) */
+    unsigned int offset, len;              /* which bytes within the page */
+    const struct pipe_buf_operations *ops; /* confirm, release, try_steal */
+    unsigned int flags;
+};
+```
+
+**How splice(2) works — file → pipe → file:**
+
+```
+                        Pipe (circular buffer of page references)
+                      ┌──────────────────────────────────────────┐
+                      │ buf[0]    buf[1]    buf[2]    buf[3]     │
+ splice_read          │ ┌─────┐  ┌─────┐  ┌─────┐  ┌─────┐     │  splice_write
+ (file → pipe)        │ │page ├──┤page ├──┤page ├──┤page │     │  (pipe → file)
+       │              │ │ref  │  │ref  │  │ref  │  │ref  │     │        │
+       ▼              │ └──┬──┘  └──┬──┘  └──┬──┘  └──┬──┘     │        ▼
+┌──────────────┐      └────┼───────┼───────┼───────┼──────────┘  ┌──────────────┐
+│ Page cache   │           │       │       │       │             │ Destination  │
+│ ┌────┬────┐  │           │       │       │       │             │ file         │
+│ │pg A│pg B│◄─┼───────────┘       │       │       │             │              │
+│ └────┴────┘  │  same pages,      │       │       │             │ write_iter() │
+│              │  just referenced   │       │       │             │ receives     │
+│ folio_get()  │  (folio_get to     │       │       │             │ bvec iter    │
+│ adds refcount│   keep alive)      │       │       │             │ pointing at  │
+└──────────────┘                    ▼       ▼       ▼             │ pipe pages   │
+                              (page cache pages               └──────────────┘
+                               stay in memory,
+                               zero bytes copied)
+```
+
+**Step 1: `splice_read` — file to pipe** (via `filemap_splice_read()`, `mm/filemap.c:3053`):
+
+The filesystem reads folios from the page cache (or issues I/O if not cached)
+and populates pipe buffers with **direct page references** — no data copy:
+
+```c
+/* mm/filemap.c — splice_folio_into_pipe() populates pipe buffers */
+*buf = (struct pipe_buffer) {
+    .ops = &page_cache_pipe_buf_ops,
+    .page = folio_page(folio, idx),   /* direct page reference */
+    .offset = offset,
+    .len = part,
+};
+folio_get(folio);   /* increment refcount — page stays alive */
+pipe->head++;
+```
+
+The page cache page is shared: both the page cache and the pipe buffer
+hold a reference to the same `struct page`. No bytes are copied.
+
+**Step 2: `splice_write` — pipe to file** (via `iter_file_splice_write()`, `fs/splice.c:661`):
+
+Pipe buffers are converted to a `bio_vec` array and wrapped in an `iov_iter`.
+The filesystem's `write_iter()` receives the iter pointing directly at the
+pipe pages — again, no data copy:
+
+```c
+/* fs/splice.c — iter_file_splice_write() builds bvec from pipe pages */
+for (each pipe buffer) {
+    bvec_set_page(&array[n], buf->page, this_len, buf->offset);
+}
+iov_iter_bvec(&from, ITER_SOURCE, array, n, sd.total_len);
+out->f_op->write_iter(&kiocb, &from);   /* filesystem writes from pipe pages */
+```
+
+**Related zero-copy syscalls built on this framework:**
+
+| Syscall | How it works | Key function |
+|---------|-------------|--------------|
+| `splice(file, pipe)` | `filemap_splice_read()` puts page cache refs in pipe | `splice_folio_into_pipe()` |
+| `splice(pipe, file)` | `iter_file_splice_write()` passes pipe page bvecs to `write_iter` | `iov_iter_bvec()` |
+| `splice(pipe, pipe)` | `splice_pipe_to_pipe()` moves or shares buffer metadata | `pipe_buf_get()` |
+| `sendfile(in, out)` | Internally creates a private pipe, splices file→pipe→socket | `do_splice_direct()` |
+| `tee(pipe, pipe)` | Duplicates pipe buffer references (both pipes share pages) | `link_pipe()` |
+| `vmsplice(user, pipe)` | Pins user pages via GUP and puts refs in pipe | `iov_iter_get_pages2()` |
+| `copy_file_range(in, out)` | FS-native copy (reflink/CoW) or falls back to splice | `vfs_copy_file_range()` |
+
+**Why pipes?** The pipe serves as a kernel-internal staging area that
+decouples the producer from the consumer. Neither side needs to know about
+the other — the producer fills pipe buffers with page references, the
+consumer drains them. This enables zero-copy chains like:
+
+```
+file → splice_read → pipe → splice_write → socket → network
+                                                   (sendfile)
+
+file → splice_read → pipe → tee → pipe₂ → splice_write → file₂
+                             │                            (copy_file_range)
+                             └─── splice_write → socket
+                                                (fan-out)
+```
+
+**The one exception:** `vmsplice(pipe → user)` cannot be zero-copy for
+security — it would expose kernel page cache pages directly to userspace.
+This direction always copies via `copy_page_to_iter()`.
 
 ### 4.4 struct address_space_operations
 
