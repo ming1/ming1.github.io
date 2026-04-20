@@ -306,23 +306,31 @@ Defined in `include/linux/fs/super_types.h:83`. Manages inode lifecycle and FS-l
 
 ### 4.2 struct inode_operations
 
-Defined in `include/linux/fs.h:2001`. Manages namespace operations on inodes.
+Defined in `include/linux/fs.h:2001`. Manages namespace operations on inodes —
+these are the operations that create, find, modify, and remove directory entries.
+Unlike `file_operations` (which operate on open files), inode_operations work on
+the filesystem namespace: names, directories, metadata, and permissions.
 
-| Method | Signature | Purpose |
-|--------|-----------|---------|
-| `lookup` | `(struct inode *dir, struct dentry *, unsigned flags)` → `struct dentry *` | Look up a name in a directory |
-| `create` | `(struct mnt_idmap *, struct inode *dir, struct dentry *, umode_t, bool excl)` | Create a new regular file |
-| `mkdir` | `(struct mnt_idmap *, struct inode *dir, struct dentry *, umode_t)` → `struct dentry *` | Create a new directory |
-| `rmdir` | `(struct inode *dir, struct dentry *)` | Remove a directory |
-| `link` | `(struct dentry *old, struct inode *dir, struct dentry *new)` | Create a hard link |
-| `unlink` | `(struct inode *dir, struct dentry *)` | Remove a name (hard link) |
-| `symlink` | `(struct mnt_idmap *, struct inode *dir, struct dentry *, const char *)` | Create a symbolic link |
-| `rename` | `(struct mnt_idmap *, struct inode *old_dir, struct dentry *old, struct inode *new_dir, struct dentry *new, unsigned int flags)` | Rename/move |
-| `permission` | `(struct mnt_idmap *, struct inode *, int mask)` | Check access permissions |
-| `setattr` | `(struct mnt_idmap *, struct dentry *, struct iattr *)` | Set inode attributes (chmod, chown, truncate) |
-| `getattr` | `(struct mnt_idmap *, const struct path *, struct kstat *, u32, unsigned int)` | Get inode attributes (stat) |
-| `get_link` | `(struct dentry *, struct inode *, struct delayed_call *)` → `const char *` | Read symlink target |
-| `atomic_open` | `(struct inode *, struct dentry *, struct file *, unsigned, umode_t)` | Combined lookup+create+open |
+| Method | VFS Caller | Triggered By | Purpose |
+|--------|-----------|--------------|---------|
+| `lookup` | path walk (`fs/namei.c:1805`) | Every pathname-based syscall (open, stat, unlink, etc.) during path component resolution | Resolve a name in a directory to a dentry/inode. The most frequently called inode operation — invoked for each component of every path walk when the dcache misses. Must instantiate the dentry (via `d_splice_alias`) or return a negative dentry if the name doesn't exist. |
+| `create` | `vfs_create()` (`fs/namei.c:4184`) | `open(path, O_CREAT)`, `creat()` | Create a new regular file. Called when `open()` with `O_CREAT` determines the file doesn't exist. The filesystem must allocate an inode, initialize it, and link it into the directory. Only called if `atomic_open` is not provided or doesn't handle the case. |
+| `mkdir` | `vfs_mkdir()` (`fs/namei.c:5232`) | `mkdir()`, `mkdirat()` | Create a new directory. Must allocate a directory inode, initialize it with "." and ".." entries, and link it into the parent directory. |
+| `rmdir` | `vfs_rmdir()` (`fs/namei.c:5339`) | `rmdir()`, `unlinkat(AT_REMOVEDIR)` | Remove an empty directory. The VFS checks that the directory is empty before calling this. The filesystem must remove the directory entry from the parent and release the inode. |
+| `link` | `vfs_link()` (`fs/namei.c:5724`) | `link()`, `linkat()` | Create a hard link. Adds a new name for an existing inode in a (possibly different) directory. The filesystem must increment the link count and add the directory entry. |
+| `unlink` | `vfs_unlink()` (`fs/namei.c:5472`) | `unlink()`, `unlinkat()` | Remove a name (directory entry) for a file. Decrements the link count. The inode is freed when link count reaches 0 and no open file descriptors remain. |
+| `symlink` | `vfs_symlink()` (`fs/namei.c:5622`) | `symlink()`, `symlinkat()` | Create a symbolic link. Must allocate a symlink inode and store the target path string. Short targets are often stored inline in the inode ("fast symlinks"). |
+| `rename` | `vfs_rename()` (`fs/namei.c:5924`) | `rename()`, `renameat()`, `renameat2()` | Atomically rename/move a file or directory. May involve two different parent directories. `renameat2` supports flags like `RENAME_EXCHANGE` (swap two names) and `RENAME_NOREPLACE` (fail if target exists). |
+| `permission` | `do_inode_permission()` (`fs/namei.c:573`) | Implicitly by all file operations | Check if the current process has the requested access (MAY_READ, MAY_WRITE, MAY_EXEC) to an inode. Called by `inode_permission()` during path walk, open, and other operations. If not provided, the VFS falls back to `generic_permission()` which uses standard UNIX permission checks. |
+| `setattr` | `notify_change()` (`fs/attr.c:427`) | `chmod()`, `chown()`, `truncate()`, `ftruncate()`, `utimensat()` | Set inode attributes: mode, owner, size, timestamps. The VFS calls `notify_change()` which validates the changes and calls the filesystem's `setattr`. Most filesystems call `setattr_prepare()` to validate, then `setattr_copy()` to apply generic fields. Truncation (changing size) is the most complex case. |
+| `getattr` | `vfs_getattr_nosec()` (`fs/stat.c:181`) | `stat()`, `lstat()`, `fstat()`, `statx()` | Retrieve inode attributes. The filesystem fills a `struct kstat` with size, mode, timestamps, link count, etc. `statx()` supports a `request_mask` to request specific fields. If not provided, the VFS uses `generic_fillattr()` which reads from the in-memory inode. |
+| `get_link` | `vfs_get_link()` (`fs/namei.c:6286`) | `readlink()`, `readlinkat()`, or path walk encountering a symlink | Return the target string of a symbolic link. Used both during path resolution (to follow symlinks) and for the `readlink()` syscall. Returns a kernel pointer to the target string; the `delayed_call` parameter allows deferred cleanup. |
+| `atomic_open` | `atomic_open()` (`fs/namei.c:4354`) | `open()`, `openat()`, `openat2()`, `creat()` | Combined lookup + create + open in one filesystem call. Avoids multiple round trips for network/FUSE filesystems where each VFS operation is expensive. If provided, the VFS calls this instead of separate `lookup` + `create` + `open` sequences. The filesystem returns `FUSE_OPEN`-style flags to control caching behavior. |
+| `mknod` | `vfs_mknod()` (`fs/namei.c:5090`) | `mknod()`, `mknodat()` | Create a special file: device node (block/char), FIFO (named pipe), or UNIX socket. The `dev_t` parameter specifies major/minor numbers for device nodes. |
+| `tmpfile` | `vfs_tmpfile()` (`fs/namei.c:4728`) | `open(O_TMPFILE)` | Create an unnamed temporary file. The file exists only as an open file descriptor — it has no directory entry. Useful for secure temporary files that can't be accessed by name. The file can later be linked into the namespace via `linkat()`. |
+| `listxattr` | `vfs_listxattr()` (`fs/xattr.c:501`) | `listxattr()`, `llistxattr()`, `flistxattr()` | List all extended attribute names on a file. Returns a null-separated list of attribute names. |
+| `fiemap` | `ioctl_fiemap()` (`fs/ioctl.c:219`) | `ioctl(fd, FS_IOC_FIEMAP, ...)` | Report the physical extent layout of a file. Used by defragmentation tools and `filefrag` to understand how a file is laid out on disk (contiguous vs. fragmented). |
+| `update_time` | `touch_atime()` / `file_update_time()` (`fs/inode.c`) | Implicitly by read/write operations | Custom timestamp update logic. Called lazily when atime needs updating on read, or mtime/ctime on write. If not provided, the VFS uses `generic_update_time()`. Filesystems with lazy time semantics (e.g., `lazytime` mount option) use this to defer timestamp writes. |
 
 ### 4.3 struct file_operations
 
@@ -348,20 +356,34 @@ Defined in `include/linux/fs.h:1926`. Handles I/O on open files.
 
 ### 4.4 struct address_space_operations
 
-Defined in `include/linux/fs.h:403`. Bridges page cache and storage.
+Defined in `include/linux/fs.h:401`. Bridges the page cache and the backing
+storage. While `file_operations` handle userspace-facing I/O (read/write
+syscalls), `address_space_operations` handle the page-cache-to-storage
+translation — they are the filesystem's contract with the memory management
+subsystem. Every filesystem that supports buffered I/O must implement at least
+`read_folio` and `writepages`.
 
-| Method | Signature | Purpose |
-|--------|-----------|---------|
-| `read_folio` | `(struct file *, struct folio *)` | Read one folio from storage |
-| `readahead` | `(struct readahead_control *)` | Batch read multiple folios |
-| `writepages` | `(struct address_space *, struct writeback_control *)` | Write dirty pages to storage |
-| `dirty_folio` | `(struct address_space *, struct folio *)` → `bool` | Mark a folio dirty |
-| `write_begin` | `(const struct kiocb *, struct address_space *, loff_t pos, unsigned len, struct folio **, void **)` | Prepare a folio for writing |
-| `write_end` | `(const struct kiocb *, struct address_space *, loff_t pos, unsigned len, unsigned copied, struct folio *, void *)` | Finish writing a folio |
-| `direct_IO` | `(struct kiocb *, struct iov_iter *)` | Bypass page cache I/O |
-| `bmap` | `(struct address_space *, sector_t)` → `sector_t` | Map file offset to disk block |
-| `invalidate_folio` | `(struct folio *, size_t offset, size_t len)` | Invalidate cached data |
-| `release_folio` | `(struct folio *, gfp_t)` → `bool` | Release FS resources from folio |
+| Method | MM/VFS Caller | Triggered By | Purpose |
+|--------|--------------|--------------|---------|
+| `read_folio` | `filemap_read_folio()` (`mm/filemap.c:2491`), `read_pages()` (`mm/readahead.c:173`) | Page cache miss during buffered `read()`, or readahead fallback when `readahead` is not set | Read a single folio from backing storage into the page cache. The filesystem must issue I/O to fill the folio and call `folio_mark_uptodate()` + `folio_unlock()` when done. This is the synchronous single-page fallback; most filesystems also implement `readahead` for batch I/O. |
+| `readahead` | `read_pages()` (`mm/readahead.c:162`) | Sequential read patterns detected by the readahead algorithm (`page_cache_ra_unbounded`), or explicit `readahead()` / `fadvise(POSIX_FADV_WILLNEED)` syscalls | Batch-read multiple folios from backing storage. The filesystem receives a `readahead_control` describing the range and can submit all I/O in one batch (e.g., one multi-page bio). More efficient than repeated `read_folio` calls for sequential access. |
+| `writepages` | `do_writepages()` (`mm/page-writeback.c:2574`) | Periodic writeback by `kthread` writeback workers (bdflush/kupdated), explicit `sync`/`fsync`/`fdatasync`, or memory pressure reclaim | Write dirty folios back to storage. The filesystem walks dirty folios using the `writeback_control` to determine scope (whole-file, range, or nr_to_write). Most block filesystems use `iomap_writepages()` or `mpage_writepages()`. |
+| `dirty_folio` | `folio_mark_dirty()` (`mm/page-writeback.c:2796`) | Buffered write completes, mmap'd page is dirtied via page fault, or filesystem explicitly dirties a folio | Called when a folio transitions to dirty. The filesystem sets dirty tracking bits (e.g., buffer head dirty flags). Returns `true` if the folio was newly dirtied. Most block filesystems use `block_dirty_folio()`; simple RAM-based filesystems use `noop_dirty_folio()`. |
+| `write_begin` | `generic_perform_write()` (`mm/filemap.c:4324`) | Buffered write path — preparing a folio before user data is copied into it | Prepare a folio for a partial write. The filesystem must find-or-create the folio in the page cache and ensure the on-disk portions are read in (so that the partial page write doesn't lose existing data). Returns the locked folio via `*foliop`. Block filesystems use this to allocate disk blocks and read existing data. |
+| `write_end` | `generic_perform_write()` (`mm/filemap.c:4345`) | Immediately after user data is copied into the folio via `copy_folio_from_iter_atomic()` | Finalize a folio after a write. The filesystem marks dirty regions, adjusts `i_size` if the file grew, and unlocks the folio. `copied` indicates how many bytes were actually copied (may be less than `len` if the copy faulted). |
+| `direct_IO` | `generic_file_read_iter()` (`mm/filemap.c:2974`), `generic_file_direct_write()` (`mm/filemap.c:4258`) | `read()`/`write()` on a file opened with `O_DIRECT` | Bypass the page cache entirely. The filesystem does I/O directly between the user buffer and storage. Used for database-style workloads that manage their own caching. Modern filesystems prefer `iomap` direct I/O over this legacy callback. |
+| `bmap` | `bmap()` (`fs/inode.c:2046`) | `ioctl(fd, FIBMAP, &block)` | Map a file's logical block number to a physical disk block number. Legacy interface used by LILO and `fsck`. The source code comments mark it as a "kludge" — modern tools use `FIEMAP` instead. |
+| `invalidate_folio` | `folio_invalidate()` (`mm/truncate.c:140`) | `truncate()`, `fallocate(FALLOC_FL_PUNCH_HOLE)`, page cache invalidation | Called when a folio (or part of it) must be discarded. The filesystem must drop any private data (e.g., buffer heads) associated with the invalidated range. Called during truncation and hole-punching operations. |
+| `release_folio` | `filemap_release_folio()` (`mm/filemap.c:4503`) | Memory reclaim (page eviction under memory pressure), or explicit `invalidate_inode_pages2()` | Called before the MM evicts a clean folio from the page cache. The filesystem must release any private resources (e.g., buffer heads, journaling references). Returns `true` if the folio can be freed, `false` if it must be kept (e.g., journaling still needs it). |
+| `free_folio` | `filemap_free_folio()` (`mm/filemap.c:235`) | Folio removal from page cache (eviction, truncation, replacement) | Called when a folio is actually removed from the page cache. Unlike `release_folio` (which asks "can I free this?"), `free_folio` is a notification that the folio is being freed — the filesystem does final cleanup. |
+| `migrate_folio` | `__folio_migrate()` (`mm/migrate.c:1103`) | NUMA balancing, memory compaction, memory hotplug/offlining | Migrate a folio's contents from one physical page to another. The filesystem must move any private data and update references. Used by the kernel's page migration infrastructure to relocate pages between NUMA nodes or for memory compaction. |
+| `launder_folio` | `folio_launder()` (`mm/truncate.c:612`) | `invalidate_inode_pages2()` — forced page cache invalidation (e.g., direct I/O coherency, NFS cache invalidation) | Clean a dirty folio before forced eviction. Unlike normal writeback (which is asynchronous), this is synchronous — the folio must be clean when the function returns. Called when the kernel must guarantee no dirty data remains in the page cache for a range. |
+| `is_partially_uptodate` | `filemap_range_uptodate()` (`mm/filemap.c:2541`) | Buffered read checking if a partially-filled folio can satisfy the request | Allows the filesystem to report that part of a folio is uptodate even if the whole folio isn't. Block filesystems with sub-page buffer heads can satisfy small reads without re-reading the entire folio from disk. |
+| `is_dirty_writeback` | `folio_check_dirty_writeback()` (`mm/vmscan.c:981`) | Page reclaim scanning to decide if a folio can be evicted | Lets the filesystem provide accurate dirty/writeback status. The MM reclaim scanner uses this to avoid evicting folios that are under writeback or have dirty data that would need to be written first. |
+| `error_remove_folio` | `truncate_error_folio()` (`mm/memory-failure.c:940`) | Hardware memory error (ECC uncorrectable error, HWPOISON) | Remove a folio from the page cache in response to a hardware memory error. Part of the kernel's memory-failure recovery path that prevents corrupted data from being served to applications. |
+| `swap_activate` | `setup_swap_extents()` (`mm/swapfile.c:2790`) | `swapon()` syscall | Prepare a file for use as swap space. The filesystem must provide the block layout so the swap subsystem can do direct I/O without going through the filesystem's normal read/write paths. |
+| `swap_deactivate` | `destroy_swap_extents()` (`mm/swapfile.c:2698`) | `swapoff()` syscall | Undo `swap_activate` — clean up when a file is no longer used as swap. |
+| `swap_rw` | `swap_write_unplug()` / `swap_read_folio()` (`mm/page_io.c`) | Swap in/out operations (page fault on swapped page, or memory pressure eviction) | Perform swap I/O for file-backed swap. Called to read a folio back from swap (swap-in) or write it out (swap-out) when the filesystem is used as swap backing store. |
 
 ### 4.5 struct dentry_operations
 
