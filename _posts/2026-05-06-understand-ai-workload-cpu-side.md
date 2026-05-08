@@ -182,8 +182,8 @@ optimizer states to CPU RAM to free GPU VRAM for larger models.
 
 **Checkpointing:** Periodically, the model state is saved to persistent storage.
 For a 70B parameter model, the weights alone in fp16 are ~140 GB; a full
-training checkpoint including Adam optimizer states (fp32 moments) can be
-~420 GB. The CPU coordinates serialization and writes to storage (often in
+training checkpoint including Adam optimizer states (fp32 master weights +
+two fp32 moment buffers) can reach ~700-980 GB. The CPU coordinates serialization and writes to storage (often in
 parallel with continued training). Asynchronous checkpointing avoids blocking
 the training loop:
 
@@ -366,13 +366,25 @@ First, some notation used throughout this section:
              embedding vector for each token. For LLaMA-70B, d_model = 8192.
              Every token is represented as a vector of 8192 numbers.
 
-  W_q, W_k, W_v — Learned weight matrices that project X into Query,
-             Key, and Value spaces. Shape: [d_model × d_model] each.
-             These are the main parameters of the model — the "knowledge"
-             learned during training. Each layer has its own set.
+  W_q     — Query projection. Shape: [d_model × d_model].
+             For LLaMA-70B: [8192 × 8192] = ~67 million parameters.
+
+  W_k, W_v — Key and Value projections. In standard multi-head attention
+             (MHA), these are also [d_model × d_model]. But modern models
+             like LLaMA use Grouped Query Attention (GQA), where K and V
+             have fewer heads (n_kv_heads) than Q (n_heads). This makes
+             W_k and W_v smaller:
+               W_k, W_v shape: [d_model × (n_kv_heads × d_k)]
+               For LLaMA-70B:  [8192 × (8 × 128)] = [8192 × 1024]
+
+             These weight matrices are the main parameters of the model —
+             the "knowledge" learned during training. Each layer has its
+             own set of W_q, W_k, W_v.
 
   W_o     — Output projection weight matrix after attention.
-  W_up, W_down — FFN (feed-forward network) weight matrices.
+  W_up, W_gate, W_down — FFN (feed-forward network) weight matrices.
+             LLaMA uses SwiGLU activation, which has three FFN matrices
+             instead of the two in standard transformers.
 
   d_k     — Dimension per attention head = d_model / n_heads.
              For LLaMA-70B: 8192 / 64 = 128.
@@ -381,7 +393,8 @@ First, some notation used throughout this section:
     d_model = 8192
     n_layers = 80
     n_heads = 64 (query), n_kv_heads = 8 (GQA)
-    Each W_q: [8192 × 8192] = 134 million parameters per layer
+    Each W_q: [8192 × 8192] = ~67 million parameters per layer
+    Each W_k: [8192 × 1024] = ~8.4 million parameters per layer (GQA)
     Total across all layers and all weight matrices: ~70 billion parameters
 ```
 
@@ -406,16 +419,17 @@ simultaneously:
   ┌──────────────────────────────────────────────────────────┐
   │ 1. Linear projections (matrix × matrix):                 │
   │    Q = X · W_q    [5 × 8192] · [8192 × 8192]            │
-  │    K = X · W_k    [5 × 8192] · [8192 × 1024] (GQA: 8kv) │
-  │    V = X · W_v    [5 × 8192] · [8192 × 1024] (GQA: 8kv) │
+  │    K = X · W_k    [5 × 8192] · [8192 × 1024] (8 KV heads)│
+  │    V = X · W_v    [5 × 8192] · [8192 × 1024] (8 KV heads)│
   │                                                          │
   │ 2. Attention (all tokens attend to all prior tokens):    │
-  │    scores = Q · K^T / √d_k       [5 × 5] attention map  │
-  │    attn = softmax(scores) · V     [5 × d_head]           │
+  │    scores = Q · K^T / √d_k       [5 × 5] (per head)     │
+  │    attn = softmax(scores) · V     [5 × d_k] (per head)   │
+  │    concat all heads → [5 × d_model]                      │
   │                                                          │
   │ 3. Output projection + FFN:                              │
   │    out = attn · W_o               matrix × matrix        │
-  │    ffn = GELU(out · W_up) · W_down  (two large matmuls)  │
+  │    SwiGLU: (out · W_gate ⊙ SiLU(out · W_up)) · W_down   │
   │                                                          │
   │ 4. Save K, V to KV cache for this layer                  │
   └──────────────────────────────────────────────────────────┘
@@ -447,12 +461,13 @@ token, runs it through all layers, and produces the next token:
   │    v = x · W_v    [1 × 8192] · [8192 × 1024] → cache    │
   │                                                          │
   │ 2. Attention (new token attends to ALL cached tokens):   │
-  │    scores = q · K_cache^T    [1 × seq_len] (read cache)  │
-  │    attn = softmax(scores) · V_cache  [1 × d_head]        │
+  │    scores = q · K_cache^T    [1 × seq_len] (per head)    │
+  │    attn = softmax(scores) · V_cache  [1 × d_k] (per head)│
+  │    concat all heads → [1 × d_model]                      │
   │                                                          │
   │ 3. Output projection + FFN:                              │
   │    out = attn · W_o            vector × matrix            │
-  │    ffn = GELU(out · W_up) · W_down                       │
+  │    SwiGLU: (out · W_gate ⊙ SiLU(out · W_up)) · W_down   │
   │                                                          │
   │ 4. Append new k, v to KV cache                           │
   └──────────────────────────────────────────────────────────┘
