@@ -1345,3 +1345,193 @@ REALITY is clever but has a specific vulnerability:
 This is exactly what happens when you see `REALITY: processed invalid
 connection: handshake did not complete successfully` in the server log — the
 ClientHello was tampered with in transit.
+
+# How the Trojan Protocol Works
+
+## Design Philosophy
+
+Most proxy protocols try to **invent** a new way to hide traffic — custom
+encryption, custom headers, custom handshakes. Trojan takes the opposite
+approach: instead of inventing anything, it **hides inside** standard HTTPS.
+The core insight is simple — if your traffic is genuinely indistinguishable
+from normal HTTPS, DPI has no choice but to allow it, because blocking it
+would break the entire internet.
+
+## Architecture
+
+```
+                           ┌───────────────────────────┐
+                           │     Trojan Server          │
+                           │                           │
+Client ──── TLS ────────►  │  Port 443                 │
+                           │    │                      │
+                           │    ├─ Password correct?    │
+                           │    │   YES → proxy mode ───┼──► internet
+                           │    │   NO  → fallback  ────┼──► nginx (real website)
+                           │    │                      │
+                           └───────────────────────────┘
+```
+
+The server listens on port 443, just like any HTTPS website. It holds a
+real TLS certificate from a real CA (e.g., Let's Encrypt). When a connection
+arrives:
+
+1. Standard TLS handshake completes (identical to any HTTPS site)
+2. First encrypted message: client sends a password
+3. If correct → connection becomes a proxy tunnel
+4. If wrong → connection is silently forwarded to nginx, which serves a
+   real website
+
+## Connection Lifecycle
+
+```
+Client                              Server (port 443)
+  │                                    │
+  │  ──── TCP SYN ──────────────────►  │  1. Standard TCP handshake
+  │  ◄─── TCP SYN-ACK ─────────────  │
+  │  ──── TCP ACK ──────────────────►  │
+  │                                    │
+  │  ──── TLS ClientHello ──────────►  │  2. Standard TLS handshake
+  │  ◄─── TLS ServerHello ─────────  │     (real cert from Let's Encrypt)
+  │  ◄─── Certificate ─────────────  │
+  │  ◄─── ServerHelloDone ─────────  │
+  │  ──── ClientKeyExchange ────────►  │
+  │  ──── Finished ─────────────────►  │
+  │  ◄─── Finished ────────────────  │
+  │                                    │
+  │  ═══════ Encrypted Channel ══════  │
+  │                                    │
+  │  ──── Password + Request ───────►  │  3. First payload (inside TLS)
+  │       (56 bytes SHA224 hash)       │
+  │       + CRLF                       │     Server checks password:
+  │       + target addr + port         │
+  │       + CRLF                       │
+  │       + payload data               │
+  │                                    │
+  │  ◄──── Proxied response ────────  │  4. If correct: proxy to target
+  │                                    │     If wrong: forward to nginx
+```
+
+Steps 1 and 2 are completely standard — identical to visiting any HTTPS
+website. There is nothing custom, nothing unusual, nothing for DPI to
+detect. The authentication happens at step 3, which is **inside the
+encrypted TLS channel** where DPI is blind.
+
+## The Trojan Wire Format
+
+After the TLS handshake, the first encrypted message the client sends has
+this structure:
+
+```
++-----------+---------+----------+----------+---------+
+| password  |  CRLF   |  target  |  CRLF    | payload |
+| (56 bytes)|  (\r\n) |  address |  (\r\n)  | (data)  |
++-----------+---------+----------+----------+---------+
+```
+
+| Field | Size | Content |
+|-------|------|---------|
+| Password | 56 bytes | SHA224 hash of the plaintext password, hex-encoded |
+| CRLF | 2 bytes | `\r\n` delimiter |
+| Command | 1 byte | `0x01` (CONNECT) or `0x03` (UDP ASSOCIATE) |
+| Address type | 1 byte | `0x01` (IPv4), `0x03` (domain), `0x04` (IPv6) |
+| Address | variable | The destination to proxy to |
+| Port | 2 bytes | Destination port (big-endian) |
+| CRLF | 2 bytes | `\r\n` delimiter |
+| Payload | variable | Actual application data (e.g., the HTTP request) |
+
+The password is hashed with SHA224, producing exactly 56 hex characters.
+This fixed-length prefix makes parsing fast — the server reads exactly 56
+bytes, looks up the hash, and decides immediately. The plaintext password
+never crosses the wire (it's inside TLS anyway, but this provides
+defense-in-depth).
+
+## The Fallback Mechanism
+
+The fallback is what makes Trojan undetectable by active probing. When a
+DPI system or scanner connects to the server:
+
+```
+Scanner/DPI probe                    Trojan Server
+  │                                    │
+  │  ── TLS handshake ──────────────►  │  Handshake succeeds (real cert)
+  │  ── random data / wrong password ► │
+  │                                    │  Password check fails
+  │  ◄── Normal website response ────  │  → forwards to nginx
+  │                                    │     (serves real HTML page)
+  │  "This is just a normal website"   │
+```
+
+The scanner sees:
+
+1. A valid TLS certificate issued by Let's Encrypt
+2. A real website with HTML, CSS, images
+3. Standard HTTP response headers
+4. No error messages, no "access denied," no proxy-like behavior
+
+There is **zero distinguishing signal** between a Trojan server and a
+regular nginx HTTPS website. The server behaves identically in both cases
+from the outside.
+
+## Where Authentication Happens: Trojan vs REALITY
+
+The critical architectural difference between Trojan and REALITY is
+**where** the authentication data lives:
+
+```
+REALITY:
+  ClientHello [auth data embedded here] ──► plaintext, DPI can modify
+  ───────── TLS handshake ─────────────
+  ═══════ encrypted channel ═══════════
+
+Trojan:
+  ClientHello [standard, nothing special] ──► DPI sees normal HTTPS
+  ───────── TLS handshake ─────────────
+  ═══════ [password + request here] ═══  ──► inside encryption, DPI is blind
+```
+
+REALITY embeds authentication in the TLS ClientHello, which is sent
+**before** encryption is established. This means DPI can inspect, modify,
+or strip the auth data. If a DPI system changes even one field in the
+ClientHello, the authentication fails.
+
+Trojan sends authentication **after** the TLS handshake completes, inside
+the encrypted channel. DPI cannot see, modify, or even detect the
+authentication data. To interfere, DPI would have to break TLS itself.
+
+## Why Trojan Beats Each DPI Technique
+
+| DPI technique | How other protocols fail | How Trojan survives |
+|---------------|------------------------|-------------------|
+| Protocol fingerprinting | Shadowsocks/VMess have unique byte patterns | Trojan is standard TLS — no custom bytes visible |
+| SNI inspection | All protocols expose SNI | Trojan's SNI points to a real domain with a real cert |
+| TLS fingerprinting (JA3) | Custom TLS libraries have unique fingerprints | Xray uses uTLS to mimic Chrome/Firefox exactly |
+| Active probing | Many proxies return errors on wrong auth | Trojan serves a real website — indistinguishable |
+| ClientHello modification | REALITY auth data in ClientHello gets corrupted | Trojan auth is inside encrypted channel — untouchable |
+| Statistical analysis | Some protocols have unusual packet patterns | Trojan traffic looks like normal HTTPS browsing |
+| Certificate validation | Self-signed certs are suspicious | Trojan uses real Let's Encrypt certificates |
+
+## Security Properties
+
+| Property | Mechanism |
+|----------|-----------|
+| Confidentiality | Standard TLS encryption (AES-GCM, ChaCha20) |
+| Authentication | SHA224 password hash inside TLS channel |
+| Forward secrecy | TLS ECDHE — past sessions safe even if key leaks |
+| Anti-probing | Wrong password → serve real website via fallback |
+| Anti-fingerprinting | uTLS mimics real browser TLS ClientHello |
+
+## Potential Attack Vectors
+
+| Attack | Risk level | Description |
+|--------|-----------|-------------|
+| Network sniffing | None | Password is inside TLS encryption |
+| TLS key compromise | Low | Forward secrecy protects past sessions |
+| Fake certificate (MITM) | Low-Medium | A state actor controlling a CA could issue a forged cert and intercept TLS. Mitigated by Certificate Transparency monitoring |
+| Server compromise | Medium | Attacker reads config file with password directly |
+| IP-based blocking | Medium | The server IP can be blocked, but easily rotated |
+
+The most realistic threat for Trojan is **IP-based blocking** — a censor
+may not be able to identify Trojan traffic, but can block specific VPS IP
+ranges. This is countered by using CDN-fronted setups (WebSocket + CDN) or
+rotating server IPs.
