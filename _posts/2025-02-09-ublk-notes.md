@@ -1384,7 +1384,70 @@ unit_offset = (logic_offset / unit_size)  * unit_size   #unit_size may not be po
 (end / unit_size) - (start / unit_size) + 1
 
 
-# issues
+# Issues
+
+
+## panic from ublk_cancel_dev()/ublk_stop_dev()
+
+### stack trace
+
+```
+------------[ cut here ]------------
+DEBUG_LOCKS_WARN_ON(lock->magic != lock)
+WARNING: kernel/locking/mutex.c:593 at __mutex_lock_common kernel/locking/mutex.c:593 [inline], CPU#0: iou-wrk-20456/20463
+WARNING: kernel/locking/mutex.c:593 at __mutex_lock+0x5aa/0x1070 kernel/locking/mutex.c:776, CPU#0: iou-wrk-20456/20463
+Modules linked in:
+CPU: 0 UID: 0 PID: 20463 Comm: iou-wrk-20456 Not tainted 6.19.11-dirty #1 PREEMPT(voluntary) 
+Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS 1.16.3-debian-1.16.3-2 04/01/2014
+RIP: 0010:__mutex_lock_common kernel/locking/mutex.c:593 [inline]
+RIP: 0010:__mutex_lock+0x5b1/0x1070 kernel/locking/mutex.c:776
+Code: 00 e9 fb fc ff ff 90 e8 3d e4 de fe 85 c0 74 1f 44 8b 35 02 f4 dc 00 45 85 f6 75 13 48 8d 3d 46 ef dd 00 48 c7 c6 a9 e2 60 83 <67> 48 0f b9 3a 90 e9 e9 fa ff ff 8b 45 80 85 c0 0f 84 86 01 00 00
+RSP: 0018:ffffc90002537aa0 EFLAGS: 00010246
+RAX: 0000000000000001 RBX: ffff888196bc4c40 RCX: ffffc90092d6f000
+RDX: 0000000000100000 RSI: ffffffff8360e2a9 RDI: ffffffff83c86f30
+RBP: ffffc90002537b50 R08: 0000000000000001 R09: 0000000000000000
+R10: 0000000000000000 R11: 0000000000000000 R12: 0000000000000000
+R13: 0000000000000000 R14: 0000000000000000 R15: 0000000000000000
+FS:  00007fc2ee80e6c0(0000) GS:ffff8882451e8000(0000) knlGS:0000000000000000
+CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+CR2: 00007f4ef43ff1eb CR3: 00000001a8029000 CR4: 0000000000750ef0
+PKRU: 80000000
+Call Trace:
+ <TASK>
+ io_ring_submit_lock io_uring/io_uring.h:397 [inline]
+ io_uring_cmd_del_cancelable io_uring/uring_cmd.c:87 [inline]
+ __io_uring_cmd_done+0x45c/0x470 io_uring/uring_cmd.c:149
+ io_uring_cmd_done include/linux/io_uring/cmd.h:169 [inline]
+ ublk_cancel_cmd+0x11d/0x140 drivers/block/ublk_drv.c:1904
+ ublk_cancel_queue drivers/block/ublk_drv.c:1959 [inline]
+ ublk_cancel_dev drivers/block/ublk_drv.c:1968 [inline]
+ ublk_stop_dev+0xa8/0xf0 drivers/block/ublk_drv.c:2052
+ ublk_ctrl_stop_dev drivers/block/ublk_drv.c:3324 [inline]
+ ublk_ctrl_uring_cmd+0xfb3/0x16f0 drivers/block/ublk_drv.c:3832
+ io_uring_cmd+0x14e/0x320 io_uring/uring_cmd.c:263
+ __io_issue_sqe+0x70/0x2f0 io_uring/io_uring.c:1828
+ io_issue_sqe+0x47/0xa70 io_uring/io_uring.c:1851
+ io_wq_submit_work+0x132/0x640 io_uring/io_uring.c:1963
+ io_worker_handle_work+0x26f/0x8d0 io_uring/io-wq.c:653
+ io_wq_worker+0x15a/0x630 io_uring/io-wq.c:708
+ ret_from_fork+0x36c/0x450 arch/x86/kernel/process.c:158
+ ret_from_fork_asm+0x11/0x20 arch/x86/entry/entry_64.S:246
+ </TASK>
+irq event stamp: 9
+hardirqs last  enabled at (9): [<ffffffff81473943>] enable_work+0x123/0x190 kernel/workqueue.c:4563
+hardirqs last disabled at (8): [<ffffffff81473257>] try_to_grab_pending+0x257/0x500 kernel/workqueue.c:2069
+softirqs last  enabled at (0): [<ffffffff8142d659>] copy_process+0xfe9/0x3050 kernel/fork.c:2167
+softirqs last disabled at (0): [<0000000000000000>] 0x0
+---[ end trace 0000000000000000 ]---
+```
+
+### Analysis
+
+#### related code paths
+
+
+
+
 
 ## I/O hang triggered by a fio test #170
 
