@@ -222,35 +222,86 @@ Key difference from Files: Flex Files handles **mirror selection** (choose
 which mirror to read from, write to all mirrors) and **multi-version
 protocol negotiation** (each DS can speak a different NFS version).
 
-**Block Layout (ID=3):** The client receives a layout that maps file byte
-ranges to block extents on SAN devices. Instead of NFS RPCs, the client
-uses the Linux block layer (`submit_bio()`) to read/write directly to
-iSCSI targets or FC LUNs. The MDS is completely out of the data path —
-the client treats the file as if it were on a local block device.
+**Block Layout (ID=3):** The application just does normal file I/O
+(`read(fd, buf, len)`) on an NFS-mounted file — it has no knowledge of
+block devices. The **NFS client in the kernel** transparently translates
+file operations into block device I/O using the layout from the MDS.
+
+The key question is: how does a file offset become a block device LBA?
+
+**Server side (MDS):** The MDS can offer block layout only if the underlying
+filesystem implements `s_export_op->map_blocks()` (checked in
+`nfsd4_setup_layout_type()` in `fs/nfsd/nfs4layouts.c`). During LAYOUTGET,
+the server calls `map_blocks()` which returns a `struct iomap` containing the
+physical block mapping. The server encodes this as an array of extents:
+
+```
+  MDS LAYOUTGET response for block layout:
+  ─────────────────────────────────────────
+
+  Server filesystem (e.g., XFS, ext4):
+    map_blocks(inode, file_offset=0, len=4MB)
+      → returns iomap: {addr=LBA 0x1000, offset=0, length=4MB, type=MAPPED}
+
+  Server encodes extent for the wire:
+  ┌────────────────────────────────────────────────────────┐
+  │ struct pnfs_block_extent (fs/nfsd/blocklayoutxdr.h):   │
+  │   vol_id:   16-byte deviceid   (identifies the device) │
+  │   foff:     0                   (file offset, bytes)    │
+  │   len:      4194304             (extent length, bytes)  │
+  │   soff:     0x1000 * 512        (storage offset, bytes) │
+  │   es:       PNFS_BLOCK_READ_DATA (extent state)         │
+  └────────────────────────────────────────────────────────┘
+```
+
+**Client side:** The client decodes these extents in `bl_alloc_lseg()`
+(`fs/nfs/blocklayout/blocklayout.c`) and stores them in **red-black trees**
+keyed by file offset (`struct pnfs_block_layout` has `bl_ext_rw` and
+`bl_ext_ro` trees). On read, `bl_read_pagelist()` translates file offset
+to device LBA:
 
 ```
   Block layout I/O path (client side):
   ────────────────────────────────────
 
+  Application: read(fd, buf, 1MB) on NFS file
+                │
+                ▼
   nfs_readahead()
     → pnfs_generic_pg_init_read()
-      → pnfs_update_layout()           // get layout from MDS
+      → pnfs_update_layout()           // LAYOUTGET → MDS returns extents
     → bl_read_pagelist()                // block layout driver
-      → Decode extent list from layout:
-        extent[0]: {device=iscsi0, LBA=4096, length=2048, state=VALID}
-        extent[1]: {device=iscsi0, LBA=8192, length=1024, state=HOLE}
-      → For VALID extents:
-        → bio_alloc() → bio_add_page() → submit_bio()
-        → Raw block I/O to iSCSI/FC device, no NFS RPC
-      → For HOLE extents:
-        → Return zeroed pages (sparse file support)
+      │
+      │ For each page:
+      │   1. Convert file offset to sector: isect = offset >> 9
+      │   2. ext_tree_lookup(bl, isect, &be)  // red-black tree search
+      │      → finds extent: {be_f_offset, be_length, be_v_offset, state}
+      │
+      │   3. If hole (NONE_DATA): zero_user_segment() — no device I/O
+      │
+      │   4. If data (READ_DATA / READWRITE_DATA):
+      │      device_sector = isect - be_f_offset + be_v_offset
+      │      → bio_alloc() → bio_add_page() → submit_bio()
+      │      → Raw block I/O to iSCSI/FC device
+      │
+      ▼
+  Block device returns data → NFS client fills page cache → app gets data
 ```
 
-The block layout needs a way for the client to discover and connect to
-block devices. This is done via `GETDEVICEINFO`, which returns device
-identification (e.g., iSCSI target address + LUN). The Linux client uses
-`rpc_pipefs` to communicate with a user-space helper daemon
-(`blkmapd`) that manages iSCSI login and device discovery.
+**Device discovery:** The client must resolve the `deviceid` from the layout
+to an actual Linux `block_device`. This happens via `GETDEVICEINFO`:
+
+- **SIMPLE volumes** (traditional block): The kernel sends the device UUID
+  to the `blkmapd` user-space daemon via `rpc_pipefs`. `blkmapd` scans
+  local block devices for a matching UUID and returns the device's
+  major/minor numbers. The kernel opens the device via
+  `bdev_file_open_by_dev()`.
+
+- **SCSI volumes**: No daemon needed. The kernel constructs a
+  `/dev/disk/by-id/` path directly from the SCSI designator in the
+  GETDEVICEINFO response (trying `dm-uuid-mpath-0x...`, then `wwn-0x...`,
+  then `nvme-eui....`) and opens it directly. It also registers a SCSI
+  Persistent Reservation key for fencing.
 
 **SCSI Layout (ID=5):** Similar to Block layout — maps file ranges to
 SCSI LBA ranges — but adds **SCSI persistent reservations** for fencing.
