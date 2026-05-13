@@ -137,6 +137,230 @@ advantages:
 2. **Client-side mirroring** — the layout can specify multiple mirrors per
    file segment, and the client handles replication.
 
+### 2.2.1 Flex Files Layout in Depth
+
+The Flex Files layout type (ID=4, [RFC 8435](https://www.rfc-editor.org/rfc/rfc8435.html))
+is the most widely deployed pNFS layout and deserves deeper examination. It was
+designed to solve the practical deployment barriers that limited adoption of the
+original Files layout (ID=1).
+
+**Why the Files Layout Wasn't Enough:**
+
+The original Files layout (RFC 8881 §12) is designed for NFSv4.1 data servers
+that operate in a tightly-coupled mode with the MDS — coordinating write
+verifiers and typically sharing session state. In practice, this means:
+- Data servers are expected to be NFSv4.1-capable (RFC 8881 uses "MAY" but
+  the protocol design assumes it)
+- DS must coordinate with the MDS for state management
+- Deploying pNFS requires purpose-built or closely-integrated storage clusters
+
+Flex Files removes these constraints:
+
+```
+  Files layout (ID=1):                Flex Files layout (ID=4):
+  ────────────────────                ────────────────────────
+
+  MDS ←── tight coupling ──► DS      MDS ←── loose coupling ──► DS
+  • DS expected to speak NFSv4.1     • DS can speak NFSv3 or NFSv4.x
+  • Write verifier coordination       • No MDS-DS coordination needed
+  • DS must be "aware" of MDS         • DS is an unmodified NFS server
+  • Single protocol version           • Mixed versions in same cluster
+
+  Result: only purpose-built          Result: existing NFS filers can
+  clusters can use pNFS               serve as pNFS data servers
+                                      (MDS manages data placement)
+```
+
+**The ff_layout4 Structure:**
+
+When a client calls `LAYOUTGET`, the MDS returns an `ff_layout4` structure
+(XDR-encoded) that describes how to access the file's data:
+
+```
+  ff_layout4 (RFC 8435 §5.1)
+  ──────────────────────────
+
+  ┌────────────────────────────────────────────────────────┐
+  │ stripe_unit: u64          (e.g., 1 MB)                 │
+  │                                                        │
+  │ mirrors[0..N-1]:          (one or more mirrors)        │
+  │   ┌────────────────────────────────────────────────┐   │
+  │   │ mirror[0]:                                     │   │
+  │   │   data_servers[0..M-1]:                        │   │
+  │   │     ┌──────────────────────────────────────┐   │   │
+  │   │     │ deviceid:  (indexes GETDEVICEINFO)   │   │   │
+  │   │     │ efficiency: u32 (mirror utility score)│   │   │
+  │   │     │ stateid:   (for DS access)           │   │   │
+  │   │     │ fh_list:   [filehandle, ...]         │   │   │
+  │   │     │ user:      "nobody" (AUTH_SYS UID)   │   │   │
+  │   │     │ group:     "nobody" (AUTH_SYS GID)   │   │   │
+  │   │     └──────────────────────────────────────┘   │   │
+  │   │   data_servers[1]: ...                         │   │
+  │   └────────────────────────────────────────────────┘   │
+  │   mirror[1]: ...  (for 2-way mirroring)                │
+  │                                                        │
+  │ flags: FF_FLAGS_NO_LAYOUTCOMMIT | FF_FLAGS_NO_IO_THRU_MDS │
+  │ stats_collect_hint: u32   (how often to report stats)  │
+  └────────────────────────────────────────────────────────┘
+```
+
+Key differences from the Files layout:
+
+| Aspect | Files Layout (ID=1) | Flex Files Layout (ID=4) |
+|--------|--------------------|-----------------------|
+| **DS protocol** | NFSv4.1 (expected) | NFSv3, NFSv4.0, NFSv4.1, NFSv4.2 |
+| **DS coupling** | Tight — verifier coordination | Loose (default) or tight (`tightly_coupled` flag) |
+| **Mirroring** | Not supported | Native N-way mirror per stripe |
+| **DS credentials** | Uses MDS session | Explicit user/group per DS, or AUTH_SYS |
+| **Error reporting** | Limited | Rich — `ff_ioerr4` in LAYOUTRETURN |
+| **Stats reporting** | None | `ff_iostats4` via LAYOUTSTATS |
+| **DS filehandle** | One per DS | List of filehandles per DS |
+| **Read balancing** | None | `efficiency` field for mirror selection |
+
+**Device Addressing — GETDEVICEINFO:**
+
+The `deviceid` in each mirror entry doesn't contain the DS network address
+directly. Instead, the client calls `GETDEVICEINFO` to resolve it to a
+`ff_device_addr4`, which contains a list of multipath data server addresses:
+
+```
+  Layout resolution flow:
+  ──────────────────────
+
+  LAYOUTGET returns:
+    mirror[0].ds[0].deviceid = 0x0001
+
+  Client calls GETDEVICEINFO(0x0001):
+  ┌───────────────────────────────────────────────────┐
+  │ ff_device_addr4:                                   │
+  │   ffda_netaddrs (multipath_list4):                 │
+  │     [0]: tcp://10.0.1.10:2049                      │
+  │     [1]: tcp://10.0.1.11:2049  (failover)          │
+  │                                                    │
+  │   ffda_versions (ff_device_versions4[]):           │
+  │     ┌────────────────────────────────────────┐     │
+  │     │ version: 3 (NFSv3)                     │     │
+  │     │ minorversion: 0                        │     │
+  │     │ rsize: 1048576, wsize: 1048576         │     │
+  │     │ tightly_coupled: false                 │     │
+  │     └────────────────────────────────────────┘     │
+  └───────────────────────────────────────────────────┘
+
+  Now the client can do direct I/O:
+    NFSv3 WRITE to 10.0.1.10:2049 using fh_list[0]
+```
+
+This two-level indirection (layout → deviceid → address) enables the MDS to:
+- Change DS addresses without recalling layouts
+- Support multipath failover transparently
+- Share device entries across files (memory-efficient)
+
+**Tight vs Loose Coupling:**
+
+The coupling mode controls how much the DS must coordinate with the MDS.
+The Files layout operates in a tightly-coupled mode. Flex Files supports
+**both** modes via the `tightly_coupled` boolean in `ff_device_versions4`,
+but the loosely-coupled mode (the default) is what makes it powerful:
+
+```
+  Tight coupling (Files layout; also Flex Files with tightly_coupled=true):
+  ────────────────────────────────────────────────────────────────────────
+
+  Client ──LAYOUTGET──► MDS ──control protocol──► DS
+    │                                               │
+    └────── NFSv4.1 with coordinated ───────────────┘
+            stateids + verifiers
+
+  The MDS and DS coordinate state (stateids, locking, verifiers).
+  The DS enforces the MDS's access control decisions.
+  The DS knows it's serving pNFS data.
+
+
+  Loose coupling (Flex Files default, tightly_coupled=false):
+  ──────────────────────────────────────────────────────────
+
+  Client ──LAYOUTGET──► MDS
+    │                    │ (MDS knows where files are,
+    │                    │  but DS doesn't know about MDS)
+    │                    │
+    └───── NFSv3 ──────► DS (stock NFS server)
+
+  The DS is unaware of pNFS.
+  The MDS manages the mapping and data placement.
+  Existing NAS filers can serve as data servers — no DS software
+  changes needed, but the MDS must arrange files and exports.
+```
+
+Loose coupling is why Flex Files became the dominant layout type — it
+enables deployment on heterogeneous storage without requiring vendor
+cooperation or DS firmware changes. The MDS handles data placement and
+credential management; the DS just serves files via standard NFS.
+
+**Error Reporting via LAYOUTRETURN:**
+
+Unlike the Files layout, Flex Files encodes rich I/O error information in
+`LAYOUTRETURN`. When the client encounters errors accessing a DS, it reports
+them to the MDS using the `ff_ioerr4` structure:
+
+```
+  ff_ioerr4 (RFC 8435 §9.1.1):
+  ──────────────────────────
+
+  struct ff_ioerr4 {
+      offset4          ffie_offset;     /* file offset of error */
+      length4          ffie_length;     /* range affected */
+      stateid4         ffie_stateid;    /* layout stateid */
+      device_error4    ffie_errors<>;   /* per-device errors */
+  };
+
+  struct device_error4 {
+      deviceid4        de_deviceid;     /* which DS failed */
+      nfsstat4         de_status;       /* NFS error code */
+      nfs_opnum4       de_opnum;        /* which operation failed */
+  };
+```
+
+This allows the MDS to:
+- Identify failing data servers and remove them from future layouts
+- Trigger data rebuild from surviving mirrors
+- Redirect clients to healthy mirrors via new layouts
+
+**I/O Statistics via LAYOUTSTATS:**
+
+The client periodically reports I/O statistics for each DS using the
+`LAYOUTSTATS` operation (NFSv4.2, RFC 7862 §15.6). For Flex Files, the
+stats include:
+
+```
+  ff_iostats4 (RFC 8435 §9.2.3):
+  ──────────────────────────────
+
+  struct ff_iostats4 {
+      offset4            ffis_offset;       /* file range start */
+      length4            ffis_length;       /* file range length */
+      stateid4           ffis_stateid;      /* layout stateid */
+      io_info4           ffis_read;         /* read stats */
+      io_info4           ffis_write;        /* write stats */
+      deviceid4          ffis_deviceid;     /* which DS */
+      ff_layoutupdate4   ffis_layoutupdate; /* layout-specific data */
+  };
+
+  struct io_info4 {                  (defined in RFC 7862)
+      uint64_t  ii_count;            /* number of I/O operations */
+      uint64_t  ii_bytes;            /* total bytes transferred */
+  };
+```
+
+The MDS uses these statistics for:
+- Load balancing — routing new files to less-loaded DS
+- Performance monitoring — detecting slow or degraded DS
+- Capacity planning — understanding per-DS utilization
+
+In the Linux kernel, the client tracks these statistics in
+`struct nfs4_ff_layout_mirror` (in `flexfilelayout.h`) and reports them
+via `nfs42_proc_layoutstats_generic()` at the interval suggested by the
+MDS's `stats_collect_hint` field.
+
 ### 2.3 The Layout Protocol: LAYOUTGET / LAYOUTRETURN / LAYOUTCOMMIT
 
 The layout lifecycle is managed by three operations plus a callback:
