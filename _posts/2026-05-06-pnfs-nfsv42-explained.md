@@ -222,110 +222,17 @@ Key difference from Files: Flex Files handles **mirror selection** (choose
 which mirror to read from, write to all mirrors) and **multi-version
 protocol negotiation** (each DS can speak a different NFS version).
 
-**Block Layout (ID=3):** The application just does normal file I/O
-(`read(fd, buf, len)`) on an NFS-mounted file — it has no knowledge of
-block devices. The **NFS client in the kernel** transparently translates
-file operations into block device I/O using the layout from the MDS.
+**Block Layout (ID=3) and SCSI Layout (ID=5):** These layouts take a
+fundamentally different approach — instead of NFS RPCs to data servers,
+the client does **raw block I/O** (`submit_bio()`) directly to SAN storage
+(iSCSI targets, FC LUNs). The MDS maps file byte ranges to block device
+LBA ranges, and the client accesses the storage hardware directly with
+no NFS protocol on the data path. The SCSI layout adds hardware-enforced
+fencing via SCSI Persistent Reservations.
 
-The key question is: how does a file offset become a block device LBA?
-
-**Server side (MDS):** The MDS can offer block layout only if the underlying
-filesystem implements `s_export_op->map_blocks()` (checked in
-`nfsd4_setup_layout_type()` in `fs/nfsd/nfs4layouts.c`). During LAYOUTGET,
-the server calls `map_blocks()` which returns a `struct iomap` containing the
-physical block mapping. The server encodes this as an array of extents:
-
-```
-  MDS LAYOUTGET response for block layout:
-  ─────────────────────────────────────────
-
-  Server filesystem (e.g., XFS, ext4):
-    map_blocks(inode, file_offset=0, len=4MB)
-      → returns iomap: {addr=LBA 0x1000, offset=0, length=4MB, type=MAPPED}
-
-  Server encodes extent for the wire:
-  ┌────────────────────────────────────────────────────────┐
-  │ struct pnfs_block_extent (fs/nfsd/blocklayoutxdr.h):   │
-  │   vol_id:   16-byte deviceid   (identifies the device) │
-  │   foff:     0                   (file offset, bytes)    │
-  │   len:      4194304             (extent length, bytes)  │
-  │   soff:     0x1000 * 512        (storage offset, bytes) │
-  │   es:       PNFS_BLOCK_READ_DATA (extent state)         │
-  └────────────────────────────────────────────────────────┘
-```
-
-**Client side:** The client decodes these extents in `bl_alloc_lseg()`
-(`fs/nfs/blocklayout/blocklayout.c`) and stores them in **red-black trees**
-keyed by file offset (`struct pnfs_block_layout` has `bl_ext_rw` and
-`bl_ext_ro` trees). On read, `bl_read_pagelist()` translates file offset
-to device LBA:
-
-```
-  Block layout I/O path (client side):
-  ────────────────────────────────────
-
-  Application: read(fd, buf, 1MB) on NFS file
-                │
-                ▼
-  nfs_readahead()
-    → pnfs_generic_pg_init_read()
-      → pnfs_update_layout()           // LAYOUTGET → MDS returns extents
-    → bl_read_pagelist()                // block layout driver
-      │
-      │ For each page:
-      │   1. Convert file offset to sector: isect = offset >> 9
-      │   2. ext_tree_lookup(bl, isect, &be)  // red-black tree search
-      │      → finds extent: {be_f_offset, be_length, be_v_offset, state}
-      │
-      │   3. If hole (NONE_DATA): zero_user_segment() — no device I/O
-      │
-      │   4. If data (READ_DATA / READWRITE_DATA):
-      │      device_sector = isect - be_f_offset + be_v_offset
-      │      → bio_alloc() → bio_add_page() → submit_bio()
-      │      → Raw block I/O to iSCSI/FC device
-      │
-      ▼
-  Block device returns data → NFS client fills page cache → app gets data
-```
-
-**Device discovery:** The client must resolve the `deviceid` from the layout
-to an actual Linux `block_device`. This happens via `GETDEVICEINFO`:
-
-- **SIMPLE volumes** (traditional block): The kernel sends the device UUID
-  to the `blkmapd` user-space daemon via `rpc_pipefs`. `blkmapd` scans
-  local block devices for a matching UUID and returns the device's
-  major/minor numbers. The kernel opens the device via
-  `bdev_file_open_by_dev()`.
-
-- **SCSI volumes**: No daemon needed. The kernel constructs a
-  `/dev/disk/by-id/` path directly from the SCSI designator in the
-  GETDEVICEINFO response (trying `dm-uuid-mpath-0x...`, then `wwn-0x...`,
-  then `nvme-eui....`) and opens it directly. It also registers a SCSI
-  Persistent Reservation key for fencing.
-
-**SCSI Layout (ID=5):** Similar to Block layout — maps file ranges to
-SCSI LBA ranges — but adds **SCSI persistent reservations** for fencing.
-When the MDS recalls a layout, it can use SCSI PR to fence off a
-misbehaving client (prevent its I/O from reaching the device), providing
-stronger safety guarantees than the Block layout's advisory approach.
-
-```
-  SCSI layout fencing (vs Block layout):
-  ──────────────────────────────────────
-
-  Block layout (no fencing):
-    MDS recalls layout → client should stop I/O
-    But: if client is unresponsive, it may still issue I/O
-    Risk: stale writes to block device → data corruption
-
-  SCSI layout (with fencing):
-    MDS recalls layout → client should stop I/O
-    If client is unresponsive:
-      MDS uses SCSI Persistent Reservation to revoke client's
-      access at the storage device level
-    → Client's I/O physically rejected by the device
-    → No stale writes possible
-```
+See [Section 2.2.2](#222-block-and-scsi-layouts-in-depth) for the full
+architecture, motivation, extent structures, LBA translation, device
+discovery, and security model.
 
 **Object Layout (ID=2):** The client uses the T10 OSD (Object Storage
 Device) protocol to access data objects on OSD targets. The layout maps
@@ -583,6 +490,212 @@ In the Linux kernel, the client tracks these statistics in
 `struct nfs4_ff_layout_mirror` (in `flexfilelayout.h`) and reports them
 via `nfs42_proc_layoutstats_generic()` at the interval suggested by the
 MDS's `stats_collect_hint` field.
+
+### 2.2.2 Block and SCSI Layouts in Depth
+
+The Block (ID=3, [RFC 5663](https://www.rfc-editor.org/rfc/rfc5663.html))
+and SCSI (ID=5, [RFC 8154](https://datatracker.ietf.org/doc/rfc8154/))
+layout types represent a fundamentally different approach from Files and
+Flex Files. Instead of redirecting NFS RPCs to data servers, they eliminate
+the NFS protocol from the data path entirely.
+
+**Why Block Layouts Exist — the Motivation:**
+
+The NFS-based layouts (Files, Flex Files) parallelize I/O by directing
+clients to multiple NFS data servers. But the NFS protocol is still in the
+data path — every read/write involves XDR encoding, RPC transport, server
+processing, and XDR decoding. The data servers need to run NFS software
+and consume CPU, memory, and network resources.
+
+In many enterprise environments, the NFS server's filesystem already stores
+its data on **shared SAN storage** (iSCSI targets, Fibre Channel LUNs).
+The clients can reach the same storage devices over the SAN fabric. So why
+route data through the NFS server (or data servers) at all?
+
+```
+  The problem: NFS server as data bottleneck
+  ───────────────────────────────────────────
+
+  With Files/Flex Files:
+
+  Client ──NFS READ──► Data Server ──block I/O──► SAN Storage
+                          │
+                     CPU: XDR decode, VFS read,
+                     copy data, XDR encode, send
+                     (DS is still in the data path)
+
+
+  With Block layout:
+
+  Client ──LAYOUTGET──► MDS (metadata only)
+    │                     │
+    │                     └── "file offset 0-4MB = LBA 0x1000 on device X"
+    │
+    └──── submit_bio() ──► SAN Storage (direct block I/O)
+
+  No NFS protocol on the data path.
+  No server or DS CPU involved in data transfer.
+  The client reads/writes the same blocks the server's filesystem uses.
+```
+
+The block layout's key insight is: **the most efficient data path is no
+protocol at all** — just direct block I/O to the storage where the data
+already lives.
+
+**Comparison with NFS-based Layouts:**
+
+| | Files / Flex Files | Block / SCSI Layout |
+|--|-------------------|-------------------|
+| **Data path protocol** | NFS RPC (XDR + TCP/RDMA) | Raw block I/O (iSCSI/FC) |
+| **Requires data servers** | Yes (NFS servers) | No (direct to SAN storage) |
+| **Server CPU in data path** | Yes (DS processes every I/O) | No |
+| **Protocol overhead** | XDR encode/decode + RPC round-trip | None (native SCSI commands) |
+| **Infrastructure** | NFS data servers | SAN connectivity from all clients |
+| **Security model** | NFS authentication per-RPC | Trust-based (Block) or SCSI PR (SCSI) |
+| **Complexity** | Moderate (standard NFS) | Higher (SAN zoning, device discovery) |
+
+**How the MDS Produces Block Layouts:**
+
+The MDS can only offer block layouts if the underlying filesystem exposes
+its block mapping. In the Linux kernel, this requires the filesystem to
+implement three `s_export_op` callbacks (checked in
+`nfsd4_setup_layout_type()` in `fs/nfsd/nfs4layouts.c`):
+
+- **`map_blocks()`** — maps file byte ranges to physical block extents
+  (returns `struct iomap` with the device LBA)
+- **`commit_blocks()`** — commits previously-invalid blocks after the
+  client writes to them
+- **`get_uuid()`** — provides a device UUID for the client to identify
+  the block device locally
+
+During `LAYOUTGET`, the server calls `map_blocks()` and encodes the result
+as an array of `pnfs_block_extent` entries:
+
+```
+  pnfs_block_extent (what the MDS returns):
+  ─────────────────────────────────────────
+
+  ┌─────────────────────────────────────────────────┐
+  │ vol_id:   16-byte deviceid  (identifies device)  │
+  │ foff:     file offset (bytes)                    │
+  │ len:      extent length (bytes)                  │
+  │ soff:     storage/LBA offset (bytes)             │
+  │ es:       extent state                           │
+  │             READWRITE_DATA — valid, read+write   │
+  │             READ_DATA      — valid, read-only    │
+  │             INVALID_DATA   — allocated, no data  │
+  │             NONE_DATA      — hole (sparse file)  │
+  └─────────────────────────────────────────────────┘
+
+  Example for a 4 MB file:
+    extent[0]: {foff=0,       len=1MB, soff=0x80000, es=READ_DATA}
+    extent[1]: {foff=1MB,     len=2MB, soff=0,       es=NONE_DATA}  ← hole
+    extent[2]: {foff=3MB,     len=1MB, soff=0xC0000, es=READWRITE_DATA}
+```
+
+**Client-Side Block I/O — the Translation:**
+
+The client stores the extents in red-black trees (keyed by file offset)
+and translates file I/O to block I/O in `bl_read_pagelist()`
+(`fs/nfs/blocklayout/blocklayout.c`):
+
+```
+  File offset → Block device LBA translation:
+  ────────────────────────────────────────────
+
+  1. Convert file offset to 512-byte sector:
+       isect = file_offset >> 9
+
+  2. Search extent tree: ext_tree_lookup(bl, isect, &be)
+       → finds: {be_f_offset, be_length, be_v_offset, be_state}
+
+  3a. If NONE_DATA (hole):
+        zero_user_segment()  — fill page with zeros, no I/O
+
+  3b. If READ_DATA or READWRITE_DATA:
+        device_sector = isect - be_f_offset + be_v_offset
+        → bio_alloc() → bio_add_page() → submit_bio()
+        → Direct block I/O to the SAN device
+
+  The formula: device_LBA = file_sector - file_start + storage_start
+```
+
+**Device Discovery:**
+
+The client must map the `deviceid` from the layout to a local Linux
+block device. There are two mechanisms:
+
+```
+  SIMPLE volumes (traditional iSCSI/FC):
+  ──────────────────────────────────────
+
+  Kernel ──rpc_pipefs──► blkmapd daemon (user-space)
+    │                       │
+    │  "find device with    │  Scans /sys/block/*/,
+    │   UUID = 0xABCD..."   │  matches UUID signature
+    │                       │
+    │◄── major=8, minor=16 ─┘
+    │
+    └── bdev_file_open_by_dev(MKDEV(8,16))
+
+
+  SCSI volumes (direct path, no daemon):
+  ──────────────────────────────────────
+
+  Kernel constructs /dev/disk/by-id/ path from SCSI designator:
+    try: /dev/disk/by-id/dm-uuid-mpath-0x<hex>  (multipath)
+    try: /dev/disk/by-id/wwn-0x<hex>            (single path)
+    try: /dev/disk/by-id/nvme-eui.<hex>         (NVMe)
+    → open the first match
+    → register SCSI Persistent Reservation key
+```
+
+**The Security Problem and SCSI Layout Fencing:**
+
+The block layout has an inherent security weakness: the client has **raw
+block access** to the storage device. A misbehaving or crashed client
+could write to blocks outside its layout, corrupting other files. The
+MDS can recall the layout, but a dead client won't respond:
+
+```
+  Block layout (ID=3) — advisory security:
+  ────────────────────────────────────────
+
+  MDS: "Please return your layout"
+  Client: (crashed, unresponsive)
+  MDS: (can't do anything — client still has block device open)
+  Risk: stale writes → data corruption
+
+  SCSI layout (ID=5) — hardware-enforced fencing:
+  ───────────────────────────────────────────────
+
+  MDS: "Please return your layout"
+  Client: (crashed, unresponsive)
+  MDS: issues SCSI Persistent Reservation to revoke client's key
+  Storage device: rejects ALL I/O from the fenced client
+  → No stale writes possible — enforced at the hardware level
+```
+
+The SCSI layout (RFC 8154) solves this by requiring the storage device to
+support SCSI Persistent Reservations. The MDS registers a reservation
+when granting a layout and can revoke it at the device level when recalling.
+In the Linux kernel, `bl_register_scsi()` in `fs/nfs/blocklayout/dev.c`
+calls `pr_ops->pr_register()` to set up the reservation key.
+
+**When to Use Block/SCSI Layouts:**
+
+| Scenario | Best Layout | Why |
+|----------|------------|-----|
+| Cloud / commodity hardware | Flex Files | No SAN needed, any NFS server works |
+| HPC with parallel filesystem | Flex Files or Files | NFS data servers scale horizontally |
+| Enterprise SAN with shared storage | Block or SCSI | Maximum performance, no DS overhead |
+| Multi-tenant with security concerns | SCSI | Hardware fencing prevents cross-client corruption |
+| Mixed NAS + SAN environment | Flex Files + Block | MDS can offer both; client chooses |
+
+The block and SCSI layouts are the right choice when the storage
+infrastructure already provides shared block access and the goal is to
+eliminate every possible layer of overhead between the application and
+the storage hardware.
 
 ### 2.3 The Layout Protocol: LAYOUTGET / LAYOUTRETURN / LAYOUTCOMMIT
 
