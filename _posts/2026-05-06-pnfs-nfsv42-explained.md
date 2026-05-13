@@ -1209,7 +1209,287 @@ the MDS.
 
 ---
 
-## 7. Summary
+## 7. Typical NFS Use Cases
+
+### 7.1 AI/ML Workloads
+
+AI and ML training pipelines have a distinctive I/O pattern: **read-heavy,
+sequential, high-throughput data ingestion** during training, combined with
+**large periodic writes** for checkpointing, and **latency-sensitive small
+I/O** during inference serving.
+
+**Typical AI/ML Workload Profile:**
+
+```
+  AI Training I/O Pattern:
+  ────────────────────────
+
+  ┌──────────────────────────────────────────────────────────────┐
+  │  Phase 1: Data Loading (continuous, during entire training)  │
+  │  • Read training data: images, text, audio                  │
+  │  • Sequential scans of datasets (100s of GB to PBs)         │
+  │  • Many parallel readers (4-16 DataLoader workers per GPU)   │
+  │  • Throughput-sensitive: GPU stalls if data is late          │
+  │                                                              │
+  │  Phase 2: Checkpointing (periodic, every N steps)            │
+  │  • Write model weights + optimizer state                     │
+  │  • Size: 10s-100s GB per checkpoint                          │
+  │  • Must not block training (async preferred)                 │
+  │                                                              │
+  │  Phase 3: Evaluation / Metrics logging                       │
+  │  • Small metadata I/O (metrics, logs, TensorBoard events)    │
+  │  • Low throughput but steady                                 │
+  └──────────────────────────────────────────────────────────────┘
+
+  AI Inference I/O Pattern:
+  ─────────────────────────
+  • Model loading at startup: single large sequential read
+  • Runtime: minimal I/O (model is in GPU VRAM)
+  • Logging: small writes, low frequency
+```
+
+**Advantages of NFS for AI/ML:**
+
+| Advantage | Why It Matters |
+|-----------|---------------|
+| **Shared dataset access** | Multiple training nodes read the same dataset without copying it per-node. A 10 TB dataset on NFS is accessible to all nodes immediately. |
+| **Standard POSIX interface** | PyTorch `DataLoader`, Hugging Face `datasets`, and DALI all work with standard file I/O. No code changes needed. |
+| **No client software to install** | The NFS client ships with every Linux kernel. No FUSE mount, no proprietary driver, no container plugin. |
+| **pNFS parallel throughput** | Flex Files layout with multiple data servers provides linear bandwidth scaling — 8 DS × 12.5 GB/s = 100 GB/s aggregate. |
+| **Checkpoint to shared storage** | All nodes checkpoint to the same namespace. Fault recovery can restart on any node and read the checkpoint. |
+| **NFSv4.2 server-side copy** | Copy model files or datasets between NFS locations without transferring data through the client. |
+
+**Disadvantages of NFS for AI/ML:**
+
+| Disadvantage | Detail |
+|-------------|--------|
+| **Metadata overhead** | Opening thousands of small files (common in ImageNet-style datasets with millions of individual image files) is metadata-heavy. `OPEN`+`GETATTR`+`CLOSE` per file. |
+| **Single-MDS metadata bottleneck** | Even with pNFS, the metadata server is a single point. Large-scale `readdir` or `stat` storms can saturate it. |
+| **Higher latency than local NVMe** | NFS adds network round-trip + XDR + RPC overhead vs. direct NVMe (microseconds vs. hundreds of microseconds). |
+| **Tuning required for throughput** | Default NFS mount options (rsize/wsize, readahead, number of NFS TCP connections) may not saturate high-bandwidth networks. |
+
+**Typical Setup / Configuration:**
+
+```bash
+# NFS mount for AI training data (requires Linux 5.3+ for nconnect)
+# rsize/wsize=1MB (max throughput), 16 TCP connections, no atime,
+# 1-hour attr cache (dataset is static during training)
+mount -t nfs -o vers=4.2,proto=tcp,\
+  rsize=1048576,wsize=1048576,\
+  nconnect=16,\
+  async,noatime,\
+  actimeo=3600 \
+  mds.example.com:/datasets /mnt/training_data
+
+# pNFS Flex Files: MDS with 4 data servers
+# MDS handles namespace; DS0-DS3 serve data in parallel
+# Client auto-discovers DS via LAYOUTGET
+mount -t nfs -o vers=4.1,proto=tcp,\
+  rsize=1048576,wsize=1048576,\
+  nconnect=8 \
+  mds.example.com:/datasets /mnt/training_data
+
+# Checkpoint storage (separate mount, sync for integrity)
+mount -t nfs -o vers=4.2,proto=tcp,\
+  rsize=1048576,wsize=1048576,\
+  nconnect=8,sync \
+  mds.example.com:/checkpoints /mnt/checkpoints
+```
+
+**Best Practices for AI/ML with NFS:**
+
+- **Use large files or container formats** — pack training samples into
+  WebDataset (tar shards), TFRecord, or Parquet files to reduce metadata
+  operations. Reading 256 MB shards sequentially is far more efficient
+  than opening millions of individual JPEG files.
+- **Enable `nconnect`** — multiple TCP connections per mount point allow
+  parallel I/O to saturate high-bandwidth links (100 GbE+).
+- **Use pNFS Flex Files** — with multiple data servers, aggregate bandwidth
+  scales linearly. This is the single biggest NFS performance lever for
+  training.
+- **Tune readahead** — increase `/sys/block/*/queue/read_ahead_kb` and
+  use `posix_fadvise(SEQUENTIAL)` for sequential training data reads.
+- **Separate data and checkpoint mounts** — different I/O patterns benefit
+  from different mount options.
+
+**Real-World Examples:**
+
+- **NVIDIA DGX Clusters + NetApp ONTAP:** NVIDIA's reference architectures
+  for DGX clusters include NetApp all-flash arrays as NFS storage. NetApp
+  ONTAP supports NFSv4.1 with pNFS Flex Files, and can serve training data
+  via multiple storage controllers. DGX nodes mount the shared `/datasets`
+  namespace via NFS, benefiting from NetApp's multi-node scale-out.
+
+- **Hammerspace for Multi-Site AI Training:** Hammerspace uses pNFS Flex
+  Files to create a global namespace across on-prem and cloud storage.
+  Training data is automatically tiered — hot data on NVMe data servers,
+  cold data on object storage — with the MDS handling placement
+  transparently. GPU clusters in different sites see the same namespace.
+
+- **Large-scale AI research labs:** Major AI research organizations
+  commonly use NFS as one of the access layers for training dataset
+  storage. The typical pattern is storing training data in large container
+  files (WebDataset shards, TFRecords) to minimize metadata overhead,
+  with NFS providing the shared mount point across GPU nodes.
+
+- **Cloud AI Training (AWS EFS, Google Filestore, Azure ANF):** All major
+  cloud providers offer managed NFS services for AI training.
+  AWS EFS provides NFSv4.1 with elastic throughput scaling.
+  Google Cloud Filestore offers high-performance NFS for GKE ML workloads.
+  Azure NetApp Files provides NFSv4.1 with ultra-low latency for AI.
+  These services are popular because they "just work" — mount and train.
+
+### 7.2 HPC Workloads
+
+High-Performance Computing workloads are characterized by **massive
+parallelism** (thousands of nodes), **large-scale scientific data**, and
+I/O patterns that range from large sequential streams to highly random
+small I/O — often within the same job.
+
+**Typical HPC Workload Profiles:**
+
+```
+  HPC I/O Patterns (vary by application domain):
+  ───────────────────────────────────────────────
+
+  Weather/Climate Simulation:
+  • Output: large sequential writes of structured grids
+  • Checkpoint: periodic, 10s-100s GB
+  • Analysis: large sequential reads of time-series data
+  • Pattern: write-heavy during simulation, read-heavy during analysis
+
+  Computational Fluid Dynamics (CFD):
+  • Mesh loading: large sequential read at startup
+  • Checkpoint/restart: periodic large writes
+  • Parallel I/O: MPI-IO, each rank writes its own region
+  • Pattern: checkpoint-dominated
+
+  Genomics / Bioinformatics:
+  • Input: many small to medium FASTQ/BAM files
+  • Processing: read-heavy, random access within files
+  • Output: processed results, alignment files
+  • Pattern: mixed read/write, metadata-heavy (many files)
+
+  Particle Physics / Astronomy:
+  • Input: massive datasets (PBs of event data / sky surveys)
+  • Processing: embarrassingly parallel, read-heavy
+  • Output: reduced datasets, analysis results
+  • Pattern: read-dominated, sequential within files
+```
+
+**Advantages of NFS for HPC:**
+
+| Advantage | Why It Matters |
+|-----------|---------------|
+| **Universal compatibility** | Every HPC node runs Linux with the NFS client built in. No per-node client installation, no license management. |
+| **pNFS scales with storage** | Adding data servers adds aggregate bandwidth. Linear scaling is proven to 100+ GB/s aggregate with Flex Files. |
+| **POSIX semantics** | Scientific codes assume POSIX file API. NFS provides full POSIX without adaptation layers. |
+| **Shared /home and /software** | NFS is the standard for sharing home directories, software stacks, and input decks across all compute nodes. |
+| **Multi-tenancy** | NFSv4 security (Kerberos, ACLs) provides per-user access control on shared storage, critical for multi-user HPC clusters. |
+| **Operational simplicity** | Sysadmins understand NFS. Upgrades, backups, monitoring, and troubleshooting use standard tools. |
+
+**Disadvantages of NFS for HPC:**
+
+| Disadvantage | Detail |
+|-------------|--------|
+| **MPI-IO integration** | MPI-IO / HDF5 parallel I/O are not natively optimized for NFS. Lustre and GPFS have MPI-IO ADIO drivers; NFS relies on POSIX fallback. |
+| **Metadata scalability at extreme scale** | 10,000+ node jobs creating millions of files can overwhelm a single MDS. Lustre/GPFS distribute metadata across multiple servers. |
+| **Lock contention** | NFSv4 byte-range locking with many concurrent writers can cause lock storms. Parallel filesystems use distributed lock managers. |
+| **No native striping of single files** | Without pNFS, a single large file reads through one server. With pNFS (Files/Flex Files), striping distributes a file across DS, but setup is more complex than Lustre's transparent striping. |
+| **Checkpoint performance at scale** | Thousands of ranks checkpointing simultaneously (N-to-1 or N-to-N pattern) can saturate the MDS and storage. Parallel filesystems handle this pattern natively. |
+
+**Typical Setup / Configuration:**
+
+```bash
+# HPC compute node mount: shared datasets (read-heavy)
+# NFS-over-RDMA for low latency, minimize metadata traffic
+mount -t nfs -o vers=4.1,proto=rdma,\
+  rsize=1048576,wsize=1048576,\
+  nconnect=8,\
+  noatime,nocto \
+  mds.hpc.local:/data /scratch/shared
+
+# Home directories: Kerberos for multi-user security
+mount -t nfs -o vers=4.2,proto=tcp,\
+  sec=krb5 \
+  nfs-home.hpc.local:/home /home
+
+# Parallel job scratch: pNFS with 8 data servers
+# Maximum write throughput for checkpoint workload
+mount -t nfs -o vers=4.1,proto=rdma,\
+  rsize=1048576,wsize=1048576,\
+  nconnect=16 \
+  mds.hpc.local:/scratch /scratch/job
+
+# Slurm job prolog: pre-stage dataset to local NVMe cache
+# (NFS → local SSD, avoids NFS traffic during compute phase)
+srun --prolog="cp /scratch/shared/input.h5 /local_nvme/" ...
+```
+
+**Key Tuning for HPC:**
+
+| Parameter | Setting | Why |
+|-----------|---------|-----|
+| `nconnect=N` | 8-16 (max 16) | Parallelize I/O across multiple TCP/RDMA connections (Linux 5.3+) |
+| `proto=rdma` | Use RDMA if available | 1-2 μs latency vs. 10-50 μs for TCP; essential for latency-sensitive codes |
+| `rsize/wsize` | 1048576 (1 MB) | Maximum NFS read/write size for throughput |
+| `noatime` | Disable atime updates | Eliminates `SETATTR` RPCs on every read |
+| `nocto` | Disable close-to-open | Avoids `GETATTR` on every open if data is read-only |
+| `actimeo=N` | Increase for static data | Caches attributes longer, reduces metadata RPCs |
+| `sec=krb5` | Kerberos auth | Required for multi-user HPC clusters with per-user access |
+
+**Real-World Examples:**
+
+- **National Labs (LLNL, ORNL, ANL):** While Lustre and GPFS dominate the
+  scratch filesystems on flagship supercomputers, NFS is universally used
+  for home directories, software stacks (`/opt`, `/sw`), and project
+  storage. Many smaller HPC clusters use NFS for all storage tiers.
+  ORNL's Frontier (the world's first exascale system) uses Lustre for
+  scratch but NFS for home and project storage.
+
+- **VAST Data NFS for HPC:** VAST Data provides all-flash NFS storage
+  purpose-built for HPC. Their architecture serves NFS with pNFS-like
+  parallelism (multiple protocol endpoints), achieving 100+ GB/s
+  aggregate throughput. Several HPC centers have replaced Lustre with
+  VAST's NFS for simpler operations while maintaining throughput.
+
+- **WekaIO (Weka) with NFS:** Weka's parallel filesystem exposes an NFS
+  interface for compatibility. HPC users mount Weka via NFS when the
+  application doesn't need POSIX-bypassing I/O (like GPU Direct Storage).
+  This hybrid approach gives Weka's performance with NFS's compatibility.
+
+- **AWS ParallelCluster + Amazon FSx / EFS:** AWS's HPC service supports
+  both Amazon FSx for Lustre and Amazon EFS (managed NFS). For HPC
+  workloads that don't need Lustre's MPI-IO integration, EFS provides
+  simpler setup with automatic scaling and no filesystem management.
+
+- **WLCG Tier Sites with dCache NFS Gateway:** Several sites in the
+  Worldwide LHC Computing Grid (WLCG) expose storage via dCache's
+  NFSv4.1/pNFS gateway for analysis workloads. While xrootd remains the
+  primary data access protocol for physics data, the NFS gateway provides
+  POSIX compatibility for analysis codes that expect a filesystem
+  interface. The read-dominant, embarrassingly-parallel nature of physics
+  analysis maps well to NFS's strengths.
+
+### 7.3 AI/ML vs HPC: NFS Configuration Comparison
+
+| Aspect | AI/ML Training | HPC Simulation |
+|--------|---------------|----------------|
+| **I/O pattern** | Sequential reads (dataset), periodic large writes (checkpoint) | Mixed: sequential + random, checkpoint-heavy |
+| **File count** | Few large files (container formats preferred) | Many files (per-rank output, restart files) |
+| **Parallelism** | 10s-100s of GPUs, 100s of DataLoader workers | 1,000s-100,000s of CPU cores |
+| **Throughput need** | 10-100 GB/s aggregate (feed GPUs) | 10-500 GB/s (depends on application) |
+| **Latency sensitivity** | Moderate (prefetching hides latency) | High (MPI synchronization barriers) |
+| **Best pNFS layout** | Flex Files (simple, multi-DS) | Flex Files or Block (for SAN environments) |
+| **Network transport** | TCP with `nconnect` (sufficient for most) | RDMA preferred (latency-critical) |
+| **Key mount options** | `nconnect=16,noatime,actimeo=3600` | `nconnect=16,proto=rdma,noatime,nocto` |
+| **Best practice** | Use large container files (WebDataset, Parquet) | Use MPI-IO aware I/O libraries; stage to local NVMe |
+| **When NFS is enough** | Most training workloads; inference always | Small-medium clusters; non-MPI-IO workloads |
+| **When to consider alternatives** | >1000 GPU training with millions of small files | Extreme-scale MPI-IO; >10,000 nodes |
+
+---
+
+## 8. Summary
 
 pNFS and NFSv4.2 together represent the evolution of NFS from a simple
 client-server file sharing protocol to a scalable parallel data access
