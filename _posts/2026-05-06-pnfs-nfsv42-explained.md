@@ -127,6 +127,178 @@ the client uses to talk to data servers:
 | **Flex Files** | 4 | NFSv3/v4 | [RFC 8435](https://www.rfc-editor.org/rfc/rfc8435.html) | Any NFS server as DS; mirroring |
 | **SCSI** | 5 | SCSI (persistent reservations) | [RFC 8154](https://datatracker.ietf.org/doc/rfc8154/) | SCSI block with fencing |
 
+**How the NFS Client Accesses Each Layout Type:**
+
+The layout types differ fundamentally in *how* the client performs data I/O
+after obtaining a layout from the MDS. They fall into two categories:
+NFS-based (Files, Flex Files) where the client sends NFS RPCs to data servers,
+and storage-based (Block, SCSI, Object) where the client accesses storage
+devices directly, bypassing NFS entirely for data operations.
+
+```
+  NFS-based layouts (Files, Flex Files):
+  ──────────────────────────────────────
+
+  Application
+      │  read(fd, buf, len)
+      ▼
+  VFS → NFS client
+      │  pnfs_update_layout() → obtains layout segment
+      │  Layout says: "bytes 0-1MB → DS 10.0.1.5, filehandle 0xABCD"
+      ▼
+  NFS RPC to Data Server
+      │  Files layout:      NFSv4.1 READ(stateid, fh, offset, count)
+      │  Flex Files layout: NFSv3 or NFSv4.x READ (per DS config)
+      ▼
+  Data Server (an NFS server) returns data via NFS reply
+
+
+  Block/SCSI-based layouts (Block, SCSI):
+  ───────────────────────────────────────
+
+  Application
+      │  read(fd, buf, len)
+      ▼
+  VFS → NFS client
+      │  pnfs_update_layout() → obtains layout segment
+      │  Layout says: "bytes 0-1MB → block device X, LBA 4096, len 2048"
+      ▼
+  Linux block layer (bio)
+      │  submit_bio() to iSCSI/FC/local SCSI device
+      │  No NFS protocol involved — raw block I/O
+      ▼
+  SAN storage (iSCSI target, FC LUN) returns raw blocks
+```
+
+Each layout type has a different client-side I/O path:
+
+**Files Layout (ID=1):** The client sends NFSv4.1 READ/WRITE RPCs directly
+to data servers. The layout contains DS file handles and a stripe pattern
+(stripe unit + stripe index). The client computes which DS holds each stripe
+and issues NFS RPCs to that DS. The DS is an NFSv4.1 server that understands
+pNFS stateids.
+
+```
+  Files layout I/O path (client side):
+  ────────────────────────────────────
+
+  nfs_readahead()
+    → pnfs_generic_pg_init_read()
+      → pnfs_update_layout()         // get layout from MDS
+    → filelayout_read_pagelist()      // layout driver's read function
+      → nfs_initiate_pgio()
+        → Calculate stripe (two-step, see nfs4_fl_calc_j_index):
+          j = ((offset - pattern_offset) / stripe_unit
+               + first_stripe_index) % stripe_count
+          DS_index = stripe_indices[j]   // indirection table from layout
+        → Send NFSv4.1 READ to DS[DS_index] with DS filehandle
+        → DS returns data via NFS COMPOUND reply
+```
+
+**Flex Files Layout (ID=4):** Similar to Files, but the client can use
+NFSv3 or NFSv4.x RPCs to data servers. The layout specifies which NFS
+version and credentials to use for each DS. The client establishes
+separate NFS connections to each DS as needed.
+
+```
+  Flex Files layout I/O path (client side):
+  ─────────────────────────────────────────
+
+  nfs_readahead()
+    → pnfs_generic_pg_init_read()
+      → pnfs_update_layout()              // get layout from MDS
+    → ff_layout_read_pagelist()            // flex files driver
+      → ff_layout_choose_best_ds_for_read()  // select mirror
+        → Pick first available mirror (pre-sorted by efficiency)
+        → For reads: pick one mirror (load balancing)
+        → For writes: write to ALL mirrors (replication)
+      → nfs_initiate_pgio()
+        → Connect to DS using NFSv3 or NFSv4.x (per ff_device_versions4)
+        → Send READ/WRITE using DS-specific filehandle and credentials
+        → Track I/O statistics per mirror for LAYOUTSTATS reporting
+```
+
+Key difference from Files: Flex Files handles **mirror selection** (choose
+which mirror to read from, write to all mirrors) and **multi-version
+protocol negotiation** (each DS can speak a different NFS version).
+
+**Block Layout (ID=3):** The client receives a layout that maps file byte
+ranges to block extents on SAN devices. Instead of NFS RPCs, the client
+uses the Linux block layer (`submit_bio()`) to read/write directly to
+iSCSI targets or FC LUNs. The MDS is completely out of the data path —
+the client treats the file as if it were on a local block device.
+
+```
+  Block layout I/O path (client side):
+  ────────────────────────────────────
+
+  nfs_readahead()
+    → pnfs_generic_pg_init_read()
+      → pnfs_update_layout()           // get layout from MDS
+    → bl_read_pagelist()                // block layout driver
+      → Decode extent list from layout:
+        extent[0]: {device=iscsi0, LBA=4096, length=2048, state=VALID}
+        extent[1]: {device=iscsi0, LBA=8192, length=1024, state=HOLE}
+      → For VALID extents:
+        → bio_alloc() → bio_add_page() → submit_bio()
+        → Raw block I/O to iSCSI/FC device, no NFS RPC
+      → For HOLE extents:
+        → Return zeroed pages (sparse file support)
+```
+
+The block layout needs a way for the client to discover and connect to
+block devices. This is done via `GETDEVICEINFO`, which returns device
+identification (e.g., iSCSI target address + LUN). The Linux client uses
+`rpc_pipefs` to communicate with a user-space helper daemon
+(`blkmapd`) that manages iSCSI login and device discovery.
+
+**SCSI Layout (ID=5):** Similar to Block layout — maps file ranges to
+SCSI LBA ranges — but adds **SCSI persistent reservations** for fencing.
+When the MDS recalls a layout, it can use SCSI PR to fence off a
+misbehaving client (prevent its I/O from reaching the device), providing
+stronger safety guarantees than the Block layout's advisory approach.
+
+```
+  SCSI layout fencing (vs Block layout):
+  ──────────────────────────────────────
+
+  Block layout (no fencing):
+    MDS recalls layout → client should stop I/O
+    But: if client is unresponsive, it may still issue I/O
+    Risk: stale writes to block device → data corruption
+
+  SCSI layout (with fencing):
+    MDS recalls layout → client should stop I/O
+    If client is unresponsive:
+      MDS uses SCSI Persistent Reservation to revoke client's
+      access at the storage device level
+    → Client's I/O physically rejected by the device
+    → No stale writes possible
+```
+
+**Object Layout (ID=2):** The client uses the T10 OSD (Object Storage
+Device) protocol to access data objects on OSD targets. The layout maps
+file ranges to object IDs on OSD devices. This layout type is largely
+defunct — the T10 OSD standard was never widely adopted, and the Linux
+kernel's OSD support (`drivers/scsi/osd/`) has been removed. It is
+listed here for completeness.
+
+**Summary — Client I/O Path by Layout Type:**
+
+| Layout | Client sends I/O via | DS/Device type | Security model |
+|--------|---------------------|----------------|---------------|
+| **Files** (1) | NFSv4.1 RPC | NFS server | NFSv4.1 stateids, sessions |
+| **Flex Files** (4) | NFSv3/v4 RPC | Any NFS server | AUTH_SYS or NFSv4.x, per DS |
+| **Block** (3) | `submit_bio()` (block I/O) | iSCSI target, FC LUN | Advisory (MDS trusts client) |
+| **SCSI** (5) | `submit_bio()` (block I/O) | SCSI device (PR-capable) | SCSI Persistent Reservations |
+| **Object** (2) | OSD protocol | OSD target | OSD security caps (defunct) |
+
+The NFS-based layouts (Files, Flex Files) are simpler to deploy because
+the data path uses the familiar NFS protocol — no special storage hardware
+needed. The block-based layouts (Block, SCSI) offer lower latency for SAN
+environments but require block device connectivity (iSCSI, FC) from every
+client and trust the client to respect layout boundaries.
+
 **Flex Files** is the most important layout type for modern deployments. It
 was engineered by Hammerspace (authored by B. Halevy and T. Haynes in
 [RFC 8435](https://www.rfc-editor.org/rfc/rfc8435.html)) and has two key
