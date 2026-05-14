@@ -1468,7 +1468,470 @@ the entire RPC stack and go directly to the storage hardware.
 
 ---
 
-## 4. Linux Kernel Implementation
+## 4. Distributed Cache Coherency
+
+A distributed filesystem's hardest problem is **cache coherency**: when
+multiple clients cache the same file and one modifies it, how do the
+others know their cache is stale? NFS has evolved increasingly
+sophisticated answers to this question across protocol versions.
+
+### 4.1 The Fundamental Problem
+
+```
+  The cache coherency challenge:
+  ──────────────────────────────
+
+  Time ──────────────────────────────────────────────────────────►
+
+  Client A:  read(file) ──► cache "hello" ──────────────► read(file)
+                                                          returns "hello"?
+                                                          or "world"?
+  Client B:            write(file, "world") ──► close()
+
+  Server:   "hello" ────────────────────────► "world"
+
+  Without coherency:  Client A returns stale "hello"  ✗
+  With CTO coherency: Client A revalidates on next open, sees "world"  ✓
+  With delegations:   Server recalls A's cache before B can write  ✓✓
+```
+
+NFS provides **three levels** of cache coherency, each stronger than the
+last:
+
+| Level | Mechanism | Guarantee | Cost |
+|-------|-----------|-----------|------|
+| **Attribute cache timeout** | `acregmin`/`acregmax` polling | Eventually consistent (seconds to minutes) | Low (periodic GETATTR) |
+| **Close-to-open (CTO)** | Revalidate on open/read | "If I open after you close, I see your changes" | Medium (GETATTR per open) |
+| **Delegations** | Server-driven cache invalidation | Strong consistency (server recalls before conflict) | Low when uncontended, callback cost on conflict |
+| **Byte-range locks** | Lock as coherency point | Full cache flush + revalidation | High (lock RPC + cache invalidation) |
+
+### 4.2 Attribute Cache: The First Line of Defense
+
+The NFS client caches file attributes (size, mtime, change attribute,
+mode, uid/gid) locally to avoid a GETATTR RPC on every `stat()` or
+`open()`. The cache timeout is controlled by four mount parameters:
+
+| Parameter | Default | Applies To | Controls |
+|-----------|---------|-----------|----------|
+| `acregmin` | 3 seconds | Regular files | Minimum cache time after revalidation |
+| `acregmax` | 60 seconds | Regular files | Maximum cache time (cap for backoff) |
+| `acdirmin` | 30 seconds | Directories | Minimum cache time |
+| `acdirmax` | 60 seconds | Directories | Maximum cache time |
+
+The timeout uses **exponential backoff**: when a revalidation confirms
+the attributes haven't changed, the timeout doubles (up to the max).
+When a change is detected, the timeout resets to the minimum. This
+adaptive approach means frequently-changing files are checked often,
+while stable files are cached longer.
+
+```
+  Attribute cache timeout backoff:
+  ────────────────────────────────
+
+  File is stable (no external changes detected):
+    acregmin=3s → 6s → 12s → 24s → 48s → acregmax=60s → 60s → ...
+
+  File changes detected (mtime or change attr differs):
+    → reset to acregmin=3s, start backoff again
+
+  In the kernel (fs/nfs/inode.c, nfs_update_inode()):
+    if (attr_changed)
+        nfsi->attrtimeo = NFS_MINATTRTIMEO(inode);     // reset
+    else if (cache was revalidated)
+        nfsi->attrtimeo <<= 1;                          // double
+        if (nfsi->attrtimeo > NFS_MAXATTRTIMEO(inode))
+            nfsi->attrtimeo = NFS_MAXATTRTIMEO(inode);  // cap
+```
+
+**The cache_validity bitfield** (`nfsi->cache_validity` in
+`include/linux/nfs_fs.h`) tracks exactly which cached attributes are
+known to be invalid:
+
+| Flag | Meaning |
+|------|---------|
+| `NFS_INO_INVALID_CHANGE` | Cached change attribute may be stale |
+| `NFS_INO_INVALID_DATA` | Cached page data may be stale — triggers page cache invalidation |
+| `NFS_INO_INVALID_MTIME` | Cached mtime may be stale |
+| `NFS_INO_INVALID_SIZE` | Cached size may be stale |
+| `NFS_INO_INVALID_ACCESS` | Cached access permissions may be stale |
+| `NFS_INO_INVALID_ACL` | Cached ACLs may be stale |
+
+When any of these flags are set, the next access to that attribute
+triggers revalidation (a GETATTR RPC to the server).
+
+### 4.3 The Change Attribute: NFS's Cache Coherency Key
+
+The **change attribute** (NFSv4) is the single most important field for
+cache coherency. It's a server-maintained counter or timestamp that
+changes whenever the file's data or metadata is modified. It's the
+NFS equivalent of an ETag.
+
+When the client fetches attributes from the server (via GETATTR or as
+part of another operation's response), it compares the server's change
+attribute against its cached value. If they differ, the client knows
+**something changed** — even if it doesn't know what — and invalidates
+its caches:
+
+```
+  Change attribute mismatch → cache invalidation:
+  ────────────────────────────────────────────────
+
+  In nfs_update_inode() (fs/nfs/inode.c):
+
+  if (cached_change_attr != server_change_attr) {
+      // Another client (or the server itself) modified this file
+
+      invalidate |= NFS_INO_INVALID_DATA      // discard all cached pages
+                  | NFS_INO_INVALID_ACCESS     // re-check permissions
+                  | NFS_INO_INVALID_ACL        // re-fetch ACLs
+                  | NFS_INO_INVALID_XATTR;     // re-fetch xattrs
+
+      // Force revalidation of ALL other attributes too
+      invalidate |= NFS_INO_INVALID_CTIME | NFS_INO_INVALID_MTIME
+                  | NFS_INO_INVALID_SIZE  | NFS_INO_INVALID_NLINK
+                  | NFS_INO_INVALID_MODE  | NFS_INO_INVALID_OTHER;
+
+      // For directories: force all dentries to be revalidated
+      nfs_force_lookup_revalidate(dir);
+
+      // Reset attribute timeout to minimum (check again soon)
+      nfsi->attrtimeo = NFS_MINATTRTIMEO(inode);
+  }
+```
+
+This is a **conservative** strategy: a single change attribute mismatch
+invalidates everything. The rationale is that the change attribute is
+the server's ground truth — if it changed, the client cannot trust any
+of its cached state.
+
+**Weak Cache Consistency (WCC):** NFSv3 and NFSv4 operations return
+**pre-op and post-op attributes** in their responses. If the pre-op
+change attribute matches the client's cached value, the client knows
+that no other client modified the file between the client's last
+operation and this one. It can safely adopt the post-op attributes
+without treating the change as an external modification:
+
+```
+  WCC (Weak Cache Consistency):
+  ─────────────────────────────
+
+  Client writes 4KB at offset 0
+  Server returns:
+    pre_change_attr  = 100    (before the write)
+    post_change_attr = 101    (after the write)
+
+  Client's cached change_attr = 100  (matches pre!)
+  → This change was caused by the client itself
+  → Safely update cached change_attr to 101
+  → No need to invalidate page cache
+```
+
+### 4.4 Close-to-Open (CTO) Consistency
+
+CTO is the primary coherency guarantee that NFS provides to
+applications. The contract:
+
+> **If client B closes a file, and client A subsequently opens the same
+> file, client A will see all changes made by client B.**
+
+This is weaker than POSIX single-system semantics (where changes are
+visible immediately), but strong enough for most real-world workflows
+(e.g., one process writes a config file and another reads it).
+
+**How CTO works in the kernel:**
+
+```
+  CTO consistency flow:
+  ─────────────────────
+
+  Client B (writer):
+  ┌────────────────────────────────────────────┐
+  │ write(fd, data)                            │
+  │   → pages dirtied in page cache            │
+  │                                            │
+  │ close(fd)                                  │
+  │   → nfs_file_flush()                       │
+  │     → nfs_wb_all()                         │
+  │       → flush ALL dirty pages to server    │
+  │       → COMMIT if unstable writes used     │
+  │   → data is now on the server              │
+  └────────────────────────────────────────────┘
+
+
+  Client A (reader):
+  ┌────────────────────────────────────────────┐
+  │ open(file)                                 │
+  │   NFSv4: nfs4_file_open()                  │
+  │     → OPEN RPC to server                   │
+  │     → server returns fresh attributes      │
+  │     → client compares change attribute      │
+  │                                            │
+  │ read(fd, buf)                              │
+  │   → nfs_file_read()                        │
+  │     → nfs_revalidate_mapping()             │
+  │       → check NFS_INO_INVALID_CHANGE       │
+  │       → if change attr differs from cached:│
+  │         invalidate_inode_pages2()           │
+  │         (discard ALL cached pages)          │
+  │     → read fresh data from server           │
+  └────────────────────────────────────────────┘
+```
+
+The **close half** of CTO is enforced by `nfs_file_flush()`
+(`fs/nfs/file.c`), which calls `nfs_wb_all()` to write back all dirty
+pages. The **open half** is enforced by `nfs4_file_open()` (NFSv4)
+which gets fresh attributes from the server, triggering a change
+attribute comparison.
+
+**The `nocto` mount option** disables the open-time revalidation. This
+is useful for read-only datasets (training data, software repos) where
+you know the data won't change during the mount, and you want to avoid
+the GETATTR cost on every `open()`.
+
+### 4.5 Delegations: Server-Driven Cache Coherency
+
+Delegations are NFSv4's most powerful cache coherency mechanism. The
+server **delegates** cache management authority to the client:
+
+```
+  Delegation lifecycle:
+  ─────────────────────
+
+  1. Client A opens file; server grants READ delegation
+     ┌──────────────┐          ┌──────────────┐
+     │ Client A     │  OPEN    │ Server       │
+     │              │ ────────►│              │
+     │              │◄──────── │ "Here's a    │
+     │ delegation   │  +deleg  │  delegation" │
+     └──────────────┘          └──────────────┘
+
+     Client A can now:
+     • Cache attributes indefinitely (no timeout!)
+     • Cache read data indefinitely
+     • Skip revalidation on every access
+     • No GETATTRs needed at all
+
+  2. Client B wants to write the same file
+     ┌──────────────┐          ┌──────────────┐
+     │ Client B     │  OPEN    │ Server       │
+     │              │ ────────►│              │
+     │              │          │ "Wait — A    │
+     │              │          │  has it"     │
+     └──────────────┘          └──────┬───────┘
+                                      │
+                               CB_RECALL to Client A
+                                      │
+     ┌──────────────┐                 │
+     │ Client A     │◄────────────────┘
+     │ flush data   │  "Return your
+     │ invalidate   │   delegation"
+     │ cache        │
+     │ DELEGRETURN  │────────────────►
+     └──────────────┘
+
+     Now Client B's OPEN can proceed.
+```
+
+**Three key bypass points in the kernel** — when a delegation is held,
+the client skips cache validation entirely:
+
+1. **`nfs_attribute_cache_expired()`** (`fs/nfs/inode.c`) — returns
+   false (cache never expires) when `nfs_have_delegated_attributes()`
+   is true
+2. **`nfs_check_inode_attributes()`** — returns 0 (no invalidation)
+   when delegated
+3. **`nfs_set_cache_invalid()`** — masks out CHANGE, SIZE, MODE,
+   OTHER, BTIME, and XATTR invalidation flags when delegated
+
+This means a client with a delegation can serve reads entirely from its
+page cache with **zero RPCs to the server** — no GETATTRs, no
+revalidation, no attribute timeout checks. The server guarantees it
+will recall the delegation before allowing any conflicting access.
+
+**The trade-off:** Delegations work beautifully for uncontended files
+(one client at a time). When files are contended (multiple clients
+accessing the same file), delegations cause overhead: the server must
+recall, the client must flush and return, and the next client must
+wait. Highly contended files may have delegations disabled by the
+server to avoid recall storms.
+
+### 4.6 Byte-Range Locks as Coherency Points
+
+Acquiring a byte-range lock (or flock) is the **strongest cache
+coherency operation** in NFS. The kernel explicitly treats lock
+acquisition as a full cache invalidation event.
+
+In `do_setlk()` (`fs/nfs/file.c`), after successfully acquiring a lock:
+
+```c
+/* Invalidate cache to prevent missing any changes.
+ * This makes locking act as a cache coherency point. */
+nfs_sync_mapping(filp->f_mapping);        // flush dirty mmapped pages
+if (!nfs_have_read_or_write_delegation(inode)) {
+    nfs_zap_caches(inode);                // invalidate ALL caches:
+                                          //   attributes, data, ACL, access
+    if (mapping_mapped(filp->f_mapping))
+        nfs_revalidate_mapping(inode, filp->f_mapping);
+                                          // force re-read of mmapped data
+}
+```
+
+This ensures that after acquiring a lock, the client sees the latest
+data — all stale cache is gone. If the client holds a delegation, the
+zap is skipped (the delegation already provides coherency).
+
+Releasing a lock (`do_unlk()`) flushes all dirty data via `nfs_wb_all()`
+to ensure the next lock holder sees the writes.
+
+```
+  Lock-based coherency protocol:
+  ──────────────────────────────
+
+  Client A:  LOCK(range) ───────────────────────────────────────
+               │
+               ├── zap ALL caches (attrs, pages, ACL)
+               ├── re-read data from server (guaranteed fresh)
+               ├── write data
+               ├── UNLOCK(range)
+               │     └── nfs_wb_all(): flush dirty data to server
+               ▼
+
+  Client B:  ──────────────── LOCK(range) ─────────────────────
+                                │
+                                ├── zap ALL caches
+                                ├── re-read data (sees A's writes)
+                                ▼
+```
+
+### 4.7 Write Consistency: Unstable Writes and COMMIT
+
+NFS write consistency has its own coherency concern: what happens if
+the server crashes after accepting a WRITE but before the data reaches
+stable storage?
+
+NFS uses a **write verifier** to detect this case:
+
+```
+  Unstable write + COMMIT protocol:
+  ──────────────────────────────────
+
+  Client                              Server
+    │                                   │
+    │  WRITE(data, UNSTABLE) ──────────►│  Write to server memory (fast)
+    │◄──────── OK + verifier=0xABCD ────│  Return write verifier
+    │                                   │
+    │  WRITE(data, UNSTABLE) ──────────►│  Write to server memory
+    │◄──────── OK + verifier=0xABCD ────│  Same verifier (still up)
+    │                                   │
+    │  COMMIT ─────────────────────────►│  Flush to stable storage
+    │◄──────── OK + verifier=0xABCD ────│  Verifier matches!
+    │                                   │  → Data is safely committed
+    │  ✓ Done                           │
+    │                                   │
+
+  Server reboots between WRITE and COMMIT:
+  ─────────────────────────────────────────
+
+  Client                              Server
+    │                                   │
+    │  WRITE(data, UNSTABLE) ──────────►│  Write to server memory
+    │◄──────── OK + verifier=0xABCD ────│
+    │                                   │
+    │               ╔═══ SERVER REBOOT ═══╗
+    │               ║ Memory lost!        ║
+    │               ╚═════════════════════╝
+    │                                   │
+    │  COMMIT ─────────────────────────►│  Flush to stable storage
+    │◄──────── OK + verifier=0x1234 ────│  NEW verifier (rebooted!)
+    │                                   │
+    │  Verifier mismatch! 0xABCD ≠ 0x1234
+    │  → Client re-sends ALL uncommitted writes
+    │  → No data loss, no silent corruption
+```
+
+The write verifier is an opaque 8-byte value that changes on server
+reboot. The client stores it per-request (`req->wb_verf`) and compares
+against the COMMIT response. On mismatch, the client re-dirties the
+pages and retransmits — the application never sees the error, and no
+data is lost.
+
+### 4.8 pNFS Coherency: Consistency Across Data Servers
+
+pNFS adds a layer of coherency complexity: with multiple data servers,
+how does the MDS know about data changes, and how do clients see a
+consistent view?
+
+```
+  pNFS coherency model:
+  ─────────────────────
+
+  ┌──────────────────────────────────────────────────────────────┐
+  │ Rule 1: The MDS is the metadata authority                    │
+  │                                                              │
+  │ Clients write data directly to DS, but the MDS doesn't       │
+  │ know about it until the client sends LAYOUTCOMMIT.            │
+  │                                                              │
+  │ Before LAYOUTCOMMIT:                                          │
+  │   MDS metadata (size, mtime) is STALE                        │
+  │   Other clients doing GETATTR to MDS see OLD metadata        │
+  │                                                              │
+  │ After LAYOUTCOMMIT:                                           │
+  │   MDS updates its metadata to reflect the writes             │
+  │   Other clients now see correct metadata                     │
+  └──────────────────────────────────────────────────────────────┘
+
+  ┌──────────────────────────────────────────────────────────────┐
+  │ Rule 2: LAYOUTRETURN + CB_LAYOUTRECALL enforce ordering      │
+  │                                                              │
+  │ When the MDS needs to ensure consistency (e.g., another      │
+  │ client wants to read the file), it recalls the layout:        │
+  │                                                              │
+  │ Client A (writer):     MDS:              Client B (reader):  │
+  │   WRITE to DS ──►       │                                    │
+  │   (data on DS)          │                                    │
+  │                     ◄── OPEN from B                          │
+  │  ◄─ CB_LAYOUTRECALL     │                                    │
+  │   LAYOUTCOMMIT ────►    │                                    │
+  │   (MDS now has          │                                    │
+  │    fresh metadata)      │                                    │
+  │   LAYOUTRETURN ────►    │                                    │
+  │                         │──► OPEN reply to B                 │
+  │                         │    (with fresh attrs)              │
+  └──────────────────────────────────────────────────────────────┘
+
+  ┌──────────────────────────────────────────────────────────────┐
+  │ Rule 3: Block layout has no protocol-level coherency         │
+  │                                                              │
+  │ For block/SCSI layouts, the client writes directly to the    │
+  │ block device. There is no "data server" enforcing access     │
+  │ control. Coherency relies on:                                │
+  │   • MDS granting non-overlapping layouts to different clients│
+  │   • SCSI Persistent Reservations for fencing (SCSI layout)   │
+  │   • Clients correctly doing LAYOUTCOMMIT after writes        │
+  └──────────────────────────────────────────────────────────────┘
+```
+
+**LAYOUTCOMMIT** is the pNFS equivalent of "flush metadata to the MDS."
+Without it, the MDS's view of the file (size, mtime, change attribute)
+is stale. A client doing a `stat()` via the MDS would see old metadata
+even though the data on the DS is current. This is an intentional
+design trade-off: LAYOUTCOMMIT is deferred to reduce MDS traffic, at
+the cost of temporary metadata inconsistency.
+
+### 4.9 Coherency Comparison: NFS vs Local Filesystems vs Other Distributed FS
+
+| Aspect | Local FS (ext4/XFS) | NFS (CTO) | NFS (Delegation) | Lustre | CephFS |
+|--------|-------------------|-----------|------------------|--------|--------|
+| **Write visibility** | Immediate | On close + open | On delegation recall | Immediate (via locks) | Immediate (via caps) |
+| **Read staleness** | None | Up to `acregmax` (60s default) | None while delegated | None | None while capped |
+| **Cache invalidation** | N/A (single node) | Polling (GETATTR) | Server-pushed (CB_RECALL) | Lock-based | Capability-based |
+| **Uncontended perf** | Baseline | Close to baseline with delegation | Same as local (zero RPCs) | Good | Good |
+| **Contended perf** | Baseline | CTO overhead | Recall overhead | Lock overhead | Cap revocation |
+| **POSIX compliant** | Full | Close-to-open (weaker) | Approaching full | Full | Full |
+
+---
+
+## 5. Linux Kernel Implementation
 
 The Linux kernel implements both pNFS client and (limited) server support.
 The source is organized as follows (paths relative to `fs/`):
@@ -1501,7 +1964,7 @@ fs/nfsd/                         ← NFS server (knfsd)
 └── flexfilelayout.c              ← Server flex files support
 ```
 
-### 4.1 Core pNFS Data Structures
+### 5.1 Core pNFS Data Structures
 
 ```c
 /* fs/nfs/pnfs.h — Layout header: one per inode with active layouts */
@@ -1551,7 +2014,7 @@ struct pnfs_layoutdriver_type {
 };
 ```
 
-### 4.2 How the Client Obtains a Layout
+### 5.2 How the Client Obtains a Layout
 
 The key function is `pnfs_update_layout()` (`fs/nfs/pnfs.c`):
 
@@ -1594,7 +2057,7 @@ pnfs_update_layout(inode, ctx, pos, count, iomode, ...)
         └── Return layout segment → client does direct I/O to DS
 ```
 
-### 4.3 Layout Type Drivers
+### 5.3 Layout Type Drivers
 
 Each layout type registers via `pnfs_register_layoutdriver()` with a
 module alias `nfs-layouttype4-<id>`:
@@ -1610,7 +2073,7 @@ The Flex Files driver (`flexfilelayout.c`, 81 KB) is the largest because it
 handles mirroring, I/O statistics tracking (`LAYOUTSTATS`), error reporting
 (`LAYOUTERROR`), and multiple DS protocol versions.
 
-### 4.4 NFSv4.2 Kernel Implementation
+### 5.4 NFSv4.2 Kernel Implementation
 
 The NFSv4.2 operations are in `fs/nfs/nfs42proc.c`:
 
@@ -1628,9 +2091,9 @@ The NFSv4.2 operations are in `fs/nfs/nfs42proc.c`:
 
 ---
 
-## 5. Performance Features
+## 6. Performance Features
 
-### 5.1 Parallel I/O — Linear Bandwidth Scaling
+### 6.1 Parallel I/O — Linear Bandwidth Scaling
 
 The core performance benefit: adding data servers adds aggregate bandwidth.
 With N data servers, the theoretical maximum throughput scales linearly:
@@ -1646,7 +2109,7 @@ This is achieved because:
 - Different clients can access different DS without contention
 - The MDS is out of the data path — it only handles metadata
 
-### 5.2 Striping
+### 6.2 Striping
 
 The Files and Flex Files layout types support **data striping** — a file is
 divided into stripe units distributed across data servers:
@@ -1664,7 +2127,7 @@ stripe_count = 3 (number of DS)
 A single large sequential read of 6 MB becomes three parallel 2 MB reads
 to three different servers — 3x the single-server bandwidth.
 
-### 5.3 Client-Side Mirroring (Flex Files)
+### 6.3 Client-Side Mirroring (Flex Files)
 
 Flex Files supports **mirrors** — each stripe can be stored on multiple DS
 for redundancy:
@@ -1682,7 +2145,7 @@ Reads can be load-balanced across mirrors. Writes go to all mirrors
 (client-driven replication). If a mirror fails, the client reports via
 `LAYOUTERROR` and the MDS can rebuild.
 
-### 5.4 Layout Caching
+### 6.4 Layout Caching
 
 Clients cache layouts aggressively. Once a `LAYOUTGET` succeeds, the
 client reuses the layout segment for all I/O to that file range until:
@@ -1696,7 +2159,7 @@ This avoids repeated round-trips to the MDS for the data path. See
 including the block layout's two-level extent tree caching and the write
 lifecycle state machine.
 
-### 5.5 NFSv4.2 Performance Features
+### 6.5 NFSv4.2 Performance Features
 
 | Feature | Performance Impact |
 |---------|-------------------|
@@ -1708,9 +2171,9 @@ lifecycle state machine.
 
 ---
 
-## 6. Hammerspace: pNFS as a Global Data Platform
+## 7. Hammerspace: pNFS as a Global Data Platform
 
-### 6.1 What Hammerspace Is
+### 7.1 What Hammerspace Is
 
 [Hammerspace](https://hammerspace.com/) is a software-defined data platform
 that uses **pNFS with Flex Files** as its core architecture. It was founded
@@ -1726,7 +2189,7 @@ layer** that sits above existing storage and provides:
 - Parallel file system performance via pNFS
 - No proprietary client software — uses the standard Linux NFS 4.2 client
 
-### 6.2 Architecture
+### 7.2 Architecture
 
 ```
                     Hammerspace Architecture
@@ -1761,7 +2224,7 @@ layer** that sits above existing storage and provides:
   Clients use standard Linux pNFS client — no agents needed.
 ```
 
-### 6.3 How pNFS Enables Hammerspace
+### 7.3 How pNFS Enables Hammerspace
 
 Hammerspace leverages specific pNFS/NFSv4.2 features:
 
@@ -1798,7 +2261,7 @@ policy engine uses this data to make informed decisions:
 - Cold files (no access for 30 days) → move to object storage
 - Geographic affinity → replicate to the site where reads are happening
 
-### 6.4 Tier 0: GPU-Direct NVMe
+### 7.4 Tier 0: GPU-Direct NVMe
 
 Hammerspace's latest innovation transforms **local NVMe storage on GPU
 servers** into a shared Tier 0 storage pool:
@@ -1819,7 +2282,7 @@ can read training data directly from each other's NVMe at local speeds via
 pNFS, rather than going through a centralized storage system. This has
 achieved up to **10 TB/s** across 800 storage nodes.
 
-### 6.5 Multi-Protocol Access
+### 7.5 Multi-Protocol Access
 
 Hammerspace exposes the same data via NFS, pNFS, SMB/CIFS, and S3 — all
 through the global namespace. A Windows workstation can edit a file via SMB
@@ -1828,9 +2291,9 @@ the MDS.
 
 ---
 
-## 7. Advantages and Disadvantages
+## 8. Advantages and Disadvantages
 
-### 7.1 pNFS Advantages
+### 8.1 pNFS Advantages
 
 | Advantage | Detail |
 |-----------|--------|
@@ -1843,7 +2306,7 @@ the MDS.
 | **Leverages existing storage** | No forklift upgrade needed — existing NAS becomes pNFS data servers. |
 | **Kernel-integrated** | pNFS client infrastructure has been in mainline Linux since 2.6.37 (January 2011), with CB_LAYOUTRECALL and refinements added in 2.6.38. Well-tested, production-quality. |
 
-### 7.2 pNFS Disadvantages / Limitations
+### 8.2 pNFS Disadvantages / Limitations
 
 | Limitation | Detail |
 |------------|--------|
@@ -1855,7 +2318,7 @@ the MDS.
 | **Layout recall latency** | Data migration requires recalling layouts from all clients, which adds latency proportional to the number of active clients. |
 | **Limited write optimization** | Writes must go to all mirrors (Flex Files) and may require `LAYOUTCOMMIT` + `COMMIT` to DS before the MDS considers them stable — more round trips than a tightly-coupled system. |
 
-### 7.3 When to Use What
+### 8.3 When to Use What
 
 | Workload | Best Choice | Why |
 |----------|------------|-----|
@@ -1867,9 +2330,9 @@ the MDS.
 
 ---
 
-## 8. Typical NFS Use Cases
+## 9. Typical NFS Use Cases
 
-### 8.1 AI/ML Workloads
+### 9.1 AI/ML Workloads
 
 AI and ML training pipelines have a distinctive I/O pattern: **read-heavy,
 sequential, high-throughput data ingestion** during training, combined with
@@ -1997,7 +2460,7 @@ mount -t nfs -o vers=4.2,proto=tcp,\
   Azure NetApp Files provides NFSv4.1 with ultra-low latency for AI.
   These services are popular because they "just work" — mount and train.
 
-### 8.2 HPC Workloads
+### 9.2 HPC Workloads
 
 High-Performance Computing workloads are characterized by **massive
 parallelism** (thousands of nodes), **large-scale scientific data**, and
@@ -2129,7 +2592,7 @@ srun --prolog="cp /scratch/shared/input.h5 /local_nvme/" ...
   interface. The read-dominant, embarrassingly-parallel nature of physics
   analysis maps well to NFS's strengths.
 
-### 8.3 AI/ML vs HPC: NFS Configuration Comparison
+### 9.3 AI/ML vs HPC: NFS Configuration Comparison
 
 | Aspect | AI/ML Training | HPC Simulation |
 |--------|---------------|----------------|
@@ -2147,7 +2610,7 @@ srun --prolog="cp /scratch/shared/input.h5 /local_nvme/" ...
 
 ---
 
-## 9. Summary
+## 10. Summary
 
 pNFS and NFSv4.2 together represent the evolution of NFS from a simple
 client-server file sharing protocol to a scalable parallel data access
