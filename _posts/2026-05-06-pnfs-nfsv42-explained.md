@@ -986,6 +986,108 @@ A 1 TB sparse file with 1 KB of actual data: `READ` would transfer 1 TB of
 zeros. `READ_PLUS` transfers 1 KB of data + a hole descriptor. `DEALLOCATE`
 punches holes (equivalent to `fallocate(FALLOC_FL_PUNCH_HOLE)`).
 
+#### CLONE
+
+The `CLONE` operation ([RFC 7862 §15.13](https://datatracker.ietf.org/doc/html/rfc7862#section-15.13))
+creates a byte-for-byte clone of a range from a source file to a
+destination file. When the underlying server filesystem supports reflinks
+(XFS, Btrfs), CLONE creates **shared block references** with copy-on-write
+semantics — no data is actually copied, only metadata is updated. This
+makes CLONE O(1) regardless of file size.
+
+```
+  CLONE vs COPY:
+  ──────────────
+
+  COPY (§15.2):                      CLONE (§15.13):
+  ─────────────                      ──────────────
+
+  Before:                            Before:
+  src:  [block A][block B]           src:  [block A][block B]
+  dst:  (empty)                      dst:  (empty)
+
+  After:                             After:
+  src:  [block A][block B]           src:  ─────┐    ┌─────
+  dst:  [block A'][block B']         dst:  ─────┤    ├─────
+        (separate copies)                       ▼    ▼
+                                          [block A][block B]
+                                          (shared, copy-on-write)
+
+  Cost: O(n) — copies every byte     Cost: O(1) — updates metadata only
+  Atomic: no                         Atomic: yes
+  Creates new blocks: yes            Creates new blocks: no (reflink)
+```
+
+**User-space triggers:** Applications invoke CLONE via two interfaces:
+
+- `ioctl(dst_fd, FICLONE, src_fd)` — clone entire file
+- `ioctl(dst_fd, FICLONERANGE, &range)` — clone a byte range
+
+(Note: `copy_file_range()` does NOT use CLONE — it uses the separate
+NFS COPY operation, and on failure falls back to `splice_copy_file_range()`.)
+
+Both reach the NFS client's `nfs42_remap_file_range()` callback
+(`fs/nfs/nfs4file.c`), which validates alignment against the server's
+`clone_blksize` (the underlying filesystem's block size, reported via
+`FATTR4_CLONE_BLKSIZE`) and then calls `nfs42_proc_clone()`.
+
+**The full call chain:**
+
+```
+  CLONE call chain:
+  ─────────────────
+
+  User: ioctl(dst_fd, FICLONE, src_fd)
+      │
+      ▼
+  fs/ioctl.c: ioctl_file_clone()
+      ▼
+  fs/remap_range.c: vfs_clone_file_range()
+      ▼
+  fs/nfs/nfs4file.c: nfs42_remap_file_range()
+      │  Validates clone_blksize alignment
+      │  Rejects REMAP_FILE_DEDUP (dedup not supported over NFS)
+      ▼
+  fs/nfs/nfs42proc.c: nfs42_proc_clone()
+      │  Sends NFSv4.2 CLONE RPC
+      ▼
+  ═══════════════ network ═══════════════
+      ▼
+  fs/nfsd/nfs4proc.c: nfsd4_clone()
+      ▼
+  fs/nfsd/vfs.c: nfsd4_clone_file_range()
+      ▼
+  fs/remap_range.c: vfs_clone_file_range()   ← same VFS function,
+      ▼                                        now on the server side
+  Server filesystem's remap_file_range():
+    XFS:   xfs_file_remap_range()  → reflink
+    Btrfs: btrfs_remap_file_range() → reflink
+    Other: -EOPNOTSUPP
+```
+
+Note that `vfs_clone_file_range()` appears on **both sides** of the
+network — once in the NFS client (to enter the NFS filesystem) and once
+in the NFS server (to enter the local filesystem). The NFS layer is
+transparent plumbing between the two VFS calls.
+
+**Capability and error handling:**
+
+The NFS client advertises `NFS_CAP_CLONE` for all NFSv4.2 mounts.
+If the server returns `NFS4ERR_NOTSUPP` or `NFS4ERR_OP_NOT_IN_SESSION`
+(because the underlying filesystem doesn't support reflinks), the client
+clears `NFS_CAP_CLONE` and returns `-EOPNOTSUPP`. Subsequent CLONE
+attempts fail immediately without an RPC, and the application can fall
+back to a regular copy.
+
+**Alignment requirements:**
+
+The server reports its `clone_blksize` via `FATTR4_CLONE_BLKSIZE`
+(typically the filesystem's block size, e.g., 4096 bytes for XFS).
+The client validates that source offset, destination offset, and count
+are aligned to this block size (with an exception: the count need not be
+aligned if cloning to the end of the source file). Misaligned CLONE
+requests are rejected before any RPC is sent.
+
 #### LAYOUTERROR and LAYOUTSTATS
 
 These let the pNFS client report back to the MDS:
