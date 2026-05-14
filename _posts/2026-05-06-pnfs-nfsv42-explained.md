@@ -697,6 +697,191 @@ infrastructure already provides shared block access and the goal is to
 eliminate every possible layer of overhead between the application and
 the storage hardware.
 
+### 2.2.3 Layout Cache Policy
+
+pNFS clients cache layouts aggressively — once a `LAYOUTGET` succeeds,
+the client reuses the cached layout for all subsequent I/O to that file
+range without contacting the MDS. This is critical for performance: a
+LAYOUTGET round-trip on every I/O would negate the parallelism benefit.
+
+**General pNFS Layout Caching (All Layout Types):**
+
+Layout segments are cached in a **per-inode** list (`plh_segs` in
+`struct pnfs_layout_hdr`). When the client needs to do I/O, it calls
+`pnfs_update_layout()` (`fs/nfs/pnfs.c`), which first searches the
+cache:
+
+```
+  pnfs_update_layout() — layout cache lookup:
+  ────────────────────────────────────────────
+
+  1. pnfs_find_lseg(lo, range, iomode)
+     → Walk plh_segs list for a segment covering the requested range
+     → Check NFS_LSEG_VALID flag and iomode compatibility
+       (a cached RW segment satisfies a READ request
+        unless strict_iomode is set)
+
+  2. Cache HIT:
+     → Return cached segment, take reference
+     → No RPC to MDS
+     → Fast path: ~ns overhead
+
+  3. Cache MISS:
+     → Send LAYOUTGET RPC to MDS
+     → MDS returns layout segment
+     → pnfs_layout_process() inserts segment into plh_segs
+     → Layout driver's alloc_lseg() decodes layout-specific data
+```
+
+**Layout Invalidation Triggers:**
+
+The cached layout is invalidated (and the client falls back to MDS I/O)
+when any of these occur:
+
+| Trigger | Mechanism | Effect |
+|---------|-----------|--------|
+| **Server recalls layout** | `CB_LAYOUTRECALL` callback | Segments marked for return; client issues `LAYOUTRETURN` |
+| **Bulk recall** | `CB_LAYOUTRECALL` with `RETURN_ALL` or `RETURN_FSID` | `NFS_LAYOUT_BULK_RECALL` flag set; all LAYOUTGETs blocked |
+| **Stateid conflict** | LAYOUTGET returns different stateid | All existing segments discarded |
+| **I/O error** | Data server or device error | `NFS_LAYOUT_RW_FAILED` / `NFS_LAYOUT_RO_FAILED` set |
+| **Setattr / truncate** | File attributes change | Layout returned (for layout types that set `PNFS_LAYOUTRET_ON_SETATTR`) |
+| **Lease expiry** | Client fails to renew lease | Server reclaims all state including layouts |
+
+After a LAYOUTGET failure, the client suppresses retries for 120 seconds
+(`PNFS_LAYOUTGET_RETRY_TIMEOUT`) before trying again. This prevents
+hammering the MDS when layout service is unavailable.
+
+**Block Layout Caching — the Two-Level Architecture:**
+
+The block layout has a unique caching design that differs from NFS-based
+layouts (Files, Flex Files). It uses a **two-level cache** where extent
+data outlives the layout segments that created it:
+
+```
+  Block layout two-level cache (per-inode):
+  ─────────────────────────────────────────
+
+  Level 1 — pNFS core (layout segments):
+  ┌─────────────────────────────────────────────────┐
+  │ plh_segs: [lseg_1] → [lseg_2] → ...            │
+  │           (layout segments are empty shells —    │
+  │            no block-layout data stored here!)    │
+  └─────────────────────────────────────────────────┘
+
+  Level 2 — Block layout (extent trees):
+  ┌─────────────────────────────────────────────────┐
+  │ bl_ext_ro: RB-tree (READ_DATA, NONE_DATA)       │
+  │   ┌────────────┐  ┌────────────┐                │
+  │   │foff=0      │  │foff=4MB    │                │
+  │   │len=4MB     │  │len=8MB     │                │
+  │   │soff=0x1000 │  │soff=HOLE   │                │
+  │   │state=READ  │  │state=NONE  │                │
+  │   └────────────┘  └────────────┘                │
+  │                                                  │
+  │ bl_ext_rw: RB-tree (READWRITE_DATA, INVALID)     │
+  │   ┌────────────┐  ┌────────────┐                │
+  │   │foff=16MB   │  │foff=20MB   │                │
+  │   │len=4MB     │  │len=8MB     │                │
+  │   │soff=0x3000 │  │soff=0x5000 │                │
+  │   │state=RW    │  │state=INVLD │                │
+  │   └────────────┘  └────────────┘                │
+  └─────────────────────────────────────────────────┘
+
+  Extents persist in the RB-trees independently of
+  layout segment lifecycle. Multiple LAYOUTGET responses
+  accumulate extents in the same trees.
+```
+
+**How this works in the kernel:**
+
+When a LAYOUTGET response arrives, `bl_alloc_lseg()`
+(`fs/nfs/blocklayout/blocklayout.c`) decodes the extents and inserts
+them into the per-inode RB-trees via `ext_tree_insert()`. The layout
+segment itself is just an empty `kzalloc`'d struct — it holds no
+block-specific data.
+
+When the segment is later freed, `bl_free_lseg()` simply calls
+`kfree(lseg)` — **the extents in the trees are NOT removed**. They
+persist and continue to be used for I/O.
+
+This means:
+- Multiple LAYOUTGET responses **accumulate** extents in the same trees
+- Adjacent compatible extents are **merged** on insertion
+  (`ext_can_merge()` in `extent_tree.c` checks same state, same device,
+  contiguous file AND volume offsets, and matching tag for invalid extents)
+- The client progressively builds a more complete block map without
+  re-requesting already-known ranges
+- On read, `ext_tree_lookup()` performs O(log n) search in the RB-tree
+
+**When extents ARE removed:**
+
+| Trigger | Function | What Happens |
+|---------|----------|-------------|
+| `CB_LAYOUTRECALL` | `bl_return_range()` | Removes extents for the recalled range |
+| `LAYOUTRETURN` | `bl_return_range()` | Removes extents for the returned range |
+| Inode eviction | `bl_free_layout_hdr()` | `ext_tree_remove()` clears all extents |
+| Write to RO extent | `ext_tree_mark_written()` | Overlapping RO extents replaced by RW |
+
+**Block Layout Write Lifecycle in the Extent Cache:**
+
+Writes involve a state machine tracked in the extent trees:
+
+```
+  Write lifecycle (extent state transitions):
+  ────────────────────────────────────────────
+
+  1. LAYOUTGET response:
+     extent = {INVALID_DATA, tag=0}
+     → "This space is allocated on device but has no valid data"
+
+  2. Client writes data to device (submit_bio):
+     ext_tree_mark_written() → tag = EXTENT_WRITTEN
+     → "Data is on device, MDS doesn't know yet"
+
+  3. LAYOUTCOMMIT preparation:
+     ext_tree_prepare_commit() → tag = EXTENT_COMMITTING
+     → "Telling MDS about this write"
+     → Extent encoded in LAYOUTCOMMIT payload
+
+  4. LAYOUTCOMMIT succeeds:
+     ext_tree_mark_committed()
+       state: INVALID_DATA → READWRITE_DATA
+       tag: EXTENT_COMMITTING → 0
+     → "MDS acknowledged, extent is now permanent valid data"
+
+  4b. LAYOUTCOMMIT fails:
+      tag: EXTENT_COMMITTING → EXTENT_WRITTEN
+      → "Revert to step 2, will retry"
+```
+
+**Why Block Layout Caching Is More Aggressive:**
+
+Block layouts map file offsets to physical LBAs on SAN devices. These
+mappings rarely change — the filesystem doesn't rearrange blocks unless
+the file is extended, truncated, or defragmented. So caching them
+aggressively makes sense: once the client learns that file offset 0-4MB
+maps to LBA 0x1000, that mapping remains valid until the server
+explicitly recalls it.
+
+This contrasts with NFS-based layouts (Files, Flex Files), where the
+layout contains data server addresses and stateids that may change more
+frequently due to server failover, load rebalancing, or DS restarts.
+
+**NFS-Based Layout Caching (Files, Flex Files):**
+
+For Files and Flex Files layouts, the caching model is simpler — the
+layout segment itself contains all the cached data (DS addresses,
+filehandles, stateids, stripe info). There is no separate extent tree.
+
+| Aspect | Block Layout | Files / Flex Files |
+|--------|-------------|-------------------|
+| **Cache structure** | Two-level: segment (shell) + per-inode RB-trees | Single-level: segment contains DS addresses/FHs |
+| **Extent persistence** | Extents outlive segments | Segment is the cache; freeing it loses everything |
+| **Multi-LAYOUTGET** | Extents accumulate and merge across responses | Each segment is independent in `plh_segs` list |
+| **Cache hit path** | `ext_tree_lookup()` on RB-tree — O(log n) | Walk `plh_segs` list for matching range |
+| **Data volatility** | Low (block mappings rarely change) | Higher (DS addresses can change on failover) |
+| **Invalidation** | `bl_return_range()` removes extents per range | Segment marked invalid (`NFS_LSEG_VALID` cleared) |
+
 ### 2.3 The Layout Protocol: LAYOUTGET / LAYOUTRETURN / LAYOUTCOMMIT
 
 The layout lifecycle is managed by three operations plus a callback:
@@ -1036,7 +1221,10 @@ client reuses the layout segment for all I/O to that file range until:
 - The layout expires (layout stateid becomes invalid)
 - The client detects a DS error
 
-This avoids repeated round-trips to the MDS for the data path.
+This avoids repeated round-trips to the MDS for the data path. See
+[Section 2.2.3](#223-layout-cache-policy) for the full cache architecture,
+including the block layout's two-level extent tree caching and the write
+lifecycle state machine.
 
 ### 4.5 NFSv4.2 Performance Features
 
