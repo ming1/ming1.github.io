@@ -1100,7 +1100,375 @@ These let the pNFS client report back to the MDS:
 
 ---
 
-## 3. Linux Kernel Implementation
+## 3. Sun RPC: The Protocol Transport Beneath NFS
+
+Every NFS operation — including all pNFS operations (LAYOUTGET, LAYOUTRETURN,
+LAYOUTCOMMIT, CB_LAYOUTRECALL) — is carried over **Sun RPC** (ONC RPC,
+[RFC 5531](https://www.rfc-editor.org/rfc/rfc5531.html)). Understanding
+RPC is essential to understanding NFS performance, debugging, and security.
+
+Sun RPC provides three things that NFS relies on:
+1. **Procedure-call semantics** — the client calls a named procedure on the
+   server and gets a typed result back
+2. **XDR marshaling** — platform-independent binary encoding of arguments
+   and results
+3. **Pluggable authentication** — AUTH_SYS, Kerberos (RPCSEC_GSS), or none
+
+### 3.1 RPC Message Format
+
+Every NFS request and reply is an RPC message on the wire. The format is
+defined by RFC 5531:
+
+```
+  RPC Call Message (client → server):
+  ───────────────────────────────────
+
+  ┌──────────────────────────────────────────────────────┐
+  │ Record Mark (TCP only): 4 bytes                       │
+  │   bit 31: last_fragment (1 = yes)                     │
+  │   bits 0-30: fragment length                          │
+  ├──────────────────────────────────────────────────────┤
+  │ XID: 4 bytes              (transaction ID, unique)    │
+  │ msg_type: 4 bytes         (0 = RPC_CALL)              │
+  │ rpc_version: 4 bytes      (always 2)                  │
+  │ program: 4 bytes          (100003 = NFS)              │
+  │ prog_version: 4 bytes     (4 = NFSv4)                 │
+  │ procedure: 4 bytes        (1 = COMPOUND for NFSv4)    │
+  ├──────────────────────────────────────────────────────┤
+  │ Credential:                                           │
+  │   flavor: 4 bytes   (0=NULL, 1=AUTH_SYS, 6=GSS)      │
+  │   body: variable     (uid/gid for AUTH_SYS,           │
+  │                       GSS token for RPCSEC_GSS)       │
+  │ Verifier:                                             │
+  │   flavor: 4 bytes                                     │
+  │   body: variable     (empty for AUTH_SYS,             │
+  │                       MIC for RPCSEC_GSS)             │
+  ├──────────────────────────────────────────────────────┤
+  │ Procedure arguments (XDR-encoded):                    │
+  │   For NFSv4: COMPOUND body with operations:           │
+  │   [SEQUENCE][PUTFH][READ offset=0 count=1MB]          │
+  └──────────────────────────────────────────────────────┘
+
+
+  RPC Reply Message (server → client):
+  ────────────────────────────────────
+
+  ┌──────────────────────────────────────────────────────┐
+  │ XID: 4 bytes              (matches the call's XID)    │
+  │ msg_type: 4 bytes         (1 = RPC_REPLY)             │
+  │ reply_stat: 4 bytes       (0 = ACCEPTED, 1 = DENIED)  │
+  ├──────────────────────────────────────────────────────┤
+  │ Verifier (server's):                                  │
+  │   flavor + body                                       │
+  ├──────────────────────────────────────────────────────┤
+  │ accept_stat: 4 bytes      (0 = SUCCESS)               │
+  │ Procedure result (XDR-encoded):                       │
+  │   For NFSv4: COMPOUND reply with per-op results       │
+  └──────────────────────────────────────────────────────┘
+```
+
+The **XID** (transaction ID) is how the client matches replies to requests.
+For NFSv4, the **procedure** is always `COMPOUND` (procedure 1) — the
+individual NFS operations (PUTFH, READ, WRITE, LAYOUTGET, etc.) are
+encoded inside the compound body, not as separate RPC procedures.
+
+In the kernel, the call header is encoded by `rpc_encode_header()`
+(`net/sunrpc/clnt.c`) and the reply is parsed by `rpc_decode_header()`.
+
+### 3.2 XDR: External Data Representation
+
+XDR ([RFC 4506](https://www.rfc-editor.org/rfc/rfc4506.html)) is the
+binary encoding used for all data on the wire. Every integer, string,
+array, and structure in an NFS message is XDR-encoded.
+
+**Key XDR rules:**
+- All values aligned to **4-byte boundaries**
+- Integers are **big-endian** (network byte order)
+- Strings are length-prefixed (4-byte length + data + padding to 4-byte
+  boundary)
+- Variable-length arrays are count-prefixed
+
+```
+  XDR encoding examples:
+  ──────────────────────
+
+  uint32 value 42:
+    00 00 00 2A                          (4 bytes, big-endian)
+
+  uint64 value 0x123456789ABCDEF0:
+    12 34 56 78  9A BC DE F0             (8 bytes, big-endian)
+
+  string "NFS":
+    00 00 00 03  4E 46 53 00             (length=3, "NFS", 1 byte padding)
+
+  opaque<12> (fixed-length):
+    XX XX XX XX  XX XX XX XX  XX XX XX XX (12 bytes, no padding needed)
+```
+
+In the Linux kernel, XDR is implemented with a **streaming API** that
+works over a multi-segment buffer (`struct xdr_buf`):
+
+```
+  struct xdr_buf — the NFS I/O buffer:
+  ────────────────────────────────────
+
+  ┌─────────────────────────┐
+  │ head[0]: kvec           │  RPC header + NFS operation headers
+  │   (kernel linear buffer)│  (small, always in kernel memory)
+  ├─────────────────────────┤
+  │ pages[]: page array     │  Bulk data (READ/WRITE payload)
+  │   (page cache pages)    │  (zero-copy: pages come directly from
+  │                         │   the page cache, not copied)
+  ├─────────────────────────┤
+  │ tail[0]: kvec           │  Trailing data after page payload
+  │   (kernel linear buffer)│  (e.g., compound operation results)
+  └─────────────────────────┘
+
+  This three-part design enables ZERO-COPY I/O:
+  - For READ:  server writes data directly into pages[]
+               that become the client's page cache pages
+  - For WRITE: client sends pages[] from its page cache
+               directly, no memcpy into an RPC buffer
+```
+
+The `struct xdr_stream` (`include/linux/sunrpc/xdr.h`) provides a cursor
+over this buffer. Encoders call `xdr_reserve_space(nbytes)` to get a
+pointer to write into; decoders call `xdr_inline_decode(nbytes)` to read.
+If the data spans a page boundary, the XDR layer transparently handles
+the cross-page access.
+
+### 3.3 The RPC Client Call Flow
+
+When NFS issues an RPC (e.g., `nfs4_proc_read()` calls `rpc_call_sync()`
+or `rpc_call_async()`), the call passes through a **state machine** in
+`net/sunrpc/clnt.c`. Each step sets `task->tk_action` to the next step:
+
+```
+  RPC Client State Machine (net/sunrpc/clnt.c):
+  ──────────────────────────────────────────────
+
+  call_start
+      │  Initialize stats, select transport
+      ▼
+  call_reserve             ──── Step 1: Reserve a slot in the transport
+      │  xprt_reserve()        (limits concurrent RPCs per connection)
+      ▼
+  call_refresh             ──── Step 2: Obtain/refresh credentials
+      │  rpcauth_refreshcred() (get Kerberos ticket if needed)
+      ▼
+  call_allocate            ──── Step 3: Allocate XDR send/recv buffers
+      │  xprt->ops->buf_alloc()
+      ▼
+  call_encode              ──── Step 4: Encode the RPC message
+      │  rpc_encode_header()       write XID, call, prog, vers, proc
+      │    └─ rpcauth_marshcred()  encode credential + verifier (internal)
+      │  rpcauth_wrap_req()        encode args (+ GSS wrap if krb5i/krb5p)
+      ▼
+  call_bind                ──── Step 5: Resolve port (rpcbind/portmap)
+      │  (skipped if port is already known)
+      ▼
+  call_connect             ──── Step 6: Establish TCP connection
+      │  xprt_connect()       (skipped if already connected)
+      ▼
+  call_transmit            ──── Step 7: Send the request
+      │  xprt_transmit()
+      │  xprt_request_wait_receive()   wait for reply
+      ▼
+  call_status              ──── Step 8: Check for transport errors
+      │  timeout → retry from call_encode
+      │  disconnect → retry from call_bind
+      ▼
+  call_decode              ──── Step 9: Decode the reply
+      │  rpc_decode_header()       check XID, reply_stat, accept_stat
+      │  rpcauth_checkverf()       validate server's verifier
+      │  rpcauth_unwrap_resp()     unwrap + decode result
+      │  garbage_args → retry from call_encode
+      ▼
+  rpc_exit_task            ──── Done: return result to NFS caller
+```
+
+**Sync vs Async:** For `rpc_call_sync()`, the calling thread drives the
+state machine directly and sleeps when waiting (for connect, transmit,
+or reply). For `rpc_call_async()`, the state machine runs on a kernel
+workqueue (`rpciod_workqueue`), and the NFS caller gets a callback when
+complete.
+
+**Retries:** If the transport disconnects or the server returns garbage,
+the state machine loops back to an earlier step (e.g., `call_bind` or
+`call_encode`) and retries. Soft-timeout mounts (`soft`) will eventually
+give up and return an error.
+
+### 3.4 The RPC Task
+
+The `struct rpc_task` (`include/linux/sunrpc/sched.h`) is the central
+unit of work — one task per RPC call in flight:
+
+```
+  struct rpc_task — one RPC call in flight:
+  ─────────────────────────────────────────
+
+  ┌─────────────────────────────────────────────┐
+  │ tk_action:    pointer to NEXT state machine  │
+  │               step (call_encode, call_decode, │
+  │               etc.)                          │
+  │ tk_status:    result of last operation        │
+  │ tk_msg:       {rpc_proc, args, result}        │
+  │               (what procedure to call,        │
+  │                arguments, where to put result) │
+  │ tk_client:    → struct rpc_clnt               │
+  │ tk_xprt:     → struct rpc_xprt (transport)    │
+  │ tk_rqstp:    → struct rpc_rqst (on-wire slot) │
+  │ tk_ops:      caller callbacks:                │
+  │                rpc_call_prepare()  (pre-call)  │
+  │                rpc_call_done()     (completion) │
+  │                rpc_release()       (cleanup)    │
+  │ tk_flags:    RPC_TASK_ASYNC, RPC_TASK_SOFT, etc│
+  └─────────────────────────────────────────────┘
+```
+
+The task scheduler (`net/sunrpc/sched.c`) manages wait queues for tasks
+blocked on slot allocation, connection, or reply. The core loop in
+`__rpc_execute()` repeatedly calls `task->tk_action` until there are no
+more steps.
+
+### 3.5 Transport Abstraction
+
+The RPC layer abstracts the network transport through `struct rpc_xprt`
+and `struct rpc_xprt_ops`. This is how NFS supports TCP, UDP, RDMA, and
+local transports through a single client interface:
+
+```
+  RPC Transport Architecture:
+  ───────────────────────────
+
+  rpc_call_sync() / rpc_call_async()
+      │
+      ▼
+  struct rpc_clnt
+      │  cl_xprt → selects transport
+      ▼
+  struct rpc_xprt (transport abstraction)
+      │  ops → struct rpc_xprt_ops (vtable)
+      │
+      ├──► xprtsock.c: TCP transport   (XPRT_TRANSPORT_TCP)
+      │      ops->connect()     → TCP connect
+      │      ops->send_request() → tcp_sendmsg()
+      │
+      ├──► xprtsock.c: UDP transport   (XPRT_TRANSPORT_UDP)
+      │      ops->send_request() → udp_sendmsg()
+      │
+      ├──► xprtrdma/: RDMA transport   (XPRT_TRANSPORT_RDMA)
+      │      ops->connect()     → RDMA connection setup
+      │      ops->send_request() → ib_post_send() (RDMA send)
+      │
+      └──► xprtlocal.c: Local transport (XPRT_TRANSPORT_LOCAL)
+             ops->send_request() → bypass network entirely
+```
+
+Each transport registers via `xprt_register_transport()` at module init.
+The key `rpc_xprt_ops` callbacks are:
+- `connect()` — establish the connection
+- `send_request()` — transmit an encoded RPC message
+- `reserve_xprt()` / `release_xprt()` — serialize access to the send path
+- `alloc_slot()` / `free_slot()` — manage concurrent request slots
+- `close()` / `destroy()` — tear down
+
+The transport also manages **congestion control** (`xprt->cong` and
+`xprt->cwnd`) and **request matching**: sent requests are tracked in an
+RB-tree (`xprt->recv_queue`, keyed by XID) so incoming replies can be
+matched to the correct `rpc_rqst` in O(log n).
+
+### 3.6 Authentication
+
+RPC authentication is pluggable — different security mechanisms are
+registered into an `auth_flavors[]` array and selected per-mount:
+
+| Flavor | Constant | Description | Wire Overhead |
+|--------|----------|-------------|---------------|
+| AUTH_NULL | `RPC_AUTH_NULL` (0) | No authentication | Minimal (empty cred/verifier) |
+| AUTH_SYS | `RPC_AUTH_UNIX` (1) | UID/GID credentials | Small (~20 bytes: uid, gid, groups) |
+| RPCSEC_GSS | `RPC_AUTH_GSS` (6) | Kerberos (GSS-API) | Variable (GSS tokens, MIC, or encrypted payload) |
+| AUTH_TLS | `RPC_AUTH_TLS` (7) | TLS transport security | Handshake only (data encrypted by TLS layer) |
+
+The auth framework has two levels of operations:
+- **`rpc_authops`** (per-flavor): create/destroy auth handles, look up
+  credentials
+- **`rpc_credops`** (per-credential): the actual wire operations:
+  - `crmarshal()` — encode credential into the call message
+  - `crvalidate()` — validate the server's verifier in the reply
+  - `crwrap_req()` — encode args AND optionally wrap (integrity/encrypt)
+  - `crunwrap_resp()` — unwrap (verify/decrypt) AND decode reply
+
+For RPCSEC_GSS with `krb5i` (integrity), `crwrap_req()` encodes the
+arguments normally, then appends a **MIC** (Message Integrity Code) computed
+over the encoded data. The server verifies the MIC before processing.
+
+For `krb5p` (privacy), `crwrap_req()` **encrypts** the entire argument
+payload. The server decrypts before processing and encrypts the reply.
+
+```
+  AUTH_SYS call:                    RPCSEC_GSS (krb5p) call:
+  ──────────────                    ────────────────────────
+
+  ┌───────────────┐                ┌───────────────┐
+  │ RPC header    │                │ RPC header    │
+  ├───────────────┤                ├───────────────┤
+  │ cred: uid=1000│                │ cred: GSS     │
+  │   gid=1000    │                │   context token│
+  │   groups=...  │                ├───────────────┤
+  ├───────────────┤                │ verifier: MIC │
+  │ verifier: NULL│                ├───────────────┤
+  ├───────────────┤                │ ╔═════════════╗│
+  │ args (clear)  │                │ ║ args        ║│
+  │   COMPOUND:   │                │ ║ (ENCRYPTED) ║│
+  │   PUTFH+READ  │                │ ╚═════════════╝│
+  └───────────────┘                └───────────────┘
+
+  Anyone on the network              Only the server can
+  can read the data                  decrypt the data
+```
+
+### 3.7 RPC in the Context of pNFS
+
+All pNFS metadata operations use RPC to communicate with the MDS:
+
+| pNFS Operation | RPC Path | Purpose |
+|----------------|----------|---------|
+| `LAYOUTGET` | Client → MDS (NFSv4.1 COMPOUND) | Request layout for a file range |
+| `LAYOUTRETURN` | Client → MDS (NFSv4.1 COMPOUND) | Return layout + error/stats |
+| `LAYOUTCOMMIT` | Client → MDS (NFSv4.1 COMPOUND) | Inform MDS of writes |
+| `CB_LAYOUTRECALL` | MDS → Client (backchannel RPC) | Recall a layout |
+| `LAYOUTSTATS` | Client → MDS (NFSv4.2 COMPOUND) | Report I/O statistics |
+| `LAYOUTERROR` | Client → MDS (NFSv4.2 COMPOUND) | Report DS errors |
+| `GETDEVICEINFO` | Client → MDS (NFSv4.1 COMPOUND) | Resolve device addresses |
+
+For the **data path**, RPC usage depends on the layout type:
+
+```
+  pNFS data path RPC usage:
+  ─────────────────────────
+
+  Files layout (ID=1):
+    Client ──NFSv4.1 RPC──► Data Server
+    (READ/WRITE inside COMPOUND, over TCP/RDMA)
+
+  Flex Files layout (ID=4):
+    Client ──NFSv3 or NFSv4 RPC──► Data Server
+    (READ/WRITE, version per DS configuration)
+
+  Block layout (ID=3) / SCSI layout (ID=5):
+    Client ──submit_bio()──► Block device
+    (NO RPC on data path — raw SCSI/iSCSI/FC)
+```
+
+The block and SCSI layouts are unique in the NFS world: they are the only
+case where an NFS client does I/O without using RPC at all. The MDS
+communication still uses RPC, but the actual data reads and writes bypass
+the entire RPC stack and go directly to the storage hardware.
+
+---
+
+## 4. Linux Kernel Implementation
 
 The Linux kernel implements both pNFS client and (limited) server support.
 The source is organized as follows (paths relative to `fs/`):
@@ -1133,7 +1501,7 @@ fs/nfsd/                         ← NFS server (knfsd)
 └── flexfilelayout.c              ← Server flex files support
 ```
 
-### 3.1 Core pNFS Data Structures
+### 4.1 Core pNFS Data Structures
 
 ```c
 /* fs/nfs/pnfs.h — Layout header: one per inode with active layouts */
@@ -1183,7 +1551,7 @@ struct pnfs_layoutdriver_type {
 };
 ```
 
-### 3.2 How the Client Obtains a Layout
+### 4.2 How the Client Obtains a Layout
 
 The key function is `pnfs_update_layout()` (`fs/nfs/pnfs.c`):
 
@@ -1226,7 +1594,7 @@ pnfs_update_layout(inode, ctx, pos, count, iomode, ...)
         └── Return layout segment → client does direct I/O to DS
 ```
 
-### 3.3 Layout Type Drivers
+### 4.3 Layout Type Drivers
 
 Each layout type registers via `pnfs_register_layoutdriver()` with a
 module alias `nfs-layouttype4-<id>`:
@@ -1242,7 +1610,7 @@ The Flex Files driver (`flexfilelayout.c`, 81 KB) is the largest because it
 handles mirroring, I/O statistics tracking (`LAYOUTSTATS`), error reporting
 (`LAYOUTERROR`), and multiple DS protocol versions.
 
-### 3.4 NFSv4.2 Kernel Implementation
+### 4.4 NFSv4.2 Kernel Implementation
 
 The NFSv4.2 operations are in `fs/nfs/nfs42proc.c`:
 
@@ -1260,9 +1628,9 @@ The NFSv4.2 operations are in `fs/nfs/nfs42proc.c`:
 
 ---
 
-## 4. Performance Features
+## 5. Performance Features
 
-### 4.1 Parallel I/O — Linear Bandwidth Scaling
+### 5.1 Parallel I/O — Linear Bandwidth Scaling
 
 The core performance benefit: adding data servers adds aggregate bandwidth.
 With N data servers, the theoretical maximum throughput scales linearly:
@@ -1278,7 +1646,7 @@ This is achieved because:
 - Different clients can access different DS without contention
 - The MDS is out of the data path — it only handles metadata
 
-### 4.2 Striping
+### 5.2 Striping
 
 The Files and Flex Files layout types support **data striping** — a file is
 divided into stripe units distributed across data servers:
@@ -1296,7 +1664,7 @@ stripe_count = 3 (number of DS)
 A single large sequential read of 6 MB becomes three parallel 2 MB reads
 to three different servers — 3x the single-server bandwidth.
 
-### 4.3 Client-Side Mirroring (Flex Files)
+### 5.3 Client-Side Mirroring (Flex Files)
 
 Flex Files supports **mirrors** — each stripe can be stored on multiple DS
 for redundancy:
@@ -1314,7 +1682,7 @@ Reads can be load-balanced across mirrors. Writes go to all mirrors
 (client-driven replication). If a mirror fails, the client reports via
 `LAYOUTERROR` and the MDS can rebuild.
 
-### 4.4 Layout Caching
+### 5.4 Layout Caching
 
 Clients cache layouts aggressively. Once a `LAYOUTGET` succeeds, the
 client reuses the layout segment for all I/O to that file range until:
@@ -1328,7 +1696,7 @@ This avoids repeated round-trips to the MDS for the data path. See
 including the block layout's two-level extent tree caching and the write
 lifecycle state machine.
 
-### 4.5 NFSv4.2 Performance Features
+### 5.5 NFSv4.2 Performance Features
 
 | Feature | Performance Impact |
 |---------|-------------------|
@@ -1340,9 +1708,9 @@ lifecycle state machine.
 
 ---
 
-## 5. Hammerspace: pNFS as a Global Data Platform
+## 6. Hammerspace: pNFS as a Global Data Platform
 
-### 5.1 What Hammerspace Is
+### 6.1 What Hammerspace Is
 
 [Hammerspace](https://hammerspace.com/) is a software-defined data platform
 that uses **pNFS with Flex Files** as its core architecture. It was founded
@@ -1358,7 +1726,7 @@ layer** that sits above existing storage and provides:
 - Parallel file system performance via pNFS
 - No proprietary client software — uses the standard Linux NFS 4.2 client
 
-### 5.2 Architecture
+### 6.2 Architecture
 
 ```
                     Hammerspace Architecture
@@ -1393,7 +1761,7 @@ layer** that sits above existing storage and provides:
   Clients use standard Linux pNFS client — no agents needed.
 ```
 
-### 5.3 How pNFS Enables Hammerspace
+### 6.3 How pNFS Enables Hammerspace
 
 Hammerspace leverages specific pNFS/NFSv4.2 features:
 
@@ -1430,7 +1798,7 @@ policy engine uses this data to make informed decisions:
 - Cold files (no access for 30 days) → move to object storage
 - Geographic affinity → replicate to the site where reads are happening
 
-### 5.4 Tier 0: GPU-Direct NVMe
+### 6.4 Tier 0: GPU-Direct NVMe
 
 Hammerspace's latest innovation transforms **local NVMe storage on GPU
 servers** into a shared Tier 0 storage pool:
@@ -1451,7 +1819,7 @@ can read training data directly from each other's NVMe at local speeds via
 pNFS, rather than going through a centralized storage system. This has
 achieved up to **10 TB/s** across 800 storage nodes.
 
-### 5.5 Multi-Protocol Access
+### 6.5 Multi-Protocol Access
 
 Hammerspace exposes the same data via NFS, pNFS, SMB/CIFS, and S3 — all
 through the global namespace. A Windows workstation can edit a file via SMB
@@ -1460,9 +1828,9 @@ the MDS.
 
 ---
 
-## 6. Advantages and Disadvantages
+## 7. Advantages and Disadvantages
 
-### 6.1 pNFS Advantages
+### 7.1 pNFS Advantages
 
 | Advantage | Detail |
 |-----------|--------|
@@ -1475,7 +1843,7 @@ the MDS.
 | **Leverages existing storage** | No forklift upgrade needed — existing NAS becomes pNFS data servers. |
 | **Kernel-integrated** | pNFS client infrastructure has been in mainline Linux since 2.6.37 (January 2011), with CB_LAYOUTRECALL and refinements added in 2.6.38. Well-tested, production-quality. |
 
-### 6.2 pNFS Disadvantages / Limitations
+### 7.2 pNFS Disadvantages / Limitations
 
 | Limitation | Detail |
 |------------|--------|
@@ -1487,7 +1855,7 @@ the MDS.
 | **Layout recall latency** | Data migration requires recalling layouts from all clients, which adds latency proportional to the number of active clients. |
 | **Limited write optimization** | Writes must go to all mirrors (Flex Files) and may require `LAYOUTCOMMIT` + `COMMIT` to DS before the MDS considers them stable — more round trips than a tightly-coupled system. |
 
-### 6.3 When to Use What
+### 7.3 When to Use What
 
 | Workload | Best Choice | Why |
 |----------|------------|-----|
@@ -1499,9 +1867,9 @@ the MDS.
 
 ---
 
-## 7. Typical NFS Use Cases
+## 8. Typical NFS Use Cases
 
-### 7.1 AI/ML Workloads
+### 8.1 AI/ML Workloads
 
 AI and ML training pipelines have a distinctive I/O pattern: **read-heavy,
 sequential, high-throughput data ingestion** during training, combined with
@@ -1629,7 +1997,7 @@ mount -t nfs -o vers=4.2,proto=tcp,\
   Azure NetApp Files provides NFSv4.1 with ultra-low latency for AI.
   These services are popular because they "just work" — mount and train.
 
-### 7.2 HPC Workloads
+### 8.2 HPC Workloads
 
 High-Performance Computing workloads are characterized by **massive
 parallelism** (thousands of nodes), **large-scale scientific data**, and
@@ -1761,7 +2129,7 @@ srun --prolog="cp /scratch/shared/input.h5 /local_nvme/" ...
   interface. The read-dominant, embarrassingly-parallel nature of physics
   analysis maps well to NFS's strengths.
 
-### 7.3 AI/ML vs HPC: NFS Configuration Comparison
+### 8.3 AI/ML vs HPC: NFS Configuration Comparison
 
 | Aspect | AI/ML Training | HPC Simulation |
 |--------|---------------|----------------|
@@ -1779,7 +2147,7 @@ srun --prolog="cp /scratch/shared/input.h5 /local_nvme/" ...
 
 ---
 
-## 8. Summary
+## 9. Summary
 
 pNFS and NFSv4.2 together represent the evolution of NFS from a simple
 client-server file sharing protocol to a scalable parallel data access
