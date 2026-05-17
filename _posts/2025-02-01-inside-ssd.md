@@ -953,6 +953,658 @@ for I/O commands.
 - allow host memory used by SSD controller
 
 
+# Linux NVMe Target
+
+## motivation
+
+NVMe over Fabrics needs a **target** — the server side that owns the physical NVMe SSD
+and exports it over the network. The Linux kernel provides `nvmet` (NVMe Target), a
+full in-kernel implementation that turns any Linux machine into an NVMe storage array.
+
+Why in-kernel instead of userspace (like SPDK)?
+
+| Aspect | Kernel (nvmet) | Userspace (SPDK) |
+|---|---|---|
+| **CPU** | Shared with other kernel tasks | Dedicated cores (polling) |
+| **Latency** | ~20-50us (context switches) | ~5-10us (busy-poll) |
+| **Ease of use** | `nvmetcli` + configfs, no special setup | Hugepages, core isolation, PCIe binding |
+| **Ecosystem** | Works with any block device (mdraid, dm, files) | Own block device abstraction |
+| **Features** | Authentication, TLS, PR, ZNS, Passthrough | Subset |
+
+The kernel target trades some peak IOPS for operational simplicity — no need to
+dedicate CPU cores or manage hugepages.
+
+## architecture overview
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        Userspace (nvmetcli)                      │
+│  mkdir, echo, symlink → configfs                                 │
+└───────────────────────────┬─────────────────────────────────────┘
+                            │
+┌───────────────────────────▼─────────────────────────────────────┐
+│                      configfs interface                          │
+│  /sys/kernel/config/nvmet/                                       │
+│    ├── subsystems/<name>/                                        │
+│    │     ├── namespaces/<nsid>/   ← bind block device or file    │
+│    │     └── allowed_hosts/<nqn>/ ← ACL                         │
+│    ├── ports/<id>/                                               │
+│    │     ├── addr_traddr = ...    ← IP/IB address                │
+│    │     └── subsystems/<name> →  symlink to subsystem           │
+│    └── hosts/<nqn>/                                              │
+│          └── dhchap_key           ← authentication secret        │
+└───────────────────────────┬─────────────────────────────────────┘
+                            │
+┌───────────────────────────▼─────────────────────────────────────┐
+│                    nvmet core (nvmet.ko)                          │
+│                                                                   │
+│  ┌──────────────┐  ┌────────────────┐  ┌────────────────────┐  │
+│  │ nvmet_subsys │  │  nvmet_ctrl    │  │   nvmet_ns         │  │
+│  │              │  │  (per-host     │  │   (block or file)  │  │
+│  │ • namespaces │  │   connection)  │  │                    │  │
+│  │ • allowed    │  │                │  │   • bdev/file      │  │
+│  │   hosts      │  │  • SQ[] CQ[]   │  │   • blksize, size │  │
+│  │ • ctrl list  │  │  • CC, CSTS    │  │   • uuid, nguid   │  │
+│  └──────┬───────┘  └───────┬────────┘  └─────────┬──────────┘  │
+│         │                  │                      │              │
+│  ┌──────┴──────────────────┴──────────────────────┴──────────┐  │
+│  │              nvmet_fabrics_ops (transport vtable)          │  │
+│  │                                                            │  │
+│  │  .queue_response()    send CQE back to host                │  │
+│  │  .add_port()          create listening socket/endpoint     │  │
+│  │  .remove_port()       tear down listening endpoint         │  │
+│  │  .delete_ctrl()       disconnect a controller              │  │
+│  │  .install_queue()     wire up SQ/CQ pair                   │  │
+│  │  .disc_traddr()       discovery log address formatting     │  │
+│  └────────────────────────────┬───────────────────────────────┘  │
+│                               │                                   │
+│              ┌────────────────┼──────────────────┐               │
+│              ▼                ▼                   ▼               │
+│     ┌────────────┐  ┌──────────────┐  ┌──────────────────┐     │
+│     │ nvmet-tcp  │  │  nvmet-rdma  │  │   nvmet-fc       │     │
+│     │ (TCP/IP)   │  │  (RDMA)      │  │   (Fibre Channel) │    │
+│     └────────────┘  └──────────────┘  └──────────────────┘     │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+The design follows a **layered, transport-agnostic** pattern:
+- **configfs** is the admin plane — create subsystems, bind namespaces, set addresses
+- **core** implements the NVMe spec logic (Identify, Get/Set Features, AER, etc.)
+- **transport ops** (`nvmet_fabrics_ops`) is a vtable — plug in TCP, RDMA, or FC without touching core
+
+## four key data structures
+
+```
+nvmet_subsys              nvmet_ctrl               nvmet_ns
+┌─────────────────┐      ┌──────────────────┐     ┌──────────────┐
+│ subsysnqn        │◄─────│ subsys           │     │ nsid         │
+│ type (NQN/disc)  │      │ cntlid           │     │ bdev or file │
+│ namespaces (xarr)│──┐   │ hostnqn          │     │ size         │
+│ ctrls (list)     │  │   │ hostid           │     │ blksize_shift│
+│ hosts (list)     │  │   │ sqs[] cqs[]      │     │ uuid, nguid  │
+│ allow_any_host   │  │   │ cap, cc, csts    │     │ readonly     │
+│ model, serial    │  │   │ state            │     │ anagrpid     │
+└─────────────────┘  │   │ kato (keep-alive) │     │ enabled      │
+                     │   │ port             │◄──┐  └──────────────┘
+                     │   └──────────────────┘  │        ▲
+                     │                         │        │ (xarray)
+                     │   nvmet_port            │   ┌────┴─────────┐
+                     │   ┌──────────────────┐  │   │              │
+                     └───│ subsystems (list)│──┘   │namespaces[]  │
+                         │ disc_addr        │      │              │
+                         │ tr_ops (vtable)  │      └──────────────┘
+                         │ enabled          │
+                         │ inline_data_size │
+                         │ priv (transport) │
+                         └──────────────────┘
+```
+
+- **`nvmet_subsys`** — An NVMe subsystem: a named collection of namespaces. Equivalent to
+  an actual NVMe SSD's internal namespace set. Defined by its NQN (NVMe Qualified Name,
+  e.g., `nqn.2024-06.com.example:storage`).
+
+- **`nvmet_ctrl`** — One connected host = one controller. Holds the controller state
+  machine (CAP, CC, CSTS registers), the SQ/CQ arrays, keep-alive timer, and async
+  event queue. Created when a host issues a `connect` fabrics command.
+
+- **`nvmet_ns`** — A namespace backed by either a block device (`/dev/sda`, `/dev/nvme0n1`,
+  dm-linear, etc.) or a regular file. Stored in the subsystem's xarray keyed by NSID.
+
+- **`nvmet_port`** — A listening endpoint. Has a transport type (TCP/RDMA/FC/PCI),
+  address (IP:port, IB GID, etc.), and a list of linked subsystems. Its `tr_ops`
+  pointer binds it to a specific transport vtable (`nvmet_fabrics_ops`).
+
+## command processing flow
+
+This is the hottest path in the target — every I/O goes through it:
+
+```
+    Host sends NVMe command over the wire
+                │
+                ▼
+┌───────────────────────────────────────┐
+│ Transport recv (e.g. TCP recvmsg)     │  ← nvmet_tcp_try_recv_pdu()
+│  - Read PDU header (cmd or data)      │
+│  - Parse NVMe command capsule (64B)   │
+│  - If inline data: recv payload too   │
+│  - If data needed: send R2T or RDMA   │
+└───────────────┬───────────────────────┘
+                │
+                ▼
+┌───────────────────────────────────────┐
+│ nvmet_req_init(req, sq, ops)          │  ← core.c
+│  - Validate flags (no fused cmds)     │
+│  - Route to parser:                   │
+│    • no ctrl yet? → connect cmd       │
+│    • qid == 0?    → admin cmd         │
+│    • qid != 0?    → I/O cmd           │
+│  - Parser sets req->execute           │
+│  - Get SQ percpu ref                  │
+└───────────────┬───────────────────────┘
+                │
+                ▼
+┌───────────────────────────────────────┐
+│ Transport maps data (SGL → pages)     │  ← nvmet_tcp_map_data()
+│  For inline data: already in buffer   │
+│  For R2T: data arrived via h2c_data   │
+│  For RDMA: MR/SGL registered          │
+└───────────────┬───────────────────────┘
+                │
+                ▼
+┌───────────────────────────────────────┐
+│ req->execute(req)                     │  ← command handler
+│                                        │
+│  Admin:  Identify, Get/Set Features,  │
+│          Create/Delete SQ/CQ, AER...  │
+│                                        │
+│  I/O:    nvmet_bdev_execute_rw()      │
+│          → bio_init/bio_alloc +      │
+│          bio_add_page() loop over SGL│
+│          → submit_bio() to block     │
+│          layer (READ or WRITE)       │
+│                                        │
+│          nvmet_file_execute_rw()      │
+│          → kiocb + vfs_iter_read/     │
+│          write (buffered or direct)   │
+└───────────────┬───────────────────────┘
+                │ (bio completion / kiocb done)
+                ▼
+┌───────────────────────────────────────┐
+│ nvmet_req_complete(req, status)       │  ← core.c
+│  - Set CQE status, sq_head            │
+│  - ops->queue_response(req)           │
+│    → TCP:  build CQE PDU, sendmsg     │
+│    → RDMA: post send WR with CQE      │
+│    → FC:   queue frame to exchange    │
+└───────────────────────────────────────┘
+                │
+                ▼
+         Host receives CQE
+```
+
+**Key insight:** The core never touches the wire format. It works entirely with
+`struct nvmet_req` (command + scatterlist + completion), and delegates wire
+serialization to the transport via `queue_response()`.
+
+## nvmet_req — the command-in-flight object
+
+```c
+struct nvmet_req {
+    struct nvme_command     *cmd;      // 64-byte SQE from the wire
+    struct nvme_completion  *cqe;      // 16-byte CQE, filled before queue_response
+    struct nvmet_sq         *sq;       // submission queue this came from
+    struct nvmet_cq         *cq;       // completion queue to post to
+    struct nvmet_ns         *ns;       // target namespace (I/O only)
+    struct scatterlist      *sg;       // data buffer (SGL → pages)
+    size_t                  transfer_len;
+    struct nvmet_port       *port;
+
+    void (*execute)(struct nvmet_req *req);  // ★ the command handler
+    const struct nvmet_fabrics_ops *ops;     // transport vtable (for queue_response)
+
+    // Inline storage for small transfers (avoids alloc):
+    struct bio_vec          inline_bvec[NVMET_MAX_INLINE_BIOVEC];  // 8 × 4KB = 32KB
+    union {
+        struct { struct bio inline_bio; } b;   // block-device path
+        struct { struct kiocb iocb; ... } f;   // file path
+    };
+};
+```
+
+`★ Insight ─────────────────────────────────────`
+
+- `req->execute` is the central dispatch mechanism — set during `nvmet_req_init()` by
+  the command parser (admin-cmd.c, io-cmd-bdev.c, io-cmd-file.c, or discovery.c),
+  then called by the transport. This is the **Strategy pattern**: the transport decides
+  *when* to execute, the core decides *what* to execute.
+
+- The `inline_bvec[8]` + `inline_bio` embed up to 32KB of bio_vecs directly in the
+  request. **Hot-path I/O (≤ 32KB) has zero memory allocation.** This is a critical
+  latency optimization — most NVMe I/O is 4KB-8KB.
+
+- The union at the end is **path-dependent**: block-device I/O uses the bio path,
+  file-backed I/O uses the kiocb path, passthrough uses the request path. A single
+  `nvmet_req` can serve any backend, chosen at namespace creation time.
+`─────────────────────────────────────────────────`
+
+## transport abstraction
+
+The transport layer is defined by `nvmet_fabrics_ops` — a vtable of ~12 function pointers:
+
+```c
+struct nvmet_fabrics_ops {
+    struct module *owner;
+    unsigned int type;              // NVMF_TRTYPE_TCP, _RDMA, _FC, _LOOP, _PCI
+    unsigned int msdbd;             // max SGL data block descriptor
+    unsigned int flags;             // NVMF_KEYED_SGLS, NVMF_METADATA_SUPPORTED
+
+    void (*queue_response)(struct nvmet_req *req);   // send CQE to host
+    int  (*add_port)(struct nvmet_port *port);        // listen on address
+    void (*remove_port)(struct nvmet_port *port);     // stop listening
+    void (*delete_ctrl)(struct nvmet_ctrl *ctrl);     // disconnect host
+    void (*disc_traddr)(...);                         // format discovery address
+    u16  (*install_queue)(struct nvmet_sq *sq);       // wire SQ/CQ to transport
+
+    // PCI endpoint target only:
+    u16  (*create_sq)(...);
+    u16  (*delete_sq)(...);
+    u16  (*create_cq)(...);
+    u16  (*delete_cq)(...);
+    u16  (*set_feature)(...);
+    u16  (*get_feature)(...);
+};
+```
+
+Transports register at module init:
+```c
+// tcp.c
+static const struct nvmet_fabrics_ops nvmet_tcp_ops = {
+    .type               = NVMF_TRTYPE_TCP,
+    .queue_response     = nvmet_tcp_queue_response,
+    .add_port           = nvmet_tcp_add_port,
+    // ...
+};
+module_init(nvmet_tcp_init);  // calls nvmet_register_transport(&nvmet_tcp_ops)
+```
+
+`★ Insight ─────────────────────────────────────`
+
+- This is the **Template Method pattern** applied to network protocols. The core
+  (admin-cmd.c, io-cmd-bdev.c) is the template — it parses NVMe commands and
+  executes them identically for all transports. Each transport fills in the
+  "how to send/receive bytes" part.
+
+- Adding a new transport means implementing ~10 functions and calling
+  `nvmet_register_transport()`. The core never changes. This is why Linux supports
+  TCP, RDMA, FC, and PCI EPF with zero code duplication in the NVMe command logic.
+`─────────────────────────────────────────────────`
+
+## deep dive: TCP transport
+
+TCP is the most widely used transport — no special hardware needed:
+
+```
+    Host                          Target (Linux)
+    ┌──────┐                      ┌──────────────────┐
+    │ NVMe │──TCP socket──────────│ nvmet_tcp_queue  │
+    │ host │  (single connection) │                  │
+    └──────┘                      │ • sock (kernel)  │
+                                  │ • nvme_sq, nvme_cq│
+                                  │ • cmd[] (pool)   │
+                                  │ • io_work (wq)   │
+                                  │ • send_list      │
+                                  │ • resp_list      │
+                                  └──────┬───────────┘
+                                         │
+                                  ┌──────▼───────────┐
+                                  │   nvmet core     │
+                                  └──────────────────┘
+```
+
+**One TCP connection = one NVMe SQ/CQ pair.** The target uses per-queue work_structs
+(`io_work`) scheduled on a per-CPU workqueue for cache locality.
+
+**PDU receive state machine** — the TCP transport parses the NVMe/TCP wire protocol
+as a 3-state FSM:
+
+```
+                         ┌──────────────┐
+            ┌────────────│  RECV_PDU    │◄──────────────┐
+            │            │  (72B cmd    │               │
+            │  inline    │   or 24B data│               │
+            │  data      │   PDU header)│               │
+            │  complete  └──────┬───────┘               │
+            │                  │                         │
+            │     data PDU     │ cmd PDU                │
+            │     + data       │ + inline data          │
+            │     needed       │                        │
+            │         ┌────────▼────────┐               │
+            │         │  RECV_DATA      │               │
+            │         │  (payload or    │───────────────┘
+            │         │   h2c data PDU) │  data done,
+            │         └────────┬────────┘  no ddgst
+            │                  │
+            │                  │ data done,
+            │                  │ ddgst enabled
+            │         ┌────────▼────────┐
+            └─────────│  RECV_DDGST    │───────────────┘
+                      │  (verify CRC)  │  ddgst verified
+                      └────────────────┘
+```
+
+The recv path uses **non-blocking socket ops** (`MSG_DONTWAIT`), looping in
+`nvmet_tcp_io_work()` up to a budget (256 recv, 256 send per iteration). This avoids
+blocking the workqueue worker and naturally balances load — if the queue stays busy,
+the work keeps getting re-queued.
+
+**Send path** uses `llist` (lockless linked list) for the response list — completions
+from different CPU cores can be queued without a spinlock, then drained by the send
+worker in batch.
+
+**Zero-copy data path**: For WRITE commands (host → target), data carried in
+`h2c_data` PDUs is received directly into bio pages via `MSG_SPLICE_PAGES`,
+avoiding a kernel buffer copy. For READ commands (target → host), data pages
+are sent via `MSG_SPLICE_PAGES` from the bio/kiocb pages.
+
+### authentication (DH-HMAC-CHAP)
+
+When `CONFIG_NVME_TARGET_AUTH` is enabled, the target supports NVMe in-band
+authentication using **DH-HMAC-CHAP** (Diffie-Hellman + HMAC Challenge Handshake):
+
+```
+    Host                              Target
+     │                                  │
+     │  connect (no auth yet)           │
+     │─────────────────────────────────►│
+     │                                  │  nvmet_setup_auth()
+     │                                  │  → check nvmet_host.dhchap_secret
+     │                                  │
+     │  Auth Send (DH public key)       │
+     │─────────────────────────────────►│  nvmet_execute_auth_send()
+     │                                  │  → DH shared secret computation
+     │  Auth Receive (challenge)        │  → derive session key via SHA
+     │◄─────────────────────────────────│
+     │                                  │
+     │  Auth Send (response + challenge)│
+     │─────────────────────────────────►│  nvmet_auth_host_hash() verify
+     │                                  │  nvmet_auth_ctrl_hash() generate
+     │  Auth Receive (success)          │
+     │◄─────────────────────────────────│
+     │                                  │
+     │  sq->authenticated = true        │
+     │  ■ normal I/O proceeds           │
+```
+
+The authentication runs on the **admin queue** (qid 0) before any I/O queues are
+connected. The `nvmet_sq` holds per-queue DH session state (`dhchap_tid`, `c1/c2`
+challenges, session key). Key material is configured via configfs under
+`/sys/kernel/config/nvmet/hosts/<nqn>/dhchap_key`.
+
+### TLS (TCP only)
+
+When `CONFIG_NVME_TARGET_TCP_TLS` is enabled, the TCP transport can encrypt the
+connection using kernel TLS (kTLS):
+
+```
+    Host                              Target
+     │  TCP SYN                        │
+     │────────────────────────────────►│
+     │  TCP SYN/ACK                    │
+     │◄────────────────────────────────│
+     │  TCP ACK + TLS ClientHello      │
+     │────────────────────────────────►│
+     │                                 │  kernel tls_handshake
+     │  TLS ServerHello ...            │  (netlink → userspace daemon)
+     │◄────────────────────────────────│  → ktls-utils provides keys
+     │                                 │  → setsockopt(TLS_TX/RX)
+     │  ■ encrypted NVMe/TCP           │
+     │◄───────────────────────────────►│
+```
+
+TLS is detected from the **transport requirements** (`TREQ` field in the connect
+command): if the host requires a secure channel and the port is configured for TLS,
+the kernel initiates a TLS handshake via the **netlink handshake API** before
+processing any NVMe commands. The `nvmet_sq` holds a `tls_key` reference — when
+the key is revoked, all queues using it are torn down.
+
+`★ Insight ─────────────────────────────────────`
+
+- Authentication and TLS serve **different threats**: DH-HMAC-CHAP authenticates the
+  **host identity** (who is connecting), while TLS encrypts the **data in flight**
+  (protecting against network sniffing). They can be used independently or together.
+
+- Both run **before I/O** on the admin queue. The `nvmet_sq.authenticated` flag
+  gates normal command execution — any command arriving on an unauthenticated queue
+  (when auth is configured) is rejected. This is enforced by
+  `nvmet_check_auth_status()` in the command parsing path.
+
+- The TLS handshake uses the kernel's **netlink handshake API** (`NET_HANDSHAKE`)
+  rather than doing crypto in-kernel. A userspace daemon (`ktls-utils`) does the
+  actual TLS protocol negotiation and provides symmetric keys to the kernel via
+  `setsockopt(TLS_TX/TLS_RX)`. The kernel only handles the symmetric encryption
+  (AES-GCM via kTLS), keeping the complex X.509/PSK negotiation in userspace.
+`─────────────────────────────────────────────────`
+
+## deep dive: RDMA transport
+
+RDMA (InfiniBand, RoCE, iWARP) provides **hardware offloaded** data movement:
+
+```
+    Host                              Target
+    ┌──────┐                          ┌───────────────────┐
+    │ NVMe │──RDMA CM (control)───────│ nvmet_rdma_queue  │
+    │ host │                          │                   │
+    └──────┘  RDMA READ/WRITE (data)  │ • cm_id (RDMA CM) │
+              ◄──────────────────────►│ • qp (Queue Pair) │
+                                      │ • srq (Shared RQ) │
+                                      │ • rsp resources   │
+                                      └───────────────────┘
+```
+
+**Data transfer is zero-copy by hardware design**: The target registers local memory
+with `ib_reg_phys_mr()`, then the RDMA NIC DMA-reads or DMA-writes host memory
+directly. The CPU never touches data bytes — it only handles the 64-byte NVMe command
+and 16-byte completion.
+
+For WRITE commands, the target allocates a local SGL (scatterlist), posts an
+`RDMA_WRITE` work request with the host's memory keys, and the NIC pulls data
+directly into the target's pages. For READ, the NIC pushes data from target
+pages back to the host via `RDMA_READ`.
+
+**Shared Receive Queue (SRQ)**: Instead of pre-posting receive WRs to each QP
+individually, RDMA queues share an SRQ. This reduces memory usage when handling
+many connections (128+ hosts).
+
+## deep dive: FC transport
+
+Fibre Channel is the enterprise SAN transport:
+
+```
+    Host (initiator)                 Target
+    ┌──────────────┐                ┌─────────────────┐
+    │ NVMe/FC      │──FC fabric─────│ nvmet_fc_target │
+    │ (lpfc/qla2xxx)│               │                 │
+    └──────────────┘                │ • LS (Link Svc) │
+                                    │ • FCP exchanges │
+                                    │ • HW queues     │
+                                    └─────────────────┘
+```
+
+FC uses **hardware command queues** in the HBA (Host Bus Adapter). The target
+receives NVMe commands via `nvmet_fc_handle_fcp_rqst()` — called from the FC
+LLDD (Low-Level Driver) in interrupt context. Data transfer uses pre-registered
+DMA buffers, and completions are posted back via FC exchange responses.
+
+The FC target also includes `fcloop` — a software loopback transport for testing
+without physical FC hardware, analogous to the `nvme-loop` transport.
+
+## multi-path and ANA
+
+NVMe supports **Asymmetric Namespace Access (ANA)**, which is the NVMe equivalent
+of SCSI ALUA for multi-path:
+
+```
+    Host                                    Target
+    ┌──────────────────┐                   ┌──────────────────┐
+    │  NVMe multipath  │                   │  Port 1 (active) │
+    │  (nvme-core)     │──path A──────────►│  ┌────────────┐  │
+    │                  │    optimized      │  │ namespace 1 │  │
+    │  ┌────────────┐  │                   │  └────────────┘  │
+    │  │ round-robin│  │                   └──────────────────┘
+    │  │ or numa-prio│  │
+    │  └────────────┘  │                   ┌──────────────────┐
+    │                  │──path B──────────►│  Port 2 (passive) │
+    │                  │    non-optimized  │  ┌────────────┐  │
+    └──────────────────┘                   │  │ namespace 1 │  │
+                                           │  └────────────┘  │
+                                           └──────────────────┘
+```
+
+When a port changes state (e.g., link down on Port 1), the target sends an
+**ANA Change AEN** (Async Event Notification) to all connected hosts, and the
+host's multipath layer re-evaluates path states. `nvmet_port_send_ana_event()`
+triggers this notification.
+
+## source code reference
+
+All paths relative to [`drivers/nvme/target/`](https://github.com/torvalds/linux/tree/master/drivers/nvme/target):
+
+| File | Purpose | Lines |
+|---|---|---|
+| [`nvmet.h`](https://github.com/torvalds/linux/blob/master/drivers/nvme/target/nvmet.h) | All data structures, transport ops vtable, inline helpers | 993 |
+| [`core.c`](https://github.com/torvalds/linux/blob/master/drivers/nvme/target/core.c) | Module init, `nvmet_req_init/complete`, transport register, SG helpers, AEN | ~1290 |
+| [`admin-cmd.c`](https://github.com/torvalds/linux/blob/master/drivers/nvme/target/admin-cmd.c) | Admin command handlers (Identify, Get/Set Features, Create/Delete SQ/CQ, AER, Keep Alive) | ~1690 |
+| [`io-cmd-bdev.c`](https://github.com/torvalds/linux/blob/master/drivers/nvme/target/io-cmd-bdev.c) | I/O via **block device** (`submit_bio` path) — READ, WRITE, FLUSH, DSM, Write Zeroes | 475 |
+| [`io-cmd-file.c`](https://github.com/torvalds/linux/blob/master/drivers/nvme/target/io-cmd-file.c) | I/O via **file** (`vfs_iter_read/write` path) — buffered or direct I/O | 381 |
+| [`discovery.c`](https://github.com/torvalds/linux/blob/master/drivers/nvme/target/discovery.c) | Discovery subsystem (Log Page, Identify for `nqn.2014-08.org.nvmexpress.discovery`) | ~400 |
+| [`fabrics-cmd.c`](https://github.com/torvalds/linux/blob/master/drivers/nvme/target/fabrics-cmd.c) | Fabrics connect command, Property Get/Set, Authentication dispatch | ~430 |
+| [`configfs.c`](https://github.com/torvalds/linux/blob/master/drivers/nvme/target/configfs.c) | Configfs interface — subsystem/port/host/namespace management | ~1850 |
+| [`tcp.c`](https://github.com/torvalds/linux/blob/master/drivers/nvme/target/tcp.c) | **TCP transport** — PDU recv/send FSM, socket management, kTLS | 2275 |
+| [`rdma.c`](https://github.com/torvalds/linux/blob/master/drivers/nvme/target/rdma.c) | **RDMA transport** — RDMA CM, QP/SRQ management, inline data | 2130 |
+| [`fc.c`](https://github.com/torvalds/linux/blob/master/drivers/nvme/target/fc.c) | **FC transport** — FC-4 NVMe LS handling, FCP exchange management | ~2500 |
+| [`loop.c`](https://github.com/torvalds/linux/blob/master/drivers/nvme/target/loop.c) | Software loopback (host ↔ target in same kernel) — testing only | 722 |
+| [`auth.c`](https://github.com/torvalds/linux/blob/master/drivers/nvme/target/auth.c) | DH-HMAC-CHAP authentication — key setup, DH exchange, session key derivation | 511 |
+| [`fabrics-cmd-auth.c`](https://github.com/torvalds/linux/blob/master/drivers/nvme/target/fabrics-cmd-auth.c) | Auth send/receive command dispatch | ~500 |
+| [`pr.c`](https://github.com/torvalds/linux/blob/master/drivers/nvme/target/pr.c) | Persistent Reservations — PR Out/In, preempt, register, reservation access check | 1155 |
+| [`passthru.c`](https://github.com/torvalds/linux/blob/master/drivers/nvme/target/passthru.c) | NVMe passthrough — forward commands to a real NVMe controller | 664 |
+| [`zns.c`](https://github.com/torvalds/linux/blob/master/drivers/nvme/target/zns.c) | Zoned Namespaces (ZNS) — Zone Management Send/Receive, Zone Append | 623 |
+| [`pci-epf.c`](https://github.com/torvalds/linux/blob/master/drivers/nvme/target/pci-epf.c) | PCI Endpoint Function target — expose NVMe over PCIe (embedded/SoC use) | ~700 |
+| [`trace.h`](https://github.com/torvalds/linux/blob/master/drivers/nvme/target/trace.h) | Tracepoint definitions for `nvmet_req_init`, `nvmet_req_complete` | 170 |
+| [`Kconfig`](https://github.com/torvalds/linux/blob/master/drivers/nvme/target/Kconfig) | Kconfig options: PASSTHRU, LOOP, RDMA, FC, FCLOOP, TCP, TCP_TLS, AUTH, PCI_EPF | 130 |
+
+`★ Insight ─────────────────────────────────────`
+
+- The **bdev vs file split** (`io-cmd-bdev.c` vs `io-cmd-file.c`) reflects a real
+  design trade-off: block devices go through `submit_bio()` (lockless, IRQ-friendly,
+  but harder to do buffered I/O), while files go through `vfs_iter_read/write()`
+  (supports page cache and direct I/O, but holds inode locks). The target supports
+  **both** back-ends, chosen per-namespace at enable time.
+
+- **Transport isolation** is so complete that `tcp.c` and `rdma.c` share zero code
+  and have zero knowledge of each other. Each has its own receiving model (TCP:
+  workqueue + socket; RDMA: completion queue + RDMA CM; FC: LLDD callback), its own
+  data mapping strategy, and its own completion signaling. The only coupling is the
+  `nvmet_req->ops` pointer back to the transport vtable.
+`─────────────────────────────────────────────────`
+
+
+## userspace NVMe target discussion
+
+The kernel `nvmet` trades peak IOPS for operational simplicity. But if you're building
+a purpose-built storage appliance, a userspace target built on **io_uring** can cut
+latency by 2-3x — from ~20-50us down to ~5-10us.
+
+### where the kernel loses time
+
+```
+kernel path:
+  ksoftirqd → recvmsg → nvmet_wq schedule → nvmet_req_init → submit_bio
+       ↑_________2-5us_________↑  ↑__5-15us__↑                  ↑__bio_alloc__↑
+
+userspace path (io_uring):
+  task poll(IORING_OP_RECV) → parse_cmd + submit IORING_OP_URING_CMD
+       ↑__________no context switch, no workqueue, no bio_alloc__________↑
+```
+
+The kernel loses time to: (1) softirq → workqueue handoff, (2) workqueue scheduling
+jitter under load, (3) `bio_alloc()` + `bio_add_page()` on every I/O. A single
+io_uring instance can fold **recv → NVMe submit → send** into one task with zero
+context switches.
+
+### zero-copy with registered buffers
+
+`IORING_REGISTER_BUFFERS` pre-pins user pages, making them valid DMA targets for
+**both** the NIC and the NVMe drive simultaneously:
+
+```
+                  ┌──────────────────────────────────┐
+                  │  io_uring registered buffer pool  │
+                  │  (pre-pinned page pool)           │
+                  └──────────┬───────────────────────┘
+                             │ same physical pages
+              ┌──────────────┼──────────────┐
+              ▼              ▼              ▼
+          NIC DMA        CPU never      NVMe DMA
+          (recv/send)    touches data    (submit)
+```
+
+Without registered buffers: `NIC → sk_buff → kernel buffer → copy_to_user → NVMe`.
+With registered buffers: `NIC → DMA to slot N → NVMe DMA from slot N`.
+
+Concrete data path for a **WRITE** (host → target → SSD):
+
+```
+1. IORING_OP_RECV (fixed buffer slot N)  → NIC DMAs host data into slot N
+2. IORING_OP_URING_CMD (NVMe write, same buffer) → SSD DMAs from slot N
+3. Buffer N goes to pending queue
+4. IORING_OP_SEND_ZC (CQE, same buffer)  → NIC DMAs CQE from slot N
+5. Notification CQE arrives              → slot N returns to free pool
+```
+
+For a **READ** (target → SSD → host):
+
+```
+1. IORING_OP_URING_CMD (NVMe read, buffer slot N) → SSD DMAs into slot N
+2. IORING_OP_SEND_ZC (data from slot N)  → NIC DMAs from slot N to host
+3. ZC notification CQE arrives           → slot N returns to free pool
+```
+
+Key io_uring features that enable this:
+
+| Feature | Direction | Mechanism |
+|---|---|---|
+| `IORING_REGISTER_BUFFERS` | Both | Pre-pin user pages — stable `struct page *` usable by NIC and NVMe |
+| `IOSQE_BUFFER_SELECT` | Recv | NIC DMAs directly into a registered buffer slot, no copy |
+| `IORING_OP_SEND_ZC` | Send | NIC DMAs from user pages, async `IORING_CQE_F_NOTIF` when TCP is done |
+| `IORING_NOTIF_USAGE_ZC_COPIED` | Send | Tells you whether actual zero-copy happened or kernel fell back to copy |
+
+`★ Insight ─────────────────────────────────────`
+
+- `IORING_OP_SEND_ZC` creates a **dmabuf-like chain**: NIC DMA from user pages,
+  zero kernel copy. The `IORING_CQE_F_NOTIF` flag on the completion marks it as a
+  buffer-reclamation notification — the pages stay pinned until the TCP ACK arrives.
+  This means you need a buffer lifecycle manager (free list + refcount) that tracks
+  each slot through the pipeline.
+
+- **Buffer sizing**: you need enough registered buffers to cover the
+  bandwidth-delay product: roughly `(network BDP + NVMe queue depth) × transfer_size`
+  pages. For a 100Gbps NIC with 10 NVMe drives, expect ~8-16GB of registered memory.
+
+- The same `struct page *` backing a registered buffer is valid for both the network
+  stack (`tcp_sendmsg` with MSG_ZEROCOPY) and the block layer (`bio_add_page` in
+  NVMe passthrough). This is the property that makes **zero-copy forwarding**
+  possible — the page never moves between subsystems, only references are passed.
+`─────────────────────────────────────────────────`
+
+### reuse nvmet core logic in userspace
+
+The kernel's `nvmet` command-parsing layer is already transport-agnostic C code.
+`nvmet_req_init()`, `nvmet_parse_admin_cmd()`, `nvmet_execute_identify()`, etc.
+can be ported to userspace almost as-is — they take a 64-byte SQE and produce a
+completion. The userspace target only needs to reimplement the **transport**
+(`nvmet_fabrics_ops`) side: recv from TCP socket, call the parser, submit I/O,
+send the CQE.
+
 
 # libnvme
 
