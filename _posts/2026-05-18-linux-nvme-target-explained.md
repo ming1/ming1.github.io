@@ -1028,7 +1028,254 @@ If a report is missing items 1–3 and 6, treat the numbers as decorative.
 
 ---
 
-## 12. Mental Model in One Paragraph
+## 12. Appendix: NVMe-TCP Call Trace, Host → Target → Host
+
+§3 showed the lifecycle in the abstract. This appendix nails it down with
+the **actual function names and line numbers** in
+[`drivers/nvme/target/tcp.c`](https://elixir.bootlin.com/linux/latest/source/drivers/nvme/target/tcp.c)
+(commit `eb2e9cefdee5`) so you can trace it under `ftrace` or
+`bpftrace -e 'kfunc:nvmet_*'` with no guesswork.
+
+We follow one command through three regimes:
+
+- **A.** A `READ` command (no inline data, simplest path)
+- **B.** A `WRITE` command with **inline** data (small PDU, single recv)
+- **C.** A `WRITE` command requiring an **R2T** round-trip (large I/O)
+- **D.** The completion path, identical for all of the above
+
+All four start from the same socket-callback entry. The TCP transport
+runs everything (recv, parse, execute, send) on a single per-queue
+workqueue `nvmet_tcp_wq`, so the whole flow is observable from one CPU.
+
+### 12.1 Entry: socket data → workqueue
+
+Inbound bytes arrive through the kernel TCP stack and wake the socket's
+`sk_data_ready` callback, which `nvmet` overrode at `accept()` time:
+
+```
+softirq / process context
+└─ tcp_v4_rcv  →  tcp_data_queue  →  sk_data_ready
+   └─ nvmet_tcp_data_ready()                       tcp.c:1629
+      └─ queue_work_on(queue_cpu, nvmet_tcp_wq, &queue->io_work)
+
+worker thread (nvmet_tcp_wq)
+└─ nvmet_tcp_io_work()                             tcp.c:1433
+   ├─ nvmet_tcp_try_recv(queue, budget=16, &ops)   tcp.c:1374
+   │  └─ loop: nvmet_tcp_try_recv_one()            tcp.c:1340
+   └─ nvmet_tcp_try_send(queue, budget=8, &ops)    tcp.c:851
+      └─ loop: nvmet_tcp_try_send_one()            tcp.c:802
+```
+
+[`nvmet_tcp_io_work`](https://elixir.bootlin.com/linux/latest/source/drivers/nvme/target/tcp.c#L1433)
+is the heart of the transport: bounded recv/send loops with a re-queue
+at the end if either side made progress. Same worker drains both
+directions; no separate RX/TX threads.
+
+### 12.2 (A) READ command: PDU → execute
+
+[`nvmet_tcp_try_recv_one`](https://elixir.bootlin.com/linux/latest/source/drivers/nvme/target/tcp.c#L1340)
+is a small state machine over `queue->rcv_state ∈ {PDU, DATA, DDGST}`.
+For a fresh command we enter in `RECV_PDU`:
+
+```
+nvmet_tcp_try_recv_one()                            tcp.c:1340
+└─ nvmet_tcp_try_recv_pdu()                         tcp.c:1188
+   ├─ kernel_recvmsg(sock, …)                      ← fill queue->pdu
+   ├─ nvmet_tcp_verify_hdgst()                      tcp.c:300   (optional)
+   └─ nvmet_tcp_done_recv_pdu()                     tcp.c:1043
+      │  /* hdr->type == nvme_tcp_cmd */
+      ├─ nvmet_tcp_get_cmd(queue)                   tcp.c:254
+      │     → returns a preallocated nvmet_tcp_cmd
+      │       (queue->cmds[], NOT a kmalloc — see tcp.c:1521)
+      ├─ memcpy(req->cmd, nvme_cmd, 64)
+      ├─ nvmet_req_init(req, sq, &nvmet_tcp_ops)    core.c
+      │  └─ nvmet_parse_io_cmd(req)                 core.c
+      │     └─ nvmet_bdev_parse_io_cmd(req)         io-cmd-bdev.c:454
+      │        → req->execute = nvmet_bdev_execute_rw
+      ├─ nvmet_tcp_map_data(cmd)                    tcp.c:417
+      │     → builds req->sg from in-capsule SGL or allocates one
+      │  /* READ: no data to receive */
+      ├─ !nvmet_tcp_need_data_in(cmd)
+      └─ cmd->req.execute(&cmd->req)                ← tail call
+         = nvmet_bdev_execute_rw(req)               io-cmd-bdev.c:253
+           ├─ bio = &req->b.inline_bio   /* zero-copy */
+           ├─ bio_init(bio, ns->bdev, req->inline_bvec, 8, REQ_OP_READ)
+           ├─ bio->bi_end_io = nvmet_bio_done
+           ├─ for_each_sg(...) bio_add_page(...)
+           └─ submit_bio(bio)            ← returns immediately
+```
+
+Two things to notice:
+
+- The command struct is **not allocated** at PDU time —
+  [`nvmet_tcp_alloc_cmds()`](https://elixir.bootlin.com/linux/latest/source/drivers/nvme/target/tcp.c#L1521)
+  preallocates `queue->cmds[nr_cmds]` once when the queue is created.
+  `nvmet_tcp_get_cmd()` is just an index walk.
+- `submit_bio()` is **asynchronous** — the worker thread continues to
+  the next recv on the budget loop while the I/O is still in flight.
+
+### 12.3 (B) WRITE with inline data
+
+Inline data means: the command capsule and the data both fit inside the
+host's *single* CapsuleCmd PDU, so the data is appended right after the
+SQE. The fast path differs only at the tail of `done_recv_pdu`:
+
+```
+nvmet_tcp_done_recv_pdu()                            tcp.c:1043
+├─ … (same as A up to nvmet_req_init + nvmet_tcp_map_data)
+├─ nvmet_tcp_need_data_in(cmd) == true
+└─ nvmet_tcp_has_inline_data(cmd) == true
+   ├─ queue->rcv_state = NVMET_TCP_RECV_DATA   /* shift state */
+   └─ nvmet_tcp_build_pdu_iovec(cmd)                 tcp.c:352
+        → arms cmd->recv_msg pointing at req->sg pages
+
+(next iteration of try_recv_one)
+nvmet_tcp_try_recv_data()                            tcp.c:1256
+├─ while (msg_data_left(&cmd->recv_msg))
+│     sock_recvmsg(sock, &cmd->recv_msg, …)   ← writes directly into
+│                                               req->sg pages
+└─ if (cmd->rbytes_done == cmd->req.transfer_len)
+   └─ nvmet_tcp_execute_request(cmd)                 tcp.c:620
+      └─ cmd->req.execute(&cmd->req)
+         = nvmet_bdev_execute_rw()  /* now with WRITE opcode */
+           └─ submit_bio(bio)   /* REQ_OP_WRITE */
+```
+
+The recv lands directly into the `req->sg` pages — `nvmet` never copies
+the payload. (`req->sg` here is allocated by `nvmet_tcp_map_data()`; for
+the bdev backend those same pages are then handed to the block layer
+via `bio_add_page()`.)
+
+### 12.4 (C) WRITE that needs R2T
+
+When inline space isn't enough (`len > port->inline_data_size`), the
+target must *ask* for the data by sending an **R2T** (Ready To Transfer)
+PDU, then receive **H2C Data** PDUs in response. Three workqueue passes
+are involved.
+
+#### Pass 1 — command parsed, R2T queued for send
+
+```
+nvmet_tcp_done_recv_pdu()                            tcp.c:1043
+├─ … (nvmet_req_init, map_data — same as A)
+├─ nvmet_tcp_need_data_in(cmd) == true
+├─ nvmet_tcp_has_inline_data(cmd) == false
+└─ nvmet_tcp_queue_response(&cmd->req)                tcp.c:587
+   ├─ llist_add(&cmd->lentry, &queue->resp_list)
+   └─ queue_work_on(io_work)            /* schedule R2T send */
+```
+
+`nvmet_tcp_queue_response()` is overloaded — it queues *any* outbound
+PDU, including R2Ts. Steering into "this is an R2T not a final
+response" happens later in `nvmet_tcp_fetch_cmd()`:
+
+```
+(next io_work pass — send side)
+nvmet_tcp_try_send_one()                             tcp.c:802
+├─ nvmet_tcp_fetch_cmd(queue)                        tcp.c:561
+│  ├─ list_splice from resp_list → resp_send_list
+│  └─ nvmet_tcp_need_data_in(snd_cmd)
+│     └─ nvmet_setup_r2t_pdu(snd_cmd)   ← state = NVMET_TCP_SEND_R2T
+└─ nvmet_try_send_r2t(cmd, …)
+   └─ sock_sendmsg()              ← R2T PDU on the wire
+```
+
+#### Pass 2 — host's H2C Data PDU arrives
+
+```
+nvmet_tcp_done_recv_pdu()                            tcp.c:1043
+└─ hdr->type == nvme_tcp_h2c_data
+   └─ nvmet_tcp_handle_h2c_data_pdu(queue)           tcp.c:980
+      └─ queue->rcv_state = NVMET_TCP_RECV_DATA
+
+(next iteration)
+nvmet_tcp_try_recv_data()                            tcp.c:1256
+├─ sock_recvmsg() into req->sg pages
+└─ rbytes_done == transfer_len
+   └─ nvmet_tcp_execute_request(cmd)                 tcp.c:620
+      └─ cmd->req.execute(req)
+         = nvmet_bdev_execute_rw()                   io-cmd-bdev.c:253
+           └─ submit_bio()    /* REQ_OP_WRITE */
+```
+
+For large I/O the host may send multiple `H2C Data` PDUs per command;
+each one re-enters the `try_recv_pdu → handle_h2c_data → try_recv_data`
+mini-loop until `rbytes_done` catches up to `transfer_len`.
+
+### 12.5 (D) Completion path — block-layer back to socket
+
+This path is identical for A/B/C. Trigger: NVMe SSD finishes the I/O,
+the block layer fires the bio's end-io callback:
+
+```
+hardirq / softirq (blk-mq completion)
+└─ bio_endio
+   └─ bio->bi_end_io == nvmet_bio_done
+      └─ nvmet_bio_done(bio)                          io-cmd-bdev.c:191
+         ├─ nvmet_req_bio_put(req, bio)
+         └─ nvmet_req_complete(req, status)           core.c:808
+            ├─ __nvmet_req_complete(req, status)      core.c:785
+            │  ├─ nvmet_update_sq_head(req)
+            │  ├─ trace_nvmet_req_complete(req)   /* bpftrace hook */
+            │  └─ req->ops->queue_response(req)
+            │     = nvmet_tcp_queue_response(req)     tcp.c:587
+            │       ├─ llist_add(&cmd->lentry, &queue->resp_list)
+            │       └─ queue_work_on(io_work)
+            └─ percpu_ref_put(&sq->ref)
+
+worker thread
+└─ nvmet_tcp_io_work() → nvmet_tcp_try_send_one()    tcp.c:802
+   ├─ nvmet_tcp_fetch_cmd()                          tcp.c:561
+   │  └─ (READ) nvmet_setup_c2h_data_pdu()
+   │     (WRITE) nvmet_setup_response_pdu()
+   ├─ /* READ: data first */
+   │  nvmet_try_send_data_pdu(cmd)
+   │  └─ sock_sendmsg(… MSG_SPLICE_PAGES …) ← zero-copy header
+   │  nvmet_try_send_data(cmd, …)
+   │  └─ sock_sendmsg(… MSG_SPLICE_PAGES …) ← zero-copy data pages
+   │  nvmet_try_send_ddgst() /* if data digest negotiated */
+   └─ nvmet_try_send_response(cmd, …)
+      └─ sock_sendmsg()      ← final CQE-bearing RspPDU
+```
+
+The key calls:
+
+- [`nvmet_bio_done`](https://elixir.bootlin.com/linux/latest/source/drivers/nvme/target/io-cmd-bdev.c#L191)
+  is the one-line bridge from block layer to target.
+- [`__nvmet_req_complete`](https://elixir.bootlin.com/linux/latest/source/drivers/nvme/target/core.c#L785)
+  is the **single funnel** every command exits through, regardless of
+  backend or transport — it stamps the CQE and calls
+  `ops->queue_response`.
+- The TCP send side uses `MSG_SPLICE_PAGES` (kernel TCP zero-copy
+  sendpage-equivalent), so READ data leaves the box without a copy from
+  the bio pages into the socket's send buffer.
+
+### 12.6 Putting it under a debugger
+
+Three useful one-liners on a running target:
+
+```bash
+# Print every command lifecycle event with its identifying fields
+bpftrace -e '
+  kfunc:vmlinux:nvmet_req_init     { printf("init  qid=%d ptr=%p\n", args->sq->qid, args->req); }
+  kfunc:vmlinux:nvmet_req_complete { printf("done  status=%x ptr=%p\n", args->status, args->req); }
+'
+
+# Capture the full TCP path stack on demand
+funcgraph -m nvmet_tcp nvmet_tcp_io_work        # bcc tool
+
+# Tracepoints (no kallsyms walk; preferred when available)
+trace-cmd record -e nvmet:nvmet_req_init -e nvmet:nvmet_req_complete -e tcp:*
+```
+
+For a single-request capture, the cleanest setup is `t/io_uring` (in
+fio's source tree) on the host with `--depth=1`, then a `funcgraph` on
+the target rooted at `nvmet_tcp_io_work` — you get the full chain from
+the §12.1 entry down to `submit_bio` in one trace.
+
+---
+
+## 13. Mental Model in One Paragraph
 
 `nvmet` is a thin, opcode-driven dispatcher with two pluggable edges. On
 the **outer edge**, a transport vtable (`tcp`, `rdma`, `fc`, `loop`,
