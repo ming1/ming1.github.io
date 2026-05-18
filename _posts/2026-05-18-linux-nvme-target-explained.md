@@ -1028,7 +1028,349 @@ If a report is missing items 1–3 and 6, treat the numbers as decorative.
 
 ---
 
-## 12. Appendix: NVMe-TCP Call Trace, Host → Target → Host
+## 12. NVMe-TCP Wire Protocol for READ / WRITE
+
+The call trace in the next section is much easier to follow once you can
+picture the bytes on the wire. This section is the **PDU-level reference**
+for everything READ and WRITE produce.
+
+All structs live in
+[`include/linux/nvme-tcp.h`](https://elixir.bootlin.com/linux/latest/source/include/linux/nvme-tcp.h).
+NVMe-TCP layers framed PDUs on top of a plain TCP byte stream — TCP
+segmentation is invisible at the NVMe layer.
+
+### 12.1 Common PDU header
+
+Every PDU starts with the same 8-byte header:
+
+```c
+struct nvme_tcp_hdr {
+    __u8    type;     /* PDU type — see §12.2 table */
+    __u8    flags;    /* HDGST | DDGST | DATA_LAST | DATA_SUCCESS */
+    __u8    hlen;     /* header length (varies by PDU type) */
+    __u8    pdo;      /* PDU Data Offset — where payload begins */
+    __le32  plen;     /* total PDU bytes on the wire */
+};
+```
+
+`plen` is the framing field: the receiver always knows the next PDU
+boundary, no matter how TCP slices the stream. `pdo` says where the
+*data* starts inside this PDU — between header and data there may be
+padding (per the negotiated alignment), and after the data there may be
+an optional 4-byte digest.
+
+### 12.2 PDU types involved in I/O
+
+| Code | Name (enum)        | Dir | Used for                              |
+|------|--------------------|-----|---------------------------------------|
+| 0x00 | `nvme_tcp_icreq`   | H→T | Connection init (one-shot)            |
+| 0x01 | `nvme_tcp_icresp`  | T→H | Connection init response              |
+| 0x04 | `nvme_tcp_cmd`     | H→T | NVMe command capsule (SQE + optional inline data) |
+| 0x05 | `nvme_tcp_rsp`     | T→H | NVMe completion capsule (CQE)         |
+| 0x06 | `nvme_tcp_h2c_data`| H→T | WRITE data following an R2T           |
+| 0x07 | `nvme_tcp_c2h_data`| T→H | READ data returning to the host       |
+| 0x09 | `nvme_tcp_r2t`     | T→H | Ready-to-Transfer; ask host for WRITE data |
+
+The READ path uses `cmd`, `c2h_data`, `rsp`. The WRITE path uses `cmd`
+plus either inline data, or `r2t` + `h2c_data` + `rsp`.
+
+### 12.3 Flag bits (`hdr.flags`)
+
+```c
+enum nvme_tcp_pdu_flags {
+    NVME_TCP_F_HDGST        = (1 << 0),  /* header digest present */
+    NVME_TCP_F_DDGST        = (1 << 1),  /* data digest present  */
+    NVME_TCP_F_DATA_LAST    = (1 << 2),  /* last data PDU for this cmd */
+    NVME_TCP_F_DATA_SUCCESS = (1 << 3),  /* skip RspPDU on success    */
+};
+```
+
+`DATA_SUCCESS` on a final `c2h_data` lets the target **omit the
+RspPDU** for successful READs — a real round-trip saving on the hot path.
+
+### 12.4 The CapsuleCmd PDU (READ / WRITE)
+
+```c
+struct nvme_tcp_cmd_pdu {
+    struct nvme_tcp_hdr     hdr;     /* 8 bytes, type = 0x04 */
+    struct nvme_command     cmd;     /* 64-byte NVMe SQE     */
+    /* optional 4-byte HDGST                                  */
+    /* optional padding to align to hdr.pdo                   */
+    /* optional inline data (WRITE only, when SGL = OFFSET)   */
+    /* optional 4-byte DDGST                                  */
+};
+```
+
+For READ and WRITE the SQE is a `nvme_rw_command`:
+
+```c
+struct nvme_rw_command {
+    __u8     opcode;       /* 0x01 = WRITE, 0x02 = READ */
+    __u8     flags;
+    __u16    command_id;   /* host-assigned, echoed in the CQE */
+    __le32   nsid;         /* target namespace ID */
+    __le32   cdw2, cdw3;
+    __le64   metadata;
+    union nvme_data_ptr dptr;   /* SGL descriptor — see below */
+    __le64   slba;         /* starting LBA */
+    __le16   length;       /* LBA count, 0-based (0 = 1 LBA)  */
+    __le16   control;      /* FUA, LR, PRINFO… */
+    __le32   dsmgmt;
+    __le32   reftag;
+    __le16   lbat, lbatm;
+};
+```
+
+### 12.5 The SGL descriptor — the routing byte
+
+For fabrics commands `dptr` is a single SGL descriptor (16 bytes):
+
+```c
+struct nvme_sgl_desc {
+    __le64  addr;
+    __le32  length;        /* total bytes of data for this command */
+    __u8    rsvd[3];
+    __u8    type;          /* NVME_SGL_FMT_* — see below */
+};
+```
+
+The `type` byte is the **one bit of magic** that decides "inline data"
+versus "needs R2T":
+
+| `type`                         | Meaning on NVMe-TCP                                       |
+|--------------------------------|-----------------------------------------------------------|
+| `NVME_SGL_FMT_OFFSET` (0x01)   | Data is *in this same PDU*, starting at `hdr.pdo` (inline) |
+| `NVME_SGL_FMT_ADDRESS` (0x00)  | Data lives elsewhere — target must pull (R2T) or push     |
+
+So the target's choice of inline-vs-R2T is not a heuristic; the host
+literally writes one of two byte values into `dptr.sgl.type`.
+
+### 12.6 READ on the wire
+
+```
+   Host                                                  Target
+    │                                                      │
+    │── CapsuleCmd  (type=0x04)  ────────────────────────▶ │
+    │   hdr.plen   = 8 + 64 [+digests]                     │
+    │   cmd.opcode = 0x02 (READ)                           │
+    │   cmd.slba   = LBA                                   │
+    │   cmd.length = blocks-1                              │
+    │   cmd.dptr.sgl: { addr=0, length=L, type=ADDRESS }   │
+    │                                                      │ nvmet_req_init
+    │                                                      │ submit_bio(REQ_OP_READ)
+    │                                                      │ … wait for SSD …
+    │                                                      │ nvmet_bio_done
+    │ ◀──────────────  C2HData    (type=0x07) ─────────────│
+    │                  hdr.pdo  = 24                       │
+    │                  hdr.plen = 24 + L [+digest]         │
+    │                  flags    = DATA_LAST [| DATA_SUCCESS]│
+    │                  command_id, data_offset=0, length=L │
+    │                  + L payload bytes                   │
+    │                                                      │
+    │ ◀────────────── RspPDU      (type=0x05) ─────────────│ (skipped if
+    │                  hdr.plen = 8 + 16                   │  DATA_SUCCESS set
+    │                  cqe.command_id, status=0            │  on the C2HData)
+```
+
+The `c2h_data` PDU is `struct nvme_tcp_data_pdu`:
+
+```c
+struct nvme_tcp_data_pdu {
+    struct nvme_tcp_hdr     hdr;
+    __u16                   command_id;
+    __u16                   ttag;          /* unused for c2h_data */
+    __le32                  data_offset;   /* offset within the command's data */
+    __le32                  data_length;   /* this PDU's payload length */
+    __u8                    rsvd[4];
+};
+```
+
+A large READ may be split into multiple `c2h_data` PDUs; the last one
+sets `NVME_TCP_F_DATA_LAST`.
+
+### 12.7 WRITE on the wire — inline (small I/O)
+
+When the total data length fits in the negotiated **inline data size**
+(configfs `param_inline_data_size`, default 16 KiB), the host puts the
+data directly into the CapsuleCmd PDU and uses `SGL_FMT_OFFSET`:
+
+```
+   Host                                                  Target
+    │                                                      │
+    │── CapsuleCmd  (type=0x04)  ────────────────────────▶ │
+    │   hdr.plen   = 8 + 64 + pad + L [+digests]           │
+    │   cmd.opcode = 0x01 (WRITE)                          │
+    │   cmd.dptr.sgl: { addr=0, length=L, type=OFFSET }    │
+    │   < pad to hdr.pdo >                                 │
+    │   < L bytes of WRITE data >                          │
+    │                                                      │ nvmet_req_init
+    │                                                      │ submit_bio(REQ_OP_WRITE)
+    │                                                      │ … wait for SSD …
+    │ ◀────────────── RspPDU      (type=0x05) ─────────────│
+    │                  cqe.command_id, status              │
+```
+
+One PDU in, one PDU out. This is the fast path NVMe-TCP was designed
+around.
+
+### 12.8 WRITE on the wire — R2T (large I/O)
+
+When the data exceeds the inline limit, the host uses
+`SGL_FMT_ADDRESS`. The target sends back an **R2T** PDU to "ask for"
+the data:
+
+```
+   Host                                                  Target
+    │                                                      │
+    │── CapsuleCmd  (type=0x04)  ────────────────────────▶ │
+    │   cmd.opcode = 0x01 (WRITE)                          │
+    │   cmd.dptr.sgl: { length=L, type=ADDRESS }           │
+    │                                                      │
+    │ ◀────────────── R2T         (type=0x09) ─────────────│
+    │                  hdr.plen     = 24                   │
+    │                  command_id, ttag = T                │
+    │                  r2t_offset   = 0                    │
+    │                  r2t_length   = L  (or chunk size)   │
+    │                                                      │
+    │── H2CData     (type=0x06)  ────────────────────────▶ │
+    │   command_id, ttag = T (echoes R2T)                  │
+    │   data_offset = 0, data_length = L                   │
+    │   + L payload bytes                                  │
+    │                                                      │ recv into req->sg
+    │                                                      │ submit_bio(REQ_OP_WRITE)
+    │ ◀────────────── RspPDU      (type=0x05) ─────────────│
+    │                  cqe.command_id, status              │
+```
+
+The R2T and H2C-Data structs are siblings:
+
+```c
+struct nvme_tcp_r2t_pdu {
+    struct nvme_tcp_hdr     hdr;
+    __u16                   command_id;
+    __u16                   ttag;         /* target-generated tag */
+    __le32                  r2t_offset;   /* offset within the cmd's data */
+    __le32                  r2t_length;   /* bytes target is willing to take */
+    __u8                    rsvd[4];
+};
+
+struct nvme_tcp_data_pdu {        /* re-used as H2CData here */
+    struct nvme_tcp_hdr     hdr;
+    __u16                   command_id;
+    __u16                   ttag;         /* echo R2T's ttag */
+    __le32                  data_offset;  /* must match r2t_offset of this batch */
+    __le32                  data_length;
+    __u8                    rsvd[4];
+};
+```
+
+Three details that matter:
+
+- **`ttag` (transfer tag)** is the target's correlator: it lets the target
+  keep multiple WRITE transfers in flight per command. The host must
+  echo it on every matching H2CData.
+- **`maxr2t`** — negotiated at ICReq time, default `1` in mainline today,
+  but the protocol permits more. With `maxr2t > 1` the target can split
+  a large WRITE into several smaller R2Ts and overlap them.
+- **`hpda` / `cpda`** — Host/Controller PDU Data Alignment, also
+  negotiated at ICReq. Pad bytes are inserted between header and data
+  so the payload lands on the receiver's preferred alignment. The
+  receiver uses `hdr.pdo` to skip past them.
+
+### 12.9 The response capsule
+
+The RspPDU is the smallest of the lot — a header plus the 16-byte CQE:
+
+```c
+struct nvme_tcp_rsp_pdu {
+    struct nvme_tcp_hdr     hdr;          /* type = 0x05 */
+    struct nvme_completion  cqe;
+};
+
+struct nvme_completion {
+    union nvme_result result;             /* command-specific u16/u32/u64 */
+    __le16  sq_head;                      /* SQ head pointer — flow control */
+    __le16  sq_id;
+    __u16   command_id;                   /* echoes the SQE's command_id   */
+    __le16  status;                       /* phase tag + status field      */
+};
+```
+
+`command_id` is how the host's blk-mq layer matches the completion
+back to the in-flight request. `sq_head` doubles as the target's
+credit return — it tells the host how many SQEs may now be reclaimed.
+
+### 12.10 PDU byte layout (CapsuleCmd, inline WRITE, both digests on)
+
+```
+ byte offset
+   0  ┌─────────────────────────────────┐
+      │ nvme_tcp_hdr (8 bytes)          │  type=0x04, flags, hlen, pdo, plen
+   8  ├─────────────────────────────────┤
+      │ nvme_command  (64 bytes)        │  opcode=0x01 WRITE, slba, length,
+      │                                 │  dptr.sgl.type = OFFSET (0x01)
+  72  ├─────────────────────────────────┤
+      │ HDGST (4 bytes, optional)       │  CRC32C over bytes 0..71
+  76  ├─────────────────────────────────┤
+      │ pad to hdr.pdo                  │  per cpda alignment
+ pdo  ├─────────────────────────────────┤  ← payload starts here
+      │ WRITE data  (L bytes)           │
+plen-4├─────────────────────────────────┤
+      │ DDGST (4 bytes, optional)       │  CRC32C over data range
+plen  └─────────────────────────────────┘  ← next PDU starts here
+```
+
+`hdr.hlen` covers everything before the data (header + SQE + optional
+HDGST + pad). `hdr.pdo` is what the receiver uses to find the data;
+`hdr.plen` is what it uses to find the *next* PDU.
+
+### 12.11 Connection setup — ICReq / ICResp
+
+Before any I/O may flow, exactly one ICReq/ICResp pair is exchanged:
+
+```c
+struct nvme_tcp_icreq_pdu {
+    struct nvme_tcp_hdr     hdr;
+    __le16                  pfv;     /* protocol version, currently 0 */
+    __u8                    hpda;    /* host PDU data alignment (dwords, 0-based) */
+    __u8                    digest;  /* HDGST_ENABLE | DDGST_ENABLE bitmap */
+    __le32                  maxr2t;  /* max outstanding R2Ts per command */
+    __u8                    rsvd2[112];
+};
+
+struct nvme_tcp_icresp_pdu {
+    struct nvme_tcp_hdr     hdr;
+    __le16                  pfv;
+    __u8                    cpda;    /* controller alignment */
+    __u8                    digest;  /* the bitmap actually selected */
+    __le32                  maxdata; /* max data per H2CData PDU      */
+    __u8                    rsvd[112];
+};
+```
+
+After this exchange both sides know whether HDGST/DDGST are on, how to
+align payload, and how to chunk large WRITEs.
+
+### 12.12 Wire concept → kernel code
+
+Quick map from "the byte on the wire" to "the function that handles it
+in `nvmet`":
+
+| Wire | Struct | Target-side function |
+|------|--------|----------------------|
+| `cmd`      | `nvme_tcp_cmd_pdu`  | [`nvmet_tcp_done_recv_pdu`](https://elixir.bootlin.com/linux/latest/source/drivers/nvme/target/tcp.c#L1043) |
+| `h2c_data` | `nvme_tcp_data_pdu` | [`nvmet_tcp_handle_h2c_data_pdu`](https://elixir.bootlin.com/linux/latest/source/drivers/nvme/target/tcp.c#L980) |
+| `c2h_data` | `nvme_tcp_data_pdu` | `nvmet_setup_c2h_data_pdu` (send) |
+| `r2t`      | `nvme_tcp_r2t_pdu`  | `nvmet_setup_r2t_pdu` (send) |
+| `rsp`      | `nvme_tcp_rsp_pdu`  | `nvmet_setup_response_pdu` (send) |
+| `icreq`    | `nvme_tcp_icreq_pdu`| [`nvmet_tcp_handle_icreq`](https://elixir.bootlin.com/linux/latest/source/drivers/nvme/target/tcp.c#L879) |
+
+With this map in mind, §13 below traces the same READ / WRITE
+operations through the kernel, function by function.
+
+---
+
+## 13. Appendix: NVMe-TCP Call Trace, Host → Target → Host
 
 §3 showed the lifecycle in the abstract. This appendix nails it down with
 the **actual function names and line numbers** in
@@ -1047,7 +1389,7 @@ All four start from the same socket-callback entry. The TCP transport
 runs everything (recv, parse, execute, send) on a single per-queue
 workqueue `nvmet_tcp_wq`, so the whole flow is observable from one CPU.
 
-### 12.1 Entry: socket data → workqueue
+### 13.1 Entry: socket data → workqueue
 
 Inbound bytes arrive through the kernel TCP stack and wake the socket's
 `sk_data_ready` callback, which `nvmet` overrode at `accept()` time:
@@ -1071,7 +1413,7 @@ is the heart of the transport: bounded recv/send loops with a re-queue
 at the end if either side made progress. Same worker drains both
 directions; no separate RX/TX threads.
 
-### 12.2 (A) READ command: PDU → execute
+### 13.2 (A) READ command: PDU → execute
 
 [`nvmet_tcp_try_recv_one`](https://elixir.bootlin.com/linux/latest/source/drivers/nvme/target/tcp.c#L1340)
 is a small state machine over `queue->rcv_state ∈ {PDU, DATA, DDGST}`.
@@ -1114,7 +1456,7 @@ Two things to notice:
 - `submit_bio()` is **asynchronous** — the worker thread continues to
   the next recv on the budget loop while the I/O is still in flight.
 
-### 12.3 (B) WRITE with inline data
+### 13.3 (B) WRITE with inline data
 
 Inline data means: the command capsule and the data both fit inside the
 host's *single* CapsuleCmd PDU, so the data is appended right after the
@@ -1146,7 +1488,7 @@ the payload. (`req->sg` here is allocated by `nvmet_tcp_map_data()`; for
 the bdev backend those same pages are then handed to the block layer
 via `bio_add_page()`.)
 
-### 12.4 (C) WRITE that needs R2T
+### 13.4 (C) WRITE that needs R2T
 
 When inline space isn't enough (`len > port->inline_data_size`), the
 target must *ask* for the data by sending an **R2T** (Ready To Transfer)
@@ -1202,7 +1544,7 @@ For large I/O the host may send multiple `H2C Data` PDUs per command;
 each one re-enters the `try_recv_pdu → handle_h2c_data → try_recv_data`
 mini-loop until `rbytes_done` catches up to `transfer_len`.
 
-### 12.5 (D) Completion path — block-layer back to socket
+### 13.5 (D) Completion path — block-layer back to socket
 
 This path is identical for A/B/C. Trigger: NVMe SSD finishes the I/O,
 the block layer fires the bio's end-io callback:
@@ -1250,7 +1592,7 @@ The key calls:
   sendpage-equivalent), so READ data leaves the box without a copy from
   the bio pages into the socket's send buffer.
 
-### 12.6 Putting it under a debugger
+### 13.6 Putting it under a debugger
 
 Three useful one-liners on a running target:
 
@@ -1271,11 +1613,11 @@ trace-cmd record -e nvmet:nvmet_req_init -e nvmet:nvmet_req_complete -e tcp:*
 For a single-request capture, the cleanest setup is `t/io_uring` (in
 fio's source tree) on the host with `--depth=1`, then a `funcgraph` on
 the target rooted at `nvmet_tcp_io_work` — you get the full chain from
-the §12.1 entry down to `submit_bio` in one trace.
+the §13.1 entry down to `submit_bio` in one trace.
 
 ---
 
-## 13. Mental Model in One Paragraph
+## 14. Mental Model in One Paragraph
 
 `nvmet` is a thin, opcode-driven dispatcher with two pluggable edges. On
 the **outer edge**, a transport vtable (`tcp`, `rdma`, `fc`, `loop`,
