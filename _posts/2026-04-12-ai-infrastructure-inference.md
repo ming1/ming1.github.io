@@ -492,6 +492,58 @@ An NVIDIA A100-80GB serving Llama 3 8B in FP16:
  └──────────────────────────────────────────┘
 ```
 
+### What is the KV Cache?
+
+In autoregressive generation, the model produces one token at a time. To generate token
+`t+1`, the attention layer must attend over the keys (`K`) and values (`V`) of **every
+previous token** in the sequence. Because `K` and `V` are linear projections of each token's
+hidden state — `K[ℓ][t] = X[t] · W_K[ℓ]`, `V[ℓ][t] = X[t] · W_V[ℓ]` — they don't change once
+computed. Recomputing them at every decode step would be O(n²) work in sequence length.
+
+The KV cache is simply that intermediate state, persisted across decode steps:
+
+```
+ At step t+1, for each layer ℓ:
+   ┌─────────────────────────────────────────────┐
+   │ K[ℓ][1..t]  V[ℓ][1..t]    ← read from cache │
+   │                                              │
+   │ K[ℓ][t+1] = X[t+1] · W_K  ← compute & append │
+   │ V[ℓ][t+1] = X[t+1] · W_V                     │
+   └─────────────────────────────────────────────┘
+```
+
+So the cache turns an O(n²) recomputation into an O(n) read plus O(1) write per step. It is
+the single largest piece of *per-request* state the inference server carries.
+
+### Why no Q in the cache?
+
+Causal attention while generating token `t` looks like this:
+
+```
+ Attention_t = softmax( Q_t · [K_1, K_2, ..., K_t]ᵀ / √d ) · [V_1, ..., V_t]
+                  ↑                ↑                              ↑
+            one query vector   all past keys                 all past values
+            (this step only)   (referenced forever)         (referenced forever)
+```
+
+Each token's `Q` is used exactly once — at the step where that token *is* the query. Causal
+masking means past tokens never query future tokens, so `Q_1, Q_2, ..., Q_{t-1}` are dead the
+moment their step ends. `K` and `V`, by contrast, are referenced by **every** subsequent
+decode step until the sequence finishes.
+
+```
+                       Q referenced      K referenced       V referenced
+ Token at position 1:  step 1 only       steps 1..N         steps 1..N
+ Token at position 2:  step 2 only       steps 2..N         steps 2..N
+ ...
+ Token at position N:  step N only       step N only        step N only
+```
+
+Caching `Q` would waste memory on data already consumed. Hence: **KV cache, not QKV cache.**
+This asymmetry is also why **Grouped-Query Attention (GQA)** is such a high-leverage memory
+optimization: Llama 3 8B keeps 32 query heads but only 8 KV heads, shrinking the side that
+*does* get cached by 4×, while leaving the side that gets discarded untouched.
+
 ### How Big is the KV Cache?
 
 For each token in each sequence, the KV cache stores K and V vectors for every attention head
@@ -511,6 +563,108 @@ With 62 GB available for KV cache:
 - At 8192 tokens per sequence: ~**61 concurrent sequences**
 
 `The KV cache — not compute — is what limits how many users you can serve simultaneously.`
+
+### How the KV Cache is Used in Inference
+
+Inference splits cleanly into two phases with very different KV cache access patterns.
+First, the unit of work that the decode phase is measured in:
+
+```
+ ┌─────────────────────────────────────────────────────────────────────┐
+ │  DECODE STEP                                                        │
+ │  ─────────────                                                      │
+ │  One forward pass through ALL L transformer layers that produces    │
+ │  exactly one new output token per active sequence in the batch.     │
+ │                                                                     │
+ │  • NOT a layer.   One step = L attention + L MLP operations         │
+ │                    chained together (32 for Llama 3 8B, 80 for 70B).│
+ │  • NOT per-sequence. One step processes the whole batch in          │
+ │                    parallel, advancing every active sequence by     │
+ │                    one of its own output positions.                 │
+ │                                                                     │
+ │  Equivalences:                                                      │
+ │     1 step   =  1 forward pass  =  1 new token / sequence           │
+ │              =  1 "iteration" in vLLM's continuous-batching loop    │
+ │     tokens/s per request  =  steps/s                                │
+ │     aggregate tokens/s    =  steps/s × batch size                   │
+ │                                                                     │
+ │  The scheduler's decision unit is exactly one step: between steps   │
+ │  it can admit a new request, evict a low-priority sequence, or      │
+ │  finish a sequence whose sampled token was EOS.                     │
+ └─────────────────────────────────────────────────────────────────────┘
+```
+
+With that in hand, the two phases:
+
+```
+ PREFILL  (compute-bound)               DECODE  (memory-bound)
+ ────────────────────────               ────────────────────────
+ Prompt: "The capital of France is"     Generate one token at a time:
+
+ All N prompt tokens processed           step N+1: read N cached (K,V)
+ in parallel in ONE forward pass.                  compute (K,V) for 1 new token
+ K,V for all N tokens written to                   append, emit output token
+ the cache in one shot.                  step N+2: read N+1 cached (K,V)
+                                                   ... and so on.
+ Workload: large matmuls,                Workload: tiny matmuls + large
+ GPU ALUs saturated.                     HBM reads. Bandwidth-bound.
+```
+
+**Why can't decode be parallelized like prefill?** Each decode step's input is the previous
+step's output:
+
+```
+ step t   →  logits_t → sample → token_t
+                                    │
+                                    ▼  (embedding of token_t becomes
+ step t+1  ← input to step t+1's forward pass)
+```
+
+You cannot start step `t+1`'s forward pass until `token_t` is sampled — that's a true data
+dependency in the algorithm, not a missed optimization. Prefill escapes it only because every
+prompt token is *already known*: stack them into one `(B, N, d)` tensor, run one forward
+pass, and the causal mask handles the "don't peek forward" constraint. Decode's per-step
+tensor is `(B, 1, d)` — a sliver of work that leaves the ALUs starved while HBM is busy
+streaming model weights, which is exactly what makes decode memory-bound.
+
+What *can* still be parallelized during decode:
+
+- **Across sequences (continuous batching)** — B different users at different decode steps
+  run together in one step. Weight reads from HBM are amortized across the batch. This is
+  the single biggest throughput lever in serving: the same GPU that does ~10 tokens/s for one
+  user can do ~2000 tokens/s aggregate across 200 users.
+- **Within a step (tensor parallelism)** — GPUs cooperate on each matmul. Doesn't reduce the
+  number of steps, just shortens each one.
+- **Speculative decoding** — sidestep the dependency by *guessing*. A small draft model
+  proposes K tokens cheaply; the target model verifies all K in one parallel forward pass
+  (each position has its "input" — the draft's guess — already known, just like prefill).
+  Accepted prefix becomes real; rejected tail is discarded. 2–4× wall-clock speedup on a
+  single sequence, at the cost of compute spent on rejected guesses.
+
+Past the basic prompt → completion path, real serving systems exploit the cache in several
+ways:
+
+- **Prefix sharing (copy-on-write)**: when many requests share a long system prompt or
+  few-shot exemplars, their KV blocks for the shared prefix point to the same physical pages.
+  Only when their generations diverge does each request get a private copy. A 4 K-token
+  system prompt that would otherwise cost 4096 × 128 KB ≈ 512 MB *per user* becomes a single
+  shared allocation across the whole batch.
+- **Multi-turn conversation reuse**: keep the cache resident across turns of a chat. A
+  follow-up message only pays prefill cost on the *new* user text — not the entire prior
+  conversation. This is what makes streaming chat UIs feel snappy on turn 5 vs. turn 1.
+- **Preemption / CPU swap**: when the scheduler runs out of GPU blocks, it can evict a
+  low-priority sequence's KV cache to CPU RAM (over PCIe) rather than killing the request.
+  Resumption is a DMA copy back; no recomputation needed.
+- **Speculative decoding**: the draft model and the target model each maintain their own KV
+  cache. When the target rejects a speculated token, only the rejected tail of the cache is
+  rolled back; the accepted prefix stays.
+- **Cross-request prefix caching**: hot prefixes (popular system prompts, RAG boilerplate,
+  code-completion file headers) can be retained across *independent* requests by hashing
+  token IDs. The next request that starts with the same prefix skips prefill for those
+  tokens entirely.
+
+These uses are all enabled by treating the KV cache as a first-class managed resource —
+which is exactly what PagedAttention makes practical.
 
 ### PagedAttention: Virtual Memory for KV Cache
 
