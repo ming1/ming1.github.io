@@ -148,50 +148,81 @@ we want to get the content (Value) of the most relevant pages.
 By using these QKV values, the model can calculate attention scores, which determine how  
 much focus each token should receive when generating predictions.
 
-From google search:
-
-```
-In the Transformer architecture, Query (Q), Key (K), and Value (V) matrices are fundamental
-components of the self-attention mechanism, which enables the model to weigh the importance
-of different parts of the input sequence when processing each element. 
-
-Query (Q): The Query matrix represents "what you are looking for" for each word or token in
-the sequence. Each row of the Query matrix corresponds to a word's query vector, which is
-used to compare against the Key vectors of other words to determine their relevance.
-
-Key (K): The Key matrix represents "how to identify information" for each word or token.
-Each row of the Key matrix corresponds to a word's key vector, encoding information about
-that word in a searchable format. The dot product between a Query vector and Key vectors
-yields attention scores, indicating how well a particular word's query matches another
-word's key.
-
-Value (V): The Value matrix represents "what information is provided" by each word or
-token. Each row of the Value matrix corresponds to a word's value vector, containing the
-actual content or meaning that the word contributes to the overall representation. These
-value vectors are weighted by the attention scores to create a contextualized
-representation for each word.
-
-How they are formed:
-
-These matrices are typically derived from the input embeddings of the sequence. For each
-word embedding, three distinct linear transformations (learned weight matrices) are applied
-to generate its corresponding Query, Key, and Value vectors. These vectors are then stacked
-to form the Q, K, and V matrices for the entire sequence.
-In essence:
-
-The Q, K, and V matrices facilitate a "search-and-retrieve" mechanism within the self-attention
-layer. Queries seek relevant information, Keys provide searchable attributes, and Values
-offer the actual content to be integrated, allowing the Transformer to build rich, context-aware
-representations of the input.
-
-```
-
 ```
 Using Query, Key, and Value matrices, transformers allow every token to interact dynamically
 with every other token in the sequence. This mechanism ensures that the model captures context
 effectively, making it one of the most powerful architectures for tasks like language translation,
 summarization, and more.
 ```
+
+```
+First: What are Q, K, V intuitively?
+
+Attention can be viewed like:
+
+Query(Q)	What I want 
+
+Key(K)	    What information I contain 
+
+Value(V)	The actual information to return 
+
+A token:
+
+emits a Key describing itself 
+
+emits a Value carrying its information 
+
+emits a Query asking what it needs 
+```
+
+**The Most Important Mental Model**
+
+```
+K/V    Long-term readable memory
+Q      Current search request
+
+Memory can be reused.
+
+Search request changes every step.
+
+Therefore:
+
+reuse K/V  && recompute Q
+```
+
+```
+Queries are dynamic because:
+
+each token has different informational needs
+
+During decode:
+
+cached K/V come from old tokens 
+
+new Q comes from current token 
+
+Then:
+
+Q_new · K_old
+
+computes relevance scores.
+
+```
+
+```
+Why Query Represents "Intent"
+
+Another intuition:
+
+Keys/Values describe:  "What information exists in history?" 
+
+Query describes:  "What information do I currently need?" 
+
+The needed information changes every token.
+
+Therefore Query must change every token.
+```
+
 
 [Understanding the Role of Query, Key, and Value Matrices in Transformer Models](https://transformers-goto-guide.hashnode.dev/understanding-the-role-of-query-key-and-value-in-transformer-models)
 
