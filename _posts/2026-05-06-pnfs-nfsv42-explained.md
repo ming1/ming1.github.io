@@ -103,9 +103,299 @@ storage**:
 
 ---
 
-## 2. pNFS Architecture and Protocol
+## 2. NFS Basic Protocol & Commands
 
-### 2.1 The Three Actors
+Before diving into pNFS specifics, it is essential to understand the
+fundamental NFS protocol — its operations, semantics, and how clients and
+servers communicate. pNFS extends this foundation, so the basics come first.
+
+### 2.1 NFS Protocol Evolution
+
+The NFS protocol has evolved through several versions, each introducing
+significant changes:
+
+| Version | RFC | Year | Key Characteristics |
+|---------|-----|------|---------------------|
+| **NFSv2** | [RFC 1094](https://www.rfc-editor.org/rfc/rfc1094.html) | 1989 | Stateless, UDP only, 8 KB max READ/WRITE, 32-bit offsets |
+| **NFSv3** | [RFC 1813](https://www.rfc-editor.org/rfc/rfc1813.html) | 1995 | Stateless, TCP support, 64-bit offsets, variable max READ/WRITE, `READDIRPLUS`, `COMMIT` for stable writes |
+| **NFSv4.0** | [RFC 7530](https://www.rfc-editor.org/rfc/rfc7530.html) | 2003 | **Stateful**, compound operations, integrated locking, delegation, `OPEN`/`CLOSE`, pseudo filesystem, Kerberos security |
+| **NFSv4.1** | [RFC 8881](https://www.rfc-editor.org/rfc/rfc8881.html) | 2010 | **pNFS** (Parallel NFS), sessions (exactly-once semantics), `RECLAIM_COMPLETE`, `DESTROY_SESSION` |
+| **NFSv4.2** | [RFC 7862](https://www.rfc-editor.org/rfc/rfc7862.html) | 2016 | Server-side COPY, CLONE, SPARSE files, SEEK, `OFFLOAD_STATUS`, application data blocks |
+
+The jump from v3 to v4.0 was the most significant architectural change:
+NFS moved from a **stateless** to a **stateful** protocol. In NFSv3, the
+server remembers nothing between requests — each operation is self-contained.
+In NFSv4, the server maintains client state (open files, locks, delegations),
+enabling better caching and consistency semantics at the cost of more
+complex recovery after server or client failure.
+
+### 2.2 NFSv3 Operations (Procedures)
+
+In NFSv3, each operation is an independent RPC call. The protocol is defined
+in terms of **NFS procedures** that each perform a single, simple action:
+
+**Mount Protocol (MOUNT v3)**
+
+The MOUNT protocol is separate from NFS proper. Its procedures:
+
+| Procedure | Direction | Description |
+|-----------|-----------|-------------|
+| `NULL` | Client → Server | Do nothing (RPC health check) |
+| `MNT` | Client → Server | Mount a path, returns **file handle** |
+| `DUMP` | Client → Server | List mounted clients |
+| `UMNT` | Client → Server | Unmount a path |
+| `UMNTALL` | Client → Server | Unmount all client mounts |
+| `EXPORT` | Client → Server | List exported filesystems |
+
+The critical output of `MNT` is the **file handle** — an opaque byte string
+that the server uses to identify a filesystem object. From then on, all NFS
+operations reference objects by file handle, not by pathname.
+
+**NFS Protocol (NFS v3)**
+
+| Procedure | Direction | Description |
+|-----------|-----------|-------------|
+| `NULL` | Client → Server | NOP / health check |
+| `GETATTR` | Client → Server | Get file/directory attributes |
+| `SETATTR` | Client → Server | Set file/directory attributes |
+| `LOOKUP` | Client → Server | Look up filename in directory, get child file handle |
+| `ACCESS` | Client → Server | Check access permissions |
+| `READLINK` | Client → Server | Read symbolic link target |
+| `READ` | Client → Server | Read file data |
+| `WRITE` | Client → Server | Write file data (can be UNSTABLE or FILE_SYNC) |
+| `CREATE` | Client → Server | Create a file |
+| `MKDIR` | Client → Server | Create a directory |
+| `SYMLINK` | Client → Server | Create a symbolic link |
+| `MKNOD` | Client → Server | Create a special device node |
+| `REMOVE` | Client → Server | Remove a file |
+| `RMDIR` | Client → Server | Remove a directory |
+| `RENAME` | Client → Server | Rename a file or directory |
+| `LINK` | Client → Server | Create a hard link |
+| `READDIR` | Client → Server | Read directory entries |
+| `READDIRPLUS` | Client → Server | Read directory entries + attributes |
+| `FSSTAT` | Client → Server | Get filesystem statistics |
+| `FSINFO` | Client → Server | Get filesystem information |
+| `PATHCONF` | Client → Server | Get POSIX pathconf info |
+| `COMMIT` | Client → Server | Commit cached (unstable) writes to stable storage |
+
+**Key design points of NFSv3:**
+
+- **Stateless**: The server maintains no per-client state. Each request is
+  independent. This makes server recovery trivial — just reboot and continue
+  serving — but forces clients to re-send state-changing operations.
+- **File handles**: Once a client obtains a file handle (via `MNT` or
+  `LOOKUP`), it uses it directly for all subsequent operations on that
+  object. File handles are opaque to the client but typically encode the
+  inode number and a generation counter.
+- **Weak cache consistency**: NFSv3 relies on timed attribute caches. A
+  client may see stale data for up to a configured timeout (typically 3–60
+  seconds). Close-to-open consistency is an implementation convention, not
+  a protocol guarantee.
+- **COMMIT**: NFSv3 introduced the `COMMIT` operation for stable writes. A
+  client can write data as `UNSTABLE` (server may cache in memory) and
+  later issue `COMMIT` to flush to disk. This enables write gathering at
+  the server side.
+
+### 2.3 NFSv4.0: Compound Operations and State
+
+NFSv4.0 fundamentally redesigned the protocol. Its most distinctive feature
+is the **COMPOUND operation** — multiple NFS operations are bundled into a
+single RPC request and executed sequentially by the server:
+
+```
+┌──────────────────────────────────────────────────┐
+│              COMPOUND Request                     │
+│  ┌──────────┐  ┌────────┐  ┌────────┐  ┌──────┐ │
+│  │ PUTFH    │  │ OPEN   │  │ GETFH  │  │ READ │ │
+│  │(file_hdl)│→ │(create)│→ │(new_fh)│→ │(data)│ │
+│  └──────────┘  └────────┘  └────────┘  └──────┘ │
+│                                                  │
+│  Server executes each op in order. If any op     │
+│  fails, the COMPOUND stops at that point.        │
+└──────────────────────────────────────────────────┘
+```
+
+This design reduces round trips dramatically. A single COMPOUND can:
+`PUTROOTFH → LOOKUP("dir") → LOOKUP("file") → OPEN → READ`, all in one RPC.
+
+**Core NFSv4.0 Operations**
+
+NFSv4.0 defines about 40 operations. The most commonly used:
+
+| Operation | Category | Description |
+|-----------|----------|-------------|
+| `PUTFH` | FH mgmt | Set current file handle |
+| `PUTROOTFH` | FH mgmt | Set current FH to root of filesystem |
+| `GETFH` | FH mgmt | Retrieve current file handle (after CREATE/LOOKUP) |
+| `SAVEFH` / `RESTOREFH` | FH mgmt | Save/restore FH to a second slot |
+| `LOOKUP` | Namespace | Resolve a filename in current directory |
+| `LOOKUPP` | Namespace | Look up parent directory ("..") |
+| `OPEN` | File | Open a file (replaces NFSv3 LOOKUP+ACCESS) |
+| `CLOSE` | File | Close a file |
+| `READ` | Data | Read file data at offset |
+| `WRITE` | Data | Write file data at offset |
+| `GETATTR` | Attr | Get file/directory attributes |
+| `SETATTR` | Attr | Set file/directory attributes |
+| `ACCESS` | Auth | Check access rights |
+| `CREATE` | Namespace | Create a file object |
+| `REMOVE` | Namespace | Remove a file object |
+| `RENAME` | Namespace | Rename a file/directory |
+| `LINK` | Namespace | Create hard link |
+| `READDIR` | Dir | Read directory entries |
+| `LOCK` / `LOCKU` | Lock | Byte-range lock / unlock |
+| `OPEN_CONFIRM` / `OPEN_DOWNGRADE` | File | Confirm/downgrade open state |
+| `DELEGRETURN` | Delegation | Return a delegation to server |
+| `RENEW` | Lease | Renew lease (keep state alive) |
+
+**State model and OPEN/CLOSE**
+
+NFSv4.0 introduces an explicit `OPEN` and `CLOSE`. An `OPEN` creates server
+state representing the client's access to the file. This replaces the
+NFSv3 model where the server had no idea which clients were accessing files.
+The benefits:
+
+- **Delegations**: The server can delegate authority to a client, allowing
+  it to cache data locally and serve read/write without contacting the
+  server. Two types: **read delegations** (multiple clients can hold) and
+  **write delegations** (exclusive to one client).
+- **Byte-range locking**: Integrated into the protocol via `LOCK`/`LOCKU`
+  operations, replacing the separate NLM (Network Lock Manager) protocol
+  used with NFSv3.
+- **Lease-based state**: All state (opens, locks, delegations) is tied to a
+  lease. The client must renew its lease periodically via `RENEW`. If the
+  lease expires, the server may release all associated state.
+
+### 2.4 NFSv4.1: Sessions and pNFS
+
+NFSv4.1 introduced **sessions**, which provide exactly-once semantics at
+the transport layer. A session is identified by a `sessionid` and maintains
+sequence numbers for request/response matching:
+
+```
+   Client                               Server
+     │                                    │
+     │  CREATE_SESSION(client_id, flags)  │
+     │───────────────────────────────────►│
+     │  sessionid, server properties      │
+     │◄───────────────────────────────────│
+     │                                    │
+     │  SEQUENCE(sessionid, seq=1)        │
+     │  └─ PUTFH → READ                   │
+     │───────────────────────────────────►│
+     │  SEQUENCE(sessionid, seq=1)        │
+     │  └─ READ result                    │
+     │◄───────────────────────────────────│
+     │                                    │
+     │  DESTROY_SESSION(sessionid)         │
+     │───────────────────────────────────►│
+```
+
+Session-related operations:
+
+| Operation | Description |
+|-----------|-------------|
+| `CREATE_SESSION` | Establish a new session with the server |
+| `DESTROY_SESSION` | Tear down a session and release all state |
+| `SEQUENCE` | Per-operation sequencing within a session |
+| `RECLAIM_COMPLETE` | Signal that client has finished reclaiming state after server reboot |
+
+Exactly-once semantics mean that if a client retries a `SEQUENCE` with the
+same slot+sequence, the server replays the cached response rather than
+re-executing. This is critical for non-idempotent operations like `REMOVE`.
+
+Additionally, NFSv4.1 added the `LAYOUTGET` / `LAYOUTRETURN` /
+`LAYOUTCOMMIT` operations that form the core of **pNFS** (detailed in the
+next section).
+
+### 2.5 NFSv4.2: Server-Side Operations
+
+NFSv4.2 introduces operations that push work to the server side, avoiding
+data movement through the client:
+
+| Operation | Description |
+|-----------|-------------|
+| `COPY` | Server-side file copy between any two files |
+| `CLONE` | CoW (reflink) clone of file blocks (zero-data copy) |
+| `SEEK` | Find next data/hole offset (sparse file support) |
+| `ALLOCATE` | Pre-allocate space for a file |
+| `DEALLOCATE` | Punch a hole (free space) in a file |
+| `READ_PLUS` | Read with hole information (sparse-aware read) |
+
+The `CLONE` operation is particularly powerful: it creates a copy-on-write
+snapshot of file blocks without physically copying data, relying on the
+underlying filesystem's reflink support (e.g., XFS, Btrfs, ZFS).
+
+### 2.6 The NFS Mount Process (End-to-End)
+
+Bringing the protocols together, here is what happens when a client mounts
+an NFSv4 export:
+
+```
+  Client                                               Server
+    │                                                    │
+    │  1. TCP connect to port 2049                        │
+    │────────────────────────────────────────────────────►│
+    │                                                    │
+    │  2. RPC NULL (health check)                        │
+    │────────────────────────────────────────────────────►│
+    │  NULL response                                     │
+    │◄────────────────────────────────────────────────────│
+    │                                                    │
+    │  3. COMPOUND { PUTROOTFH, GETATTR(fsid,...) }      │
+    │────────────────────────────────────────────────────►│
+    │  fsid, server capabilities                         │
+    │◄────────────────────────────────────────────────────│
+    │                                                    │
+    │  4. COMPOUND { PUTROOTFH, LOOKUP("export_path"),   │
+    │                GETFH, GETATTR }                    │
+    │────────────────────────────────────────────────────►│
+    │  file handle for the export root                   │
+    │◄────────────────────────────────────────────────────│
+    │                                                    │
+    │  5. (optional) CREATE_SESSION for NFSv4.1+         │
+    │────────────────────────────────────────────────────►│
+    │  sessionid                                         │
+    │◄────────────────────────────────────────────────────│
+    │                                                    │
+    │  6. Regular file operations ...                    │
+    │                                                    │
+```
+
+For NFSv3, the mount process is different: the client first contacts the
+**rpcbind** service (port 111) to discover the MOUNT daemon's port, then
+calls `MNT` to obtain the root file handle, then proceeds with NFS
+operations on port 2049.
+
+### 2.7 Viewing NFS Operations in Practice
+
+On Linux, you can observe NFS operations on the wire or via kernel
+tracepoints:
+
+```bash
+## Watch NFS operations live (NFS client side)
+mount -t nfs -o v4.2 server:/export /mnt/nfs
+cat /proc/self/mountstats | grep -A 50 "nfs"
+
+## nfsstat: display NFS client and server statistics
+nfsstat -c          # client-side stats: calls, retransmissions
+nfsstat -s          # server-side stats: operations served
+nfsstat -o all -3   # show per-op counts for NFSv3
+nfsstat -o all -4   # show per-op counts for NFSv4
+
+## tshark: capture NFS packets on the wire
+tshark -i eth0 -f "port 2049" -Y "nfs" -T fields \
+  -e nfs.main_opcode -e nfs.fh_hash -e nfs.offset -e nfs.count
+```
+
+Each `nfsstat` counter maps to one of the NFS procedures described above. A
+high `getattr` count typically indicates metadata-heavy workloads; a high
+`write` count with low `commit` suggests clients are using unstable writes.
+
+---
+
+## 3. pNFS Architecture and Protocol
+
+### 3.1 The Three Actors
 
 | Actor | Role | Protocol |
 |-------|------|----------|
@@ -113,7 +403,7 @@ storage**:
 | **Metadata Server (MDS)** | Namespace, locking, layout management | NFSv4.1+ |
 | **Data Server (DS)** | Stores and serves file data | NFS, iSCSI, FCP, or OSD (depends on layout type) |
 
-### 2.2 Layout Types
+### 3.2 Layout Types
 
 A **layout** is a mapping from `{file, offset, length}` to `{data_server,
 protocol, credentials}`. The layout type determines what storage protocol
@@ -230,7 +520,7 @@ LBA ranges, and the client accesses the storage hardware directly with
 no NFS protocol on the data path. The SCSI layout adds hardware-enforced
 fencing via SCSI Persistent Reservations.
 
-See [Section 2.2.2](#222-block-and-scsi-layouts-in-depth) for the full
+See [Section 3.2.2](#322-block-and-scsi-layouts-in-depth) for the full
 architecture, motivation, extent structures, LBA translation, device
 discovery, and security model.
 
@@ -267,7 +557,7 @@ advantages:
 2. **Client-side mirroring** — the layout can specify multiple mirrors per
    file segment, and the client handles replication.
 
-### 2.2.1 Flex Files Layout in Depth
+### 3.2.1 Flex Files Layout in Depth
 
 The Flex Files layout type (ID=4, [RFC 8435](https://www.rfc-editor.org/rfc/rfc8435.html))
 is the most widely deployed pNFS layout and deserves deeper examination. It was
@@ -491,7 +781,7 @@ In the Linux kernel, the client tracks these statistics in
 via `nfs42_proc_layoutstats_generic()` at the interval suggested by the
 MDS's `stats_collect_hint` field.
 
-### 2.2.2 Block and SCSI Layouts in Depth
+### 3.2.2 Block and SCSI Layouts in Depth
 
 The Block (ID=3, [RFC 5663](https://www.rfc-editor.org/rfc/rfc5663.html))
 and SCSI (ID=5, [RFC 8154](https://datatracker.ietf.org/doc/rfc8154/))
@@ -697,7 +987,7 @@ infrastructure already provides shared block access and the goal is to
 eliminate every possible layer of overhead between the application and
 the storage hardware.
 
-### 2.2.3 Layout Cache Policy
+### 3.2.3 Layout Cache Policy
 
 pNFS clients cache layouts aggressively — once a `LAYOUTGET` succeeds,
 the client reuses the cached layout for all subsequent I/O to that file
@@ -882,7 +1172,7 @@ filehandles, stateids, stripe info). There is no separate extent tree.
 | **Data volatility** | Low (block mappings rarely change) | Higher (DS addresses can change on failover) |
 | **Invalidation** | `bl_return_range()` removes extents per range | Segment marked invalid (`NFS_LSEG_VALID` cleared) |
 
-### 2.3 The Layout Protocol: LAYOUTGET / LAYOUTRETURN / LAYOUTCOMMIT
+### 3.3 The Layout Protocol: LAYOUTGET / LAYOUTRETURN / LAYOUTCOMMIT
 
 The layout lifecycle is managed by three operations plus a callback:
 
@@ -936,7 +1226,7 @@ This happens when another client needs conflicting access, the MDS wants to
 migrate data, or a DS is being removed. The client must return the layout
 and fall back to going through the MDS for data.
 
-### 2.4 NFSv4.2 Operations
+### 3.4 NFSv4.2 Operations
 
 NFSv4.2 adds several new operations on top of the NFSv4.1 base:
 
@@ -1100,7 +1390,7 @@ These let the pNFS client report back to the MDS:
 
 ---
 
-## 3. Sun RPC: The Protocol Transport Beneath NFS
+## 4. Sun RPC: The Protocol Transport Beneath NFS
 
 Every NFS operation — including all pNFS operations (LAYOUTGET, LAYOUTRETURN,
 LAYOUTCOMMIT, CB_LAYOUTRECALL) — is carried over **Sun RPC** (ONC RPC,
@@ -1114,7 +1404,7 @@ Sun RPC provides three things that NFS relies on:
    and results
 3. **Pluggable authentication** — AUTH_SYS, Kerberos (RPCSEC_GSS), or none
 
-### 3.1 RPC Message Format
+### 4.1 RPC Message Format
 
 Every NFS request and reply is an RPC message on the wire. The format is
 defined by RFC 5531:
@@ -1175,7 +1465,7 @@ encoded inside the compound body, not as separate RPC procedures.
 In the kernel, the call header is encoded by `rpc_encode_header()`
 (`net/sunrpc/clnt.c`) and the reply is parsed by `rpc_decode_header()`.
 
-### 3.2 XDR: External Data Representation
+### 4.2 XDR: External Data Representation
 
 XDR ([RFC 4506](https://www.rfc-editor.org/rfc/rfc4506.html)) is the
 binary encoding used for all data on the wire. Every integer, string,
@@ -1237,7 +1527,7 @@ pointer to write into; decoders call `xdr_inline_decode(nbytes)` to read.
 If the data spans a page boundary, the XDR layer transparently handles
 the cross-page access.
 
-### 3.3 The RPC Client Call Flow
+### 4.3 The RPC Client Call Flow
 
 When NFS issues an RPC (e.g., `nfs4_proc_read()` calls `rpc_call_sync()`
 or `rpc_call_async()`), the call passes through a **state machine** in
@@ -1298,7 +1588,7 @@ the state machine loops back to an earlier step (e.g., `call_bind` or
 `call_encode`) and retries. Soft-timeout mounts (`soft`) will eventually
 give up and return an error.
 
-### 3.4 The RPC Task
+### 4.4 The RPC Task
 
 The `struct rpc_task` (`include/linux/sunrpc/sched.h`) is the central
 unit of work — one task per RPC call in flight:
@@ -1331,7 +1621,7 @@ blocked on slot allocation, connection, or reply. The core loop in
 `__rpc_execute()` repeatedly calls `task->tk_action` until there are no
 more steps.
 
-### 3.5 Transport Abstraction
+### 4.5 Transport Abstraction
 
 The RPC layer abstracts the network transport through `struct rpc_xprt`
 and `struct rpc_xprt_ops`. This is how NFS supports TCP, UDP, RDMA, and
@@ -1378,7 +1668,7 @@ The transport also manages **congestion control** (`xprt->cong` and
 RB-tree (`xprt->recv_queue`, keyed by XID) so incoming replies can be
 matched to the correct `rpc_rqst` in O(log n).
 
-### 3.6 Authentication
+### 4.6 Authentication
 
 RPC authentication is pluggable — different security mechanisms are
 registered into an `auth_flavors[]` array and selected per-mount:
@@ -1428,7 +1718,7 @@ payload. The server decrypts before processing and encrypts the reply.
   can read the data                  decrypt the data
 ```
 
-### 3.7 RPC in the Context of pNFS
+### 4.7 RPC in the Context of pNFS
 
 All pNFS metadata operations use RPC to communicate with the MDS:
 
@@ -1468,14 +1758,14 @@ the entire RPC stack and go directly to the storage hardware.
 
 ---
 
-## 4. Distributed Cache Coherency
+## 5. Distributed Cache Coherency
 
 A distributed filesystem's hardest problem is **cache coherency**: when
 multiple clients cache the same file and one modifies it, how do the
 others know their cache is stale? NFS has evolved increasingly
 sophisticated answers to this question across protocol versions.
 
-### 4.1 The Fundamental Problem
+### 5.1 The Fundamental Problem
 
 ```
   The cache coherency challenge:
@@ -1505,7 +1795,7 @@ last:
 | **Delegations** | Server-driven cache invalidation | Strong consistency (server recalls before conflict) | Low when uncontended, callback cost on conflict |
 | **Byte-range locks** | Lock as coherency point | Full cache flush + revalidation | High (lock RPC + cache invalidation) |
 
-### 4.2 Attribute Cache: The First Line of Defense
+### 5.2 Attribute Cache: The First Line of Defense
 
 The NFS client caches file attributes (size, mtime, change attribute,
 mode, uid/gid) locally to avoid a GETATTR RPC on every `stat()` or
@@ -1559,7 +1849,7 @@ known to be invalid:
 When any of these flags are set, the next access to that attribute
 triggers revalidation (a GETATTR RPC to the server).
 
-### 4.3 The Change Attribute: NFS's Cache Coherency Key
+### 5.3 The Change Attribute: NFS's Cache Coherency Key
 
 The **change attribute** (NFSv4) is the single most important field for
 cache coherency. It's a server-maintained counter or timestamp that
@@ -1626,7 +1916,7 @@ without treating the change as an external modification:
   → No need to invalidate page cache
 ```
 
-### 4.4 Close-to-Open (CTO) Consistency
+### 5.4 Close-to-Open (CTO) Consistency
 
 CTO is the primary coherency guarantee that NFS provides to
 applications. The contract:
@@ -1688,7 +1978,7 @@ is useful for read-only datasets (training data, software repos) where
 you know the data won't change during the mount, and you want to avoid
 the GETATTR cost on every `open()`.
 
-### 4.5 Delegations: Server-Driven Cache Coherency
+### 5.5 Delegations: Server-Driven Cache Coherency
 
 Delegations are NFSv4's most powerful cache coherency mechanism. The
 server **delegates** cache management authority to the client:
@@ -1755,7 +2045,7 @@ recall, the client must flush and return, and the next client must
 wait. Highly contended files may have delegations disabled by the
 server to avoid recall storms.
 
-### 4.6 Byte-Range Locks as Coherency Points
+### 5.6 Byte-Range Locks as Coherency Points
 
 Acquiring a byte-range lock (or flock) is the **strongest cache
 coherency operation** in NFS. The kernel explicitly treats lock
@@ -1803,7 +2093,7 @@ to ensure the next lock holder sees the writes.
                                 ▼
 ```
 
-### 4.7 Write Consistency: Unstable Writes and COMMIT
+### 5.7 Write Consistency: Unstable Writes and COMMIT
 
 NFS write consistency has its own coherency concern: what happens if
 the server crashes after accepting a WRITE but before the data reaches
@@ -1855,7 +2145,7 @@ against the COMMIT response. On mismatch, the client re-dirties the
 pages and retransmits — the application never sees the error, and no
 data is lost.
 
-### 4.8 pNFS Coherency: Consistency Across Data Servers
+### 5.8 pNFS Coherency: Consistency Across Data Servers
 
 pNFS adds a layer of coherency complexity: with multiple data servers,
 how does the MDS know about data changes, and how do clients see a
@@ -1918,7 +2208,7 @@ even though the data on the DS is current. This is an intentional
 design trade-off: LAYOUTCOMMIT is deferred to reduce MDS traffic, at
 the cost of temporary metadata inconsistency.
 
-### 4.9 Coherency Comparison: NFS vs Local Filesystems vs Other Distributed FS
+### 5.9 Coherency Comparison: NFS vs Local Filesystems vs Other Distributed FS
 
 | Aspect | Local FS (ext4/XFS) | NFS (CTO) | NFS (Delegation) | Lustre | CephFS |
 |--------|-------------------|-----------|------------------|--------|--------|
@@ -1931,7 +2221,7 @@ the cost of temporary metadata inconsistency.
 
 ---
 
-## 5. Linux Kernel Implementation
+## 6. Linux Kernel Implementation
 
 The Linux kernel implements both pNFS client and (limited) server support.
 The source is organized as follows (paths relative to `fs/`):
@@ -1964,7 +2254,7 @@ fs/nfsd/                         ← NFS server (knfsd)
 └── flexfilelayout.c              ← Server flex files support
 ```
 
-### 5.1 Core pNFS Data Structures
+### 6.1 Core pNFS Data Structures
 
 ```c
 /* fs/nfs/pnfs.h — Layout header: one per inode with active layouts */
@@ -2014,7 +2304,7 @@ struct pnfs_layoutdriver_type {
 };
 ```
 
-### 5.2 How the Client Obtains a Layout
+### 6.2 How the Client Obtains a Layout
 
 The key function is `pnfs_update_layout()` (`fs/nfs/pnfs.c`):
 
@@ -2057,7 +2347,7 @@ pnfs_update_layout(inode, ctx, pos, count, iomode, ...)
         └── Return layout segment → client does direct I/O to DS
 ```
 
-### 5.3 Layout Type Drivers
+### 6.3 Layout Type Drivers
 
 Each layout type registers via `pnfs_register_layoutdriver()` with a
 module alias `nfs-layouttype4-<id>`:
@@ -2073,7 +2363,7 @@ The Flex Files driver (`flexfilelayout.c`, 81 KB) is the largest because it
 handles mirroring, I/O statistics tracking (`LAYOUTSTATS`), error reporting
 (`LAYOUTERROR`), and multiple DS protocol versions.
 
-### 5.4 NFSv4.2 Kernel Implementation
+### 6.4 NFSv4.2 Kernel Implementation
 
 The NFSv4.2 operations are in `fs/nfs/nfs42proc.c`:
 
@@ -2091,9 +2381,9 @@ The NFSv4.2 operations are in `fs/nfs/nfs42proc.c`:
 
 ---
 
-## 6. Performance Features
+## 7. Performance Features
 
-### 6.1 Parallel I/O — Linear Bandwidth Scaling
+### 7.1 Parallel I/O — Linear Bandwidth Scaling
 
 The core performance benefit: adding data servers adds aggregate bandwidth.
 With N data servers, the theoretical maximum throughput scales linearly:
@@ -2109,7 +2399,7 @@ This is achieved because:
 - Different clients can access different DS without contention
 - The MDS is out of the data path — it only handles metadata
 
-### 6.2 Striping
+### 7.2 Striping
 
 The Files and Flex Files layout types support **data striping** — a file is
 divided into stripe units distributed across data servers:
@@ -2127,7 +2417,7 @@ stripe_count = 3 (number of DS)
 A single large sequential read of 6 MB becomes three parallel 2 MB reads
 to three different servers — 3x the single-server bandwidth.
 
-### 6.3 Client-Side Mirroring (Flex Files)
+### 7.3 Client-Side Mirroring (Flex Files)
 
 Flex Files supports **mirrors** — each stripe can be stored on multiple DS
 for redundancy:
@@ -2145,7 +2435,7 @@ Reads can be load-balanced across mirrors. Writes go to all mirrors
 (client-driven replication). If a mirror fails, the client reports via
 `LAYOUTERROR` and the MDS can rebuild.
 
-### 6.4 Layout Caching
+### 7.4 Layout Caching
 
 Clients cache layouts aggressively. Once a `LAYOUTGET` succeeds, the
 client reuses the layout segment for all I/O to that file range until:
@@ -2155,11 +2445,11 @@ client reuses the layout segment for all I/O to that file range until:
 - The client detects a DS error
 
 This avoids repeated round-trips to the MDS for the data path. See
-[Section 2.2.3](#223-layout-cache-policy) for the full cache architecture,
+[Section 3.2.3](#323-layout-cache-policy) for the full cache architecture,
 including the block layout's two-level extent tree caching and the write
 lifecycle state machine.
 
-### 6.5 NFSv4.2 Performance Features
+### 7.5 NFSv4.2 Performance Features
 
 | Feature | Performance Impact |
 |---------|-------------------|
@@ -2171,9 +2461,9 @@ lifecycle state machine.
 
 ---
 
-## 7. Hammerspace: pNFS as a Global Data Platform
+## 8. Hammerspace: pNFS as a Global Data Platform
 
-### 7.1 What Hammerspace Is
+### 8.1 What Hammerspace Is
 
 [Hammerspace](https://hammerspace.com/) is a software-defined data platform
 that uses **pNFS with Flex Files** as its core architecture. It was founded
@@ -2189,7 +2479,7 @@ layer** that sits above existing storage and provides:
 - Parallel file system performance via pNFS
 - No proprietary client software — uses the standard Linux NFS 4.2 client
 
-### 7.2 Architecture
+### 8.2 Architecture
 
 ```
                     Hammerspace Architecture
@@ -2224,7 +2514,7 @@ layer** that sits above existing storage and provides:
   Clients use standard Linux pNFS client — no agents needed.
 ```
 
-### 7.3 How pNFS Enables Hammerspace
+### 8.3 How pNFS Enables Hammerspace
 
 Hammerspace leverages specific pNFS/NFSv4.2 features:
 
@@ -2261,7 +2551,7 @@ policy engine uses this data to make informed decisions:
 - Cold files (no access for 30 days) → move to object storage
 - Geographic affinity → replicate to the site where reads are happening
 
-### 7.4 Tier 0: GPU-Direct NVMe
+### 8.4 Tier 0: GPU-Direct NVMe
 
 Hammerspace's latest innovation transforms **local NVMe storage on GPU
 servers** into a shared Tier 0 storage pool:
@@ -2282,7 +2572,7 @@ can read training data directly from each other's NVMe at local speeds via
 pNFS, rather than going through a centralized storage system. This has
 achieved up to **10 TB/s** across 800 storage nodes.
 
-### 7.5 Multi-Protocol Access
+### 8.5 Multi-Protocol Access
 
 Hammerspace exposes the same data via NFS, pNFS, SMB/CIFS, and S3 — all
 through the global namespace. A Windows workstation can edit a file via SMB
@@ -2291,9 +2581,9 @@ the MDS.
 
 ---
 
-## 8. Advantages and Disadvantages
+## 9. Advantages and Disadvantages
 
-### 8.1 pNFS Advantages
+### 9.1 pNFS Advantages
 
 | Advantage | Detail |
 |-----------|--------|
@@ -2306,7 +2596,7 @@ the MDS.
 | **Leverages existing storage** | No forklift upgrade needed — existing NAS becomes pNFS data servers. |
 | **Kernel-integrated** | pNFS client infrastructure has been in mainline Linux since 2.6.37 (January 2011), with CB_LAYOUTRECALL and refinements added in 2.6.38. Well-tested, production-quality. |
 
-### 8.2 pNFS Disadvantages / Limitations
+### 9.2 pNFS Disadvantages / Limitations
 
 | Limitation | Detail |
 |------------|--------|
@@ -2318,7 +2608,7 @@ the MDS.
 | **Layout recall latency** | Data migration requires recalling layouts from all clients, which adds latency proportional to the number of active clients. |
 | **Limited write optimization** | Writes must go to all mirrors (Flex Files) and may require `LAYOUTCOMMIT` + `COMMIT` to DS before the MDS considers them stable — more round trips than a tightly-coupled system. |
 
-### 8.3 When to Use What
+### 9.3 When to Use What
 
 | Workload | Best Choice | Why |
 |----------|------------|-----|
@@ -2330,9 +2620,9 @@ the MDS.
 
 ---
 
-## 9. Typical NFS Use Cases
+## 10. Typical NFS Use Cases
 
-### 9.1 AI/ML Workloads
+### 10.1 AI/ML Workloads
 
 AI and ML training pipelines have a distinctive I/O pattern: **read-heavy,
 sequential, high-throughput data ingestion** during training, combined with
@@ -2460,7 +2750,7 @@ mount -t nfs -o vers=4.2,proto=tcp,\
   Azure NetApp Files provides NFSv4.1 with ultra-low latency for AI.
   These services are popular because they "just work" — mount and train.
 
-### 9.2 HPC Workloads
+### 10.2 HPC Workloads
 
 High-Performance Computing workloads are characterized by **massive
 parallelism** (thousands of nodes), **large-scale scientific data**, and
@@ -2592,7 +2882,7 @@ srun --prolog="cp /scratch/shared/input.h5 /local_nvme/" ...
   interface. The read-dominant, embarrassingly-parallel nature of physics
   analysis maps well to NFS's strengths.
 
-### 9.3 AI/ML vs HPC: NFS Configuration Comparison
+### 10.3 AI/ML vs HPC: NFS Configuration Comparison
 
 | Aspect | AI/ML Training | HPC Simulation |
 |--------|---------------|----------------|
@@ -2610,7 +2900,7 @@ srun --prolog="cp /scratch/shared/input.h5 /local_nvme/" ...
 
 ---
 
-## 10. Summary
+## 11. Summary
 
 pNFS and NFSv4.2 together represent the evolution of NFS from a simple
 client-server file sharing protocol to a scalable parallel data access
