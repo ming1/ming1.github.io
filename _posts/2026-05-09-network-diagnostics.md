@@ -819,6 +819,8 @@ by a firewall or DPI system, not general connectivity.
 
 ## tcpdump
 
+[pcap filter](https://www.tcpdump.org/manpages/pcap-filter.7.html)
+
 ```bash
 # Capture traffic on port 443
 tcpdump -i eth0 -nn port 443
@@ -852,6 +854,431 @@ retransmissions.
 with exponential backoff: 1s, 2s, 4s, 8s, 16s. If you see a connection
 taking ~31 seconds, it means 5 SYN retransmissions before success, indicating
 heavy packet loss or filtering.
+
+## Wireshark
+
+While `tcpdump` excels at live capture and quick CLI inspection, **Wireshark**
+is the tool of choice for deep-dive analysis. It provides a graphical
+interface for dissecting protocols, tracking conversations, graphing TCP
+behavior, and navigating packet captures that would be tedious to inspect
+line-by-line.
+
+### Capturing Traffic for Wireshark
+
+[Wireshark wiki capture filters](https://wiki.wireshark.org/CaptureFilters)
+
+Wireshark can capture live, but often you capture remotely and analyze
+locally:
+
+```bash
+## Capture on a remote server, analyze in Wireshark locally
+## On the server:
+tcpdump -i eth0 -nn -w /tmp/capture.pcap port 443
+
+## Copy to local machine, then open in Wireshark:
+wireshark capture.pcap
+```
+
+For live remote capture with Wireshark's GUI:
+
+```bash
+## Pipe tcpdump from a remote server into local Wireshark in real-time
+ssh root@server 'tcpdump -i eth0 -nn -w - port 443' | wireshark -k -i -
+```
+
+### Display Filters vs Capture Filters
+
+[Wireshark Tutorial: Display Filter Expressions](https://unit42.paloaltonetworks.com/using-wireshark-display-filter-expressions/)
+
+[Wireshark wiki display filters](https://wiki.wireshark.org/DisplayFilters)
+
+
+Wireshark has two independent filter systems that serve different purposes:
+
+| Filter Type | Syntax | Applied | Purpose |
+|------------|--------|---------|---------|
+| **Capture filter** | BPF (Berkeley Packet Filter) | Before capture | Limits which packets are stored; reduces file size |
+| **Display filter** | Wireshark-specific syntax | After capture | Limits which captured packets are shown; full data is preserved |
+
+**Capture filters** reduce what you record (good for long-running captures
+where you only care about specific traffic). **Display filters** hide
+irrelevant packets from view but keep everything in the file — you can
+toggle the filter off to see the full capture at any time.
+
+#### Common Capture Filters (BPF Syntax)
+
+```text
+port 443                           # only traffic on port 443
+host 192.168.1.100                 # only traffic to/from this host
+tcp port 80 or tcp port 443        # HTTP or HTTPS
+not host 192.168.1.1               # exclude traffic from this host
+src net 10.0.0.0/8                 # only traffic originating from this subnet
+icmp                               # only ICMP (ping, traceroute)
+tcp and port not 22                # all TCP except SSH
+```
+
+These use the same BPF syntax as `tcpdump` — anything you can pass to
+`tcpdump` as a filter expression works as a Wireshark capture filter.
+
+### Common Display Filters
+
+Display filters are where Wireshark really shines. The syntax is
+hierarchical: `protocol.field` with comparison operators and boolean
+combinators.
+
+#### TCP Filters
+
+```text
+## Connection basics
+tcp.port == 443                    # any packet with source or dest port 443
+tcp.srcport == 443                 # only packets FROM port 443
+tcp.dstport == 443                 # only packets TO port 443
+tcp.port in {80 443 8080}          # multiple ports
+ip.addr == 192.168.1.100           # any packet involving this IP (TCP, UDP, ICMP...)
+ip.src == 10.0.0.1                 # only packets FROM this IP
+ip.dst == 10.0.0.1                 # only packets TO this IP
+```
+
+```text
+## TCP flags
+tcp.flags.syn == 1 && tcp.flags.ack == 0    # pure SYN (connection initiation)
+tcp.flags.syn == 1 && tcp.flags.ack == 1    # SYN-ACK (server response)
+tcp.flags.reset == 1                         # RST (connection refused or torn down)
+tcp.flags.fin == 1                           # FIN (graceful close)
+tcp.flags == 0x002                           # SYN only (hex mask equivalent)
+```
+
+**Why flag filters matter**: During troubleshooting, isolating control
+packets from data packets saves time:
+
+```text
+## Show only TCP control packets — hides all the ACKs and data segments
+tcp.flags.syn == 1 || tcp.flags.reset == 1 || tcp.flags.fin == 1
+```
+
+```text
+## TCP problems — critical filters for performance debugging
+tcp.analysis.retransmission        # retransmitted segments (packet loss)
+tcp.analysis.duplicate_ack         # duplicate ACKs (reordering or loss)
+tcp.analysis.fast_retransmission   # fast retransmit triggered by 3 dup ACKs
+tcp.analysis.spurious_retransmission   # unnecessarily retransmitted (false alarm)
+tcp.analysis.lost_segment          # segment believed lost
+tcp.analysis.window_update         # TCP window size changes
+tcp.analysis.keep_alive            # TCP keepalive probes
+tcp.analysis.zero_window           # receiver advertised zero window (backpressure)
+tcp.analysis.acked_lost_segment    # ACK for a previously-lost segment
+tcp.analysis.out_of_order          # segment arrived out of sequence
+```
+
+**Interpreting the TCP analysis flags**: Wireshark infers these from
+sequence numbers and timing. A few retransmissions on a long path is
+normal; sustained retransmissions indicate packet loss. `zero_window`
+means the receiver can't keep up — its receive buffer is full. `out_of_order`
+combined with `duplicate_ack` often indicates path asymmetry or per-packet
+load balancing.
+
+```text
+## Follow a specific TCP connection
+tcp.stream eq 5                    # isolate one TCP conversation
+tcp.stream eq 5 and tcp.analysis.retransmission  # retransmissions in that stream
+```
+
+Every TCP connection in a capture is assigned a stream index. Right-click
+a packet → "Follow → TCP Stream" to see the reconstructed data and note
+the stream number for filtering.
+
+#### TLS/HTTPS Filters
+
+```text
+## TLS handshake phases
+tls.handshake.type == 1            # ClientHello
+tls.handshake.type == 2            # ServerHello
+tls.handshake.type == 11           # Certificate
+tls.handshake.type == 14           # ServerHelloDone
+tls.handshake.type == 15           # CertificateVerify
+tls.handshake.type == 16           # ClientKeyExchange
+tls.handshake.type == 20           # Finished
+```
+
+```text
+## TLS content — SNI, version, ciphers
+tls.handshake.extensions_server_name           # contains the SNI hostname
+tls.handshake.extensions_server_name contains "example.com"
+tls.handshake.version                           # TLS version in handshake
+tls.record.version                              # TLS version in record layer
+tls.handshake.ciphersuites                      # offered cipher suites
+tls.handshake.ciphersuite                       # selected cipher suite
+tls.record.content_type == 21                   # TLS Alert (error) records
+```
+
+```text
+## TLS alerts — handshake failures
+tls.alert_message.desc == 40        # Handshake Failure
+tls.alert_message.desc == 70        # Protocol Version (TLS version mismatch)
+tls.alert_message.desc == 112       # Unrecognized Name (SNI not recognized)
+```
+
+When a TLS handshake fails, the server (or client) sends a `Fatal Alert`
+with a description code. Filtering by `tls.alert_message.desc` reveals
+exactly why the handshake was rejected — far more precise than guessing
+from connection timeouts.
+
+#### HTTP Filters
+
+```text
+http.request                        # HTTP requests
+http.response                       # HTTP responses
+http.request.method == "POST"       # POST requests only
+http.response.code >= 400           # HTTP errors (4xx, 5xx)
+http.response.code == 502           # Bad Gateway
+http.host contains "example.com"    # requests to specific host
+http.user_agent                     # User-Agent header
+http.request.uri contains "/api"    # requests to specific path
+http.content_type contains "json"   # JSON responses
+```
+
+#### DNS Filters
+
+```text
+dns                                # all DNS traffic
+dns.flags.response == 0            # only queries (not responses)
+dns.flags.response == 1            # only responses
+dns.flags.rcode != 0               # DNS errors (NXDOMAIN, SERVFAIL, etc.)
+dns.qry.name contains "example"    # queries for a specific domain
+dns.resp.name contains "example"   # responses for a specific domain
+dns.qry.type == 1                  # A record queries (IPv4 address)
+dns.qry.type == 28                 # AAAA record queries (IPv6 address)
+dns.qry.type == 15                 # MX record queries (mail exchange)
+dns.qry.type == 16                 # TXT record queries
+dns.a                              # filter to A record responses specifically
+```
+
+#### Common Filter Combinations
+
+```text
+## Exclude noise — hide routine traffic to focus on anomalies
+!(tcp.port == 443 or tcp.port == 80 or dns or arp or icmp)
+
+## Show only TCP SYN packets for a specific host (connection attempts)
+tcp.flags.syn == 1 && tcp.flags.ack == 0 && ip.addr == 192.168.1.100
+
+## All packets between two specific hosts
+ip.addr == 10.0.0.5 && ip.addr == 10.0.0.10
+
+## Detect possible DPI interference — look for RSTs with unexpected TTL
+tcp.flags.reset == 1 && !(ip.src == server.ip)
+
+## TLS ClientHello with specific SNI
+tls.handshake.type == 1 && tls.handshake.extensions_server_name contains "google"
+
+## TCP problems on a specific connection
+tcp.stream eq 3 && (tcp.analysis.retransmission || tcp.analysis.duplicate_ack)
+
+## All DNS queries that returned an error
+dns.flags.response == 1 && dns.flags.rcode != 0
+```
+
+### Key Wireshark Features for Troubleshooting
+
+#### Follow TCP Stream
+
+Right-click any packet → **Follow → TCP Stream**. This reconstructs the
+bidirectional data stream as the application sees it — reassembled, in
+order, without TCP headers. For HTTP, you see the full request and
+response. For TLS, you see the encrypted bytes. For SSH, you see the
+protocol banner and then ciphertext.
+
+This is the single most-used feature in Wireshark. It turns a pile of
+packets into a coherent conversation.
+
+#### Flow Graph (Statistics → Flow Graph)
+
+Shows a time-sequenced diagram of which side sent what, when. Useful for
+understanding the handshake flow and spotting abnormal sequences:
+
+```
+Time      Client                Server
+0.000     SYN ─────────────────►
+0.050     ◄───────────────── SYN-ACK
+0.051     ACK ─────────────────►
+0.052     ClientHello ─────────►     ← TLS begins
+0.100     ◄───────────────── ServerHello
+          ◄───────────────── Certificate
+          ◄───────────────── ServerHelloDone
+0.105     ClientKeyExchange ───►
+          ChangeCipherSpec ────►
+          Finished ────────────►
+0.155     ◄───────────────── ChangeCipherSpec
+          ◄───────────────── Finished
+0.156     Application Data ────►     ← encrypted from here
+...
+```
+
+Errors stand out immediately: no ServerHello after ClientHello, a RST
+after ClientHello, missing Certificate, or long gaps between messages
+(indicating a hung handshake or middlebox interference).
+
+#### IO Graph (Statistics → IO Graph)
+
+Plots packets per second or bytes per second over time. Essential for
+spotting throughput drops, traffic bursts, or periodic patterns. Configure
+multiple graph layers with different display filters to compare:
+
+```text
+Graph 1 (blue):  tcp.port == 443          # total HTTPS throughput
+Graph 2 (red):   tcp.analysis.retransmission  # retransmits over time
+Graph 3 (green): tcp.analysis.zero_window     # zero-window events
+```
+
+If red spikes correlate with throughput drops, the problem is packet loss.
+If green spikes correlate, the receiver is overwhelmed.
+
+#### TCP Stream Graphs (Statistics → TCP Stream Graphs)
+
+Wireshark provides several visualizations of TCP behavior for a single
+connection:
+
+| Graph | What it shows | Diagnostic value |
+|-------|--------------|-----------------|
+| **Time-Sequence (Stevens)** | Sequence number over time (line = bytes sent) | Slope = throughput; flat sections = idle; gaps = lost segments |
+| **Time-Sequence (tcptrace)** | Similar but with ACK line overlay | ACK line below seq line = data in flight |
+| **Throughput** | Bytes/second over time | Identify throughput collapse events |
+| **Round Trip Time** | RTT per segment over time | Spikes in RTT = queuing delays / congestion |
+| **Window Scaling** | Advertised receive window over time | Shrinking window = receiver bottleneck |
+
+The **Round Trip Time** graph is particularly useful: a sudden jump in RTT
+from 20ms to 200ms mid-connection often indicates router bufferbloat or a
+path change (rerouting).
+
+#### Expert Info (Analyze → Expert Info)
+
+Wireshark automatically flags protocol anomalies and rates them by
+severity:
+
+| Level | Meaning | Example |
+|-------|---------|---------|
+| **Error** | Protocol violation | Malformed packet, invalid checksum |
+| **Warning** | Unusual but not illegal | Retransmission, duplicate ACK, zero window |
+| **Note** | Informational | TCP keep-alive, window update |
+| **Chat** | Normal protocol chatter | SYN, FIN, RST |
+
+Open Expert Info after loading a capture to see a summary of every
+anomaly Wireshark detected. Click any entry to jump directly to that
+packet. Always check Expert Info first — it may immediately highlight
+the root cause without manual inspection.
+
+#### Endpoints and Conversations (Statistics → Endpoints / Conversations)
+
+Shows aggregate statistics per host (Endpoints) or per host-pair
+(Conversations): packet count, byte count, throughput, duration.
+Sort by bytes to identify which conversation dominates the capture.
+Sort by packets to find chatty protocols.
+
+### Troubleshooting Workflows
+
+#### Workflow 1: Finding the cause of TCP retransmissions
+
+```text
+Step 1: Apply display filter → tcp.analysis.retransmission
+Step 2: Check Expert Info (Analyze → Expert Info) for Warnings
+Step 3: IO Graph with two layers:
+        - tcp.port == <problem_port>  (throughput)
+        - tcp.analysis.retransmission (retransmit count)
+        Correlation = packet loss is the cause
+Step 4: TCP Stream Graph → Round Trip Time
+        RTT spikes before retransmissions = congestion
+        RTT stable, retransmissions continue = path packet loss
+Step 5: Check specific stream → tcp.stream eq N
+        Follow TCP Stream → see if application data is correct
+```
+
+#### Workflow 2: Diagnosing a TLS handshake failure
+
+```text
+Step 1: Filter to the connection attempt
+        → ip.addr == <server_ip> && tcp.port == 443
+Step 2: Check TCP handshake
+        → Is there a SYN → SYN-ACK → ACK? (TCP is established?)
+Step 3: Check for ClientHello
+        → tls.handshake.type == 1
+        If missing: TCP connected but TLS never started (port mismatch)
+Step 4: Check for ServerHello
+        → tls.handshake.type == 2
+        If missing after ClientHello: server doesn't speak TLS on this port
+        or a middlebox is blocking the ClientHello
+Step 5: Check for alerts
+        → tls.alert_message.desc
+        Fatal alert present → read the description code for exact reason
+Step 6: If handshake hung, check timing
+        → Flow Graph (Statistics → Flow Graph)
+        Look for gaps > 5 seconds between ClientHello and ServerHello
+        → middlebox interference or server-side issue
+```
+
+#### Workflow 3: Tracing DNS resolution issues
+
+```text
+Step 1: Filter → dns
+Step 2: Check for queries with no response
+        → dns.flags.response == 0
+        Compare query count vs response count — unmatched = dropped queries
+Step 3: Check for error responses
+        → dns.flags.rcode != 0
+        rcode 3 = NXDOMAIN (domain doesn't exist)
+        rcode 2 = SERVFAIL (server couldn't process query)
+        rcode 5 = REFUSED (server refused to answer)
+Step 4: Check which DNS server responded
+        → ip.src filter combined with dns
+        Confirm responses come from your configured DNS, not an interceptor
+Step 5: Check response time
+        → dns.time (shown in response packet, time since query)
+        > 1 second = slow DNS server or network latency to resolver
+```
+
+#### Workflow 4: Analyzing a slow connection
+
+```text
+Step 1: Identify the connection → tcp.stream eq N
+Step 2: TCP Stream Graph → Time-Sequence (Stevens)
+        Flat slope = low throughput
+        Gaps in the line = idle periods (application think time or stalls)
+Step 3: TCP Stream Graph → Round Trip Time
+        Check baseline RTT — if high, latency is the issue
+        Check for RTT spikes — if present, intermittent congestion
+Step 4: Wireshark IO Graph → bytes/sec for this stream
+        Compare with expected throughput
+Step 5: Check window scaling
+        → tcp.window_size
+        Small window throughout = receiver bottleneck
+        Shrinking window = receiver can't keep up
+Step 6: Check retransmissions
+        → tcp.analysis.retransmission
+        > 1% retransmit rate = packet loss is slowing throughput
+```
+
+### Tips for Efficient Wireshark Use
+
+1. **Always apply capture filters for long-running captures** — a
+   busy server can generate gigabytes of pcap in minutes. A capture filter
+   like `port 443` limits file size before it becomes a problem.
+
+2. **Use `tcp.stream eq N` to focus** — once you find a problematic
+   connection, isolate it with its stream index. This hides thousands of
+   unrelated packets and makes patterns visible.
+
+3. **Check Expert Info first** — before manually scanning packets, open
+   Analyze → Expert Info. It may immediately point to the problem.
+
+4. **Use the IO Graph to correlate events** — plot retransmits, zero
+   windows, and throughput on the same graph. Correlation reveals causation.
+
+5. **Use `frame.time_relative` to measure delays** — add a column for
+   `frame.time_relative` (time since first captured packet) to see exact
+   timing between events. Useful for quantifying slow-handshake issues.
+
+6. **Export filtered results** — once you've isolated the relevant packets
+   with a display filter, use File → Export Specified Packets to save a
+   smaller pcap that you can share with colleagues.
 
 # Quick Reference
 
