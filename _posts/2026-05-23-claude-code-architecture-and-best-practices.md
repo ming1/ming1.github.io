@@ -7,6 +7,67 @@ tags: [AI, claude code, agent, LLM, architecture, MCP, best practices]
 * TOC
 {:toc}
 
+# Architecture of Claude Code: The While-Loop Design
+
+## Overview
+The "while-loop" architecture of Claude Code is a deterministic orchestration wrapper 
+surrounding a ReAct (Reason + Act) agentic framework. Research suggests that only about 
+1.6% of the codebase is dedicated to the core AI logic, while the remaining 98.4% is 
+infrastructure focused on safety, state management, and reliable tool interaction.
+
+![Claud code framework](/assets/images/claude_code_framework.png)
+
+## The Core Execution Loop
+
+The system functions as an `AsyncGenerator`, where each iteration follows a strict 
+nine-step sequence:
+
+1. **Settings Resolution**: Loads project-specific configurations (e.g., `CLAUDE.md`).
+2. **State Initialization**: Defines the workspace, user permissions, and session constraints.
+3. **Context Assembly**: Gathers relevant files, logs, and interaction history.
+4. **Context Compaction**: Executes a 5-layer pipeline (Budget Reduction, Snip, Microcompact, Context Collapse, Auto-Compact) to minimize token overhead.
+5. **Model Call**: The LLM evaluates state and determines the next action.
+6. **Tool Dispatch**: Converts model intent into executable commands.
+7. **Permission Gate**: Validates the request against a multi-modal trust spectrum.
+8. **Tool Execution**: Runs the command via a `StreamingToolExecutor` or serial execution path.
+9. **Stop Condition Check**: Evaluates if the task should terminate or continue to the next iteration.
+
+[Image of a flow chart showing the 9-step while-loop execution process for an AI agent]
+
+## Design Principles
+
+The architecture is governed by specific principles designed to prioritize reliability:
+
+* **Poka-yoke (Mistake-proofing) Interfaces**: Forces strict input formats (e.g., absolute 
+file paths) to reduce common model hallucinations or syntax errors.
+
+* **Error-as-String Handling**: Instead of crashing on errors, tools return error messages as 
+strings, allowing the agent to "read" the error and attempt a fix in the next iteration of the loop.
+
+* **Deny-First Security**: Permissions are re-validated in every instance of the loop, preventing 
+persistent trust escalation.
+
+* **Subagent Isolation**: Delegation triggers the instantiation of a completely new, isolated loop 
+instance to prevent context pollution.
+
+## Execution Paths and Termination
+
+The system optimizes performance through two paths:
+
+* **StreamingToolExecutor**: Used for non-destructive, concurrent-safe operations.
+
+* **Fallback/Exclusive Path**: Serializes execution for tools that require exclusive file system 
+access to prevent race conditions.
+
+**Termination** is strictly enforced via a "Max Iterations" cap (typically 15-25 turns). If the 
+limit is reached, the agent is forced into an "early stopping" pattern, summarizing the current 
+state rather than abruptly terminating.
+
+## References
+
+- Liu, J., Zhao, X., Shang, X., & Shen, Z. (2026). *Dive into Claude Code: The Design Space of Today's and Future AI Agent Systems*. arXiv.
+
+
 # Overview
 
 Claude Code is usually described as "an AI coding assistant." That framing
