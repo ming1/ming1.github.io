@@ -673,7 +673,7 @@ The most useful ones for diagnosis:
 |------------|--------------|------------|
 | `writeback:writeback_queue` | A `wb_writeback_work` is enqueued | `name` (bdi), `reason`, `nr_pages`, `sync_mode` |
 | `writeback:writeback_start` / `writeback_written` | Work item begins / finishes execution | same as above |
-| `writeback:writeback_dirty_inode_start` | An inode is being marked dirty | `name` (bdi), `ino`, `state`, `flags` |
+| `writeback:writeback_mark_inode_dirty` | Entry into `__mark_inode_dirty` (hot path) | `name` (bdi), `ino`, `state`, `flags` |
 | `writeback:writeback_single_inode_start` | One inode's pages start writing | `name` (bdi), `ino`, `nr_to_write` |
 | `writeback:writeback_pages_written` | `wb_workfn` reports how many pages it wrote | `pages` |
 | `writeback:balance_dirty_pages` | A dirtier is throttled | `bdi`, `dirty`, `limit`, `pause`, `dirty_ratelimit` |
@@ -690,8 +690,9 @@ is exposed as `ino`; resolve it to a path with
 
 The script [**`writeback-observe.bt`**]({{ site.baseurl }}/code/writeback-observe.bt)
 hooks the four tracepoints needed to answer the recurring writeback
-questions in one run: **why** writeback fires, **who** is dirtying
-inodes, **what** the workqueue is flushing, and **when** dirtiers get
+questions in one run: **why** writeback fires, **who** dirties which
+inodes (aggregated by call stack — too frequent to print live),
+**what** the workqueue is flushing, and **when** dirtiers get
 throttled. Download it and run as root:
 
 ```bash
@@ -712,15 +713,19 @@ BEGIN {                                     # enum wb_reason lookup
 }
 
 tracepoint:writeback:writeback_queue { ... }              /* "reason" */
-tracepoint:writeback:writeback_dirty_inode_start { ... }  /* "dirty"  */
 tracepoint:writeback:writeback_single_inode_start { ... } /* "write"  */
 tracepoint:writeback:balance_dirty_pages /args->pause>0/ { ... }
                                                           /* "THROTTLE" */
 
+/* High-frequency event - aggregate only, no live printf */
+tracepoint:writeback:writeback_mark_inode_dirty {
+    @mark_dirty[kstack(8), args->name, args->ino] = count();
+}
+
 END {                                       # aggregates printed on Ctrl-C
-    print(@reasons);     /* (bdi, reason) -> count */
-    print(@dirtied_by);  /* comm -> count          */
-    print(@throttle_ms); /* comm -> sum of pause ms */
+    print(@reasons);     /* (bdi, reason)      -> count          */
+    print(@mark_dirty);  /* (kstack, bdi, ino) -> count          */
+    print(@throttle_ms); /* comm               -> sum of pause ms */
 }
 ```
 
@@ -733,17 +738,6 @@ Sample live output during a `dd if=/dev/zero of=/mnt/big bs=1M count=2000`:
 
 ```
 EVENT     COMM             PID    DETAIL
-dirty     dd               31204  bdi=8:0 ino=24117249
-
-        __mark_inode_dirty+0x6f
-        generic_update_time+0x6c
-        file_update_time+0xb5
-        ext4_buffered_write_iter+0x57
-        vfs_write+0x256
-        ksys_write+0x6f
-        do_syscall_64+0x80
-        entry_SYSCALL_64_after_hwframe+0x6e
-
 THROTTLE  dd               31204  bdi=8:0 pause=27ms dirty=204800/262144 wb_dirty=198302
 reason    kworker/u8:3     142    bdi=8:0 reason=periodic nr_pages=9223372036854775807
 write     kworker/u8:3     142    bdi=8:0 ino=24117249 nr_to_write=1024
@@ -757,9 +751,17 @@ And on Ctrl-C:
 @reasons[sda, periodic]:    142
 @reasons[sda, sync]:          4
 
-=== inode-dirty events (top dirtying tasks) ===
-@dirtied_by[dd]:            2048
-@dirtied_by[postgres]:        73
+=== inode-dirty calls (by stack, bdi, inode) ===
+@mark_dirty[
+    __mark_inode_dirty+0x6f
+    generic_update_time+0x6c
+    file_update_time+0xb5
+    ext4_buffered_write_iter+0x57
+    vfs_write+0x256
+    ksys_write+0x6f
+    do_syscall_64+0x80
+    entry_SYSCALL_64_after_hwframe+0x6e
+, sda, 24117249]: 2048
 
 === cumulative throttle pause (ms) per task ===
 @throttle_ms[dd]:          14820
@@ -767,27 +769,33 @@ And on Ctrl-C:
 
 ### Reading the output
 
-Four event prefixes line up with the four tracepoints, in the order
-events naturally happen:
+Three live event prefixes plus one summary aggregate. Live first, in
+the order events naturally happen:
 
-1. **`dirty`** — a task is calling `__mark_inode_dirty` on an inode.
-   `comm`/`pid` say *who*; `bdi=` is the BDI's printable name (usually
-   `<major>:<minor>`); `ino=` is the inode number on that filesystem.
-   The kernel stack underneath shows the path that led to the dirty
-   call (syscall, VFS layer, filesystem callback).
-2. **`reason`** — a `wb_writeback_work` was queued onto `wb->work_list`,
+1. **`reason`** — a `wb_writeback_work` was queued onto `wb->work_list`,
    typically by a periodic timer (`periodic`), reclaim (`vmscan`), or
    a `sync(2)` caller (`sync`). `nr_pages=9223372036854775807` is
    `LONG_MAX`, used to mean "flush everything".
-3. **`write`** — `wb_workfn` started writing one inode's pages.
+2. **`write`** — `wb_workfn` started writing one inode's pages.
    `comm` here is the kworker (`kworker/u8:3:writeback`-style)
    handling the work item.
-4. **`THROTTLE`** — `balance_dirty_pages` slept a dirtier. `pause` is
+3. **`THROTTLE`** — `balance_dirty_pages` slept a dirtier. `pause` is
    in milliseconds (the kernel already converted from jiffies in the
    tracepoint's `TP_fast_assign`), capped at `MAX_PAUSE` (~200 ms at
    `HZ=1000`). Sustained pauses for one task on one BDI mean the
    device cannot keep up with that task's dirty rate, or `dirty_ratio`
    is too low for the workload.
+
+And the END-only aggregate:
+
+4. **`@mark_dirty[kstack, bdi, ino]`** — every
+   `writeback:writeback_mark_inode_dirty` event (the entry into
+   `__mark_inode_dirty`) collapses by unique
+   (kernel stack, BDI, inode) tuple. Live printing is suppressed
+   because this is the hot path: a buffered-write workload can fire
+   it millions of times a second. The aggregate gives "which call
+   stacks dirtied which files how many times" without flooding the
+   terminal; bpftrace deduplicates identical kstacks server-side.
 
 ### Resolving the supporting fields
 

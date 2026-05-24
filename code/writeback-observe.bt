@@ -6,9 +6,12 @@
  * stable tracepoints under include/trace/events/writeback.h:
  *
  *   reason   - why writeback was queued (background / sync / vmscan / ...)
- *   dirty    - which task dirtied which inode on which BDI, with stack
  *   write    - which inode wb_workfn is flushing right now
  *   THROTTLE - dirtiers slept by balance_dirty_pages, with pause in ms
+ *
+ * Plus a summary-only aggregate (@mark_dirty) keyed by
+ * (kstack, bdi, ino) over writeback_mark_inode_dirty events.  This is
+ * the high-volume event, so it is not printed live.
  *
  * Per-event lines stream live; aggregate summaries print on Ctrl-C.
  *
@@ -39,11 +42,8 @@ tracepoint:writeback:writeback_queue {
            @reason[args->reason], args->nr_pages);
 }
 
-tracepoint:writeback:writeback_dirty_inode_start {
-    @dirtied_by[comm] = count();
-    printf("%-9s %-16s %-6d bdi=%s ino=%llu\n",
-           "dirty", comm, pid, args->name, args->ino);
-    print(kstack(8));
+tracepoint:writeback:writeback_mark_inode_dirty {
+    @mark_dirty[kstack(8), args->name, args->ino] = count();
 }
 
 tracepoint:writeback:writeback_single_inode_start {
@@ -62,8 +62,8 @@ tracepoint:writeback:balance_dirty_pages /args->pause > 0/ {
 END {
     printf("\n=== writeback work queued (by reason, by bdi) ===\n");
     print(@reasons);
-    printf("\n=== inode-dirty events (top dirtying tasks) ===\n");
-    print(@dirtied_by);
+    printf("\n=== inode-dirty calls (by stack, bdi, inode) ===\n");
+    print(@mark_dirty);
     printf("\n=== cumulative throttle pause (ms) per task ===\n");
     print(@throttle_ms);
     clear(@reason);
