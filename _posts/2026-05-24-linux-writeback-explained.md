@@ -688,78 +688,46 @@ is exposed as `ino`; resolve it to a path with
 
 ## One Script, Four Views
 
-The script below hooks the four tracepoints needed to answer the
-recurring writeback questions in one run: **why** writeback fires,
-**who** is dirtying inodes, **what** the workqueue is flushing, and
-**when** dirtiers get throttled. Save as `writeback-observe.bt` and
-run as root.
+The script [**`writeback-observe.bt`**]({{ site.baseurl }}/code/writeback-observe.bt)
+hooks the four tracepoints needed to answer the recurring writeback
+questions in one run: **why** writeback fires, **who** is dirtying
+inodes, **what** the workqueue is flushing, and **when** dirtiers get
+throttled. Download it and run as root:
 
 ```bash
-#!/usr/bin/env bpftrace
-/*
- * writeback-observe.bt
- *
- * One-shot view of the Linux writeback subsystem using only the
- * stable tracepoints under include/trace/events/writeback.h.
- *
- *   reason   - why writeback was queued (background / sync / vmscan / ...)
- *   dirty    - which task dirtied which inode on which BDI, with stack
- *   write    - which inode wb_workfn is flushing right now
- *   THROTTLE - dirtiers slept by balance_dirty_pages, with pause in ms
- *
- * Per-event lines stream live; aggregate summaries print on Ctrl-C.
- */
+wget https://ming1.github.io/code/writeback-observe.bt
+sudo bpftrace ./writeback-observe.bt
+```
 
-BEGIN {
-    /* enum wb_reason - see include/linux/backing-dev-defs.h:45 */
-    @reason[0] = "background";
-    @reason[1] = "vmscan";
-    @reason[2] = "sync";
-    @reason[3] = "periodic";
+The structure, with each tracepoint shown stripped of its printf for
+clarity (full source in the file):
+
+```awk
+BEGIN {                                     # enum wb_reason lookup
+    @reason[0] = "background"; @reason[1] = "vmscan";
+    @reason[2] = "sync";       @reason[3] = "periodic";
     @reason[4] = "fs_free_space";
     @reason[5] = "forker_thread";
     @reason[6] = "foreign_flush";
-
-    printf("%-9s %-16s %-6s %s\n", "EVENT", "COMM", "PID", "DETAIL");
 }
 
-tracepoint:writeback:writeback_queue {
-    @reasons[str(args->name), @reason[args->reason]] = count();
-    printf("%-9s %-16s %-6d bdi=%s reason=%s nr_pages=%ld\n",
-           "reason", comm, pid, str(args->name),
-           @reason[args->reason], args->nr_pages);
-}
+tracepoint:writeback:writeback_queue { ... }              /* "reason" */
+tracepoint:writeback:writeback_dirty_inode_start { ... }  /* "dirty"  */
+tracepoint:writeback:writeback_single_inode_start { ... } /* "write"  */
+tracepoint:writeback:balance_dirty_pages /args->pause>0/ { ... }
+                                                          /* "THROTTLE" */
 
-tracepoint:writeback:writeback_dirty_inode_start {
-    @dirtied_by[comm] = count();
-    printf("%-9s %-16s %-6d bdi=%s ino=%llu\n",
-           "dirty", comm, pid, str(args->name), args->ino);
-    print(kstack(8));
-}
-
-tracepoint:writeback:writeback_single_inode_start {
-    printf("%-9s %-16s %-6d bdi=%s ino=%llu nr_to_write=%ld\n",
-           "write", comm, pid, str(args->name),
-           args->ino, args->nr_to_write);
-}
-
-tracepoint:writeback:balance_dirty_pages /args->pause > 0/ {
-    @throttle_ms[comm] = sum(args->pause);
-    printf("%-9s %-16s %-6d bdi=%s pause=%ldms dirty=%lu/%lu wb_dirty=%lu\n",
-           "THROTTLE", comm, pid, str(args->bdi), args->pause,
-           args->dirty, args->limit, args->wb_dirty);
-}
-
-END {
-    printf("\n=== writeback work queued (by reason, by bdi) ===\n");
-    print(@reasons);
-    printf("\n=== inode-dirty events (top dirtying tasks) ===\n");
-    print(@dirtied_by);
-    printf("\n=== cumulative throttle pause (ms) per task ===\n");
-    print(@throttle_ms);
-    clear(@reason);
+END {                                       # aggregates printed on Ctrl-C
+    print(@reasons);     /* (bdi, reason) -> count */
+    print(@dirtied_by);  /* comm -> count          */
+    print(@throttle_ms); /* comm -> sum of pause ms */
 }
 ```
+
+All five string fields used (`args->name` on the writeback events,
+`args->bdi` on `balance_dirty_pages`) are already typed as
+`string[32]` by bpftrace's BTF integration — no `str()` wrapper
+needed, applying one is a type error on bpftrace ≥ ~2024.
 
 Sample live output during a `dd if=/dev/zero of=/mnt/big bs=1M count=2000`:
 
