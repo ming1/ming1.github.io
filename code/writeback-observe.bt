@@ -32,7 +32,8 @@ BEGIN {
     @reason[5] = "forker_thread";
     @reason[6] = "foreign_flush";
 
-    printf("%-9s %-16s %-6s %s\n", "EVENT", "COMM", "PID", "DETAIL");
+    printf("%-15s %-50s %-16s %-6s %s\n",
+           "TIME", "PROBE", "COMM", "PID", "DETAIL");
 }
 
 /*
@@ -44,25 +45,26 @@ BEGIN {
  */
 tracepoint:writeback:writeback_start {
     @reasons[args->name, @reason[args->reason]] = count();
-    printf("%-9s %-16s %-6d bdi=%s reason=%s nr_pages=%ld\n",
-           "reason", comm, pid, args->name,
-           @reason[args->reason], args->nr_pages);
+    printf("%-15s %-50s %-16s %-6d bdi=%s reason=%s nr_pages=%ld\n",
+           strftime("%H:%M:%S.%f", nsecs), probe, comm, pid,
+           args->name, @reason[args->reason], args->nr_pages);
 }
 
 tracepoint:writeback:writeback_mark_inode_dirty {
-    @mark_dirty[kstack(8), args->name, args->ino] = count();
+    @mark_dirty[kstack(8), args->name/*, args->ino*/] = count();
 }
 
 tracepoint:writeback:writeback_single_inode_start {
-    printf("%-9s %-16s %-6d bdi=%s ino=%llu nr_to_write=%ld\n",
-           "write", comm, pid, args->name,
-           args->ino, args->nr_to_write);
+    printf("%-15s %-50s %-16s %-6d bdi=%s ino=%llu nr_to_write=%ld\n",
+           strftime("%H:%M:%S.%f", nsecs), probe, comm, pid,
+           args->name, args->ino, args->nr_to_write);
 }
 
 tracepoint:writeback:balance_dirty_pages /args->pause > 0/ {
     @throttle_ms[comm] = sum(args->pause);
-    printf("%-9s %-16s %-6d bdi=%s pause=%ldms dirty=%lu/%lu wb_dirty=%lu\n",
-           "THROTTLE", comm, pid, args->bdi, args->pause,
+    printf("%-15s %-50s %-16s %-6d bdi=%s pause=%ldms dirty=%lu/%lu wb_dirty=%lu\n",
+           strftime("%H:%M:%S.%f", nsecs), probe, comm, pid,
+           args->bdi, args->pause,
            args->dirty, args->limit, args->wb_dirty);
 }
 

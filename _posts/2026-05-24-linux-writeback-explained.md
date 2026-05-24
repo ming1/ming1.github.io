@@ -719,7 +719,7 @@ tracepoint:writeback:balance_dirty_pages /args->pause>0/ { ... }
 
 /* High-frequency event - aggregate only, no live printf */
 tracepoint:writeback:writeback_mark_inode_dirty {
-    @mark_dirty[kstack(8), args->name, args->ino] = count();
+    @mark_dirty[kstack(8), args->name] = count();
 }
 
 END {                                       # aggregates printed on Ctrl-C
@@ -737,11 +737,18 @@ needed, applying one is a type error on bpftrace ≥ ~2024.
 Sample live output during a `dd if=/dev/zero of=/mnt/big bs=1M count=2000`:
 
 ```
-EVENT     COMM             PID    DETAIL
-THROTTLE  dd               31204  bdi=8:0 pause=27ms dirty=204800/262144 wb_dirty=198302
-reason    kworker/u8:3     142    bdi=8:0 reason=periodic nr_pages=9223372036854775807
-write     kworker/u8:3     142    bdi=8:0 ino=24117249 nr_to_write=1024
+TIME            PROBE                                              COMM             PID    DETAIL
+12:34:56.812341 tracepoint:writeback:balance_dirty_pages           dd               31204  bdi=8:0 pause=27ms dirty=204800/262144 wb_dirty=198302
+12:34:56.834906 tracepoint:writeback:writeback_start               kworker/u8:3     142    bdi=8:0 reason=periodic nr_pages=9223372036854775807
+12:34:56.835218 tracepoint:writeback:writeback_single_inode_start  kworker/u8:3     142    bdi=8:0 ino=24117249 nr_to_write=1024
 ```
+
+Each live line carries a microsecond timestamp (`%H:%M:%S.%f` via
+bpftrace's `strftime` extension) and the full
+`tracepoint:writeback:*` probe name, so events can be correlated
+against other tracers (`dmesg`, `perf trace`, `journalctl`) by
+wall-clock time and distinguished by probe even when their
+DETAIL columns look similar.
 
 And on Ctrl-C:
 
@@ -751,7 +758,7 @@ And on Ctrl-C:
 @reasons[sda, periodic]:    142
 @reasons[sda, sync]:          4
 
-=== inode-dirty calls (by stack, bdi, inode) ===
+=== inode-dirty calls (by stack, bdi) ===
 @mark_dirty[
     __mark_inode_dirty+0x6f
     generic_update_time+0x6c
@@ -761,7 +768,7 @@ And on Ctrl-C:
     ksys_write+0x6f
     do_syscall_64+0x80
     entry_SYSCALL_64_after_hwframe+0x6e
-, sda, 24117249]: 2048
+, sda]: 2048
 
 === cumulative throttle pause (ms) per task ===
 @throttle_ms[dd]:          14820
@@ -769,24 +776,25 @@ And on Ctrl-C:
 
 ### Reading the output
 
-Three live event prefixes plus one summary aggregate. Live first, in
-the order events naturally happen:
+Three live probes plus one summary aggregate. Live first, in the
+order events naturally happen:
 
-1. **`reason`** — `wb_writeback()` is starting to flush a work item.
-   `reason=` says *why* — `periodic` (the 5-second timer),
-   `background` (dirty count exceeded `dirty_background_ratio`),
-   `vmscan` (reclaim pressure), `sync` (a `sync(2)` caller),
-   `fs_free_space`, `forker_thread`, or `foreign_flush`.
-   `nr_pages=9223372036854775807` is `LONG_MAX`, used to mean
-   "flush everything". This hook is `writeback_start` rather than
-   `writeback_queue` because periodic and background work is built
-   on the stack inside `wb_workfn` and skips `wb_queue_work` — it
-   would never appear via `writeback_queue` even though it is the
-   dominant writeback source.
-2. **`write`** — `wb_workfn` started writing one inode's pages.
-   `comm` here is the kworker (`kworker/u8:3:writeback`-style)
-   handling the work item.
-3. **`THROTTLE`** — `balance_dirty_pages` slept a dirtier. `pause` is
+1. **`tracepoint:writeback:writeback_start`** — `wb_writeback()` is
+   starting to flush a work item. `reason=` says *why* — `periodic`
+   (the 5-second timer), `background` (dirty count exceeded
+   `dirty_background_ratio`), `vmscan` (reclaim pressure), `sync`
+   (a `sync(2)` caller), `fs_free_space`, `forker_thread`, or
+   `foreign_flush`. `nr_pages=9223372036854775807` is `LONG_MAX`,
+   used to mean "flush everything". This hook is `writeback_start`
+   rather than `writeback_queue` because periodic and background
+   work is built on the stack inside `wb_workfn` and skips
+   `wb_queue_work` — it would never appear via `writeback_queue`
+   even though it is the dominant writeback source.
+2. **`tracepoint:writeback:writeback_single_inode_start`** —
+   `wb_workfn` started writing one inode's pages. `comm` here is
+   the kworker (`kworker/u8:3:writeback`-style) handling the work
+   item.
+3. **`tracepoint:writeback:balance_dirty_pages`** — the throttler slept a dirtier. `pause` is
    in milliseconds (the kernel already converted from jiffies in the
    tracepoint's `TP_fast_assign`), capped at `MAX_PAUSE` (~200 ms at
    `HZ=1000`). Sustained pauses for one task on one BDI mean the
@@ -795,7 +803,7 @@ the order events naturally happen:
 
 And the END-only aggregate:
 
-4. **`@mark_dirty[kstack, bdi, ino]`** — every
+4. **`@mark_dirty[kstack, bdi]`** — every
    `writeback:writeback_mark_inode_dirty` event (the entry into
    `__mark_inode_dirty`) collapses by unique
    (kernel stack, BDI, inode) tuple. Live printing is suppressed
