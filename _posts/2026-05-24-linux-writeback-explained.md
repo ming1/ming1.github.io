@@ -686,16 +686,32 @@ is exposed as `ino`; resolve it to a path with
 `find <mountpoint> -inum <ino>` or
 `debugfs -R 'ncheck <ino>' /dev/<dev>` from userspace after the fact.
 
-## Reasons by BDI
+## One Script, Four Views
 
-Count writeback work-queueing events grouped by reason and device.
-Answers "what kicks writeback on this host, and how often?"
+The script below hooks the four tracepoints needed to answer the
+recurring writeback questions in one run: **why** writeback fires,
+**who** is dirtying inodes, **what** the workqueue is flushing, and
+**when** dirtiers get throttled. Save as `writeback-observe.bt` and
+run as root.
 
 ```bash
 #!/usr/bin/env bpftrace
+/*
+ * writeback-observe.bt
+ *
+ * One-shot view of the Linux writeback subsystem using only the
+ * stable tracepoints under include/trace/events/writeback.h.
+ *
+ *   reason   - why writeback was queued (background / sync / vmscan / ...)
+ *   dirty    - which task dirtied which inode on which BDI, with stack
+ *   write    - which inode wb_workfn is flushing right now
+ *   THROTTLE - dirtiers slept by balance_dirty_pages, with pause in ms
+ *
+ * Per-event lines stream live; aggregate summaries print on Ctrl-C.
+ */
 
 BEGIN {
-    /* enum wb_reason, see include/linux/backing-dev-defs.h:45 */
+    /* enum wb_reason - see include/linux/backing-dev-defs.h:45 */
     @reason[0] = "background";
     @reason[1] = "vmscan";
     @reason[2] = "sync";
@@ -703,46 +719,53 @@ BEGIN {
     @reason[4] = "fs_free_space";
     @reason[5] = "forker_thread";
     @reason[6] = "foreign_flush";
+
+    printf("%-9s %-16s %-6s %s\n", "EVENT", "COMM", "PID", "DETAIL");
 }
 
 tracepoint:writeback:writeback_queue {
-    @count[str(args->name), @reason[args->reason]] = count();
+    @reasons[str(args->name), @reason[args->reason]] = count();
+    printf("%-9s %-16s %-6d bdi=%s reason=%s nr_pages=%ld\n",
+           "reason", comm, pid, str(args->name),
+           @reason[args->reason], args->nr_pages);
 }
 
-END { clear(@reason); }
-```
+tracepoint:writeback:writeback_dirty_inode_start {
+    @dirtied_by[comm] = count();
+    printf("%-9s %-16s %-6d bdi=%s ino=%llu\n",
+           "dirty", comm, pid, str(args->name), args->ino);
+    print(kstack(8));
+}
 
-Sample output on a typical desktop:
+tracepoint:writeback:writeback_single_inode_start {
+    printf("%-9s %-16s %-6d bdi=%s ino=%llu nr_to_write=%ld\n",
+           "write", comm, pid, str(args->name),
+           args->ino, args->nr_to_write);
+}
 
-```
-@count[sda, periodic]:   142
-@count[sda, background]:  18
-@count[sda, sync]:         4
-@count[dm-0, vmscan]:      2
-```
+tracepoint:writeback:balance_dirty_pages /args->pause > 0/ {
+    @throttle_ms[comm] = sum(args->pause);
+    printf("%-9s %-16s %-6d bdi=%s pause=%ldms dirty=%lu/%lu wb_dirty=%lu\n",
+           "THROTTLE", comm, pid, str(args->bdi), args->pause,
+           args->dirty, args->limit, args->wb_dirty);
+}
 
-## Who Dirties What, and on Which Device
-
-For each inode-dirty event, capture the dirtier's task and kernel
-stack alongside the inode number and BDI device. Answers
-"which task touched which file on which device?"
-
-```bash
-#!/usr/bin/env bpftrace
-
-tracepoint:writeback:writeback_dirty_inode_start
-{
-    printf("[%-16s pid=%-6d tgid=%-6d] dirty bdi=%s ino=%llu flags=0x%lx\n",
-           comm, pid, tid, str(args->name), args->ino, args->flags);
-    print(kstack);
-    printf("\n");
+END {
+    printf("\n=== writeback work queued (by reason, by bdi) ===\n");
+    print(@reasons);
+    printf("\n=== inode-dirty events (top dirtying tasks) ===\n");
+    print(@dirtied_by);
+    printf("\n=== cumulative throttle pause (ms) per task ===\n");
+    print(@throttle_ms);
+    clear(@reason);
 }
 ```
 
-Sample event:
+Sample live output during a `dd if=/dev/zero of=/mnt/big bs=1M count=2000`:
 
 ```
-[postgres         pid=12873  tgid=12830 ] dirty bdi=8:0 ino=4194561 flags=0x21
+EVENT     COMM             PID    DETAIL
+dirty     dd               31204  bdi=8:0 ino=24117249
 
         __mark_inode_dirty+0x6f
         generic_update_time+0x6c
@@ -752,64 +775,67 @@ Sample event:
         ksys_write+0x6f
         do_syscall_64+0x80
         entry_SYSCALL_64_after_hwframe+0x6e
+
+THROTTLE  dd               31204  bdi=8:0 pause=27ms dirty=204800/262144 wb_dirty=198302
+reason    kworker/u8:3     142    bdi=8:0 reason=periodic nr_pages=9223372036854775807
+write     kworker/u8:3     142    bdi=8:0 ino=24117249 nr_to_write=1024
 ```
 
-Two things to know reading this:
+And on Ctrl-C:
 
-- `bdi` is the kernel's printable BDI name, typically `<major>:<minor>`
-  for block-backed filesystems. Look it up with
-  `cat /sys/dev/block/<major>:<minor>/uevent` if you want the
-  device name (`sda`, `nvme0n1`, …).
-- `ino` is the inode number on that filesystem. Resolve with
-  `find /mnt -inum <ino>` (slow on big trees but exact) or
-  `debugfs -R 'ncheck <ino>' /dev/sda` (ext4-only, fast).
+```
+=== writeback work queued (by reason, by bdi) ===
+@reasons[sda, background]:   18
+@reasons[sda, periodic]:    142
+@reasons[sda, sync]:          4
 
-## What `wb_workfn` Is Writing Right Now
+=== inode-dirty events (top dirtying tasks) ===
+@dirtied_by[dd]:            2048
+@dirtied_by[postgres]:        73
 
-While `wb_workfn` runs, every inode it touches fires
-`writeback_single_inode_start`. Tail this to see the workqueue's
-in-progress writes:
-
-```bash
-#!/usr/bin/env bpftrace
-
-tracepoint:writeback:writeback_single_inode_start
-{
-    printf("[%-16s pid=%-6d] write bdi=%s ino=%llu nr_to_write=%ld\n",
-           comm, pid, str(args->name), args->ino, args->nr_to_write);
-}
+=== cumulative throttle pause (ms) per task ===
+@throttle_ms[dd]:          14820
 ```
 
-`comm` here will typically be `kworker/...:writeback` (a `bdi_wq`
-worker) for background writeback, or the user task for synchronous
-paths.
+### Reading the output
 
-## Throttle Pauses From `balance_dirty_pages`
+Four event prefixes line up with the four tracepoints, in the order
+events naturally happen:
 
-When the PI controller in §5 decides a dirtier must sleep, this
-tracepoint fires *before* `io_schedule_timeout()`. Useful for
-diagnosing "why is my write syscall slow?":
+1. **`dirty`** — a task is calling `__mark_inode_dirty` on an inode.
+   `comm`/`pid` say *who*; `bdi=` is the BDI's printable name (usually
+   `<major>:<minor>`); `ino=` is the inode number on that filesystem.
+   The kernel stack underneath shows the path that led to the dirty
+   call (syscall, VFS layer, filesystem callback).
+2. **`reason`** — a `wb_writeback_work` was queued onto `wb->work_list`,
+   typically by a periodic timer (`periodic`), reclaim (`vmscan`), or
+   a `sync(2)` caller (`sync`). `nr_pages=9223372036854775807` is
+   `LONG_MAX`, used to mean "flush everything".
+3. **`write`** — `wb_workfn` started writing one inode's pages.
+   `comm` here is the kworker (`kworker/u8:3:writeback`-style)
+   handling the work item.
+4. **`THROTTLE`** — `balance_dirty_pages` slept a dirtier. `pause` is
+   in milliseconds (the kernel already converted from jiffies in the
+   tracepoint's `TP_fast_assign`), capped at `MAX_PAUSE` (~200 ms at
+   `HZ=1000`). Sustained pauses for one task on one BDI mean the
+   device cannot keep up with that task's dirty rate, or `dirty_ratio`
+   is too low for the workload.
 
-```bash
-#!/usr/bin/env bpftrace
+### Resolving the supporting fields
 
-tracepoint:writeback:balance_dirty_pages
-/args->pause > 0/
-{
-    printf("[%-16s pid=%-6d] throttled bdi=%s pause=%ldms "
-           "dirty=%lu/%lu wb_dirty=%lu rl=%luKBps task_rl=%luKBps\n",
-           comm, pid, str(args->bdi), args->pause,
-           args->dirty, args->limit,
-           args->wb_dirty,
-           args->dirty_ratelimit, args->task_ratelimit);
-}
-```
-
-The `pause` field is in **milliseconds** (the kernel already converted
-from jiffies in the tracepoint's `TP_fast_assign`), capped at
-`MAX_PAUSE` (~200 ms). Sustained non-zero pauses for one task on one
-BDI mean either the device cannot keep up with that task's dirty rate
-or `dirty_ratio` is too low for the workload.
+- **BDI name → block device.** `bdi=8:0` is `<major>:<minor>`.
+  Translate with `cat /sys/dev/block/8:0/uevent` (gives
+  `DEVNAME=sda` etc.). For NFS, FUSE, and other non-block backings
+  the BDI uses a string name like `0:42`.
+- **Inode number → path.** Resolve `ino` to a file name with one of:
+  ```bash
+  find /mnt -inum <ino>             # any FS, slow on large trees
+  debugfs -R 'ncheck <ino>' /dev/sda  # ext2/3/4 only, fast
+  xfs_db -r -c "inode <ino>" -c print /dev/sda  # XFS
+  ```
+  The script deliberately does *not* walk the dentry chain inside the
+  trace — that would risk dereferencing freed VFS objects on the
+  fast path. Resolve from userspace after the fact.
 
 ## Verifying the Tracepoints Are Available
 
