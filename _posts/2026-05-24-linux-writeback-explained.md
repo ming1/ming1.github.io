@@ -671,8 +671,8 @@ The most useful ones for diagnosis:
 
 | Tracepoint | When it fires | Key fields |
 |------------|--------------|------------|
-| `writeback:writeback_queue` | A `wb_writeback_work` is enqueued | `name` (bdi), `reason`, `nr_pages`, `sync_mode` |
-| `writeback:writeback_start` / `writeback_written` | Work item begins / finishes execution | same as above |
+| `writeback:writeback_start` | A `wb_writeback_work` enters `wb_writeback()` (fires for every writeback, including periodic/background) | `name` (bdi), `reason`, `nr_pages`, `sync_mode` |
+| `writeback:writeback_queue` / `writeback_written` | An explicit enqueue / completion | same as above |
 | `writeback:writeback_mark_inode_dirty` | Entry into `__mark_inode_dirty` (hot path) | `name` (bdi), `ino`, `state`, `flags` |
 | `writeback:writeback_single_inode_start` | One inode's pages start writing | `name` (bdi), `ino`, `nr_to_write` |
 | `writeback:writeback_pages_written` | `wb_workfn` reports how many pages it wrote | `pages` |
@@ -712,7 +712,7 @@ BEGIN {                                     # enum wb_reason lookup
     @reason[6] = "foreign_flush";
 }
 
-tracepoint:writeback:writeback_queue { ... }              /* "reason" */
+tracepoint:writeback:writeback_start { ... }              /* "reason" */
 tracepoint:writeback:writeback_single_inode_start { ... } /* "write"  */
 tracepoint:writeback:balance_dirty_pages /args->pause>0/ { ... }
                                                           /* "THROTTLE" */
@@ -772,10 +772,17 @@ And on Ctrl-C:
 Three live event prefixes plus one summary aggregate. Live first, in
 the order events naturally happen:
 
-1. **`reason`** — a `wb_writeback_work` was queued onto `wb->work_list`,
-   typically by a periodic timer (`periodic`), reclaim (`vmscan`), or
-   a `sync(2)` caller (`sync`). `nr_pages=9223372036854775807` is
-   `LONG_MAX`, used to mean "flush everything".
+1. **`reason`** — `wb_writeback()` is starting to flush a work item.
+   `reason=` says *why* — `periodic` (the 5-second timer),
+   `background` (dirty count exceeded `dirty_background_ratio`),
+   `vmscan` (reclaim pressure), `sync` (a `sync(2)` caller),
+   `fs_free_space`, `forker_thread`, or `foreign_flush`.
+   `nr_pages=9223372036854775807` is `LONG_MAX`, used to mean
+   "flush everything". This hook is `writeback_start` rather than
+   `writeback_queue` because periodic and background work is built
+   on the stack inside `wb_workfn` and skips `wb_queue_work` — it
+   would never appear via `writeback_queue` even though it is the
+   dominant writeback source.
 2. **`write`** — `wb_workfn` started writing one inode's pages.
    `comm` here is the kworker (`kworker/u8:3:writeback`-style)
    handling the work item.

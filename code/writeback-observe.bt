@@ -35,7 +35,14 @@ BEGIN {
     printf("%-9s %-16s %-6s %s\n", "EVENT", "COMM", "PID", "DETAIL");
 }
 
-tracepoint:writeback:writeback_queue {
+/*
+ * writeback_start fires inside wb_writeback() for every work item -
+ * explicit enqueues (sync(2), reclaim) AND the stack-constructed work
+ * built by wb_check_old_data_flush / wb_check_background_flush.
+ * writeback_queue, by contrast, fires only for explicit enqueues and
+ * would miss periodic + background entirely.
+ */
+tracepoint:writeback:writeback_start {
     @reasons[args->name, @reason[args->reason]] = count();
     printf("%-9s %-16s %-6d bdi=%s reason=%s nr_pages=%ld\n",
            "reason", comm, pid, args->name,
