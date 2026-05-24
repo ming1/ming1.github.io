@@ -657,6 +657,178 @@ The writeback subsystem sits between several others and is usually the
 
 ---
 
+# Observing Writeback With bpftrace
+
+The writeback subsystem exposes a rich set of **stable tracepoints**
+under
+[`include/trace/events/writeback.h`](https://elixir.bootlin.com/linux/latest/source/include/trace/events/writeback.h).
+Tracepoints are part of the kernel ABI: their names and field names
+do not change across releases, which makes them the right hook for
+production observability — preferred over `kprobe`s on internal
+helpers that can be renamed or inlined away.
+
+The most useful ones for diagnosis:
+
+| Tracepoint | When it fires | Key fields |
+|------------|--------------|------------|
+| `writeback:writeback_queue` | A `wb_writeback_work` is enqueued | `name` (bdi), `reason`, `nr_pages`, `sync_mode` |
+| `writeback:writeback_start` / `writeback_written` | Work item begins / finishes execution | same as above |
+| `writeback:writeback_dirty_inode_start` | An inode is being marked dirty | `name` (bdi), `ino`, `state`, `flags` |
+| `writeback:writeback_single_inode_start` | One inode's pages start writing | `name` (bdi), `ino`, `nr_to_write` |
+| `writeback:writeback_pages_written` | `wb_workfn` reports how many pages it wrote | `pages` |
+| `writeback:balance_dirty_pages` | A dirtier is throttled | `bdi`, `dirty`, `limit`, `pause`, `dirty_ratelimit` |
+| `writeback:global_dirty_state` | Periodic snapshot of dirty counters | `nr_dirty`, `nr_writeback`, `bg_thresh`, `thresh` |
+
+The BDI device name is already a string field on the tracepoint
+(filled via `bdi_dev_name(wb->bdi)`), so you do not need to chase
+pointers to identify the underlying block device. The inode number
+is exposed as `ino`; resolve it to a path with
+`find <mountpoint> -inum <ino>` or
+`debugfs -R 'ncheck <ino>' /dev/<dev>` from userspace after the fact.
+
+## Reasons by BDI
+
+Count writeback work-queueing events grouped by reason and device.
+Answers "what kicks writeback on this host, and how often?"
+
+```bash
+#!/usr/bin/env bpftrace
+
+BEGIN {
+    /* enum wb_reason, see include/linux/backing-dev-defs.h:45 */
+    @reason[0] = "background";
+    @reason[1] = "vmscan";
+    @reason[2] = "sync";
+    @reason[3] = "periodic";
+    @reason[4] = "fs_free_space";
+    @reason[5] = "forker_thread";
+    @reason[6] = "foreign_flush";
+}
+
+tracepoint:writeback:writeback_queue {
+    @count[str(args->name), @reason[args->reason]] = count();
+}
+
+END { clear(@reason); }
+```
+
+Sample output on a typical desktop:
+
+```
+@count[sda, periodic]:   142
+@count[sda, background]:  18
+@count[sda, sync]:         4
+@count[dm-0, vmscan]:      2
+```
+
+## Who Dirties What, and on Which Device
+
+For each inode-dirty event, capture the dirtier's task and kernel
+stack alongside the inode number and BDI device. Answers
+"which task touched which file on which device?"
+
+```bash
+#!/usr/bin/env bpftrace
+
+tracepoint:writeback:writeback_dirty_inode_start
+{
+    printf("[%-16s pid=%-6d tgid=%-6d] dirty bdi=%s ino=%llu flags=0x%lx\n",
+           comm, pid, tid, str(args->name), args->ino, args->flags);
+    print(kstack);
+    printf("\n");
+}
+```
+
+Sample event:
+
+```
+[postgres         pid=12873  tgid=12830 ] dirty bdi=8:0 ino=4194561 flags=0x21
+
+        __mark_inode_dirty+0x6f
+        generic_update_time+0x6c
+        file_update_time+0xb5
+        ext4_buffered_write_iter+0x57
+        vfs_write+0x256
+        ksys_write+0x6f
+        do_syscall_64+0x80
+        entry_SYSCALL_64_after_hwframe+0x6e
+```
+
+Two things to know reading this:
+
+- `bdi` is the kernel's printable BDI name, typically `<major>:<minor>`
+  for block-backed filesystems. Look it up with
+  `cat /sys/dev/block/<major>:<minor>/uevent` if you want the
+  device name (`sda`, `nvme0n1`, …).
+- `ino` is the inode number on that filesystem. Resolve with
+  `find /mnt -inum <ino>` (slow on big trees but exact) or
+  `debugfs -R 'ncheck <ino>' /dev/sda` (ext4-only, fast).
+
+## What `wb_workfn` Is Writing Right Now
+
+While `wb_workfn` runs, every inode it touches fires
+`writeback_single_inode_start`. Tail this to see the workqueue's
+in-progress writes:
+
+```bash
+#!/usr/bin/env bpftrace
+
+tracepoint:writeback:writeback_single_inode_start
+{
+    printf("[%-16s pid=%-6d] write bdi=%s ino=%llu nr_to_write=%ld\n",
+           comm, pid, str(args->name), args->ino, args->nr_to_write);
+}
+```
+
+`comm` here will typically be `kworker/...:writeback` (a `bdi_wq`
+worker) for background writeback, or the user task for synchronous
+paths.
+
+## Throttle Pauses From `balance_dirty_pages`
+
+When the PI controller in §5 decides a dirtier must sleep, this
+tracepoint fires *before* `io_schedule_timeout()`. Useful for
+diagnosing "why is my write syscall slow?":
+
+```bash
+#!/usr/bin/env bpftrace
+
+tracepoint:writeback:balance_dirty_pages
+/args->pause > 0/
+{
+    printf("[%-16s pid=%-6d] throttled bdi=%s pause=%ldms "
+           "dirty=%lu/%lu wb_dirty=%lu rl=%luKBps task_rl=%luKBps\n",
+           comm, pid, str(args->bdi), args->pause,
+           args->dirty, args->limit,
+           args->wb_dirty,
+           args->dirty_ratelimit, args->task_ratelimit);
+}
+```
+
+The `pause` field is in **milliseconds** (the kernel already converted
+from jiffies in the tracepoint's `TP_fast_assign`), capped at
+`MAX_PAUSE` (~200 ms). Sustained non-zero pauses for one task on one
+BDI mean either the device cannot keep up with that task's dirty rate
+or `dirty_ratio` is too low for the workload.
+
+## Verifying the Tracepoints Are Available
+
+```bash
+# List all writeback tracepoints on the running kernel
+ls /sys/kernel/debug/tracing/events/writeback/
+
+# Inspect a tracepoint's field layout
+cat /sys/kernel/debug/tracing/events/writeback/writeback_queue/format
+```
+
+If a tracepoint listed above is missing, your kernel was built without
+`CONFIG_FTRACE` / `CONFIG_TRACEPOINTS` or with a writeback subsystem
+older than ~v4.2 (the `balance_dirty_pages` tracepoint landed in
+`v3.2`, `writeback_single_inode` in `v3.8`, the `wb_reason` argument
+gained `FOREIGN_FLUSH` in `v4.2`).
+
+---
+
 # Summary
 
 **Main advantages**
