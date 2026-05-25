@@ -514,8 +514,9 @@ cluster required. The cluster is only the *deployment vehicle* for the
 preconditions; the kernel mechanism is plain `unshare(CLONE_NEWNS)` plus
 ordering of process exits. Below: a local repro using
 [`rublk`](https://github.com/ublk-org/rublk) (the Rust reference daemon
-built on libublk-rs), then a K8s `Pod` manifest that produces the same
-state in-cluster.
+built on libublk-rs), a K8s `Pod` manifest that produces the same state
+in-cluster, and a single-host Podman pod variant that exercises the same
+multi-container structure without needing a cluster.
 
 ### 11.1 Prerequisites
 
@@ -685,7 +686,107 @@ Confirm on the node:
 # echo w > /proc/sysrq-trigger    # also prints the trace to dmesg
 ```
 
-### 11.4 Why the repro needs `setsid`
+### 11.4 Podman pod repro
+
+If you want the multi-container, shared-namespace structure of the K8s
+repro but without a cluster, a Podman pod gives you the same dynamic on
+a single host. The wrinkle is that Podman's pod `--share` flag covers
+`pid`, `ipc`, `uts`, `net` — **but not `mnt`**. To reproduce the bug we
+have to share the mount namespace by hand, via `nsenter` into a
+long-lived "anchor" container that plays the role of K8s' idle workload
+container.
+
+The structural mapping:
+
+| K8s pod element | Podman equivalent |
+|---|---|
+| `pause` infra container holding namespaces | Pod's infra container (auto-created) |
+| `shareProcessNamespace: true` | `podman pod create --share=pid,...` |
+| Long-lived workload container (`sleep infinity`) | `ublk-idle` container — anchors `mnt_ns` |
+| `initContainers` block (setup + `setsid rublk`) | `ublk-setup` container that `nsenter`s into `ublk-idle`'s mount ns |
+| `kubectl delete --grace-period=0` | `podman pod kill --signal=KILL` |
+
+```bash
+# One-time: build a test image with rublk + util-linux.
+podman image exists ublk-test:local || podman build -t ublk-test:local - <<'EOF'
+FROM fedora:latest
+RUN dnf -y install e2fsprogs util-linux kmod procps-ng cargo gcc \
+        clang openssl-devel && \
+    cargo install rublk --root /usr/local && \
+    dnf -y remove cargo gcc clang openssl-devel && dnf clean all
+EOF
+
+# Pod with shared PID namespace so the setup container can see the
+# anchor container's PID 1 and nsenter into its mount namespace.
+podman pod create --name ublk-pod --share=pid,ipc,uts,net
+
+# Anchor container: pure 'sleep infinity'. Its mnt_ns is the one we
+# care about — it stays alive until the pod is killed, holding the
+# mount on /dev/ublkb0.
+podman run --rm -d --pod=ublk-pod --privileged --name ublk-idle \
+    -v /dev:/dev fedora:latest sleep infinity
+
+# Setup container: shares pod PID ns, nsenter into PID 1's mnt_ns
+# (which is the anchor's), set up the device + mount there, then exit.
+podman run --rm --pod=ublk-pod --privileged --name ublk-setup \
+    -v /lib/modules:/lib/modules:ro \
+    -v /dev:/dev \
+    ublk-test:local /bin/sh -c '
+        modprobe ublk_drv || true
+        # PID 1 in the pod is the anchor container'\''s sleep -> its mnt_ns.
+        nsenter -t 1 -m -- /bin/sh -c "
+            truncate -s 1G /tmp/disk.img
+            setsid rublk add -n 0 -t loop -f /tmp/disk.img -q 1 \
+                </dev/null >/tmp/rublk.log 2>&1
+            sleep 2
+            mkfs.ext4 -F /dev/ublkb0
+            mkdir -p /mnt/ublk
+            mount /dev/ublkb0 /mnt/ublk
+            dd if=/dev/zero of=/mnt/ublk/dirty bs=1M count=64 conv=fsync
+        "
+        # ublk-setup exits here.  rublk (different session, started via
+        # setsid inside the anchor'\''s mnt_ns) lives on, reparented to
+        # PID 1 of the shared PID ns (the anchor'\''s sleep).
+    '
+
+# Trigger: kill every container's main process in the pod.
+# The anchor's PID 1 (sleep) and rublk both get SIGKILL.  rublk has
+# the heavier do_exit (io_uring teardown, multiple worker threads,
+# request_queue with the ext4 mount on top), so it finishes nsproxy
+# cleanup last and inherits the __cleanup_mnt task_work — wedging on
+# its own flush bio, just like in production.
+podman pod kill --signal=KILL ublk-pod
+
+# Observe on the host (note: the pod will not finish stopping, since
+# Podman waits for the wedged rublk to reap):
+DAEMON_PID=$(pgrep -of rublk)
+echo "rublk PID: $DAEMON_PID"
+cat /proc/${DAEMON_PID}/status | grep -E '^(State|Tgid|Pid):'
+cat /proc/${DAEMON_PID}/stack
+```
+
+Expected `/proc/$PID/stack` is identical to §11.2 and §11.3 — the kernel
+mechanism does not care whether the namespace was created by `unshare(1)`,
+`runc`, or Podman's infra container; the deadlock only depends on the
+shape of `mnt_ns` refcount drops at exit time.
+
+Cleanup after observing (the pod will not stop on its own):
+
+```bash
+# rublk is stuck in D state — you cannot kill it.  Remove the pod by
+# force; Podman will leave the kernel task dangling until reboot.
+podman pod rm -f ublk-pod
+# Confirm the task is still wedged after the pod is gone:
+ps -p ${DAEMON_PID} -o stat,comm 2>/dev/null && echo "still D-state"
+```
+
+The "the task survives the pod" observation is itself instructive: it
+shows that the deadlock lives in the kernel's `do_exit` path, not in any
+userspace orchestrator state — there is nothing Podman/kubelet/containerd
+can do to unwedge it once the flush bio is in flight against a dead ublk
+backend.
+
+### 11.5 Why the repro needs `setsid`
 
 Without `setsid`, the inner bash's exit sends `SIGHUP` to its job-controlled
 children (including `rublk`) because the controlling-terminal hang-up
@@ -701,7 +802,7 @@ it `SIGHUP`. That makes the kill order predictable: bash exits cleanly,
 deterministically triggers the deadlock on `rublk` — matching the
 production scenario.
 
-### 11.5 Observation aids
+### 11.6 Observation aids
 
 Useful commands while a deadlock is live:
 
