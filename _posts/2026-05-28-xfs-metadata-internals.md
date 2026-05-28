@@ -93,6 +93,10 @@ zooms into each box.
 
 # High-Level Architecture
 
+## Layout
+
+![XFS ondisk layout](/assets/images/xfs_layout.png)
+
 ## Allocation groups
 
 XFS partitions the volume into **allocation groups (AGs)**, each a
