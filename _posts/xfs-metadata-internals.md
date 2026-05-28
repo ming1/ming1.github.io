@@ -178,11 +178,15 @@ helps to look at them together:
   in this AG without scanning. Kernel entry point:
   [`xfs_read_agf`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_alloc.c#L3365).
 - **AGI** points at the inode btree (`inobt`) and the free-inode btree
-  (`finobt`), and owns the **`agi_unlinked[64]`** array — 64 buckets
-  of unlinked-but-open inodes used to keep inode chunks reachable
-  through a crash. The unlinked list is the reason `unlink()` of an
-  open file in XFS is journal-only, not a leaked block: the AGI bucket
-  hash is logged.
+  (`finobt`), and owns the **`agi_unlinked[64]`** array — 64
+  hash-bucket heads of a per-AG list of inodes that have nlink == 0
+  but are still open. Their blocks are *not yet* freed; the buckets
+  exist so a crash before the last close can't orphan them: the next
+  mount walks each bucket and finishes the eviction. That is also
+  why `unlink()` of an open file in XFS only logs a small AGI edit
+  rather than freeing anything: the on-disk state is "still
+  reachable from the unlinked list", and the eventual free runs from
+  the last close (or from recovery).
 - **AGFL** is a ring of single free blocks reserved to bootstrap btree
   splits. The free-space btree itself needs free blocks to grow, so
   pulling those out of the btree would be circular. The AGFL pre-stages
@@ -222,11 +226,16 @@ dumps all three for one AG:
 
 ## Purpose and layout
 
-An inode in XFS is a fixed-size record, typically 512 bytes today
-(`sb_inodesize`). It lives inside an **inode chunk** — a contiguous
-group of 64 inodes (or `XFS_INODES_PER_CHUNK`) allocated in one
-extent inside an AG. The inode number encodes its (AG, AG block,
-offset-within-chunk) tuple.
+An inode in XFS is a fixed-size record, typically 512 bytes today on
+v5 filesystems (`sb_inodesize`). It lives inside an **inode chunk** —
+a logically contiguous group of 64 inodes (`XFS_INODES_PER_CHUNK`)
+allocated inside an AG. The inode number encodes its (AG, AG block,
+offset-within-chunk) tuple. With the `sparse_inodes` feature (on by
+default in recent `mkfs.xfs`) a chunk's on-disk blocks may be a
+strict subset of the full 64-inode footprint — the inobt record then
+carries a `holemask` marking which 4K inode-cluster blocks are
+actually allocated, and inodes inside an unallocated cluster simply
+don't exist. The structure of the chunk is otherwise unchanged.
 
 ```
  ┌──────────────────────────────────────────────────────────────┐
@@ -248,14 +257,19 @@ Core fields that matter for debugging:
 
 - `di_magic`, `di_version`: integrity / format gate.
 - `di_format`, `di_aformat`: encoding of the data and attr forks.
-  Possible values: `dev` (0), `local` (1, payload inline),
-  `extents` (2, array of `xfs_bmbt_rec`), `btree` (3, bmbt root in
-  the literal area). Local-format dirs and symlinks have no extents
-  at all.
+  Possible values: `dev` (0, only on special files — char/block
+  devices, sockets, FIFOs), `local` (1, payload inline), `extents`
+  (2, array of `xfs_bmbt_rec`), `btree` (3, bmbt root in the literal
+  area). Regular files only ever use `local`/`extents`/`btree`.
+  Local-format dirs and symlinks have no extents at all.
 - `di_nextents` / `di_anextents`: counts that match the array size in
   *extents* format.
-- `di_flushiter`: bumped each `xfs_iflush`. Recovery uses it to skip
-  log items already overwritten on disk.
+- `di_lsn` (v5 / CRC inodes): last log sequence number that touched
+  this inode. Recovery compares against the log item's LSN to skip
+  replays whose home block is already newer. On legacy v4 inodes the
+  equivalent role is played by `di_flushiter`, which is bumped each
+  `xfs_iflush`; v5 made it a proper LSN and `di_flushiter` is no
+  longer maintained.
 
 The full structure is in
 [`xfs_format.h`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_format.h);
@@ -336,9 +350,12 @@ extracted by `dd`. Both tag the most important fields back to
 
 ## Why btrees everywhere
 
-XFS uses B+ trees for every variable-cardinality lookup: free space
-(twice), inodes, file extent maps, reverse maps (rmap), reference
-counts (reflink). The shape is shared via
+XFS uses B+ trees for every variable-cardinality lookup. Per-AG:
+free space by start block (bnobt), free space by length (cntbt),
+allocated inode chunks (inobt), inode chunks with at least one free
+slot (finobt), reverse maps (rmapbt), and reference counts
+(refcountbt) — six on a modern v5 filesystem. Per-inode: the file
+extent map (bmbt). The shape is shared via
 [`struct xfs_btree_cur`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_btree.h) —
 a per-cursor object that hides the per-tree differences (key compare,
 record format, leaf size) behind ops vectors. Code that walks the
@@ -401,9 +418,15 @@ is why the kernel has only one btree walker.
 A btree mutation always happens inside a transaction. The buffers that
 back tree blocks get joined (`xfs_trans_bjoin`), logged with their
 range of modified bytes (`xfs_trans_log_buf`), and on commit attach a
-buffer log item to the CIL. Splits and merges generate intent items
-(EFI/EFD pairs from free-block allocations) so that the multi-step
-edit is restartable if it crashes halfway through.
+buffer log item to the CIL. Where a mutation has to free blocks that
+the transaction itself can't finish in-line — e.g. a bmap update on
+the data fork that releases an extent, or a merge that releases an
+interior btree block — the free is deferred and logged as an
+EFI/EFD pair (and any matching BUI/BUD or RUI/RUD), so a crash
+between the intent and the done leaves enough state in the log for
+the next mount to finish the work. Allocations themselves don't
+produce intents; they edit the free-space btrees directly inside the
+transaction.
 
 ---
 
@@ -460,10 +483,15 @@ different btree.
 ## The CIL
 
 The **Committed Item List** is an in-memory aggregator between
-transaction commit and on-disk log record. It deduplicates: if 100
-threads all log the same AGF buffer's `freeblks` field within one
-checkpoint window, only one buffer log item is in the CIL, not 100.
-The data structure is
+transaction commit and on-disk log record. It absorbs **relogging**:
+the log item attached to a dirty buffer or inode is a singleton, so a
+sequence of transactions that all dirty the same AGF buffer's
+`freeblks` field within one checkpoint window keeps reusing one
+buffer log item and accumulating dirty byte ranges into it. The CIL
+push then formats that one item once, no matter how many
+transactions touched the buffer. (Concurrent transactions can't race
+here — the buffer lock serializes them; the win is across *sequential*
+transactions inside the checkpoint window.) The data structure is
 [`struct xfs_cil`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/xfs_log_priv.h#L284),
 holding a current context (`xfs_cil_ctx`) plus per-CPU staging lists.
 
@@ -518,8 +546,11 @@ recovery may still need to replay through that point.
 
 ## Log force and fsync
 
-`xfs_log_force(mp, lsn)` ensures every log record up to `lsn` is on
-disk. `fsync(2)` on XFS lives in
+`xfs_log_force(mp, flags)` flushes everything currently in the CIL
+out to the log device; `xfs_log_force_seq(mp, seq, flags, log_flushed)`
+does the same but only up to a specific CIL sequence (used to wait for
+"my transaction" instead of "all transactions"). `fsync(2)` on XFS
+lives in
 [`xfs_file_fsync`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/xfs_file.c#L125)
 and does, roughly:
 
@@ -539,16 +570,24 @@ intervenes.
 
 On mount of an uncleanly-unmounted filesystem,
 [`xlog_recover`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/xfs_log_recover.c)
-does two passes:
+walks the log in several ordered phases:
 
-- **Pass 1 (intent pass)**: scan the log forward, build the list of
-  intent items that have no matching done.
-- **Pass 2 (replay pass)**: walk forward again, replaying buffer and
-  inode log items into their home blocks, skipping any whose
-  `di_flushiter` / buffer LSN says the home block is already newer.
-  Unmatched intents are then drained — for each EFI without an EFD,
-  finish the free; for each BUI without a BUD, finish the bmap update;
-  etc.
+- **Scan**: read the log forward and build an in-memory hash of
+  checkpoints and the items inside them, pairing intents with their
+  matching `done` records as they're seen.
+- **Replay buffers**: walk the items and write buffer log items back
+  to their home blocks, skipping any whose buffer LSN says the home
+  block is already newer. Buffers go first so that any inode cluster
+  blocks (and any blocks an `icreate` references) exist and are
+  zero-initialised before inodes touch them.
+- **Replay inodes and icreate**: replay inode log items into their
+  cluster buffers, using `di_lsn` (v5) or `di_flushiter` (v4) to
+  skip items whose home is already current; replay `icreate`
+  intents to zero freshly allocated inode chunks.
+- **Finish intents**: drain whatever intents remain unmatched — for
+  each EFI without an EFD, finish the free; for each BUI without a
+  BUD, finish the bmap update; for each RUI/CUI without its done,
+  finish the rmap/refcount update.
 
 After replay, the log tail advances; the filesystem is consistent.
 
@@ -621,22 +660,30 @@ item) to the active transaction.
  (clean; back on LRU)
 ```
 
-A buffer carries multiple kinds of pins:
+A buffer carries three independent pieces of state that gate writes:
 
-- **Log pin** — set when the buffer is in the CIL/AIL. While pinned,
-  the buffer cannot be written; it would be hazardous to flush a
-  buffer whose log record hasn't been written yet (that would break
-  WAL).
-- **IO pin** — set while a bio is outstanding.
-- **Lock** — held while a thread is mutating.
+- **Log pin** (`b_pin_count`) — incremented when the buffer is joined
+  to a CIL context, decremented when its log item is unpinned after
+  the checkpoint reaches the AIL. While `b_pin_count > 0` the buffer
+  cannot be written back; flushing a buffer whose log record isn't
+  durable yet would break WAL.
+- **Lock** (`b_sema`) — held by the thread currently mutating or
+  formatting the buffer; not a pin, but the only thing that
+  serialises in-place modifications.
+- **In-flight IO** (`b_io_remaining`) — a refcount on outstanding bios
+  carrying the buffer back to its home block. Completion drains this
+  before `xfs_buf_iodone` runs.
 
 ## Locking and ordering
 
 Metadata buffers are locked in **AG number order** and, within an AG,
 in a canonical order (AGF before AGI before AGFL). This is the
 deadlock-avoidance rule for cross-AG operations like rename across
-directory parents. The convention is enforced by code reviewers, not
-by lockdep classes; reading the relevant `xfs_buf_lock` calls in
+directory parents. Inode locks do install lockdep subclasses
+(`XFS_ILOCK_*`, `XFS_IOLOCK_*`) that encode parent/child and
+inumber-ascending ordering, so violations of *those* trip lockdep
+directly. Buffer ordering, by contrast, is convention enforced by
+review; reading the relevant `xfs_buf_lock` calls in
 `xfs_inode.c::xfs_rename` is the usual onboarding exercise.
 
 ## Delayed write
@@ -817,8 +864,8 @@ The interesting case. With a freshly written file:
    logs the inode (so the i_size and timestamps are captured in a log
    item with a definite LSN).
 3. Push the CIL.
-4. `xfs_log_force_lsn` waits until the on-disk log has covered the
-   inode's LSN.
+4. `xfs_log_force_seq` waits until the on-disk log has covered the
+   CIL sequence that committed the inode's log item.
 5. Issue a device flush.
 
 Run [`xfs-meta-observe-fsync.sh`]({{ site.baseurl }}/code/xfs-meta-observe-fsync.sh)
@@ -869,9 +916,10 @@ home block from it.
   application's responsibility — XFS will recover its metadata to a
   consistent state, but `fsync` is the only contract for "my bytes are
   durable".
-- **The on-disk format is rich.** Five btrees per AG (with rmap and
-  reflink), packed bmbt records, intent/done item types, and the v5
-  CRC-everywhere format mean debugging requires fluency with
+- **The on-disk format is rich.** Six btrees per AG on v5 (bnobt,
+  cntbt, inobt, finobt, rmapbt, refcountbt), packed bmbt records,
+  intent/done item types, and the CRC-everywhere format mean
+  debugging requires fluency with
   `xfs_db`, `xfs_logprint`, and the structures in `xfs_format.h`.
   Scripts like the ones linked from this post are the practical entry
   point to that fluency.
