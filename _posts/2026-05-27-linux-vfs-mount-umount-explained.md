@@ -1451,7 +1451,232 @@ itself via RCU; `delayed_free_vfsmnt` frees the `struct mount` via
 RCU; and `module_put(fs->owner)` from `put_filesystem` lets the XFS
 module be rmmoded.
 
-## 4.4 Why teardown is asynchronous
+## 4.4 Per-FS enforcement of "all I/O before bdev close"
+
+§4.3 ended with `kill_block_super` running `generic_shutdown_super` →
+`put_super` → `bdev_fput`, and noted in passing that *all* filesystem I/O
+must complete inside `put_super` and never leak past `bdev_fput`. The
+VFS does not enforce this with an assert; it enforces it by making the
+alternative non-implementable — once `bdev_fput` runs, the FS has no
+remaining channel into the device (the request queue may freeze, the
+bdev inode is released, the gendisk reference is dropped). The closure
+*is* the gate.
+
+But the VFS knows nothing about *what* metadata needs flushing. It hands
+the FS a `put_super` hook and says "tell me when you're done." Each
+filesystem's implementation of that hook is its own contract with the
+rule. This section walks XFS as the worked example.
+
+### 4.4.1 Where XFS metadata lives in memory
+
+XFS has more in-memory metadata state than most filesystems, and that's
+why its unmount path is the most elaborate. Five distinct caches/queues
+hold metadata that the disk doesn't yet know about:
+
+| Layer | Holds | Drain primitive |
+|---|---|---|
+| **CIL** (Committed Item List) | Log items committed in-memory but not yet packed into an iclog | `xfs_log_force(XFS_LOG_SYNC)` |
+| **iclogs** (in-core log buffers) | Log records formatted but not yet on disk | Same — `xfs_log_force` waits for iclog → disk |
+| **AIL** (Active Item List) | Items already in the log but whose **target metadata block** hasn't been written to its final on-disk location | `xfs_ail_push_all_sync` |
+| **xfs_buf cache** | Metadata buffers (AGF, AGI, inode buffers, btree blocks) — some in-flight, some still dirty | `xfs_buftarg_wait` |
+| **xfs_inode + workers** | Inodes pending inactivation, blockgc speculation, zone GC | `xfs_inodegc_flush`, `xfs_blockgc_stop`, `xfs_zone_gc_stop` |
+
+The AIL is the conceptual centerpiece. Its invariant: **an item is on
+the AIL iff its log record has been written but its target metadata
+block has not yet reached its final disk location**. So "AIL is empty"
+is logically equivalent to "every metadata change ever committed has
+hit its final disk address." That's why `xfs_ail_push_all_sync` is the
+load-bearing call in unmount.
+
+### 4.4.2 The full XFS drain sequence
+
+Reading top-down from `xfs_fs_put_super` (`fs/xfs/xfs_super.c:1218`),
+with each step's job:
+
+```
+xfs_fs_put_super(sb)
+  ├─ xfs_filestream_unmount(mp)             // allocation-hint cache
+  ├─ xfs_unmountfs(mp)                      // fs/xfs/xfs_mount.c:1295
+  │    ├─ xfs_inodegc_flush(mp)             // drain deferred inode inactivation
+  │    │                                    //   (CoW prealloc cleanup, free
+  │    │                                    //    inode btree shape changes)
+  │    ├─ xfs_blockgc_stop(mp)              // speculative-prealloc workers OFF
+  │    ├─ xfs_zone_gc_stop(mp)              // zoned-device GC OFF (if zoned)
+  │    ├─ xfs_fs_unreserve_ag_blocks(mp)    // give back AG reservations
+  │    ├─ xfs_qm_unmount_quotas(mp)         // release dquot inodes
+  │    ├─ xfs_rtunmount_inodes(mp)          // RT bitmap/summary inodes
+  │    ├─ xfs_irele(m_rootip)               // drop root inode ref
+  │    ├─ xfs_irele(m_metadirip)            // drop metadir ref
+  │    ├─ xfs_unmount_flush_inodes(mp)      // last inode flush + wait
+  │    ├─ xfs_qm_unmount(mp)                // tear down quota subsystem
+  │    ├─ xfs_reserve_blocks(0)             // unreserve free-space pool
+  │    │                                    //   (so lazy SB counters are exact)
+  │    ├─ xfs_unmount_check(mp)             // sanity-check incore counters
+  │    └─ xfs_log_unmount(mp)               // ★ THE flush
+  │         └─ xfs_log_clean(mp)
+  │              ├─ xfs_log_quiesce(mp)     // fs/xfs/xfs_log.c:950
+  │              │    ├─ cancel l_work          // stop the log worker
+  │              │    ├─ xfs_log_force(SYNC)    // CIL → iclogs → disk
+  │              │    ├─ xfs_ail_push_all_sync  // every AIL item to final loc
+  │              │    ├─ xfs_buftarg_wait       // wait in-flight metadata bufs
+  │              │    ├─ xfs_buf_lock(m_sb_bp)  // bespoke SB-buffer wait (!)
+  │              │    └─ xfs_log_cover(mp)      // emit covering record
+  │              └─ xfs_log_unmount_write(mp)   // ★ the unmount record itself
+  ├─ xfs_rtmount_freesb(mp), xfs_freesb(mp) // release SB buffer
+  ├─ xfs_destroy_percpu_counters(mp)
+  ├─ xfs_destroy_mount_workqueues(mp)       // tear down workqueues ONLY after
+  │                                         //   AIL/log are already drained
+  └─ xfs_shutdown_devices(mp)               // close RT, log devices
+
+[returns to kill_block_super]
+  ├─ sync_blockdev(bdev)                    // bdev page-cache flush
+  └─ bdev_fput(s_bdev_file)                 // ← main bdev close
+```
+
+Two ordering invariants in this sequence are non-obvious:
+
+- **Background workers stop *before* the AIL drain, workqueues destroy
+  *after*.** `xfs_blockgc_stop` runs early so no new transactions can
+  show up while we're draining; but `xfs_destroy_mount_workqueues` runs
+  near the very end because the workqueues are what *process* AIL items
+  and buffer I/O — destroy them too early and the drain itself stalls.
+- **The unmount record is written AFTER `xfs_log_quiesce` returns.**
+  This is subtle: the quiesce drains everything *already in* the log,
+  then we add exactly one more log record (the unmount marker) and
+  force it. The order matters because the unmount record's meaning —
+  "next mount can skip recovery" — only holds if nothing else is in the
+  log behind it.
+
+### 4.4.3 The bespoke SB-buffer wait
+
+The most instructive single piece of code in this section is six lines
+inside `xfs_log_quiesce` (`fs/xfs/xfs_log.c:968`):
+
+```c
+/*
+ * The superblock buffer is uncached and while xfs_ail_push_all_sync()
+ * will push it, xfs_buftarg_wait() will not wait for it. Further,
+ * xfs_buf_iowait() cannot be used because it was pushed with the
+ * XBF_ASYNC flag set, so we need to use a lock/unlock pair to wait
+ * for the IO to complete.
+ */
+xfs_ail_push_all_sync(mp->m_ail);
+xfs_buftarg_wait(mp->m_ddev_targp);
+xfs_buf_lock(mp->m_sb_bp);
+xfs_buf_unlock(mp->m_sb_bp);
+```
+
+This is the rule made concrete. The general drain primitives
+(`xfs_ail_push_all_sync`, `xfs_buftarg_wait`) cover *most* metadata, but
+the SB buffer takes a different path — it's pushed `XBF_ASYNC`, lives
+outside the cached buftarg, and falls through every generic wait
+mechanism. Without the explicit `xfs_buf_lock(m_sb_bp); xfs_buf_unlock(m_sb_bp);`
+pair, the SB I/O could still be in-flight when we proceed to write the
+unmount record. XFS extends the rule with a bespoke wait targeted at
+exactly one buffer.
+
+That's what "per-FS enhancement" of the I/O-before-bdev-close rule
+looks like up close: a state machine the VFS knows nothing about, with
+a paper-thin lock/unlock pair as the only signal that "that one
+specific I/O has landed."
+
+### 4.4.4 The unmount record: the FS-level "clean" attestation
+
+`xfs_log_unmount_write` is the most important single I/O of the whole
+sequence. Functionally it's just a small log record (`XLOG_UNMOUNT_TYPE`),
+but semantically it's the answer to "what makes the next mount of this
+filesystem fast?" Concretely:
+
+- **If the unmount record is on disk**: `xfs_log_mount` sees
+  `XLOG_UNMOUNT_TYPE` at the tail of the log and skips log replay.
+  Mount is milliseconds.
+- **If it isn't** (crash, power loss, or the unmount record I/O never
+  made it): `xlog_recover` walks every record from the last clean
+  checkpoint forward, re-applies the transactions, replays the
+  metadata. Mount is seconds-to-minutes depending on log size and
+  dirtiness.
+
+This is why XFS *cannot* close the bdev before this single small write
+is on stable storage. Every other metadata write up to this point
+ensures the log is empty; this final write is the on-disk attestation
+of that emptiness. Lose it, and you've turned a clean unmount into the
+moral equivalent of a crash.
+
+### 4.4.5 How other filesystems extend the same rule
+
+**ext4** does an equivalent dance through JBD2:
+
+```
+ext4_put_super
+  ├─ ext4_unregister_li_request          // lazy-init thread off
+  ├─ flush_work(&sbi->s_error_work)
+  ├─ ext4_mb_release(sb)                 // mballoc tear-down
+  ├─ ext4_ext_release(sb)                // extent status tree release
+  ├─ jbd2_journal_destroy(sbi->s_journal)// ★ commit final txn, mark clean
+  └─ ext4_commit_super(sb)               // final SB write
+```
+
+`jbd2_journal_destroy` is ext4's analog of `xfs_log_unmount`: wait for
+all committing transactions, write the final commit, mark the journal
+clean. ext4 doesn't have anything like the AIL — its in-memory metadata
+model is simpler (transactions hold buffer heads, JBD2 commits them
+in-order) — so the drain has fewer distinct layers. The *rule* is the
+same: every metadata change must be on disk before the next step.
+
+**btrfs** adds a twist: multi-device. `close_ctree` must:
+- stop background workers (`cleaner_kthread`, `transaction_kthread`),
+- commit the final transaction (`btrfs_commit_transaction`),
+- write **all four** SB copies to **every** device in the volume
+  (`btrfs_write_dev_supers`),
+- close each device with `btrfs_close_devices`.
+
+The "all I/O before close" rule expands to "all I/O to every device in
+the multi-device set, with consistent SB copies across all of them." A
+single device closed early would mean cross-device divergence and a
+later mount that can't reconcile.
+
+**FUSE** is the degenerate case — `fuse_kill_sb_blk` /
+`fuse_kill_sb_anon` sends a `FUSE_DESTROY` message to the userspace
+daemon and waits for ack. The kernel doesn't issue any I/O of its own;
+whether the *daemon* has persisted its metadata is the daemon's
+problem. The rule is satisfied trivially in the kernel because the
+kernel has nothing to flush; it has been **outsourced** to userspace.
+
+### 4.4.6 The general recipe
+
+Pulling back, the per-FS enhancement of "I/O before bdev close" follows
+a six-step recipe:
+
+1. **Stop sources.** Cancel/quiesce every background worker that could
+   *generate* new metadata I/O (XFS: `xfs_blockgc_stop`,
+   `xfs_inodegc_flush`; ext4: `flush_work(s_error_work)`; btrfs:
+   `kthread_stop(cleaner_kthread)`).
+2. **Drain transactions.** Force every in-memory transaction or log
+   buffer to disk (XFS: `xfs_log_force(SYNC)` + CIL flush; ext4:
+   `jbd2_journal_destroy`; btrfs: `btrfs_commit_transaction`).
+3. **Drain final-location writeback.** Wait for every dirty metadata
+   block to reach its *target* disk address, not just its log copy
+   (XFS: `xfs_ail_push_all_sync` + `xfs_buftarg_wait`; ext4: implicit
+   via JBD2 checkpoint; btrfs: explicit waits in commit path).
+4. **Write the "I'm clean" attestation.** A single small synchronous
+   metadata write whose presence is the disk-level proof of clean
+   shutdown (XFS: unmount record; ext4: clean SB with `EXT4_VALID_FS`;
+   btrfs: final commit SB).
+5. **Tear down workqueues/threads only after the drains are complete.**
+   Order matters — the workers are what *do* the draining.
+6. **Return from `put_super`.** That return value is the FS saying "I
+   have no more I/O to issue; the close is safe."
+
+The VFS owns the *opportunity*, the FS owns the *definition*. XFS's
+definition is unusually rich because XFS's metadata model is unusually
+rich — AIL, CIL, iclogs, deferred inactivation, zoned GC, RT subvolumes,
+external log devices. Each of those state machines contributes one or
+more drain calls to `xfs_unmountfs`, and missing any of them would
+mean closing the bdev with metadata still owed to disk — surfacing on
+the next mount as log recovery in the best case, `xfs_repair`-needed
+corruption in the worst.
+
+## 4.5 Why teardown is asynchronous
 
 The chain "umount(2) returns → SB still alive" is by design. If
 `umount(2)` waited synchronously for `kill_sb` to finish, every
