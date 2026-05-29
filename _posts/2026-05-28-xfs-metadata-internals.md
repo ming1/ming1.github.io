@@ -586,6 +586,85 @@ click instead of grepping for its first explanation.
   `xfs_logprint` output show the right header line (`AGF Buffer:
   XAGF`, `AGI Buffer: XAGI`) for an otherwise opaque buffer dump.
 
+- **bnobt / cntbt / inobt / finobt / rmapbt / refcountbt / bmbt —
+  the XFS B+ trees.** All XFS metadata that needs variable-
+  cardinality lookup lives in a B+ tree. Six are per-AG and one is
+  per-inode:
+
+  | Tree | Indexes | Scope | Record |
+  |---|---|---|---|
+  | **bnobt** | free extents, by **starting block** | per-AG | [`xfs_alloc_rec`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_format.h#L1543) |
+  | **cntbt** | free extents, by **length** | per-AG | [`xfs_alloc_rec`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_format.h#L1543) |
+  | **inobt** | allocated 64-inode chunks | per-AG | [`xfs_inobt_rec`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_format.h#L1600) |
+  | **finobt** | inode chunks with ≥1 free inode | per-AG | [`xfs_inobt_rec`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_format.h#L1600) |
+  | **rmapbt** | reverse map: block → owner | per-AG | [`xfs_rmap_rec`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_format.h#L1687) |
+  | **refcountbt** | refcount per shared extent (reflink) | per-AG | [`xfs_refcount_rec`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_format.h#L1797) |
+  | **bmbt** | file extents (logical → physical map) | per-inode | [`xfs_bmbt_rec`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_format.h#L1871) |
+
+  bnobt and cntbt index the *same* set of free extents — two
+  orderings, two trees — so the allocator can match queries shaped
+  as "give me space near hint X" (bnobt) or "give me a 32-block run"
+  (cntbt) in O(log n). Every tree is walked through the same generic
+  [`xfs_btree_cur`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_btree.h#L266)
+  cursor with a per-tree ops vector — one walker implementation,
+  seven trees.
+
+- **TID — Transaction ID.** A 32-bit identifier (`oh_tid` in
+  [`xlog_op_header`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_log_format.h#L108))
+  assigned to every transaction that emits log items. Recovery
+  groups ops by TID to reconstruct the original transaction
+  boundary, since a single transaction can span multiple log records
+  (XLOG_START_TRANS / XLOG_CONTINUE_TRANS / XLOG_COMMIT_TRANS
+  brackets in `oh_flags`). In `xfs_logprint` output, the
+  `tid: a99e3740` field on each `Oper(N)` line is the TID; every op
+  with that same value belongs to one transaction.
+
+- **iclog — In-Core Log buffer.** One of a small ring (typically 8)
+  of in-flight log buffers ([`xlog_in_core`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/xfs_log_priv.h#L202))
+  that XFS uses to stage outgoing log records before bio submission.
+  A CIL push formats checkpoint records into the head iclog; a full
+  iclog is submitted to the log device while subsequent commits fill
+  the next one in the ring. Each iclog write is rounded up to
+  `sb_logsunit` (if `LOGV2`) or `sb_logsectsize` otherwise, so log
+  writes stay aligned to RAID stripes. The iclog ring sits on the
+  in-core [`xlog`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/xfs_log_priv.h#L414).
+
+- **delalloc / NULLSTARTBLOCK.** The "delayed allocation" marker
+  XFS uses for buffered writes. At write time, the in-core extent
+  list gets a placeholder bmbt record with a sentinel physical block
+  — the NULLSTARTBLOCK pattern, high bits set — and the actual
+  physical-block assignment is deferred to writeback through
+  `xfs_bmapi_convert_delalloc`. The bpftrace sample in the
+  [append walkthrough](#append-write-with-extent-allocation) shows
+  this directly: `iext_insert ino=0x84 logical=0x0 phys=0xffffffffe0008
+  blocks=256` — the in-core record exists, but the on-disk address
+  is the delalloc sentinel until writeback replaces it.
+
+- **delwri — delayed-write list.** The list of dirty metadata
+  buffers waiting to be written to their home blocks. Most
+  metadata-buffer writes are *not* triggered at transaction commit;
+  the buffer sits on the delwri list until either the AIL pushes it
+  (its LSN is the tail and log space is needed) or a sync forces it
+  via `xfs_buf_delwri_submit`. This is the coalescing that turns ten
+  transactions modifying one AGF buffer in the same second into one
+  home-block write instead of ten — durability is still intact
+  because the log already carries every change.
+
+- **holemask — sparse_inodes hole bitmask.** A 64-bit bitmask in
+  each inobt record ([`xfs_inobt_rec`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_format.h#L1600))
+  indicating which 4 KiB inode-cluster sub-blocks of a chunk are
+  *not* actually allocated on disk. With the `sparse_inodes` feature
+  (visible as `SPARSE_INODES` in the SB sample, default on modern
+  `mkfs.xfs`), a 64-inode chunk's on-disk extent can be a strict
+  subset of the logical chunk footprint; inodes inside an
+  unallocated cluster simply don't exist. `holemask = 0` means the
+  chunk is fully allocated (the case in our captured walk-bnobt
+  sample); set bits mark sparse holes. The feature exists because
+  for tiny / heavily-aged filesystems, requiring every inode chunk
+  to be a contiguous 64-inode extent caused allocator failures even
+  when free space was available — sparse chunks let allocation
+  succeed with as little as one 4 KiB sub-block free.
+
 - **fsb / daddr / agbno — the three block-address spaces.** The
   same physical block can be named three ways, and XFS code is
   punctilious about which:
