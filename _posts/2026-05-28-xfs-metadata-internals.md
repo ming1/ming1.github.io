@@ -167,6 +167,11 @@ agblocks  = 131072               # blocks per AG (= 512 MiB at 4 KiB blocks)
 agcount   = 4                    # 4 AGs total
 inodesize = 512                  # v5 default; 256 on older mkfs
 inopblock = 8                    # inodes per fs block (4096 / 512)
+logstart  = 262151               # internal-log start in fs blocks
+                                 # (0 here would mean external log)
+logblocks = 25650                # internal-log size in fs blocks
+                                 # (≈ 100 MiB at 4 KiB blocks)
+logsunit  = 1                    # log-stripe alignment in fs blocks
 versionnum = 0xb4a5              # version + primary feature bits
 features2  = 0x18a               # secondary feature bitmap
 features_ro_compat = 0xf         # rmap / reflink / inobt-counts / sparse
@@ -190,6 +195,90 @@ unknown `features_incompat` bits.
 The script prints the magic, version bits, block size, AG geometry and
 inode size — exactly the fields you need before doing anything else
 with an image.
+
+## Log area
+
+XFS supports two physical layouts for the log; the superblock tells
+you which one and (for the internal case) where the log lives.
+
+```
+ Internal log                              External log
+ ───────────────                            ───────────────
+ data device                                data device         log device
+ ┌──────────┐                                ┌──────────┐        ┌──────────┐
+ │ SB AGn…  │                                │ SB AGn…  │        │  log     │
+ │ ...      │  log lives at sb_logstart      │ ...      │        │  records │
+ │ ┌──────┐ │  (offset in fs blocks),        │          │        │  (whole  │
+ │ │ log  │ │  for sb_logblocks fs blocks    │          │        │   device │
+ │ └──────┘ │                                │          │        │   from   │
+ │ ...      │                                │          │        │   byte 0)│
+ └──────────┘                                └──────────┘        └──────────┘
+ sb_logstart != 0                            sb_logstart == 0
+ sb_logblocks  > 0                           sb_logblocks > 0
+```
+
+**Internal log (the common case).** `mkfs.xfs` allocates one
+contiguous run of fs blocks inside the data device and records its
+location in the superblock as `sb_logstart` (start fsblock) and
+`sb_logblocks` (length, in fs blocks). The placement is *not* "always
+in AG 0" — mkfs picks an AG that gives the requested log size and
+alignment; on a default 4-AG image it's typically AG 2.
+
+Look at the SB sample above: `logstart = 262151`, `logblocks = 25650`.
+With `agblocks = 131072` that's fsblock 262151 = AG 2 + ~7 blocks
+into the AG, occupying roughly 25650 × 4 KiB ≈ 100 MiB.
+
+**External log.** Supplied at mount time with `mount -o logdev=/dev/X`
+(or recorded at mkfs time with `mkfs.xfs -l logdev=/dev/X`). The
+superblock then has `sb_logstart = 0`, and the log occupies the
+external device starting at *its* byte 0. Useful when you want the
+log on a separate, faster (or differently-redundant) device — common
+on storage where the data device is HDD/RAID-6 and the log device is
+SSD/RAID-1.
+
+**Log sector / stripe geometry.** The log writes go through their own
+sector size (`sb_logsectsize`, `sb_logsectlog`) — which can be larger
+than the data device's logical sector for compatibility reasons — and
+honour a stripe-unit alignment (`sb_logsunit`) so log records align
+to RAID stripes. On v5 with `LOGV2` (visible in the version-bits
+decode), the in-core log code uses `sb_logsunit` to round iclog write
+sizes up; otherwise it falls back to `sb_logsectsize`.
+
+**How the kernel finds it at mount.**
+[`xfs_log_mount`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/xfs_log.c#L534)
+takes the values out of the superblock and constructs the in-core
+`struct xlog`. The log device is reached through a `xfs_buftarg`
+held on the mount:
+
+```
+ struct xfs_mount {
+   struct xfs_buftarg *m_ddev_targp;     // data device
+   struct xfs_buftarg *m_logdev_targp;   // log device
+   struct xfs_buftarg *m_rtdev_targp;    // realtime device (optional)
+   struct xlog        *m_log;            // in-core log
+   ...
+ };
+```
+
+For an internal log,
+[`xfs_open_devices`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/xfs_super.c#L478)
+aliases `m_logdev_targp = m_ddev_targp` — the same block device,
+addressed at `sb_logstart`. For an external log, it allocates a
+*separate* `xfs_buftarg` for the log device. The rest of the kernel
+just goes through `m_logdev_targp` and stays oblivious to the
+distinction: bios issued to it land on whichever device that buftarg
+wraps.
+
+**Inspecting the log location at runtime.** `xfs_info /mnt/foo`
+prints both `logstart` (start daddr) and the log device name; for an
+offline image, `xfs-meta-parse-sb.sh` shows `logstart` and
+`logblocks` directly, and
+[`xfs-meta-dump-log.sh`]({{ site.baseurl }}/code/xfs-meta-dump-log.sh)'s
+header line shows the resolved log device path and daddr range —
+e.g. on the fresh image used for the samples above,
+`log device: 0x10300 daddr: 2097208 length: 205200`, where the daddr
+is `sb_logstart` translated to 512-byte sectors and the length is
+`sb_logblocks` in the same unit.
 
 ## AGF, AGI, AGFL
 
