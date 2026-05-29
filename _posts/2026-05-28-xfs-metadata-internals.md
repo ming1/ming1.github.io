@@ -1003,6 +1003,46 @@ gen 0x...` is one `xfs_icreate_log`; `INODE CORE magic 0x494e mode
 040755 version 3 format 1` is the data region following one
 `xfs_inode_log_format` whose `ilf_fields` includes `XFS_ILOG_CORE`.
 
+**Worked example: how small does a small change get?** The dump
+shows the exact wire-byte count for each op. Lining the inode log
+item from the sample up with the structures above:
+
+```
+Oper (11): tid:a99e3740  len: 56   INODE   #regs:3  ino:0x80
+                                            ^^^^^^^^
+                                            xfs_inode_log_format (56 B)
+                                            ilf_fields says 3 regions follow
+                                            (CORE + DDATA + likely TIMESTAMP)
+Oper (12): tid:a99e3740  len: 176  INODE CORE
+                                   ^^^^^^^^^^
+                                   v5 inode core (176 B, ILOG_CORE)
+Oper (13): tid:a99e3740  len:  28  LOCAL inode data
+                                   ^^^^^^^^^^^^^^^^^
+                                   inline directory payload (ILOG_DDATA),
+                                   only the 28 dirty bytes — not the full
+                                   464-byte literal area
+```
+
+Total bytes on the wire for this one inode log item: **56 + 176 + 28
+= 260 bytes**, against a 512-byte inode and a 4 KiB cluster buffer
+holding 8 inodes. For a *ctime-only* update (e.g. `touch -c file`),
+only `XFS_ILOG_CORE` is set in `ilf_fields`, so the cost drops to
+**56 + 176 = 232 bytes** — no `DDATA` / `DEXT` region follows because
+nothing about the data fork changed. That's ~45 % of the inode itself
+and ~5.7 % of the cluster buffer, and it's why thousands of small
+metadata updates per second produce kilobytes per second of log
+traffic, not megabytes.
+
+The same arithmetic applies to buffer log items via `blf_data_map`:
+if a transaction dirties three 128-byte chunks of a 4 KiB AGF buffer,
+its `blf_data_map` has three bits set and the wire payload is
+`sizeof(xfs_buf_log_format) + 3 × 128 = ~52 + 384 = ~436 bytes`,
+not the full 4 KiB AGF. The CIL then *relogs* this buffer log item
+across subsequent transactions in the same checkpoint window (the
+mechanism the next section describes), and the final formatted item
+carries the *union* of all dirty chunks since the last push — still
+typically much smaller than the buffer it covers.
+
 ## The CIL
 
 The **Committed Item List** is an in-memory aggregator between
