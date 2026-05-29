@@ -509,6 +509,107 @@ click instead of grepping for its first explanation.
     space because recovery may still need to replay through that
     point.
 
+- **CIL — Committed Item List.** The in-memory aggregator between
+  transaction commit and on-disk log record. A commit hands its log
+  items to the CIL; the CIL absorbs *relogging* across sequential
+  transactions inside one checkpoint window, so 100 sequential
+  updates to the same buffer end up as one formatted item, not 100.
+  A *push* writes a checkpoint to the log device. The current staging
+  area is one
+  [`xfs_cil_ctx`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/xfs_log_priv.h#L235)
+  hanging off the
+  [`xfs_cil`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/xfs_log_priv.h#L284);
+  push work runs in
+  [`xlog_cil_push_work`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/xfs_log_cil.c#L96).
+  The "delta logging keeps the log small" and "fsync is cheap-
+  but-correct" claims both rest on the CIL.
+
+- **AIL — Active Item List.** The durable counterpart of the CIL.
+  Once a checkpoint reaches the log device, its items move from the
+  CIL onto the AIL with assigned LSNs; the AIL is sorted by LSN,
+  oldest first. The
+  [`xfsaild`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/xfs_trans_ail.c)
+  kthread walks the AIL and pushes the oldest items to their home
+  blocks (`iop_push`). An item leaves the AIL when its home block is
+  durable. The oldest LSN still in the AIL is the **tail LSN** — it
+  pins log space because recovery may still need to replay through
+  that point. Roughly: CIL is "not on disk yet"; AIL is "on the log,
+  not yet on the home block".
+
+- **EFI / EFD, BUI / BUD, RUI / RUD, CUI / CUD — intent / done
+  pairs.** A general protocol for restartable multi-step operations.
+  An *intent* item declares "I plan to perform this change"; a *done*
+  item, identified by the matching `id` field, declares "I did". If
+  recovery sees an unmatched intent, it finishes the work itself.
+  The four families differ only in what they describe:
+
+  - **EFI / EFD** — Extent Free Intent / Done. Free a set of extents
+    on the data device. Per-extent record: 16-byte `xfs_extent_64`.
+  - **BUI / BUD** — Bmap Update Intent / Done. Insert or remove
+    records in a file's bmap btree (e.g. an extent unmap during
+    `truncate`). Per-step record: 32-byte
+    [`xfs_map_extent`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_log_format.h#L723).
+  - **RUI / RUD** — Reverse-map Update Intent / Done. Update the
+    rmapbt for an extent. Same 32-byte `xfs_map_extent` body (the
+    owner field is meaningful here).
+  - **CUI / CUD** — Refcount Update Intent / Done. Adjust the
+    refcountbt entries for a CoW / reflink operation. Per-step
+    record: 16-byte `xfs_phys_extent`.
+
+  All four share the same 16-byte header shape
+  ([`xfs_efi_log_format`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_log_format.h#L619)
+  is the canonical example): `type + size + nextents + id`, followed
+  by the per-step record array. RT variants
+  (`XFS_LI_EFI_RT` / `_RUI_RT` / `_CUI_RT` …) repeat the same shape
+  for realtime-device operations.
+
+- **ICREATE — Inode Chunk Create intent.** Unlike the four families
+  above, ICREATE has *no matching done item* — it's a one-way marker
+  for replay. On commit it records "AG `icl_ag` block `icl_agbno`
+  now holds an `icl_count`-inode chunk"; on replay, recovery
+  zero-initialises the chunk before any extent-allocation log items
+  that reference inodes inside it get applied. See
+  [`xfs_icreate_log`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_log_format.h#L1007).
+  Why an intent instead of just logging the chunk? Because the chunk
+  is 64 × 512 B = 32 KiB of mostly-zeros — logging "init these blocks
+  to gen X" is far cheaper than logging 32 KiB of bytes.
+
+- **blft — Buffer Log Format Type.** A 5-bit subtype code packed
+  into the upper bits of `blf_flags` on every `xfs_buf_log_format`,
+  telling recovery what kind of metadata the buffer carries (so it
+  can re-verify the buffer's CRC after replay). Values come from
+  [`enum xfs_blft`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_log_format.h#L548):
+  `XFS_BLFT_AGF_BUF`, `XFS_BLFT_AGI_BUF`, `XFS_BLFT_AGFL_BUF`,
+  `XFS_BLFT_DINO_BUF`, `XFS_BLFT_BTREE_BUF`,
+  `XFS_BLFT_DIR_LEAF1_BUF`, …, 32 codes total. Encode / decode via
+  `xfs_blft_to_flags` / `xfs_blft_from_flags`. This is what makes
+  `xfs_logprint` output show the right header line (`AGF Buffer:
+  XAGF`, `AGI Buffer: XAGI`) for an otherwise opaque buffer dump.
+
+- **fsb / daddr / agbno — the three block-address spaces.** The
+  same physical block can be named three ways, and XFS code is
+  punctilious about which:
+
+  - **daddr** — *disk address* in 512-byte sectors; the unit the
+    block-IO layer speaks. This is what `submit_bio` and `xfs_buf`'s
+    `b_maps[].bm_bn` carry.
+  - **fsb** — *filesystem block*; address in `sb_blocksize` units
+    over the entire data device. Range 0 .. `sb_dblocks - 1`.
+    `sb_logstart` is an fsb.
+  - **agbno** — *AG-block*; address in `sb_blocksize` units
+    relative to the start of one AG. Range 0 .. `sb_agblocks - 1`.
+    `agf_roots[BNO]`, the rmap startblock field, and the btree-record
+    block numbers are all agbno-scoped.
+
+  Conversions:
+  `fsb = (agno << sb_agblklog) | agbno`,
+  `daddr = fsb << (sb_blocklog - sb_sectlog)`.
+  The `xfs-meta-parse-logarea.sh` script in the Log area subsection
+  uses both: it decomposes `sb_logstart` (an fsb) into `(AG, agbno)`,
+  then matches against an rmap record (also agbno-scoped) — and the
+  `daddr 2097208` printed by `xfs-meta-dump-log.sh` is the same
+  fsblock shifted to the IO layer's unit.
+
 ---
 
 # Data structures
