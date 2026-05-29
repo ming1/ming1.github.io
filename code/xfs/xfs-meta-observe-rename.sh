@@ -20,8 +20,9 @@ set -euo pipefail
 
 echo "tracing... ^C to stop"
 bpftrace -e '
-tracepoint:xfs:xfs_rename  { printf("rename        src_dp=%lld -> tgt_dp=%lld\n",
-                                    args->src_dp_ino, args->target_dp_ino); }
+tracepoint:xfs:xfs_rename  { printf("rename        src_dp=%lld(namelen=%d) -> tgt_dp=%lld(namelen=%d)\n",
+                                    args->src_dp_ino, args->src_namelen,
+                                    args->target_dp_ino, args->target_namelen); }
 kprobe:xfs_dir_removename  { printf("  dir_remove  (source dir-block edit)\n"); }
 kprobe:xfs_dir_createname  { printf("  dir_create  (target dir-block edit)\n"); }
 kprobe:xlog_cil_push_work  { printf("  cil_push    (checkpoint)\n"); }

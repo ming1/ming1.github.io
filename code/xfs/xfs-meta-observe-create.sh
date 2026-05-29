@@ -20,8 +20,8 @@ set -euo pipefail
 
 echo "tracing... ^C to stop"
 bpftrace -e '
-tracepoint:xfs:xfs_create  { printf("create        dp_ino=%lld\n",
-                                    args->dp_ino); }
+tracepoint:xfs:xfs_create  { printf("create        dp_ino=%lld namelen=%d\n",
+                                    args->dp_ino, args->namelen); }
 kprobe:xfs_dialloc         { printf("  dialloc     (inobt/finobt/AGI dirtied)\n"); }
 kprobe:xfs_dir_createname  { printf("  dir_create  (parent dir-block edit)\n"); }
 kprobe:xlog_cil_push_work  { printf("  cil_push    (checkpoint)\n"); }
