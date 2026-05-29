@@ -1054,6 +1054,39 @@ extent record).
 The data itself is *never* journaled — only the metadata that locates
 it.
 
+Trans flow (buffered write + fsync; delalloc → writeback → log force):
+
+```
+ write(2)                                  [no transaction at write time]
+   └── xfs_buffered_write_iomap_begin
+         └── xfs_bmapi_reserve_delalloc    in-core extent inserted with
+                                           NULLSTARTBLOCK; nothing logged
+
+ [writeback / fsync triggers real allocation]
+ xfs_trans_alloc                           transaction reservation
+   │
+   ├── xfs_bmapi_convert_delalloc          delalloc → real extent
+   │     ├── xfs_alloc_vextent             pick blocks from bnobt/cntbt
+   │     │     ├── AGF counter update      -> buffer log item
+   │     │     ├── bnobt / cntbt edits     -> buffer log items
+   │     │     └── (AGFL pull if needed)   -> buffer log item
+   │     └── xfs_iext_update               in-core extent replaces delalloc
+   │           └── xfs_trans_log_inode     -> inode log item
+   │                                       (size, nblocks, nextents,
+   │                                        possibly fork format)
+   │
+   ├── (optional) EFI/EFD                  if an unwritten-to-written
+   │                                       conversion split a record
+   │
+   └── xfs_trans_commit                    -> CIL
+
+ fsync(2):
+   ├── filemap_write_and_wait_range        flush data bios
+   ├── xfs_log_force_seq(seq)              wait for log to cover the
+   │                                       inode's CIL sequence
+   └── blkdev_issue_flush                  device cache flush
+```
+
 Observe with [`xfs-meta-observe-append.sh`]({{ site.baseurl }}/code/xfs/xfs-meta-observe-append.sh):
 
 ```
@@ -1115,6 +1148,51 @@ target (nlink → 0, `iflags` updated to mark it on the unlinked list),
 and a buffer log item for the AGI sector whose `agi_unlinked` bucket
 now points at the target's inode number. No EFIs yet — the extents
 are not freed until the last close drives the deferred cleanup.
+
+Trans flow — closed-file unlink (frees in-line):
+
+```
+ xfs_trans_alloc
+   │
+   ├── xfs_dir_removename                  remove entry from parent dir
+   │     ├── parent inode change           -> inode log item (parent)
+   │     └── dir-block buffer edits        -> buffer log items
+   │
+   ├── xfs_droplink                        nlink -> 0
+   │     └── xfs_trans_log_inode           -> inode log item (target)
+   │
+   ├── xfs_inactive_*                      free target's extents
+   │     ├── BUI/BUD per bmap removal      -> intent pair
+   │     ├── EFI/EFD per extent freed      -> intent pair (deferred free)
+   │     ├── inobt update (bit flipped)    -> buffer log item
+   │     └── AGI counter update            -> buffer log item
+   │
+   └── xfs_trans_commit                    -> CIL
+```
+
+Trans flow — open-file unlink (extents stay until last close):
+
+```
+ xfs_trans_alloc
+   │
+   ├── xfs_dir_removename                  remove entry from parent dir
+   │     ├── parent inode change           -> inode log item (parent)
+   │     └── dir-block buffer edits        -> buffer log items
+   │
+   ├── xfs_droplink                        nlink -> 0
+   │     └── xfs_trans_log_inode           -> inode log item (target)
+   │
+   ├── xfs_iunlink                         park target on AGI bucket
+   │     ├── AGI agi_unlinked[hash] edit   -> buffer log item
+   │     └── target di_next_unlinked       -> inode log item (target, again)
+   │
+   └── xfs_trans_commit                    -> CIL
+         (extents NOT freed yet; deferred to last close)
+
+ [later, when last fd closes:]
+ xfs_inactive → xfs_inode_free            same EFI/EFD + inobt + AGI
+                                          edits as the closed-file case
+```
 
 Observe with [`xfs-meta-observe-unlink.sh`]({{ site.baseurl }}/code/xfs/xfs-meta-observe-unlink.sh):
 
@@ -1183,6 +1261,33 @@ exists in neither directory or in both. This is the property
 across AGs are reservation-expensive: the worst-case set of log items
 spans the maximum of both AGs' touched buffers.
 
+Trans flow (single transaction; lock order = ascending AG number):
+
+```
+ xfs_trans_alloc                           worst-case reservation
+   │
+   ├── xfs_dir_removename(src_dp, src_name)
+   │     ├── src-dir inode change          -> inode log item (src_dp)
+   │     └── src dir-block edits           -> buffer log items
+   │
+   ├── xfs_dir_createname(tgt_dp, tgt_name)
+   │     ├── tgt-dir inode change          -> inode log item (tgt_dp)
+   │     └── tgt dir-block edits           -> buffer log items
+   │
+   ├── source inode bump                   ctime / nlink unchanged for
+   │     └── xfs_trans_log_inode           a same-name move
+   │                                       -> inode log item (renamed)
+   │
+   ├── (overwrite case only) tgt was a file:
+   │     ├── xfs_droplink → nlink -> 0     -> inode log item (overwritten)
+   │     ├── xfs_iunlink                   AGI bucket head edit
+   │     │     -> buffer log item
+   │     └── (later) extent free on close  EFI/EFD
+   │
+   └── xfs_trans_commit                    -> CIL
+         (removename + createname in ONE checkpoint = atomic)
+```
+
 Observe with [`xfs-meta-observe-rename.sh`]({{ site.baseurl }}/code/xfs/xfs-meta-observe-rename.sh):
 
 ```
@@ -1221,6 +1326,34 @@ replay finishes the rest.
 Dirty transitions: each sub-transaction independently moves through
 in-CIL → in-AIL; the inode's `di_size` only reaches the home block
 after the last sub-transaction's inode log item is flushed.
+
+Trans flow (per sub-transaction, iterated until all extents past
+new_size are freed):
+
+```
+ xfs_setattr_size
+   │
+   └── xfs_itruncate_extents_flags         one sub-transaction:
+         xfs_trans_alloc                   bounded log reservation
+           │
+           ├── xfs_bunmapi                  unmap a bounded range
+           │     ├── BUI                    -> intent: bmap update
+           │     └── inode bmap btree edit  -> inode log item
+           │
+           ├── xfs_defer_finish_noroll      drive the intent chain
+           │     ├── BUD                    -> matches BUI above
+           │     ├── EFI per freed extent   -> intent: free blocks
+           │     └── EFD per freed extent   -> matches each EFI
+           │
+           ├── (last sub-txn only)
+           │     xfs_trans_log_inode        update di_size, nblocks,
+           │     -> inode log item          nextents to final value
+           │
+           └── xfs_trans_commit             -> CIL
+
+ [Crash between sub-transaction k and k+1 leaves unmatched BUI
+  in the log; replay finishes the rest from there.]
+```
 
 Observe with [`xfs-meta-observe-truncate.sh`]({{ site.baseurl }}/code/xfs/xfs-meta-observe-truncate.sh):
 
@@ -1262,6 +1395,34 @@ The interesting case. With a freshly written file:
 4. `xfs_log_force_seq` waits until the on-disk log has covered the
    CIL sequence that committed the inode's log item.
 5. Issue a device flush.
+
+Trans flow (fsync transacts only if the inode is dirty in-core; the
+log-force step does not allocate a transaction of its own):
+
+```
+ xfs_file_fsync
+   │
+   ├── filemap_write_and_wait_range        flush data bios first;
+   │                                       wait for writeback completion
+   │
+   ├── (if inode dirty)
+   │     xfs_trans_alloc
+   │       └── xfs_trans_log_inode         capture current i_size
+   │             -> inode log item         and timestamps with a
+   │       └── xfs_trans_commit            definite LSN
+   │             -> CIL
+   │
+   ├── xfs_log_force_seq(seq)              wait for on-disk log to
+   │     └── xlog_cil_push_work            cover the inode's CIL
+   │           (may run inline if          sequence — triggers a push
+   │            no async push pending)     if it isn't already happening
+   │
+   └── blkdev_issue_flush                  device cache flush
+                                           (REQ_PREFLUSH)
+
+ [No home-block writeback of the inode cluster in this path;
+  AIL flushes it later. Recovery rebuilds the cluster from the log.]
+```
 
 Run [`xfs-meta-observe-fsync.sh`]({{ site.baseurl }}/code/xfs/xfs-meta-observe-fsync.sh)
 in one terminal while doing `xfs_io -f -c "pwrite 0 4k" -c "fsync"
