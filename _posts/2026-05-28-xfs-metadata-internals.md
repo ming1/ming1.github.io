@@ -280,6 +280,42 @@ e.g. on the fresh image used for the samples above,
 is `sb_logstart` translated to 512-byte sectors and the length is
 `sb_logblocks` in the same unit.
 
+**Is the log area recorded in any btree?** Not in `bnobt` / `cntbt` —
+those track *free* space, and the log is allocated. It *is* recorded
+in the per-AG reverse-map btree (`rmapbt`) as a single record carrying
+the special owner code `XFS_RMAP_OWN_LOG` (-4ULL):
+
+```c
+/* fs/xfs/libxfs/xfs_format.h */
+#define XFS_RMAP_OWN_NULL    (-1ULL) /* No owner, for growfs */
+#define XFS_RMAP_OWN_UNKNOWN (-2ULL) /* Unknown owner, for EFI recovery */
+#define XFS_RMAP_OWN_FS      (-3ULL) /* static fs metadata */
+#define XFS_RMAP_OWN_LOG     (-4ULL) /* static fs metadata */   <-- log
+#define XFS_RMAP_OWN_AG      (-5ULL) /* AG freespace btree blocks */
+#define XFS_RMAP_OWN_INOBT   (-6ULL) /* Inode btree blocks */
+#define XFS_RMAP_OWN_INODES  (-7ULL) /* Inode chunk */
+#define XFS_RMAP_OWN_REFC    (-8ULL) /* refcount tree */
+#define XFS_RMAP_OWN_COW     (-9ULL) /* cow allocations */
+```
+
+These negative owner IDs are how rmap distinguishes "owned by *some
+structural part* of the filesystem" from "owned by inode N" (which is
+a positive owner ID). Confirm on a live image:
+
+```
+xfs_db -r -c "agf 2" -c "addr rmaproot" -c "p" /dev/nvme0n1 \
+  | grep -E "owner|startblock"
+# look for: owner = -4   (= XFS_RMAP_OWN_LOG)
+```
+
+This is also why rmap is the load-bearing structure for
+[`xfs_repair`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/scrub)
+and online `xfs_scrub`: every block on disk has exactly one rmap
+record naming its owner, including otherwise-invisible static
+metadata like the log. Pre-rmap, the log was just a hole in
+`bnobt` / `cntbt` and repair had to *infer* its existence from
+`sb_logstart` / `sb_logblocks` alone.
+
 ## AGF, AGI, AGFL
 
 Three short, hot, per-AG headers. They behave very differently, so it
