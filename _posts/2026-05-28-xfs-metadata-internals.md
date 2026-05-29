@@ -1266,6 +1266,101 @@ Walks happen through `xfs_iext_lookup_extent` for the in-core list,
 or `xfs_bmapi_read` / `xfs_bmapi_write` for the
 allocate-or-map path.
 
+## On-disk layout: blocks, headers, and where they come from
+
+Every btree block (root, internal node, or leaf) is exactly **one
+filesystem block** — `sb_blocksize`, typically 4 KiB. The block is
+self-describing: a header at the top names the magic / level /
+record-count / siblings / (v5: owner + CRC + UUID + LSN), and the
+rest of the block is either an array of records (leaf) or two
+parallel arrays of keys and child pointers (internal).
+
+```
+ one btree block = sb_blocksize bytes (4 KiB at default geometry)
+ ┌──────────────────────────────────────────────────────────────┐
+ │ header (xfs_btree_block)                                     │
+ │  bb_magic    4 B    "AB3B" / "AB3C" / "IAB3" / "BMA3" / …    │
+ │  bb_level    2 B    0 = leaf, > 0 = internal                 │
+ │  bb_numrecs  2 B    records currently in this block          │
+ │  bb_leftsib  4 / 8  sibling block at this level (null at ends)│
+ │  bb_rightsib 4 / 8                                           │
+ │  ── v5 trailer ──                                            │
+ │  bb_blkno    8 B    self-daddr (where the kernel expected    │
+ │                     to find this block — catches stray writes)│
+ │  bb_lsn      8 B    last LSN that modified this block        │
+ │  bb_uuid    16 B    fs UUID (catches mount-on-wrong-fs)      │
+ │  bb_owner    4 / 8  AG number (short) or inode number (long) │
+ │  bb_crc      4 B    block-wide CRC                           │
+ │  bb_pad      4 B    (long form only, alignment)              │
+ ├──────────────────────────────────────────────────────────────┤
+ │ Leaf block (bb_level = 0):                                   │
+ │  record[0], record[1], ..., record[bb_numrecs - 1]           │
+ │  records packed tightly, record size set by the tree         │
+ │  (8 B for bnobt/cntbt, 16 B for inobt/bmbt, etc.)            │
+ ├──────────────────────────────────────────────────────────────┤
+ │ Internal block (bb_level > 0):                               │
+ │  key[0],   key[1],   ..., key[bb_numrecs - 1]                │
+ │  ptr[0],   ptr[1],   ..., ptr[bb_numrecs - 1]                │
+ │  two parallel arrays, NOT interleaved — gives clean          │
+ │  cache-line packing for the binary search through keys       │
+ └──────────────────────────────────────────────────────────────┘
+```
+
+**Short vs long form.** Per-AG btrees (bnobt, cntbt, inobt, finobt,
+rmapbt, refcountbt) use the *short* form — sibling pointers and the
+owner are 32-bit values, because nothing inside a btree can refer
+outside its AG. Per-inode btrees (bmbt) use the *long* form —
+pointers are full 64-bit fsblock numbers, since a file's extents can
+live in any AG. The two forms are
+[`xfs_btree_block_shdr`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_format.h#L1928)
+and
+[`xfs_btree_block_lhdr`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_format.h#L1940);
+on v5 they are 56 B and 72 B respectively (24 B / 16 B without the
+CRC trailer on pre-v5).
+
+**Records-per-block math.** With a 4 KiB block size and a 56 B v5
+short header, a bnobt leaf holds `(4096 − 56) / 8 = 505` records;
+an inobt leaf holds `(4096 − 56) / 16 = 252` records (one per
+64-inode chunk); a long-form bmbt leaf with 72 B header and 16 B
+records holds `(4096 − 72) / 16 = 251` records. Internal blocks
+hold fewer entries each since they store a key + a pointer per
+slot, but the same tree only goes a few levels deep at petabyte
+scale — `(4096 − 56) / (4 + 4) = 505`-fanout means three internal
+levels reach >100 million leaves. The captured
+`xfs-meta-walk-bnobt.sh` sample shows `level = 0, numrecs = 1` for
+a near-empty filesystem where the root is also the only leaf.
+
+**Where the blocks come from.** Per-AG btrees can't simply
+"allocate a free block" the way a file does, because the allocator
+itself walks bnobt/cntbt — re-entering them during a split would
+deadlock. The
+[`xfs_agfl`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_format.h#L692)
+solves this: it's a per-AG ring of pre-staged free blocks reserved
+for btree splits. When bnobt or cntbt (or any other per-AG tree)
+needs a new block, it pops one off the AGFL; when a merge frees a
+block, it returns to the AGFL. The ring is sized so the deepest
+possible worst-case split path (`bnobt` and `cntbt` each splitting
+root → leaf, plus the rare cross-AG split) can always proceed
+without recursing into the trees that the split is trying to grow.
+At every allocation,
+[`xfs_alloc_fix_freelist`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_alloc.c)
+refills the AGFL from bnobt/cntbt *before* the actual allocation
+runs, so the ring is always topped up when a split might fire.
+Newly-allocated per-AG btree blocks are owned in rmap by the
+`XFS_RMAP_OWN_AG` sentinel — that's why the `xfs-meta-parse-logarea.sh`
+sample shows several `owner = -5` records right next to the OWN_LOG
+record.
+
+**Per-inode bmbt** doesn't need an AGFL. The root sits inside the
+inode literal area (a tiny
+[`xfs_bmdr_block_t`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_format.h#L1843)
+of 4 B + records/pointers), so a split that doesn't grow past the
+literal area just rewrites the inode. When the bmbt grows beyond
+the literal area, child blocks come from regular extent allocation
+via `xfs_bmap_alloc` — these blocks are tracked in rmap with a
+*positive* owner ID equal to the inode number, distinguishing them
+from per-AG metadata.
+
 ## Walking from userspace
 
 [`xfs-meta-walk-bnobt.sh`]({{ site.baseurl }}/code/xfs-meta-walk-bnobt.sh)
