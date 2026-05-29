@@ -980,6 +980,62 @@ fork. The split between forks is parameterised by `di_forkoff`, an
 both the data extent map and small extended attributes inside one
 512-byte inode.
 
+### How many bytes per inode
+
+Every inode costs the full `sb_inodesize` slot regardless of what
+the file is. On a modern v5 mkfs that's **512 B per inode**, split
+into a 176 B core and a 336 B literal area:
+
+```
+ xfs_dinode slot, sb_inodesize = 512 B
+ ┌────────────────────────────┬───────────────────────────────┐
+ │   inode core (xfs_dinode)  │   literal area                │
+ │   176 B on v5              │   336 B (= 512 - 176)         │
+ │                            │                               │
+ │   magic / version / mode   │   data fork: inline data,     │
+ │   size / nblocks / nlink   │     extent array, or bmbt     │
+ │   timestamps / di_lsn      │     root (xfs_bmdr_block_t)   │
+ │   format / forkoff / flags │   ↑ split by di_forkoff ↓     │
+ │   crc / inumber / uuid     │   attr fork (if any)          │
+ └────────────────────────────┴───────────────────────────────┘
+                                          ▲
+                                          │
+                              file's data / extent map / xattrs
+                              fit here when small enough to inline
+```
+
+A 4-byte symlink and a 4 TiB sparse file pay the same 512 B for the
+inode itself — the literal area is where the `di_format` choice
+earns its keep:
+
+- **LOCAL** — tiny dir or short symlink fits inline; **zero** extra
+  blocks beyond the inode.
+- **EXTENTS** — up to ~21 `xfs_bmbt_rec` records inline
+  (336 B / 16 B = 21); fragmenting past that pushes the format to
+  BTREE. With a non-zero `di_forkoff` reserving literal-area bytes
+  for the attr fork, the cap drops accordingly.
+- **BTREE** — the `xfs_bmdr_block_t` root sits in the literal area;
+  child blocks elsewhere. The inode still costs 512 B; the rest of
+  the cost moves to the data fork's bmbt blocks.
+
+Across the per-AG structures the amortized cost adds a small constant
+on top of the inode slot:
+
+| Structure | Bytes per chunk (64 inodes) | Per inode |
+|---|---|---|
+| inode slot                            | 64 × 512 B = 32 768 B | **512 B**  |
+| inobt record                          | 16 B                  | 0.25 B     |
+| finobt record (if any)                | 16 B                  | up to 0.25 B |
+| rmapbt record covering the chunk      | ~24 B                 | ~0.4 B     |
+| **Total amortized per inode**         |                       | **~512.9 B** |
+
+A million-file filesystem therefore spends roughly 490 MiB on inodes
+and their indexing. Older v4 mkfs defaulted to `inodesize = 256`,
+which halves both the slot and (e.g.) the literal-area headroom —
+LOCAL fits less, EXTENTS flips to BTREE earlier, and modern
+features like parent pointers don't fit inline. The default has
+been 512 B since v5.
+
 Core fields that matter for debugging:
 
 - `di_magic`, `di_version`: integrity / format gate.
