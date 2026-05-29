@@ -847,6 +847,162 @@ The intent/done pattern is what lets XFS keep multi-step operations
 atomic in a single transaction even though each sub-step touches a
 different btree.
 
+### On-disk wire format
+
+A log record is a three-layer envelope. Recovery walks it from the
+outside in:
+
+```
+  log record
+  ┌──────────────────────────────────────────────────────────────┐
+  │ xlog_rec_header   { h_magicno, h_cycle, h_lsn,               │
+  │                      h_len, h_crc, h_num_logops, h_fs_uuid }│
+  │ ┌──────────────────────────────────────────────────────────┐│
+  │ │ xlog_op_header  { oh_tid, oh_len, oh_clientid, oh_flags }││
+  │ │ <log-item payload, oh_len bytes>                         ││
+  │ └──────────────────────────────────────────────────────────┘│
+  │ ┌──────────────────────────────────────────────────────────┐│
+  │ │ xlog_op_header  ...                                      ││
+  │ │ <log-item payload>                                       ││
+  │ └──────────────────────────────────────────────────────────┘│
+  │ ...                                          h_num_logops   │
+  └──────────────────────────────────────────────────────────────┘
+```
+
+The outer `xlog_rec_header` (`fs/xfs/libxfs/xfs_log_format.h`) carries
+the LSN, the record CRC, the number of operations inside, and the fs
+UUID. The inner `xlog_op_header` (16 bytes, also in the same header)
+wraps every formatted item and records which transaction it belongs
+to (`oh_tid`) and its payload length (`oh_len`); `oh_flags` carries
+`XLOG_START_TRANS` / `XLOG_COMMIT_TRANS` / `XLOG_CONTINUE_TRANS`
+markers that bracket a transaction across multiple records when it
+spans log-record boundaries.
+
+Each payload begins with a 4-byte `(type, size)` pair so recovery can
+dispatch on the type. The full type table from
+[`xfs_log_format.h`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_log_format.h):
+
+```c
+#define XFS_LI_EFI       0x1236   /* Extent Free Intent */
+#define XFS_LI_EFD       0x1237   /* Extent Free Done */
+#define XFS_LI_IUNLINK   0x1238   /* AGI unlinked-list edit */
+#define XFS_LI_INODE     0x123b   /* inode log item */
+#define XFS_LI_BUF       0x123c   /* metadata buffer */
+#define XFS_LI_DQUOT     0x123d   /* dquot */
+#define XFS_LI_ICREATE   0x123f   /* inode-chunk init */
+#define XFS_LI_RUI/RUD   0x1240/41 /* rmap update intent/done */
+#define XFS_LI_CUI/CUD   0x1242/43 /* refcount intent/done */
+#define XFS_LI_BUI/BUD   0x1244/45 /* bmap update intent/done */
+#define XFS_LI_ATTRI/ATTRD 0x1246/47 /* attr set/remove */
+/* …plus realtime variants 0x124a..0x124f */
+```
+
+**Buffer log item — `struct xfs_buf_log_format`** (`XFS_LI_BUF`,
+0x123c):
+
+```c
+struct xfs_buf_log_format {
+    unsigned short blf_type;       /* = XFS_LI_BUF */
+    unsigned short blf_size;
+    unsigned short blf_flags;      /* + 5-bit blft (which kind of
+                                      metadata: AGF / AGI / DINO /
+                                      DIR_LEAF / BTREE / …) in upper bits */
+    unsigned short blf_len;        /* buffer length, in fsblocks */
+    int64_t        blf_blkno;      /* on-disk daddr of the buffer */
+    unsigned int   blf_map_size;
+    unsigned int   blf_data_map[]; /* dirty bitmap: 1 bit per 128 B */
+};
+```
+
+After this header come the *actual dirty bytes*, packed in the order
+indicated by `blf_data_map`. The bitmap is the heart of delta logging:
+each bit covers `XFS_BLF_CHUNK = 128` bytes of the buffer, so a 4 KiB
+metadata buffer needs 32 bits, and only the chunks whose bits are set
+are written. `blft` is hidden inside the top 5 bits of `blf_flags`
+(`XFS_BLFT_AGF_BUF`, `XFS_BLFT_AGI_BUF`, `XFS_BLFT_DINO_BUF`,
+`XFS_BLFT_DIR_LEAF1_BUF`, …) so recovery can re-verify the buffer's
+CRC after replay by knowing what kind of metadata it is.
+
+**Inode log item — `struct xfs_inode_log_format`** (`XFS_LI_INODE`,
+0x123b):
+
+```c
+struct xfs_inode_log_format {
+    uint16_t ilf_type;             /* = XFS_LI_INODE */
+    uint16_t ilf_size;
+    uint32_t ilf_fields;           /* mask: which parts of the inode
+                                      changed — XFS_ILOG_CORE,
+                                      _DDATA / _DEXT / _DBROOT for the
+                                      data fork, _ADATA / _AEXT /
+                                      _ABROOT for the attr fork,
+                                      _TIMESTAMP */
+    uint16_t ilf_asize, ilf_dsize; /* attr- and data-fork payload size */
+    uint32_t ilf_pad;
+    uint64_t ilf_ino;              /* inode number */
+    union { uint32_t ilfu_rdev; uint8_t __pad[16]; } ilf_u;
+    int64_t  ilf_blkno;            /* daddr of the inode cluster buffer */
+    int32_t  ilf_len;              /* cluster buffer length */
+    int32_t  ilf_boffset;          /* offset of this inode within cluster */
+};
+```
+
+After this header come the dirty regions named by `ilf_fields`, in
+order: the inode core (96/176 bytes on v4/v5), then the data-fork
+literal area or extent array or bmbt root, then the corresponding
+attr-fork piece, then the timestamp block if separately logged. The
+fields-mask is why XFS log volume is roughly proportional to the
+*amount of change*, not the inode size: an inode whose only change is
+ctime emits just `ILOG_CORE`'s 176 bytes, not the whole 512-byte inode.
+
+**Extent free intent/done — `struct xfs_efi_log_format`** (`XFS_LI_EFI`,
+0x1236) and its mirror EFD (0x1237):
+
+```c
+struct xfs_efi_log_format {
+    uint16_t  efi_type;            /* = XFS_LI_EFI */
+    uint16_t  efi_size;
+    uint32_t  efi_nextents;        /* how many extents in this intent */
+    uint64_t  efi_id;              /* matched by EFD's efd_efi_id */
+    struct xfs_extent efi_extents[]; /* { ext_start, ext_len }, repeated */
+};
+```
+
+The matching EFD has the same shape but `efd_efi_id` instead of
+`efi_id`. Recovery pairs an EFD with the EFI whose `efi_id` equals
+the EFD's `efd_efi_id`; an EFI with no matching EFD means the system
+crashed mid-operation, and recovery does the free itself. The same
+structural pattern shows up for RUI/RUD (rmap, `struct xfs_map_extent`
+records), CUI/CUD (refcount), BUI/BUD (bmap update) — type code
+changes, body is "intent id + array of per-step records".
+
+**ICREATE — `struct xfs_icreate_log`** (`XFS_LI_ICREATE`, 0x123f):
+
+```c
+struct xfs_icreate_log {
+    uint16_t icl_type;             /* = XFS_LI_ICREATE */
+    uint16_t icl_size;
+    __be32   icl_ag, icl_agbno;    /* AG + AG-block of the chunk */
+    __be32   icl_count;            /* number of inodes (typically 64) */
+    __be32   icl_isize;            /* inode size */
+    __be32   icl_length;           /* extent length in fs blocks */
+    __be32   icl_gen;              /* initial inode generation */
+};
+```
+
+On replay this directly tells recovery "zero-initialise an N-inode
+chunk at `(icl_ag, icl_agbno)` with this `icl_gen`" — the chunk gets
+fully zeroed before any extent-allocation log items that reference
+inodes inside it get replayed, which is why the ICREATE intent is
+needed at all.
+
+**Connecting it to the dump.** The `xfs_logprint` excerpt in
+[*Inspecting the log*](#inspecting-the-log) renders these exact
+structs by name: `AGF Buffer: XAGF len 131072` is one `xfs_buf_log_format`
+(blft = `AGF_BUF`); `ICR: #ag 1 agbno 0x10 len 8 cnt 64 isize 512
+gen 0x...` is one `xfs_icreate_log`; `INODE CORE magic 0x494e mode
+040755 version 3 format 1` is the data region following one
+`xfs_inode_log_format` whose `ilf_fields` includes `XFS_ILOG_CORE`.
+
 ## The CIL
 
 The **Committed Item List** is an in-memory aggregator between
