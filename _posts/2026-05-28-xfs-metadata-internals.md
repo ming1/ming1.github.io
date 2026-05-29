@@ -1043,6 +1043,43 @@ mechanism the next section describes), and the final formatted item
 carries the *union* of all dirty chunks since the last push — still
 typically much smaller than the buffer it covers.
 
+**Intent items are even tinier.** Every intent/done pair shares the
+same 16-byte header (`uint16 type + uint16 size + uint32 nextents +
+uint64 id`) followed by a variable-length array of per-step records.
+The record size depends on the operation kind:
+
+```
+EFI / EFD          xfs_extent_64        16 B / extent
+CUI / CUD          xfs_phys_extent      16 B / extent
+RUI / RUD          xfs_map_extent       32 B / extent (carries owner)
+BUI / BUD          xfs_map_extent       32 B / extent
+```
+
+So a single-extent free is `16 + 16 = 32 bytes` for the EFI and
+another `32 bytes` for its EFD — **64 bytes total** for the entire
+"I plan to free this extent, I did free this extent" round trip.
+Scaling that up to the heavy case: a truncate sub-transaction
+freeing 50 extents emits
+
+```
+BUI:  16 + 50 × 32 = 1616 B    (bmap update intent)
+BUD:  16 + 50 × 32 = 1616 B
+EFI:  16 + 50 × 16 =  816 B    (extent-free intent)
+EFD:  16 + 50 × 16 =  816 B
+                    --------
+                     4864 B    (~4.9 KiB of intent traffic to
+                                  describe 50 extents of free)
+```
+
+Plus the inode log item updates for the bmbt, plus the AGF/free-space
+buffer log items for the actual block frees — but the intent overhead
+itself stays comfortably under 5 KiB even when the truncate releases
+*hundreds of megabytes* of file data. That's the structural reason
+multi-step deferred operations can keep their log reservation tight
+even when the *physical* effect of the transaction is huge: the log
+records *what changed in the structures*, not what those structures
+ultimately point at on disk.
+
 ## The CIL
 
 The **Committed Item List** is an in-memory aggregator between
