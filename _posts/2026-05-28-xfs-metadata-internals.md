@@ -472,9 +472,18 @@ deleted while held open at the time of the dump.
 # Data structures
 
 A grouped reference for the structs the rest of the post talks about.
-Each entry is tagged **(on-disk)** for an on-disk / on-the-wire form
-or **(in-core)** for the in-memory runtime form, so the "how it lives
-on disk vs. how it lives in memory" pair is one click apart.
+Each entry is tagged:
+
+- **(on-disk)** — persistent metadata that lives in a fixed home
+  block on the data device (superblock, AG headers, inode core,
+  btree records).
+- **(on-wire)** — log-stream format that only ever exists as bytes
+  *inside a log record*; recovery decodes these to rebuild on-disk
+  state, but they never appear in a home block.
+- **(in-core)** — in-memory runtime form, the kernel's view.
+
+So the "how it lives on disk vs. how it travels through the log vs.
+how it lives in memory" trio is one click apart.
 
 - **Superblock**
   - [`xfs_dsb`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_format.h#L193)
@@ -556,35 +565,35 @@ on disk vs. how it lives in memory" pair is one click apart.
     **(in-core)** — log item attached to a dirty metadata buffer;
     tracks the bitmap of dirty 128-byte chunks.
   - [`xfs_buf_log_format`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_log_format.h#L527)
-    **(on-disk)** — wire format of a buffer log item: blkno + length
+    **(on-wire)** — log format of a buffer log item: blkno + length
     + `blf_data_map` dirty bitmap followed by the dirty byte regions.
   - [`xfs_inode_log_item`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/xfs_inode_item.h#L16)
     **(in-core)** — log item attached to a dirty inode; the
     `ili_fields` mask records which fork regions changed.
   - [`xfs_inode_log_format`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_log_format.h#L274)
-    **(on-disk)** — wire format: `ilf_fields` mask + inode number +
+    **(on-wire)** — log format: `ilf_fields` mask + inode number +
     cluster blkno; the dirty regions named by the mask follow.
 
 - **Intent / done items**
   - [`xfs_efi_log_format`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_log_format.h#L619)
-    **(on-disk)** — extent-free intent (matched by its EFD by
+    **(on-wire)** — extent-free intent (matched by its EFD by
     `efi_id`); the same 16-byte header shape is reused by CUI/CUD,
     RUI/RUD, BUI/BUD.
   - [`xfs_map_extent`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_log_format.h#L723)
-    **(on-disk)** — per-step record carrying owner + startblock +
+    **(on-wire)** — per-step record carrying owner + startblock +
     offset + len + flags; the body of rmap (RUI/RUD) and bmap
     (BUI/BUD) intents.
   - [`xfs_icreate_log`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_log_format.h#L1007)
-    **(on-disk)** — inode-chunk init intent; replay zero-initialises
+    **(on-wire)** — inode-chunk init intent; replay zero-initialises
     a 64-inode chunk before any reference to inodes inside it gets
     replayed.
 
 - **Log record envelope**
   - [`xlog_rec_header`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_log_format.h#L139)
-    **(on-disk)** — outer log record header: LSN, CRC, format,
+    **(on-wire)** — outer log record header: LSN, CRC, format,
     `h_num_logops`, filesystem UUID.
   - [`xlog_op_header`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_log_format.h#L108)
-    **(on-disk)** — 16-byte per-operation wrapper inside a log
+    **(on-wire)** — 16-byte per-operation wrapper inside a log
     record (`oh_tid`, `oh_len`, `oh_flags` carry the
     `XLOG_*_TRANS` markers).
 
