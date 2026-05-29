@@ -287,6 +287,109 @@ click instead of grepping for its first explanation.
   when free space was available — sparse chunks let allocation
   succeed with as little as one 4 KiB sub-block free.
 
+- **WAL — Write-Ahead Logging.** The foundational rule the rest of
+  XFS sits on: *no metadata block is ever rewritten in its home
+  position before the corresponding log records are durable*. The CIL
+  push must reach the log device before `xfsaild` is allowed to
+  write back the dirty buffer / inode cluster. Concretely, the
+  "log pin" (`b_pin_count` on
+  [`xfs_buf`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/xfs_buf.h#L150))
+  is incremented when the buffer joins a CIL context and only cleared
+  after the matching checkpoint reaches the AIL; while pinned the
+  buffer is *unflushable*. Every other invariant in the post —
+  recovery correctness, fsync's "log force is enough", AIL ordering —
+  is a consequence of WAL.
+
+- **iflush — inode cluster flush.** The AIL's push action for an
+  `xfs_inode_log_item`: format the dirty in-core inode back into its
+  cluster buffer and submit that buffer for write. Implemented in
+  `xfs_iflush` (`fs/xfs/xfs_inode_item.c`); the buffer write is what
+  finally retires the inode log item from the AIL. The cluster
+  buffer is the *home block* — a 4 KiB block holding (typically) 8
+  inodes — so one iflush can carry several inodes' worth of dirty
+  state.
+
+- **iunlink — add an inode to the AGI unlinked bucket.** The
+  operation that runs when a still-open inode reaches `nlink = 0`.
+  `xfs_iunlink` looks up the AGI bucket by `agino mod 64`, splices
+  the inode onto the head of the bucket's linked list (via the
+  inode's `di_next_unlinked` field), and produces both a buffer log
+  item for the AGI sector edit and an inode log item for the
+  target's `di_next_unlinked` change. Recovery scans every AGI
+  bucket on mount, so a crash can't orphan a half-unlinked inode —
+  see the open-unlinked path in the
+  [`unlink()` walkthrough](#unlink).
+
+- **fork / data fork / attr fork / literal area / di_forkoff.** An
+  inode's *literal area* is the bytes after the inode core
+  (`sizeof(xfs_dinode)`) up to the end of its slot (`sb_inodesize`).
+  It holds two *forks* — a **data fork** (inline data, extents
+  array, or bmbt root) and an optional **attr fork** (extended
+  attributes) — split by `di_forkoff`, an 8-byte-granular offset
+  inside the literal area. Each fork's *format* (`di_format` for
+  data, `di_aformat` for attr) decides how that fork's bytes are
+  interpreted. The inode dump in the post shows this split via the
+  `core.forkoff` and `core.format` fields.
+
+- **inode chunk vs. inode cluster.** Two different units that both
+  group inodes contiguously, easy to confuse:
+
+  - **Inode chunk** — the allocation unit: 64 inodes
+    (`XFS_INODES_PER_CHUNK`), tracked by one
+    [`xfs_inobt_rec`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_format.h#L1600).
+    With `sparse_inodes` the chunk's on-disk extent can be a strict
+    subset, marked by `holemask`.
+  - **Inode cluster** — the IO unit: one filesystem block (4 KiB
+    typical) holding `inopblock` inodes (8 at default geometry).
+    The cluster is what `xfs_buf` reads and `iflush` writes; an
+    `xfs_inode_log_item`'s `ilf_blkno` names the cluster, and a
+    chunk normally spans several clusters (64 inodes / 8 per
+    cluster = 8 clusters).
+
+- **di_format values: DEV / LOCAL / EXTENTS / BTREE.** The four
+  encodings of an inode fork, set by `di_format` (data fork) or
+  `di_aformat` (attr fork):
+
+  - **`0` DEV** — special files (char/block devices, sockets,
+    FIFOs); the inode carries an `rdev` value, no fork payload.
+  - **`1` LOCAL** — inline data living in the literal area; how
+    short symlinks and short directories avoid needing an extent at
+    all (the root inode in our captured sample uses this).
+  - **`2` EXTENTS** — array of `xfs_bmbt_rec` records living in the
+    literal area; small/medium files with handful-of-extents.
+  - **`3` BTREE** — bmap btree root (`xfs_bmdr_block_t`) in the
+    literal area, with child blocks elsewhere in the filesystem;
+    files large enough to spill out of the literal area.
+
+  The format is recovery-critical: the same literal-area bytes mean
+  completely different things at different formats, so the wrong
+  `di_format` would silently corrupt the inode.
+
+- **log head and tail.** Two pointers into the on-disk log ring.
+  The **head** is where the next iclog write will land — the most
+  recent committed checkpoint. The **tail** is the oldest LSN still
+  needed by recovery, i.e. the oldest LSN of any item still in the
+  AIL whose home block hasn't been written. Between tail and head is
+  *recoverable history*; behind the tail the log is reusable. Log
+  space is bounded by `head - tail` (mod ring size); when that gap
+  approaches the configured limit, new reservations stall waiting
+  for the tail to advance — i.e. for `xfsaild` to flush more home
+  blocks. The clean-unmount sample showed `log tail: 73 head: 73
+  state: <CLEAN>` because every item had been flushed and the gap
+  is zero.
+
+- **iomap.** A generic VFS framework
+  ([`include/linux/iomap.h`](https://elixir.bootlin.com/linux/v7.0/source/include/linux/iomap.h))
+  that handles buffered, direct, and DAX file I/O on top of a
+  filesystem-supplied mapping callback. XFS plugs in via
+  `xfs_buffered_write_iomap_ops`, `xfs_direct_write_iomap_ops`, and
+  friends; when iomap needs "where do bytes X..Y live", it calls
+  `xfs_buffered_write_iomap_begin`, which in turn drives
+  `xfs_bmapi_reserve_delalloc` or `xfs_bmapi_write`. iomap is why
+  every modern XFS write path looks shallower than older versions —
+  the page-cache and bio plumbing lives in `fs/iomap/` rather than
+  inside XFS.
+
 - **fsb / daddr / agbno — the three block-address spaces.** The
   same physical block can be named three ways, and XFS code is
   punctilious about which:
