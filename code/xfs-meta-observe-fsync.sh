@@ -21,9 +21,14 @@ set -euo pipefail
 MOUNT=${1:?usage: $0 <xfs-mountpoint>}
 
 # Pick a sane event set; -p restricts to one filesystem if you wish.
+# Modern XFS fsync goes through xfs_log_force_seq (per-CIL-sequence
+# force); xfs_log_force is the "force everything" variant.  Probe both
+# so the trace is non-empty on any kernel old or new.
 echo "tracing... ^C to stop"
 bpftrace -e '
-kprobe:xfs_file_fsync   { printf("fsync   pid=%d ino=%d\n", pid, ((struct file *)arg0)->f_inode->i_ino); }
-kprobe:xfs_log_force    { printf("log_force lsn=0x%lx\n", arg1); }
-kprobe:xlog_cil_push_work { printf("cil_push (checkpoint)\n"); }
+kprobe:xfs_file_fsync     { printf("fsync         pid=%d ino=%d\n", pid,
+                                   ((struct file *)arg0)->f_inode->i_ino); }
+kprobe:xfs_log_force      { printf("log_force     flags=0x%lx\n", arg1); }
+kprobe:xfs_log_force_seq  { printf("log_force_seq seq=0x%lx\n", arg1); }
+kprobe:xlog_cil_push_work { printf("cil_push      (checkpoint)\n"); }
 ' 2>/dev/null

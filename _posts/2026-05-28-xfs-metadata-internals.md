@@ -152,8 +152,38 @@ ever rewrites the superblock sector.
 Dump it with [`xfs-meta-parse-sb.sh`]({{ site.baseurl }}/code/xfs-meta-parse-sb.sh):
 
 ```
-./xfs-meta-parse-sb.sh /dev/loop0
+./xfs-meta-parse-sb.sh /dev/nvme0n1
 ```
+
+Sample output on a fresh 2 GiB `mkfs.xfs` (excerpt):
+
+```
+==== primary superblock (AG 0) ====
+magicnum = 0x58465342
+blocksize = 4096
+dblocks = 524288
+rootino = 128
+agblocks = 131072
+agcount = 4
+inodesize = 512
+inopblock = 8
+versionnum = 0xb4a5
+features2 = 0x18a
+features_ro_compat = 0xf
+features_incompat = 0x2b
+crc = 0x1b34a4dd (correct)
+
+==== feature bitmaps decoded ====
+versionnum [0xb4a5+0x18a] = V5,NLINK,DIRV2,ALIGN,LOGV2,EXTFLG,MOREBITS,
+ATTR2,LAZYSBCOUNT,PROJID32BIT,CRC,FTYPE,FINOBT,SPARSE_INODES,RMAPBT,
+REFLINK,INOBTCNT,BIGTIME,NREXT64
+```
+
+Four AGs of 131072 blocks (= 512 MiB) each, 512-byte v5 inodes with 8
+per 4 KiB block. The decoded feature list spells out what a modern
+`mkfs.xfs` turns on by default — every one of those bits is a separate
+on-disk format extension, and `mount` will refuse anything with
+unknown `features_incompat` bits.
 
 The script prints the magic, version bits, block size, AG geometry and
 inode size — exactly the fields you need before doing anything else
@@ -207,8 +237,44 @@ a **buffer log item** to the current transaction.
 dumps all three for one AG:
 
 ```
-./xfs-meta-parse-ag.sh /dev/loop0 0
+./xfs-meta-parse-ag.sh /dev/nvme0n1 0
 ```
+
+Sample output (excerpt) on the same fresh filesystem:
+
+```
+==== AGF (free-space root + counters) for AG 0 ====
+magicnum  = 0x58414746
+seqno     = 0
+length    = 131072
+bnoroot   = 1
+cntroot   = 2
+rmaproot  = 5
+refcntroot= 6
+freeblks  = 130919
+longest   = 130919
+flcount   = 6
+
+==== AGI (inode root + unlinked buckets) for AG 0 ====
+magicnum  = 0x58414749
+count     = 64
+freecount = 23
+root      = 3
+free_root = 4
+unlinked[0-63] =                  # all buckets empty
+
+==== AGFL (free-list ring) for AG 0 ====
+magicnum  = 0x5841464c
+bno[0-118] = 0:null 1:7 2:8 3:9 4:10 5:11 6:12 7:null ...   # 6 staged
+```
+
+All six per-AG btree roots are visible side by side — `bnoroot`,
+`cntroot`, `rmaproot`, `refcntroot` in the AGF and `root` (inobt) plus
+`free_root` (finobt) in the AGI. The AGFL is pre-staged with 6 free
+blocks (`flcount = 6`) so a worst-case bnobt+cntbt split can run
+without recursing into the free-space btrees that the split is trying
+to grow. Every `unlinked[*]` bucket is `null` because nothing was
+deleted while held open at the time of the dump.
 
 ## Lifecycle and crash consistency
 
@@ -342,11 +408,83 @@ change*, not the inode size.
   Only now can the log space backing this change be released.
 
 [`xfs-meta-parse-inode.sh`]({{ site.baseurl }}/code/xfs-meta-parse-inode.sh)
-dumps an inode and its forks; for environments without `xfs_db`,
+dumps an inode and its forks:
+
+```
+./xfs-meta-parse-inode.sh /dev/nvme0n1 128
+```
+
+Sample output (excerpt) for the root inode of a fresh filesystem with
+a few files created:
+
+```
+==== inode 128 core ====
+core.magic    = 0x494e
+core.mode     = 040755
+core.version  = 3
+core.format   = 1 (local)
+core.nlinkv2  = 4
+core.size     = 126
+core.nextents = 0
+v3.crc        = 0x469c2d34 (correct)
+v3.change_count = 9
+v3.lsn        = 0x10000003c
+v3.flags2     = 0x18    # BIGTIME | NREXT64
+v3.inumber    = 128
+v3.bigtime    = 1
+v3.nrext64    = 1
+u3.sfdir3.hdr.count = 7
+u3.sfdir3.list[0].name = "d1"
+u3.sfdir3.list[1].name = "d2"
+u3.sfdir3.list[2].name = "fsync-test-1"
+u3.sfdir3.list[3].name = "fsync-test-2"
+...
+```
+
+Note the data-fork format is `1 (local)`: the directory's entries fit
+inside the inode literal area, so `nextents = 0` and there is no
+on-disk directory block. `v3.lsn` is the recovery-skip key on v5, and
+`v3.change_count` bumps on every modification — neither field exists
+on legacy v4 inodes.
+
+For environments without `xfs_db`,
 [`xfs-meta-parse-inode-raw.py`]({{ site.baseurl }}/code/xfs-meta-parse-inode-raw.py)
-decodes the first 96 bytes (the inode core) from a raw byte blob
-extracted by `dd`. Both tag the most important fields back to
-`xfs_dinode`.
+decodes the inode core (and, on v5, the extra v5 header fields
+through `di_lsn` / `di_flags2`) from a raw byte blob extracted by
+`dd`. Both tag the most important fields back to `xfs_dinode`.
+
+```
+dd if=/dev/nvme0n1 bs=1 skip=65536 count=512 \
+   status=none of=/tmp/ino.bin
+./xfs-meta-parse-inode-raw.py /tmp/ino.bin
+```
+
+Sample output:
+
+```
+di_magic    0x494e ('IN')
+di_version  3 (v5/CRC)
+di_mode     0o40755
+di_format   1 (local)
+di_aformat  2 (extents)
+di_nlink    4
+di_size     126
+di_nblocks  0
+di_nextents 0  (data fork records)
+di_forkoff  0 (units of 8 bytes; 0 = no attr fork)
+di_flags    0x0000
+di_gen      0
+di_crc      0x469c2d34
+di_changecount 9
+di_lsn      0x000000010000003c  (recovery skip key on v5)
+di_flags2   0x0000000000000018
+```
+
+The `di_lsn` value matches `v3.lsn` reported by `xfs_db` above — same
+field, two paths to the same bytes. (The `dd` offset 65536 = sector 128
+× 512; sector 128 is what `xfs_db inode 128 -c daddr` reports for the
+default 4 KiB-block / 8-inodes-per-block geometry shown by
+`xfs-meta-parse-sb.sh`.)
 
 ---
 
@@ -413,9 +551,48 @@ allocate-or-map path.
 
 [`xfs-meta-walk-bnobt.sh`]({{ site.baseurl }}/code/xfs-meta-walk-bnobt.sh)
 reads the bnobt, cntbt, and inobt roots out of the AGF/AGI and prints
-the root block. From there `xfs_db`'s `addr` command takes you to
-children. The same cursor structure shows up at every level — which
-is why the kernel has only one btree walker.
+the root block:
+
+```
+./xfs-meta-walk-bnobt.sh /dev/nvme0n1 0
+```
+
+Sample output on a near-empty AG:
+
+```
+==== bnobt root for AG 0 ====
+magic   = 0x41423342           # "AB3B" — bnobt v5 magic
+level   = 0
+numrecs = 1
+bno     = 8
+recs[1] = [startblock,blockcount]
+1:[153,130919]
+
+==== cntbt root for AG 0 ====
+magic   = 0x41423343           # "AB3C" — cntbt v5 magic
+recs[1] = [startblock,blockcount]
+1:[153,130919]
+
+==== inobt root for AG 0 ====
+magic   = 0x49414233           # "IAB3" — inobt v5 magic
+recs[1] = [startino,holemask,count,freecount,free]
+1:[128,0,64,23,0xfffffe0000000000]
+```
+
+Three things stand out. First, bnobt and cntbt both index the *same
+single free extent* `[153, 130919]` — that's the "two orderings of one
+set" the post emphasises. Second, `holemask = 0` on the inobt record
+means this chunk is not sparse; with `sparse_inodes` enabled the same
+record can carry a non-zero `holemask` flagging which 4 KiB sub-blocks
+of the chunk are actually allocated. Third, the inobt's `free` bitmask
+`0xfffffe0000000000` says inodes 128-168 (41 inodes) are in use and
+the rest of the chunk is free — that's the root inode (128), the
+realtime bitmap/summary (129, 130), and 38 inodes from our small
+populate workload.
+
+From there `xfs_db`'s `addr` command takes you to children. The same
+cursor structure shows up at every level — which is why the kernel has
+only one btree walker.
 
 ## Synchronization
 
@@ -601,12 +778,57 @@ After replay, the log tail advances; the filesystem is consistent.
 wraps `xfs_logprint`:
 
 ```
-./xfs-meta-dump-log.sh /dev/loop0
+./xfs-meta-dump-log.sh /dev/nvme0n1
 ```
 
-The output is transaction-grouped: each TID lists the items that were
-committed together. Reading a few of these is the fastest way to build
-intuition about what a real operation looks like on the wire.
+Sample output (excerpt — one transaction):
+
+```
+==== transaction summary ====
+xfs_logprint:
+    data device: 0x10300
+    log device: 0x10300 daddr: 2097208 length: 205200
+    log tail: 73 head: 73 state: <CLEAN>
+
+==== first inode/buffer items ====
+cycle: 1   version: 2    lsn: 1,2   tail_lsn: 1,2   num ops: 141
+Oper (1): tid: a99e3740  TRANS  num_items: 138
+Oper (3): AGF Buffer: XAGF
+  ver: 1  seq#: 1  len: 131072
+  root BNO: 1  CNT: 2     level BNO: 1  CNT: 1
+  1st: 1 last: 6 cnt: 6  freeblks: 131051  longest: 131048
+Oper (10): ICR:  #ag: 1  agbno: 0x10  len: 8
+           cnt: 64  isize: 512    gen: 0xcdafb29b
+Oper (12): INODE CORE
+  magic 0x494e mode 040755 version 3 format 1
+  nlink 4 uid 0 gid 0
+  size 0x1a nblocks 0x0 nextents 0x0
+  flags2 0x18 cowextsize 0x0
+Oper (13): LOCAL inode data
+           SHORTFORM DIRECTORY size 26
+Oper (15): AGI Buffer: XAGI
+  cnt: 64  root: 3  level: 1  free#: 0x3f  newino: 0x80
+  bucket[0 - 3]: 0xffffffff 0xffffffff 0xffffffff 0xffffffff
+```
+
+`state: <CLEAN>` is the post-unmount marker — a clean unmount drains
+every metadata item back to its home block, so the only thing the
+*current* head shows is the UNMOUNT record. The interesting traffic is
+still in the log behind the head, though, because `xfs_logprint`
+walks every record it finds. The single transaction shown above
+contains exactly the items the post predicts for a `create()`-shaped
+workload: an `AGF` buffer (extent allocation), an `ICR` (icreate
+intent — chunk init), an `INODE CORE` plus `LOCAL inode data` (the
+new inode plus its short-form directory contents), and an `AGI` buffer
+(inode counters + unlinked buckets) — all stitched into one TID.
+
+To dump a *non-clean* log on purpose, kill the VM mid-transaction
+(e.g. `echo b > /proc/sysrq-trigger` from inside the guest) and run
+the script against the unrecovered image — then `state: <DIRTY>` and
+the unmatched intent items become visible. The output is
+transaction-grouped: each TID lists the items that were committed
+together. Reading a few of these is the fastest way to build intuition
+about what a real operation looks like on the wire.
 
 ## What is *not* journaled
 
@@ -874,11 +1096,44 @@ The interesting case. With a freshly written file:
 
 Run [`xfs-meta-observe-fsync.sh`]({{ site.baseurl }}/code/xfs-meta-observe-fsync.sh)
 in one terminal while doing `xfs_io -f -c "pwrite 0 4k" -c "fsync"
-/mnt/foo` in another, and you'll see the trio: `xfs_file_fsync` →
-`xfs_log_force` → `xlog_cil_push_work`. The inode-cluster home-block
-write is *not* in that sequence; AIL flushes it later. The fsync
-guarantee holds because the log is durable and recovery reproduces the
-home block from it.
+/mnt/foo` in another:
+
+```
+./xfs-meta-observe-fsync.sh /mnt/foo
+```
+
+Sample output for five back-to-back fsync calls on freshly created
+files:
+
+```
+Attaching 4 probes...
+fsync         pid=357 ino=164
+log_force_seq seq=0x2
+cil_push      (checkpoint)
+fsync         pid=358 ino=165
+log_force_seq seq=0x3
+cil_push      (checkpoint)
+fsync         pid=360 ino=166
+log_force_seq seq=0x4
+cil_push      (checkpoint)
+fsync         pid=361 ino=167
+log_force_seq seq=0x5
+cil_push      (checkpoint)
+fsync         pid=363 ino=168
+log_force_seq seq=0x6
+cil_push      (checkpoint)
+```
+
+The trio (`xfs_file_fsync` → `xfs_log_force_seq` → `xlog_cil_push_work`)
+repeats per fsync, and the CIL sequence number monotonically increases
+— each fsync stamps the inode's log item with a new CIL sequence,
+forces the log up to that sequence, and the push that satisfies it is
+the `cil_push` line. Note that the modern kernel goes through
+`xfs_log_force_seq` (force to a specific CIL sequence), not the older
+`xfs_log_force` (force everything); the script probes both so the
+trace works on either. The inode-cluster home-block write is *not* in
+that sequence; AIL flushes it later. The fsync guarantee holds because
+the log is durable and recovery reproduces the home block from it.
 
 ---
 

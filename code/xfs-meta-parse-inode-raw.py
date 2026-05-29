@@ -2,9 +2,9 @@
 """xfs-meta-parse-inode-raw.py - Decode an XFS inode without xfs_db.
 
 Useful when you have a metadump, a forensics image, or a stripped
-recovery environment where xfs_db is not available.  Reads the first 96
-bytes (di_core) of one inode and prints the fields that decide what the
-rest of the inode means.
+recovery environment where xfs_db is not available.  Reads the inode
+core (and, on v5, the extra v5 header fields) and prints the fields
+that decide what the rest of the inode means.
 
 Usage:
     # extract the inode region from a device first
@@ -27,6 +27,18 @@ The interesting decision flow:
         2 -> extents    di_nextents records of 16 bytes each
         3 -> btree      data fork has a bmbt root in the inode literal
         4 -> dev        a device file; no fork payload
+
+v5 layout after the 96-byte core:
+    offset  96  di_next_unlinked  4
+    offset 100  di_crc            4
+    offset 104  di_changecount    8
+    offset 112  di_lsn            8   <- used by recovery on v5
+    offset 120  di_flags2         8
+    offset 128  di_cowextsize     4
+    offset 132  di_pad2          12
+    offset 144  di_crtime         8
+    offset 152  di_ino            8
+    offset 160  di_uuid          16
 """
 
 import struct
@@ -60,6 +72,9 @@ import sys
 #   uint16 di_flags
 #   uint32 di_gen
 CORE_FMT = ">HHbbHIIIHH6sH8s8s8sqqIIHbbIHHI"
+# v5 extension after byte 96; we skip di_next_unlinked + di_crc
+# and decode di_changecount, di_lsn, di_flags2.
+V5_TAIL_FMT = ">IIQQQ"
 
 FORMAT_NAMES = {
     0: "dev",     # legacy: device file
@@ -70,7 +85,7 @@ FORMAT_NAMES = {
 
 def main(path: str) -> int:
     with open(path, "rb") as f:
-        buf = f.read(96)
+        buf = f.read(200)
     if len(buf) < 96:
         print(f"need 96 bytes; got {len(buf)}", file=sys.stderr)
         return 1
@@ -79,7 +94,7 @@ def main(path: str) -> int:
      di_uid, di_gid, di_nlink, di_projid_lo, di_projid_hi,
      _pad, di_flushiter, _at, _mt, _ct, di_size, di_nblocks,
      di_extsize, di_nextents, di_anextents, di_forkoff,
-     di_aformat, _dmemask, _dmstate, di_flags, di_gen) = struct.unpack(CORE_FMT, buf)
+     di_aformat, _dmemask, _dmstate, di_flags, di_gen) = struct.unpack(CORE_FMT, buf[:96])
 
     if di_magic != 0x494e:
         print(f"bad magic: 0x{di_magic:04x} (want 0x494e 'IN')", file=sys.stderr)
@@ -100,9 +115,18 @@ def main(path: str) -> int:
     print(f"di_nextents {di_nextents}  (data fork records)")
     print(f"di_anextents {di_anextents} (attr fork records)")
     print(f"di_forkoff  {di_forkoff} (units of 8 bytes; 0 = no attr fork)")
-    print(f"di_flushiter {di_flushiter} (bumped each xfs_iflush)")
     print(f"di_flags    0x{di_flags:04x}")
     print(f"di_gen      {di_gen}")
+
+    if di_version >= 3 and len(buf) >= 128:
+        (di_next_unlinked, di_crc, di_changecount,
+         di_lsn, di_flags2) = struct.unpack(V5_TAIL_FMT, buf[96:128])
+        print(f"di_crc      0x{di_crc:08x}")
+        print(f"di_changecount {di_changecount}")
+        print(f"di_lsn      0x{di_lsn:016x}  (recovery skip key on v5)")
+        print(f"di_flags2   0x{di_flags2:016x}")
+    else:
+        print(f"di_flushiter {di_flushiter} (v4 recovery skip key; unused on v5)")
     return 0
 
 if __name__ == "__main__":
