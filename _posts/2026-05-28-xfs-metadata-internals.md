@@ -129,8 +129,10 @@ splitting the free-space btrees without recursing into themselves.
 
 The structures live in
 [`fs/xfs/libxfs/xfs_format.h`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_format.h):
-`struct xfs_dsb`, `struct xfs_agf`, `struct xfs_agi`,
-`struct xfs_agfl`.
+[`struct xfs_dsb`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_format.h#L193),
+[`struct xfs_agf`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_format.h#L517),
+[`struct xfs_agi`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_format.h#L618),
+[`struct xfs_agfl`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_format.h#L692).
 
 ## Superblock
 
@@ -141,8 +143,8 @@ inode size, log location, and the three feature bitmaps
 bits; that bitmap is why a kernel built without rmap support cannot
 even read-only-mount an rmap filesystem.
 
-In core, the superblock is `struct xfs_sb` cached on
-`xfs_mount->m_sb`. Counters that move on every operation
+In core, the superblock is [`struct xfs_sb`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_format.h#L95) cached on
+[`xfs_mount`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/xfs_mount.h#L154)`->m_sb`. Counters that move on every operation
 (`fdblocks`, `ifree`, …) are not updated atomically on the on-disk
 copy; instead, deltas are accumulated per-CPU and folded back into the
 superblock when a transaction commits. That folding produces a
@@ -247,7 +249,7 @@ sizes up; otherwise it falls back to `sb_logsectsize`.
 **How the kernel finds it at mount.**
 [`xfs_log_mount`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/xfs_log.c#L534)
 takes the values out of the superblock and constructs the in-core
-`struct xlog`. The log device is reached through a `xfs_buftarg`
+[`struct xlog`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/xfs_log_priv.h#L414). The log device is reached through a [`xfs_buftarg`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/xfs_buf.h#L96)
 held on the mount:
 
 ```
@@ -401,7 +403,7 @@ helps to look at them together:
   `xfs_alloc_fix_freelist` refills it as part of any allocation that
   drains it.
 
-In core, each AG is wrapped by `struct xfs_perag`. The buffers backing
+In core, each AG is wrapped by [`struct xfs_perag`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_ag.h#L34). The buffers backing
 AGF/AGI/AGFL are normal metadata buffers (`xfs_buf`); mutations attach
 a **buffer log item** to the current transaction.
 
@@ -491,7 +493,7 @@ don't exist. The structure of the chunk is otherwise unchanged.
  └──────────────────────────────────────────────────────────────┘
 ```
 
-Each inode has two parts: the **core** (`struct xfs_dinode`) and the
+Each inode has two parts: the **core** ([`struct xfs_dinode`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_format.h#L901)) and the
 **literal area** that holds the data fork and (optionally) the attr
 fork. The split between forks is parameterised by `di_forkoff`, an
 8-byte-granular offset *inside* the literal area; this is how XFS fits
@@ -504,7 +506,7 @@ Core fields that matter for debugging:
 - `di_format`, `di_aformat`: encoding of the data and attr forks.
   Possible values: `dev` (0, only on special files — char/block
   devices, sockets, FIFOs), `local` (1, payload inline), `extents`
-  (2, array of `xfs_bmbt_rec`), `btree` (3, bmbt root in the literal
+  (2, array of [`xfs_bmbt_rec`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_format.h#L1871)), `btree` (3, bmbt root in the literal
   area). Regular files only ever use `local`/`extents`/`btree`.
   Local-format dirs and symlinks have no extents at all.
 - `di_nextents` / `di_anextents`: counts that match the array size in
@@ -524,11 +526,11 @@ the in-core form is
 ## In-memory: `xfs_inode`
 
 `xfs_inode` is the in-core counterpart. It embeds the generic VFS
-`struct inode`, the metadata cluster buffer pointer, and per-fork
-`struct xfs_ifork` objects that hold the *expanded* fork (the in-core
+[`struct inode`](https://elixir.bootlin.com/linux/v7.0/source/include/linux/fs.h), the metadata cluster buffer pointer, and per-fork
+[`struct xfs_ifork`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_inode_fork.h#L15) objects that hold the *expanded* fork (the in-core
 extent list is decompressed from the packed on-disk form for fast
 lookup). It also owns the inode log item
-(`struct xfs_inode_log_item`) which is what threads attach to a
+([`struct xfs_inode_log_item`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/xfs_inode_item.h#L16)) which is what threads attach to a
 transaction when they dirty inode fields.
 
 The cache is **per-AG**: each `xfs_perag` keeps a radix tree of
@@ -677,7 +679,7 @@ allocated inode chunks (inobt), inode chunks with at least one free
 slot (finobt), reverse maps (rmapbt), and reference counts
 (refcountbt) — six on a modern v5 filesystem. Per-inode: the file
 extent map (bmbt). The shape is shared via
-[`struct xfs_btree_cur`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_btree.h) —
+[`struct xfs_btree_cur`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_btree.h#L266) —
 a per-cursor object that hides the per-tree differences (key compare,
 record format, leaf size) behind ops vectors. Code that walks the
 tree (`xfs_btree_lookup`, `xfs_btree_insert`, `xfs_btree_delete`) is
@@ -699,12 +701,14 @@ shared across all five trees.
 The roots and heights live in the AGF (for free-space) and AGI (for
 inodes). Records are defined in
 [`xfs_format.h`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_format.h):
-`xfs_alloc_rec`, `xfs_inobt_rec`, `xfs_bmbt_rec`.
+[`xfs_alloc_rec`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_format.h#L1543),
+[`xfs_inobt_rec`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_format.h#L1600),
+`xfs_bmbt_rec`.
 
 ## Per-inode btree: the extent map
 
 File extents are kept in a btree **rooted inside the inode** when
-`di_format == XFS_DINODE_FMT_BTREE`. The root block (`xfs_bmdr_block_t`)
+`di_format == XFS_DINODE_FMT_BTREE`. The root block ([`xfs_bmdr_block_t`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_format.h#L1843))
 lives in the inode literal area; the rest of the tree is in normal
 filesystem blocks. For small files, `di_format == EXTENTS` keeps the
 records inline; for tiny files (or short symlinks, or small dirs),
@@ -804,7 +808,7 @@ follows.
 
 ## The transaction
 
-`struct xfs_trans` is an in-memory object that:
+[`struct xfs_trans`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/xfs_trans.h#L125) is an in-memory object that:
 
 - carries a **log space reservation** (worst-case bytes the transaction
   may need to log, paid up-front to keep the log from filling under
@@ -830,7 +834,7 @@ holds a pointer to the owning AIL, the LSN, flags, and an ops vector
 (`iop_format`, `iop_pin`, `iop_unpin`, `iop_push`, `iop_committed`,
 etc.) implemented per item type:
 
-- **`xfs_buf_log_item`** — a metadata buffer was modified.
+- **[`xfs_buf_log_item`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/xfs_buf_item.h#L39)** — a metadata buffer was modified.
   `iop_format` emits the dirty byte ranges, not the whole buffer.
 - **`xfs_inode_log_item`** — an inode was modified.
 - **EFI / EFD** — Extent Free Intent / Done. Pair: EFI = "I intend
@@ -869,9 +873,10 @@ outside in:
   └──────────────────────────────────────────────────────────────┘
 ```
 
-The outer `xlog_rec_header` (`fs/xfs/libxfs/xfs_log_format.h`) carries
-the LSN, the record CRC, the number of operations inside, and the fs
-UUID. The inner `xlog_op_header` (16 bytes, also in the same header)
+The outer [`xlog_rec_header`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_log_format.h#L139)
+carries the LSN, the record CRC, the number of operations inside, and
+the fs UUID. The inner [`xlog_op_header`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_log_format.h#L108)
+(16 bytes, also in the same header)
 wraps every formatted item and records which transaction it belongs
 to (`oh_tid`) and its payload length (`oh_len`); `oh_flags` carries
 `XLOG_START_TRANS` / `XLOG_COMMIT_TRANS` / `XLOG_CONTINUE_TRANS`
@@ -897,7 +902,7 @@ dispatch on the type. The full type table from
 /* …plus realtime variants 0x124a..0x124f */
 ```
 
-**Buffer log item — `struct xfs_buf_log_format`** (`XFS_LI_BUF`,
+**Buffer log item — [`struct xfs_buf_log_format`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_log_format.h#L527)** (`XFS_LI_BUF`,
 0x123c):
 
 ```c
@@ -923,7 +928,7 @@ are written. `blft` is hidden inside the top 5 bits of `blf_flags`
 `XFS_BLFT_DIR_LEAF1_BUF`, …) so recovery can re-verify the buffer's
 CRC after replay by knowing what kind of metadata it is.
 
-**Inode log item — `struct xfs_inode_log_format`** (`XFS_LI_INODE`,
+**Inode log item — [`struct xfs_inode_log_format`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_log_format.h#L274)** (`XFS_LI_INODE`,
 0x123b):
 
 ```c
@@ -954,7 +959,7 @@ fields-mask is why XFS log volume is roughly proportional to the
 *amount of change*, not the inode size: an inode whose only change is
 ctime emits just `ILOG_CORE`'s 176 bytes, not the whole 512-byte inode.
 
-**Extent free intent/done — `struct xfs_efi_log_format`** (`XFS_LI_EFI`,
+**Extent free intent/done — [`struct xfs_efi_log_format`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_log_format.h#L619)** (`XFS_LI_EFI`,
 0x1236) and its mirror EFD (0x1237):
 
 ```c
@@ -971,11 +976,11 @@ The matching EFD has the same shape but `efd_efi_id` instead of
 `efi_id`. Recovery pairs an EFD with the EFI whose `efi_id` equals
 the EFD's `efd_efi_id`; an EFI with no matching EFD means the system
 crashed mid-operation, and recovery does the free itself. The same
-structural pattern shows up for RUI/RUD (rmap, `struct xfs_map_extent`
+structural pattern shows up for RUI/RUD (rmap, [`struct xfs_map_extent`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_log_format.h#L723)
 records), CUI/CUD (refcount), BUI/BUD (bmap update) — type code
 changes, body is "intent id + array of per-step records".
 
-**ICREATE — `struct xfs_icreate_log`** (`XFS_LI_ICREATE`, 0x123f):
+**ICREATE — [`struct xfs_icreate_log`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_log_format.h#L1007)** (`XFS_LI_ICREATE`, 0x123f):
 
 ```c
 struct xfs_icreate_log {
@@ -1093,7 +1098,7 @@ transactions touched the buffer. (Concurrent transactions can't race
 here — the buffer lock serializes them; the win is across *sequential*
 transactions inside the checkpoint window.) The data structure is
 [`struct xfs_cil`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/xfs_log_priv.h#L284),
-holding a current context (`xfs_cil_ctx`) plus per-CPU staging lists.
+holding a current context ([`xfs_cil_ctx`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/xfs_log_priv.h#L235)) plus per-CPU staging lists.
 
 The push happens in
 [`xlog_cil_push_work`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/xfs_log_cil.c#L96)
@@ -1269,7 +1274,7 @@ Two large things:
 ## Why a separate cache
 
 XFS reads metadata through
-[`struct xfs_buf`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/xfs_buf.h),
+[`struct xfs_buf`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/xfs_buf.h#L150),
 not through the page cache. The page cache is keyed by file inode +
 offset; metadata is keyed by *device + block + length*, can span
 sector sizes different from `PAGE_SIZE`, and needs explicit pin/unpin
