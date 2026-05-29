@@ -469,6 +469,48 @@ deleted while held open at the time of the dump.
 
 ---
 
+# Terms
+
+A glossary of recurring acronyms the rest of the post leans on.
+Grouped here so a reader landing mid-post can resolve a name in one
+click instead of grepping for its first explanation.
+
+- **LSN — Log Sequence Number.** A 64-bit
+  [`xfs_lsn_t`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_types.h#L27)
+  (`int64_t`) that totally orders every byte ever written to the log.
+  It's packed as two 32-bit halves:
+
+  ```
+   ┌──────────────────────┬──────────────────────┐
+   │   cycle (upper 32)   │   block (lower 32)   │
+   └──────────────────────┴──────────────────────┘
+   |  CYCLE_LSN(lsn)      |  BLOCK_LSN(lsn)      |
+  ```
+
+  The *cycle* counts how many times the log has wrapped around the
+  ring; the *block* is the position within the current cycle, in log
+  sectors. The split + the cycle counter is what lets `XFS_LSN_CMP`
+  compare two LSNs unambiguously even across wraps — when the log
+  reaches the end of the ring, the cycle bumps and block resets to 0,
+  but the int64 value as a whole still increases. See
+  [`xlog_assign_lsn`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_log_format.h#L58)
+  and `CYCLE_LSN` / `BLOCK_LSN` macros in `xfs_log_format.h`.
+
+  Three concrete places the rest of the post relies on LSNs:
+
+  - **Recovery skip key.** On v5 inodes, `di_lsn` holds the LSN of
+    the last log item that touched the inode; recovery skips
+    replaying any log item whose LSN is older.
+  - **fsync target.** `xfs_log_force_seq` waits for the on-disk log
+    head to cover the CIL sequence that committed the inode's log
+    item; that sequence resolves to an LSN under the hood.
+  - **AIL ordering.** The AIL is sorted by LSN, oldest first; the
+    *tail LSN* is the oldest LSN still in the AIL, and it pins log
+    space because recovery may still need to replay through that
+    point.
+
+---
+
 # Data structures
 
 A grouped reference for the structs the rest of the post talks about.
