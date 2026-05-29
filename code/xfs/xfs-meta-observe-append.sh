@@ -25,7 +25,11 @@ set -euo pipefail
 
 echo "tracing... ^C to stop"
 bpftrace -e '
-tracepoint:xfs:xfs_file_buffered_write { printf("write         (one buffered write call)\n"); }
-tracepoint:xfs:xfs_iext_insert         { printf("  iext_insert (new extent in in-core list)\n"); }
+tracepoint:xfs:xfs_file_buffered_write { printf("write         ino=0x%lx disize=0x%lx pos=0x%lx bytes=0x%lx\n",
+                                                args->ino, args->size,
+                                                args->offset, args->count); }
+tracepoint:xfs:xfs_iext_insert         { printf("  iext_insert ino=0x%lx logical=0x%lx phys=0x%lx blocks=%lu  (new bmbt rec)\n",
+                                                args->ino, args->startoff,
+                                                args->startblock, args->blockcount); }
 kprobe:xlog_cil_push_work              { printf("  cil_push    (checkpoint)\n"); }
 ' 2>/dev/null

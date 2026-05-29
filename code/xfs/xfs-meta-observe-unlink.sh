@@ -26,12 +26,12 @@ set -euo pipefail
 
 echo "tracing... ^C to stop"
 bpftrace -e '
-tracepoint:xfs:xfs_remove                  { printf("remove        dp_ino=%lld\n",
-                                                    args->dp_ino); }
-tracepoint:xfs:xfs_iunlink_update_bucket   { printf("  iu_bucket   agno=%u bucket=%u old=0x%x new=0x%x\n",
+tracepoint:xfs:xfs_remove                  { printf("remove        dp_ino=%lld namelen=%d\n",
+                                                    args->dp_ino, args->namelen); }
+tracepoint:xfs:xfs_iunlink_update_bucket   { printf("  iu_bucket   agno=%u bucket=%u old=0x%x new=0x%x  (AGI bucket head)\n",
                                                     args->agno, args->bucket,
                                                     args->old_ptr, args->new_ptr); }
-tracepoint:xfs:xfs_iunlink_update_dinode   { printf("  iu_dinode   agno=%u agino=0x%x old=0x%x new=0x%x\n",
+tracepoint:xfs:xfs_iunlink_update_dinode   { printf("  iu_dinode   agno=%u agino=0x%x old=0x%x new=0x%x  (inode next-on-list)\n",
                                                     args->agno, args->agino,
                                                     args->old_ptr, args->new_ptr); }
 kprobe:xlog_cil_push_work                  { printf("  cil_push    (checkpoint)\n"); }
