@@ -159,24 +159,26 @@ Sample output on a fresh 2 GiB `mkfs.xfs` (excerpt):
 
 ```
 ==== primary superblock (AG 0) ====
-magicnum = 0x58465342
-blocksize = 4096
-dblocks = 524288
-rootino = 128
-agblocks = 131072
-agcount = 4
-inodesize = 512
-inopblock = 8
-versionnum = 0xb4a5
-features2 = 0x18a
-features_ro_compat = 0xf
-features_incompat = 0x2b
-crc = 0x1b34a4dd (correct)
+magicnum  = 0x58465342           # "XFSB"; mount refuses anything else
+blocksize = 4096                 # filesystem block size in bytes
+dblocks   = 524288               # total fs size in blocks (= 2 GiB)
+rootino   = 128                  # inode number of "/"
+agblocks  = 131072               # blocks per AG (= 512 MiB at 4 KiB blocks)
+agcount   = 4                    # 4 AGs total
+inodesize = 512                  # v5 default; 256 on older mkfs
+inopblock = 8                    # inodes per fs block (4096 / 512)
+versionnum = 0xb4a5              # version + primary feature bits
+features2  = 0x18a               # secondary feature bitmap
+features_ro_compat = 0xf         # rmap / reflink / inobt-counts / sparse
+features_incompat  = 0x2b        # ftype + meta_uuid + bigtime + nrext64
+crc        = 0x1b34a4dd (correct)# sb sector self-CRC verified
 
 ==== feature bitmaps decoded ====
 versionnum [0xb4a5+0x18a] = V5,NLINK,DIRV2,ALIGN,LOGV2,EXTFLG,MOREBITS,
 ATTR2,LAZYSBCOUNT,PROJID32BIT,CRC,FTYPE,FINOBT,SPARSE_INODES,RMAPBT,
 REFLINK,INOBTCNT,BIGTIME,NREXT64
+# every name here is one bit in one of the feature bitmaps above;
+# unknown bits in *_incompat fail the mount.
 ```
 
 Four AGs of 131072 blocks (= 512 MiB) each, 512-byte v5 inodes with 8
@@ -244,28 +246,31 @@ Sample output (excerpt) on the same fresh filesystem:
 
 ```
 ==== AGF (free-space root + counters) for AG 0 ====
-magicnum  = 0x58414746
-seqno     = 0
-length    = 131072
-bnoroot   = 1
-cntroot   = 2
-rmaproot  = 5
-refcntroot= 6
-freeblks  = 130919
-longest   = 130919
-flcount   = 6
+magicnum  = 0x58414746            # "XAGF"
+seqno     = 0                     # this is AG 0
+length    = 131072                # blocks in this AG (matches sb_agblocks)
+bnoroot   = 1                     # bnobt root: AG-block 1
+cntroot   = 2                     # cntbt root: AG-block 2
+rmaproot  = 5                     # rmapbt root: AG-block 5
+refcntroot= 6                     # refcountbt root: AG-block 6
+freeblks  = 130919                # free blocks in this AG
+longest   = 130919                # longest contiguous free extent
+flcount   = 6                     # AGFL entries currently staged
 
 ==== AGI (inode root + unlinked buckets) for AG 0 ====
-magicnum  = 0x58414749
-count     = 64
-freecount = 23
-root      = 3
-free_root = 4
-unlinked[0-63] =                  # all buckets empty
+magicnum  = 0x58414749            # "XAGI"
+count     = 64                    # inodes allocated in this AG
+freecount = 23                    # free inodes inside allocated chunks
+root      = 3                     # inobt root: AG-block 3
+free_root = 4                     # finobt root: AG-block 4
+unlinked[0-63] =                  # all 64 buckets empty (no open-unlinked)
 
 ==== AGFL (free-list ring) for AG 0 ====
-magicnum  = 0x5841464c
-bno[0-118] = 0:null 1:7 2:8 3:9 4:10 5:11 6:12 7:null ...   # 6 staged
+magicnum  = 0x5841464c            # "XAFL"
+bno[0-118] = 0:null 1:7 2:8 3:9 4:10 5:11 6:12 7:null ...
+                                  # ring slots 1..6 hold the 6 free blocks
+                                  # pre-staged for worst-case bnobt+cntbt
+                                  # split; the rest are empty
 ```
 
 All six per-AG btree roots are visible side by side — `bnoroot`,
@@ -419,24 +424,26 @@ a few files created:
 
 ```
 ==== inode 128 core ====
-core.magic    = 0x494e
-core.mode     = 040755
-core.version  = 3
-core.format   = 1 (local)
-core.nlinkv2  = 4
-core.size     = 126
-core.nextents = 0
-v3.crc        = 0x469c2d34 (correct)
-v3.change_count = 9
-v3.lsn        = 0x10000003c
-v3.flags2     = 0x18    # BIGTIME | NREXT64
-v3.inumber    = 128
-v3.bigtime    = 1
-v3.nrext64    = 1
-u3.sfdir3.hdr.count = 7
-u3.sfdir3.list[0].name = "d1"
-u3.sfdir3.list[1].name = "d2"
-u3.sfdir3.list[2].name = "fsync-test-1"
+core.magic    = 0x494e               # "IN"
+core.mode     = 040755               # directory, rwxr-xr-x
+core.version  = 3                    # v5 / CRC inode
+core.format   = 1 (local)            # data fork lives inline in literal area
+core.nlinkv2  = 4                    # ., .., d1, d2 — 4 nlink references
+core.size     = 126                  # bytes of inline directory data
+core.nextents = 0                    # no on-disk extents (local format)
+v3.crc        = 0x469c2d34 (correct) # inode self-CRC verified
+v3.change_count = 9                  # bumped each mutation; nfs / online repair use
+v3.lsn        = 0x10000003c          # cycle 1, block 0x3c — last log seq that
+                                     # modified this inode; recovery skips items
+                                     # whose LSN < this (v5 recovery key)
+v3.flags2     = 0x18                 # BIGTIME | NREXT64
+v3.inumber    = 128                  # self inode number (must match lookup)
+v3.bigtime    = 1                    # timestamps are nsec since 1901, not 1970
+v3.nrext64    = 1                    # 64-bit extent counters enabled
+u3.sfdir3.hdr.count = 7              # 7 entries in this short-form dir
+u3.sfdir3.list[0].name = "d1"        # subdirectory
+u3.sfdir3.list[1].name = "d2"        # subdirectory
+u3.sfdir3.list[2].name = "fsync-test-1"   # plain file
 u3.sfdir3.list[3].name = "fsync-test-2"
 ...
 ```
@@ -462,22 +469,24 @@ dd if=/dev/nvme0n1 bs=1 skip=65536 count=512 \
 Sample output:
 
 ```
-di_magic    0x494e ('IN')
-di_version  3 (v5/CRC)
-di_mode     0o40755
-di_format   1 (local)
-di_aformat  2 (extents)
-di_nlink    4
-di_size     126
-di_nblocks  0
+di_magic    0x494e ('IN')                    # valid XFS inode
+di_version  3 (v5/CRC)                       # modern format
+di_mode     0o40755                          # directory, rwxr-xr-x
+di_format   1 (local)                        # data fork inline
+di_aformat  2 (extents)                      # attr fork format (no attrs here)
+di_nlink    4                                # link count
+di_uid:gid  0:0                              # owned by root
+di_size     126                              # bytes in inline payload
+di_nblocks  0                                # no extents allocated
 di_nextents 0  (data fork records)
+di_anextents 0 (attr fork records)
 di_forkoff  0 (units of 8 bytes; 0 = no attr fork)
-di_flags    0x0000
-di_gen      0
-di_crc      0x469c2d34
-di_changecount 9
+di_flags    0x0000                           # no per-inode flags set
+di_gen      0                                # NFS generation counter
+di_crc      0x469c2d34                       # matches v3.crc from xfs_db above
+di_changecount 9                             # matches v3.change_count above
 di_lsn      0x000000010000003c  (recovery skip key on v5)
-di_flags2   0x0000000000000018
+di_flags2   0x0000000000000018               # BIGTIME | NREXT64
 ```
 
 The `di_lsn` value matches `v3.lsn` reported by `xfs_db` above — same
@@ -562,21 +571,26 @@ Sample output on a near-empty AG:
 ```
 ==== bnobt root for AG 0 ====
 magic   = 0x41423342           # "AB3B" — bnobt v5 magic
-level   = 0
-numrecs = 1
-bno     = 8
+level   = 0                    # leaf level (root is also the only node)
+numrecs = 1                    # one record in this node
+bno     = 8                    # this btree block lives at AG-block 8
 recs[1] = [startblock,blockcount]
-1:[153,130919]
+1:[153,130919]                 # one free extent: 130919 blocks @ AG-block 153
 
 ==== cntbt root for AG 0 ====
 magic   = 0x41423343           # "AB3C" — cntbt v5 magic
 recs[1] = [startblock,blockcount]
-1:[153,130919]
+1:[153,130919]                 # SAME extent, indexed by length this time
 
 ==== inobt root for AG 0 ====
 magic   = 0x49414233           # "IAB3" — inobt v5 magic
 recs[1] = [startino,holemask,count,freecount,free]
 1:[128,0,64,23,0xfffffe0000000000]
+#  ^   ^  ^  ^   └─ "free" bitmask: bit i = 1 if inode i in this chunk is free
+#  ^   ^  ^  └──── 23 free inodes inside the chunk
+#  ^   ^  └─────── chunk size (always 64)
+#  ^   └────────── holemask = 0: chunk has no sparse holes (sparse_inodes off here)
+#  └────────────── chunk starts at inode 128 (the root inode)
 ```
 
 Three things stand out. First, bnobt and cntbt both index the *same
@@ -787,28 +801,29 @@ Sample output (excerpt — one transaction):
 ==== transaction summary ====
 xfs_logprint:
     data device: 0x10300
-    log device: 0x10300 daddr: 2097208 length: 205200
-    log tail: 73 head: 73 state: <CLEAN>
+    log device: 0x10300 daddr: 2097208 length: 205200   # internal log
+    log tail: 73 head: 73 state: <CLEAN>                # cleanly unmounted
 
 ==== first inode/buffer items ====
-cycle: 1   version: 2    lsn: 1,2   tail_lsn: 1,2   num ops: 141
-Oper (1): tid: a99e3740  TRANS  num_items: 138
-Oper (3): AGF Buffer: XAGF
+cycle: 1  version: 2  lsn: 1,2  tail_lsn: 1,2  num ops: 141
+                                              # one log record, 141 oper entries
+Oper (1): tid: a99e3740  TRANS  num_items: 138       # transaction header (138 items)
+Oper (3): AGF Buffer: XAGF                            # buffer log item: AGF dirtied
   ver: 1  seq#: 1  len: 131072
-  root BNO: 1  CNT: 2     level BNO: 1  CNT: 1
+  root BNO: 1  CNT: 2     level BNO: 1  CNT: 1       # bnobt/cntbt roots & heights
   1st: 1 last: 6 cnt: 6  freeblks: 131051  longest: 131048
-Oper (10): ICR:  #ag: 1  agbno: 0x10  len: 8
-           cnt: 64  isize: 512    gen: 0xcdafb29b
-Oper (12): INODE CORE
+Oper (10): ICR:  #ag: 1  agbno: 0x10  len: 8         # icreate intent: zero new
+           cnt: 64  isize: 512    gen: 0xcdafb29b    # 64-inode chunk on replay
+Oper (12): INODE CORE                                 # inode log item: new inode
   magic 0x494e mode 040755 version 3 format 1
   nlink 4 uid 0 gid 0
   size 0x1a nblocks 0x0 nextents 0x0
   flags2 0x18 cowextsize 0x0
-Oper (13): LOCAL inode data
-           SHORTFORM DIRECTORY size 26
-Oper (15): AGI Buffer: XAGI
+Oper (13): LOCAL inode data                           # the inode's data fork:
+           SHORTFORM DIRECTORY size 26                #  26-byte inline dir
+Oper (15): AGI Buffer: XAGI                           # buffer log item: AGI dirtied
   cnt: 64  root: 3  level: 1  free#: 0x3f  newino: 0x80
-  bucket[0 - 3]: 0xffffffff 0xffffffff 0xffffffff 0xffffffff
+  bucket[0 - 3]: 0xffffffff 0xffffffff 0xffffffff 0xffffffff  # unlinked buckets
 ```
 
 `state: <CLEAN>` is the post-unmount marker — a clean unmount drains
@@ -1107,10 +1122,10 @@ files:
 
 ```
 Attaching 4 probes...
-fsync         pid=357 ino=164
-log_force_seq seq=0x2
-cil_push      (checkpoint)
-fsync         pid=358 ino=165
+fsync         pid=357 ino=164     # userspace calls fsync() on inode 164
+log_force_seq seq=0x2             # xfs_file_fsync forces the log to CIL seq 2
+cil_push      (checkpoint)        # CIL push writes seq 2 to the on-disk log
+fsync         pid=358 ino=165     # next fsync; next CIL sequence
 log_force_seq seq=0x3
 cil_push      (checkpoint)
 fsync         pid=360 ino=166
