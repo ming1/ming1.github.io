@@ -1003,6 +1003,27 @@ block, and the newly-created inode core. The ICREATE intent ensures a
 freshly-allocated chunk is fully zero-initialised before any extent
 references it.
 
+Observe with [`xfs-meta-observe-create.sh`]({{ site.baseurl }}/code/xfs/xfs-meta-observe-create.sh):
+
+```
+./xfs-meta-observe-create.sh
+```
+
+Sample output for one `touch /mnt/xfs/created`:
+
+```
+create        dp_ino=128                     # VFS entry; parent = root dir
+  dialloc     (inobt/finobt/AGI dirtied)     # inode allocator: 3 buffer log items
+  dir_create  (parent dir-block edit)        # entry insert in parent dir
+  cil_push    (checkpoint)                   # CIL push (forced by sync)
+```
+
+The four-line trace lines up one-to-one with the four-step transaction
+diagram above. The `dialloc` line stands for *all three* AG-header
+buffer log items the inobt/finobt/AGI edits produce — bpftrace sees
+one call, but the transaction it commits attaches three buffer log
+items to the CIL.
+
 ## Append-write with extent allocation
 
 A write past i_size that needs a new extent:
@@ -1028,6 +1049,29 @@ extent record).
 
 The data itself is *never* journaled — only the metadata that locates
 it.
+
+Observe with [`xfs-meta-observe-append.sh`]({{ site.baseurl }}/code/xfs/xfs-meta-observe-append.sh):
+
+```
+./xfs-meta-observe-append.sh
+```
+
+Sample output for `xfs_io -f -c "pwrite -b 1M 0 1M" -c fsync /mnt/xfs/big`:
+
+```
+write         (one buffered write call)     # xfs_file_buffered_write tracepoint
+  iext_insert (new extent in in-core list)  # the extent the alloc produced
+  cil_push    (checkpoint)                  # fsync forces the log
+```
+
+Just three events — and the *data* never shows up in either of them.
+The `iext_insert` is the in-core extent list growing by one record (a
+new `xfs_bmbt_rec` for the 1 MiB extent); the only thing the CIL push
+carries is the inode log item describing that record, plus the
+AGF/free-space-btree buffer log items that document where the blocks
+came from. Trace a write *without* fsync and the `cil_push` line
+drops out — the alloc still happened, but the CIL push is now
+deferred to the periodic timer.
 
 ## `unlink()`
 
@@ -1058,6 +1102,41 @@ and a buffer log item for the AGI sector whose `agi_unlinked` bucket
 now points at the target's inode number. No EFIs yet — the extents
 are not freed until the last close drives the deferred cleanup.
 
+Observe with [`xfs-meta-observe-unlink.sh`]({{ site.baseurl }}/code/xfs/xfs-meta-observe-unlink.sh):
+
+```
+./xfs-meta-observe-unlink.sh
+```
+
+Sample output for a workload that exercises both paths — `rm u_closed`
+(no open fd) then `rm u_open` inside a subshell that holds it open via
+`exec 9<u_open`:
+
+```
+remove        dp_ino=128                                          # closed-file rm:
+                                                                  #   inode + extents
+                                                                  #   freed in-line;
+                                                                  #   no iu_bucket
+remove        dp_ino=128                                          # open-file rm:
+  iu_bucket   agno=0 bucket=5 old=0xffffffff new=0x85             #   bucket head set
+                                                                  #   to orphan inode
+  iu_bucket   agno=0 bucket=5 old=0x85 new=0xffffffff             # subshell exits →
+                                                                  #   fd 9 closes →
+                                                                  #   deferred free
+                                                                  #   clears bucket
+  cil_push    (checkpoint)                                        # ONE push covers
+                                                                  # both unlinks
+```
+
+Two reading notes worth pulling out. First: the closed-file `remove`
+produces *no* `iu_bucket` line because the inode is freed in-line —
+there is nothing to park on the unlinked list. Second: both unlinks
+share *one* `cil_push` at the end. That's the CIL aggregating two
+sequential transactions into one checkpoint — the same "relogging
+within the checkpoint window" mechanism the [CIL section](#the-cil)
+describes, visible here as one bpftrace line where the prose would
+predict two.
+
 ## `rename()`
 
 [`xfs_rename`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/xfs_inode.c#L2125)
@@ -1084,6 +1163,28 @@ exists in neither directory or in both. This is the property
 across AGs are reservation-expensive: the worst-case set of log items
 spans the maximum of both AGs' touched buffers.
 
+Observe with [`xfs-meta-observe-rename.sh`]({{ site.baseurl }}/code/xfs/xfs-meta-observe-rename.sh):
+
+```
+./xfs-meta-observe-rename.sh
+```
+
+Sample output for `mv /mnt/xfs/r_src /mnt/xfs/r_dst`:
+
+```
+rename        src_dp=128 -> tgt_dp=128             # both names in root dir
+  dir_create  (target dir-block edit)              # new entry "r_dst"
+  dir_remove  (source dir-block edit)              # old entry "r_src" gone
+  cil_push    (checkpoint)                         # ONE push for the whole rename
+```
+
+The trace makes the atomicity claim concrete: there is no checkpoint
+boundary between `dir_remove` and `dir_create`, so on the on-disk log
+the source-side removal and target-side insertion are inseparable.
+Both dir-block edits, both parent-inode log items, and (if blocks
+were freed) the matching EFI/EFD all land in the single `cil_push`
+line.
+
 ## `truncate()`
 
 `xfs_setattr_size` calls `xfs_itruncate_extents_flags`. For a file
@@ -1098,6 +1199,31 @@ Dirty transitions: each sub-transaction independently moves through
 in-CIL → in-AIL; the inode's `di_size` only reaches the home block
 after the last sub-transaction's inode log item is flushed.
 
+Observe with [`xfs-meta-observe-truncate.sh`]({{ site.baseurl }}/code/xfs/xfs-meta-observe-truncate.sh):
+
+```
+./xfs-meta-observe-truncate.sh
+```
+
+Sample output for `xfs_io -c "truncate 0"` on a 4 MiB file (one extent):
+
+```
+setattr_size  (VFS truncate entry)            # xfs_setattr_size
+  itrunc      (sub-txn extent free)           # one sub-transaction
+                                              # freed all extents
+  defer       (intent chain advance)          # BUI/EFI drained #1
+  defer       (intent chain advance)          # BUI/EFI drained #2
+  cil_push    (checkpoint)                    # one push commits the lot
+```
+
+A 4 MiB file fits in one extent, so one `itrunc` line is enough; the
+two `defer` lines are the intent chain rolling forward (one for the
+bmap-side BUI/BUD, one for the free-space-side EFI/EFD). Truncating a
+*heavily fragmented* file produces the same pattern but with many
+itrunc/defer/cil_push iterations — each sub-transaction stays within
+its log reservation, and the intent chain makes the whole sequence
+restartable on crash.
+
 ## `fsync()`
 
 The interesting case. With a freshly written file:
@@ -1111,7 +1237,7 @@ The interesting case. With a freshly written file:
    CIL sequence that committed the inode's log item.
 5. Issue a device flush.
 
-Run [`xfs-meta-observe-fsync.sh`]({{ site.baseurl }}/code/xfs-meta-observe-fsync.sh)
+Run [`xfs-meta-observe-fsync.sh`]({{ site.baseurl }}/code/xfs/xfs-meta-observe-fsync.sh)
 in one terminal while doing `xfs_io -f -c "pwrite 0 4k" -c "fsync"
 /mnt/foo` in another:
 
