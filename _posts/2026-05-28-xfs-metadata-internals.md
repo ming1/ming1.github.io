@@ -1266,6 +1266,72 @@ Walks happen through `xfs_iext_lookup_extent` for the in-core list,
 or `xfs_bmapi_read` / `xfs_bmapi_write` for the
 allocate-or-map path.
 
+### EXTENTS vs. BTREE — same records, different container
+
+Both `di_format` values store the same `xfs_bmbt_rec` records; only the
+*container* around them changes:
+
+|                              | **EXTENTS** (`di_format = 2`)               | **BTREE** (`di_format = 3`)                                  |
+|------------------------------|---------------------------------------------|--------------------------------------------------------------|
+| **Where records live**       | inline `xfs_bmbt_rec[]` in the literal area | bmbt B+ tree; root in literal area, leaves elsewhere on disk |
+| **Container in the inode**   | flat array                                  | `xfs_bmdr_block_t` header + keys + child pointers            |
+| **Records per "slot"**       | up to ~21 (336 B / 16 B)                    | ~250 records per 4 KiB leaf; ~21 root pointers               |
+| **Lookup IO cost**           | zero — array is in the inode you just read  | walk root → 0-2 internals → leaf; one bio per level on miss  |
+| **Storage cost per file**    | 16 B × extent count                         | 16 B × extents + 4 KiB per ~250 records (tree blocks)        |
+| **Capacity**                 | ~21 extents (less if attr fork eats space)  | unbounded — tree grows as needed                             |
+
+XFS holds a file in EXTENTS as long as its extents fit in the inline
+array. The next allocation that would *overflow* the array
+(`xfs_bmap_extents_to_btree`) converts the fork to BTREE: copy the
+inline records into a freshly-allocated leaf block, write a
+`xfs_bmdr_block_t` root + the single pointer into the literal area,
+update `di_format`. The conversion is reversible: a `truncate` or
+`unlink` that drops the extent count below threshold runs
+`xfs_bmap_btree_to_extents`, frees the leaf block via
+EFI/EFD (visible as `defer` lines in the truncate walkthrough's
+trace), and rewrites the literal area as a flat array again.
+
+Two captured examples make the difference tangible:
+
+**EXTENTS** — from `xfs-meta-name-inode.sh -v`:
+
+```
+1048706  2 (extents)  16777216  0100600  dir2/big.bin
+```
+
+A 16 MiB `falloc`'d file. *One* contiguous extent, *one*
+`xfs_bmbt_rec`, the entire data fork is **16 bytes in the literal
+area**. Reading the inode tells the kernel everything it needs to
+find any byte of the file.
+
+**BTREE** — from `xfs-meta-walk-bmbt.sh`:
+
+```
+=== bmbt root in inode 131 literal area (depth=0) ===
+  u3.bmbt.level = 2
+  u3.bmbt.numrecs = 1
+  u3.bmbt.ptrs[1] = 60
+  === bmbt block fsb=60 daddr=480 (depth=1) ===     ← 1 internal node
+    === bmbt block fsb=15 daddr=120 (depth=2) ===   ← 131 leaves
+    === bmbt block fsb=14 daddr=112 (depth=2) ===
+    ... 129 more leaves ...
+```
+
+A 256 MiB file with 32 K `fpunch` holes — thousands of extents,
+spilled into a 3-level bmbt. The inline root has just one pointer
+(the literal area is too small for more), so the second level
+fans out to 131 leaf blocks each packing ~250 `xfs_bmbt_rec`
+records. Same record format as the inline EXTENTS case; just
+many more of them.
+
+The fundamental trade-off is **inline cap vs. per-block overhead**.
+Every regular file in a typical filesystem (small mail spools,
+package files, source trees, container layers) stays in EXTENTS and
+pays zero extra block-IO to find its data; only the genuinely-
+fragmented or genuinely-huge files pay the per-block overhead of the
+btree, and even then the per-record bytes are identical. There's no
+"BTREE penalty" beyond the IO to walk the tree on a cold cache.
+
 ## On-disk layout: blocks, headers, and where they come from
 
 Every btree block (root, internal node, or leaf) is exactly **one
