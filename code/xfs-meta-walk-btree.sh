@@ -30,8 +30,36 @@ if [ $# -ge 2 ]; then shift 2; else shift "$#"; fi
 TREES=("$@")
 [ ${#TREES[@]} -eq 0 ] && TREES=(bnobt cntbt inobt)
 
-AGBLOCKS=$(xfs_db -r -c "sb 0" -c "p agblocks" "$DEV" \
-	| awk -F' *= *' '$1 == "agblocks" {print $2; exit}')
+# Pull geometry once.  Use daddr (512-byte sectors) for all block
+# navigation: it's universally accepted across xfs_db versions, while
+# 'fsblock' has at least one variant (different bounds check) that
+# rejects valid block numbers under certain layouts.
+SB_FIELDS=$(xfs_db -r -c "sb 0" \
+	-c "p agcount agblocks blocksize sectsize" "$DEV")
+get_field() {
+	awk -v f="$1" -F' *= *' '$1 == f {print $2; exit}' <<<"$SB_FIELDS"
+}
+AGCOUNT=$(get_field agcount)
+AGBLOCKS=$(get_field agblocks)
+BLOCKSIZE=$(get_field blocksize)
+SECTSIZE=$(get_field sectsize)
+SECT_PER_BLOCK=$(( BLOCKSIZE / SECTSIZE ))
+
+if [ -z "$AGCOUNT" ] || [ -z "$AGBLOCKS" ] || [ -z "$BLOCKSIZE" ] \
+		|| [ -z "$SECTSIZE" ]; then
+	echo "could not read geometry from sb 0" >&2
+	echo "raw sb fields:" >&2
+	echo "$SB_FIELDS" >&2
+	exit 2
+fi
+
+if [ "$AG" -ge "$AGCOUNT" ]; then
+	echo "AG $AG out of range (agcount = $AGCOUNT); valid AGs are 0..$((AGCOUNT-1))" >&2
+	exit 2
+fi
+
+echo "# geometry: agcount=$AGCOUNT agblocks=$AGBLOCKS" \
+     "blocksize=$BLOCKSIZE sectsize=$SECTSIZE" >&2
 
 # Map tree name -> "field:header" where field is the AGF/AGI field
 # holding the root agbno and header is "agf" or "agi".
@@ -58,12 +86,13 @@ get_root() {
 walk() {
 	local tree=$1 agbno=$2 depth=$3
 	local fsb=$(( AG * AGBLOCKS + agbno ))
+	local daddr=$(( fsb * SECT_PER_BLOCK ))
 	local prefix
 	prefix=$(printf '%*s' $((depth*2)) '')
 
-	echo "${prefix}=== $tree block agbno=$agbno fsb=$fsb (depth=$depth) ==="
+	echo "${prefix}=== $tree block agbno=$agbno fsb=$fsb daddr=$daddr (depth=$depth) ==="
 	local out
-	out=$(xfs_db -r -c "fsblock $fsb" -c "type $tree" -c "print" "$DEV")
+	out=$(xfs_db -r -c "daddr $daddr" -c "type $tree" -c "print" "$DEV")
 	echo "$out" | sed "s/^/$prefix/"
 
 	local level numrecs
