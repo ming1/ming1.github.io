@@ -474,21 +474,26 @@ deleted while held open at the time of the dump.
 A grouped reference for the structs the rest of the post talks about.
 Each entry is tagged:
 
-- **(on-disk)** — persistent metadata that lives in a fixed home
-  block on the data device (superblock, AG headers, inode core,
-  btree records).
-- **(on-wire)** — log-stream format that only ever exists as bytes
-  *inside a log record*; recovery decodes these to rebuild on-disk
-  state, but they never appear in a home block.
-- **(in-core)** — in-memory runtime form, the kernel's view.
+- **(on-disk, N B)** — persistent metadata that lives in a fixed
+  home block on the data device. The size shown is `sizeof()` of the
+  C struct; many on-disk slots are *padded out to a sector*
+  (`sb_sectsize`, typically 512 B) so the slot the kernel writes to
+  is at least that large.
+- **(on-wire, N B)** — log-stream format that only ever exists as
+  bytes *inside a log record*; recovery decodes these to rebuild
+  on-disk state, but they never appear in a home block. For
+  variable-length items the size is given as `base + N×rec`.
+- **(in-core)** — in-memory runtime form, the kernel's view; sizes
+  vary per build (kernel version, CONFIG_LOCKDEP, BTF presence) so
+  they're not tagged here.
 
-So the "how it lives on disk vs. how it travels through the log vs.
-how it lives in memory" trio is one click apart.
+Sizes were taken from `pahole -C <type> fs/xfs/xfs.ko` against the
+v7.0 build the rest of the post uses.
 
 - **Superblock**
   - [`xfs_dsb`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_format.h#L193)
-    **(on-disk)** — filesystem geometry, feature bits, log location,
-    root inode number.
+    **(on-disk, 304 B in a 512 B sector slot)** — filesystem geometry,
+    feature bits, log location, root inode number.
   - [`xfs_sb`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_format.h#L95)
     **(in-core)** — copy cached on the mount; lazy counters fold
     per-CPU deltas back into it.
@@ -500,21 +505,23 @@ how it lives in memory" trio is one click apart.
 
 - **AG headers**
   - [`xfs_agf`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_format.h#L517)
-    **(on-disk)** — per-AG free-space btree roots + free-block
-    counters.
+    **(on-disk, 224 B in a 512 B sector slot)** — per-AG free-space
+    btree roots + free-block counters.
   - [`xfs_agi`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_format.h#L618)
-    **(on-disk)** — per-AG inode btree roots + inode counters + 64
-    unlinked-list buckets.
+    **(on-disk, 344 B in a 512 B sector slot)** — per-AG inode btree
+    roots + inode counters + 64 unlinked-list buckets.
   - [`xfs_agfl`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_format.h#L692)
-    **(on-disk)** — circular ring of free blocks pre-staged so
-    free-space btree splits can't recurse.
+    **(on-disk, 36 B header + bno ring filling the rest of a 512 B
+    sector)** — circular ring of free blocks pre-staged so free-space
+    btree splits can't recurse.
   - [`xfs_perag`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_ag.h#L34)
     **(in-core)** — per-AG wrapper holding pinned AG-header buffers
     and the per-AG inode radix tree.
 
 - **Inode**
   - [`xfs_dinode`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_format.h#L901)
-    **(on-disk)** — inode core + literal area for data and attr forks.
+    **(on-disk, 176 B core in a 512 B inode slot)** — inode core +
+    literal area for data and attr forks.
   - [`xfs_inode`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/xfs_inode.h#L25)
     **(in-core)** — embeds the VFS inode, points at the cluster
     buffer, and owns the inode log item.
@@ -527,16 +534,17 @@ how it lives in memory" trio is one click apart.
 
 - **Btree records and cursor**
   - [`xfs_alloc_rec`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_format.h#L1543)
-    **(on-disk)** — record of one free extent in bnobt / cntbt.
+    **(on-disk, 8 B)** — record of one free extent in bnobt / cntbt.
   - [`xfs_inobt_rec`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_format.h#L1600)
-    **(on-disk)** — record of one 64-inode chunk in inobt / finobt
-    (with sparse_inodes `holemask`).
+    **(on-disk, 16 B)** — record of one 64-inode chunk in inobt /
+    finobt (with sparse_inodes `holemask`).
   - [`xfs_bmbt_rec`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_format.h#L1871)
-    **(on-disk)** — packed 128-bit record of one file-extent in the
-    bmap btree or `EXTENTS`-format array.
+    **(on-disk, 16 B)** — packed 128-bit record of one file-extent
+    in the bmap btree or `EXTENTS`-format array.
   - [`xfs_bmdr_block_t`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_format.h#L1843)
-    **(on-disk)** — bmap btree root block that lives inside the
-    inode literal area when `di_format == BTREE`.
+    **(on-disk, 4 B header + records filling the inode literal
+    area)** — bmap btree root block that lives inside the inode
+    literal area when `di_format == BTREE`.
   - [`xfs_btree_cur`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_btree.h#L266)
     **(in-core)** — cursor used by every XFS btree; an ops vector
     hides per-tree differences behind a shared walk implementation.
@@ -565,37 +573,40 @@ how it lives in memory" trio is one click apart.
     **(in-core)** — log item attached to a dirty metadata buffer;
     tracks the bitmap of dirty 128-byte chunks.
   - [`xfs_buf_log_format`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_log_format.h#L527)
-    **(on-wire)** — log format of a buffer log item: blkno + length
-    + `blf_data_map` dirty bitmap followed by the dirty byte regions.
+    **(on-wire, 88 B header + dirty regions)** — log format of a
+    buffer log item: blkno + length + `blf_data_map` dirty bitmap
+    followed by the dirty byte regions named by the bitmap.
   - [`xfs_inode_log_item`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/xfs_inode_item.h#L16)
     **(in-core)** — log item attached to a dirty inode; the
     `ili_fields` mask records which fork regions changed.
   - [`xfs_inode_log_format`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_log_format.h#L274)
-    **(on-wire)** — log format: `ilf_fields` mask + inode number +
-    cluster blkno; the dirty regions named by the mask follow.
+    **(on-wire, 56 B header + dirty regions)** — log format:
+    `ilf_fields` mask + inode number + cluster blkno; the dirty
+    regions named by the mask follow.
 
 - **Intent / done items**
   - [`xfs_efi_log_format`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_log_format.h#L619)
-    **(on-wire)** — extent-free intent (matched by its EFD by
-    `efi_id`); the same 16-byte header shape is reused by CUI/CUD,
-    RUI/RUD, BUI/BUD.
+    **(on-wire, 16 B header + N × 16 B `xfs_extent_64`)** —
+    extent-free intent (matched by its EFD by `efi_id`); the same
+    16-byte header shape is reused by CUI/CUD (with `xfs_phys_extent`,
+    16 B/rec) and RUI/RUD, BUI/BUD (with `xfs_map_extent`, 32 B/rec).
   - [`xfs_map_extent`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_log_format.h#L723)
-    **(on-wire)** — per-step record carrying owner + startblock +
-    offset + len + flags; the body of rmap (RUI/RUD) and bmap
-    (BUI/BUD) intents.
+    **(on-wire, 32 B per record)** — per-step record carrying owner
+    + startblock + offset + len + flags; the body of rmap (RUI/RUD)
+    and bmap (BUI/BUD) intents.
   - [`xfs_icreate_log`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_log_format.h#L1007)
-    **(on-wire)** — inode-chunk init intent; replay zero-initialises
-    a 64-inode chunk before any reference to inodes inside it gets
-    replayed.
+    **(on-wire, 28 B fixed)** — inode-chunk init intent; replay
+    zero-initialises a 64-inode chunk before any reference to inodes
+    inside it gets replayed.
 
 - **Log record envelope**
   - [`xlog_rec_header`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_log_format.h#L139)
-    **(on-wire)** — outer log record header: LSN, CRC, format,
-    `h_num_logops`, filesystem UUID.
+    **(on-wire, 512 B)** — outer log record header: LSN, CRC,
+    format, `h_num_logops`, filesystem UUID.
   - [`xlog_op_header`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_log_format.h#L108)
-    **(on-wire)** — 16-byte per-operation wrapper inside a log
-    record (`oh_tid`, `oh_len`, `oh_flags` carry the
-    `XLOG_*_TRANS` markers).
+    **(on-wire, 12 B)** — per-operation wrapper inside a log record
+    (`oh_tid`, `oh_len`, `oh_flags` carry the `XLOG_*_TRANS`
+    markers).
 
 - **In-core log + CIL**
   - [`xlog`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/xfs_log_priv.h#L414)
@@ -1020,7 +1031,7 @@ outside in:
 The outer [`xlog_rec_header`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_log_format.h#L139)
 carries the LSN, the record CRC, the number of operations inside, and
 the fs UUID. The inner [`xlog_op_header`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_log_format.h#L108)
-(16 bytes, also in the same header)
+(12 bytes, also in the same header)
 wraps every formatted item and records which transaction it belongs
 to (`oh_tid`) and its payload length (`oh_len`); `oh_flags` carries
 `XLOG_START_TRANS` / `XLOG_COMMIT_TRANS` / `XLOG_CONTINUE_TRANS`
@@ -1185,7 +1196,7 @@ traffic, not megabytes.
 The same arithmetic applies to buffer log items via `blf_data_map`:
 if a transaction dirties three 128-byte chunks of a 4 KiB AGF buffer,
 its `blf_data_map` has three bits set and the wire payload is
-`sizeof(xfs_buf_log_format) + 3 × 128 = ~52 + 384 = ~436 bytes`,
+`sizeof(xfs_buf_log_format) + 3 × 128 = 88 + 384 = 472 bytes`,
 not the full 4 KiB AGF. The CIL then *relogs* this buffer log item
 across subsequent transactions in the same checkpoint window (the
 mechanism the next section describes), and the final formatted item
