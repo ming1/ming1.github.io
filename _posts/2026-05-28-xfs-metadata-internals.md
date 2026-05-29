@@ -1009,20 +1009,24 @@ Observe with [`xfs-meta-observe-create.sh`]({{ site.baseurl }}/code/xfs/xfs-meta
 ./xfs-meta-observe-create.sh
 ```
 
-Sample output for one `touch /mnt/xfs/created`:
+Sample output for one `: > /tmp/xfs-mnt/created`:
 
 ```
-create        dp_ino=128                     # VFS entry; parent = root dir
+create        dp_ino=128 namelen=7           # parent = root inode 128;
+                                             # new name is "created" (7 chars)
   dialloc     (inobt/finobt/AGI dirtied)     # inode allocator: 3 buffer log items
   dir_create  (parent dir-block edit)        # entry insert in parent dir
   cil_push    (checkpoint)                   # CIL push (forced by sync)
 ```
 
 The four-line trace lines up one-to-one with the four-step transaction
-diagram above. The `dialloc` line stands for *all three* AG-header
-buffer log items the inobt/finobt/AGI edits produce — bpftrace sees
-one call, but the transaction it commits attaches three buffer log
-items to the CIL.
+diagram above. `dp_ino=128` is the root directory; `namelen=7` matches
+"created". The `dialloc` line stands for *all three* AG-header buffer
+log items the inobt/finobt/AGI edits produce — bpftrace sees one
+call, but the transaction it commits attaches three buffer log items
+to the CIL. (Note: bpftrace on this kernel returns an empty string
+for the tracepoint's `__data_loc name` array, so the script prints
+the length as a proxy.)
 
 ## Append-write with extent allocation
 
@@ -1056,22 +1060,32 @@ Observe with [`xfs-meta-observe-append.sh`]({{ site.baseurl }}/code/xfs/xfs-meta
 ./xfs-meta-observe-append.sh
 ```
 
-Sample output for `xfs_io -f -c "pwrite -b 1M 0 1M" -c fsync /mnt/xfs/big`:
+Sample output for `xfs_io -f -c "pwrite -b 1M 0 1M" -c fsync /tmp/xfs-mnt/big`:
 
 ```
-write         (one buffered write call)     # xfs_file_buffered_write tracepoint
-  iext_insert (new extent in in-core list)  # the extent the alloc produced
-  cil_push    (checkpoint)                  # fsync forces the log
+write         ino=0x84 disize=0x0 pos=0x0 bytes=0x100000
+                                          # inode 0x84 (132 decimal); file currently
+                                          # empty (disize=0), writing 1 MiB at offset 0
+  iext_insert ino=0x84 logical=0x0 phys=0xffffffffe0008 blocks=256  (new bmbt rec)
+                                          # extent inserted into in-core list:
+                                          # logical offset 0, 256 blocks = 1 MiB,
+                                          # phys is a NULLSTARTBLOCK / delalloc
+                                          # sentinel — a real AG-block isn't
+                                          # assigned until writeback
+  cil_push    (checkpoint)                # fsync forces the log; bmap log item +
+                                          # AGF/free-space-btree buffer log items
+                                          # commit together
 ```
 
-Just three events — and the *data* never shows up in either of them.
-The `iext_insert` is the in-core extent list growing by one record (a
-new `xfs_bmbt_rec` for the 1 MiB extent); the only thing the CIL push
-carries is the inode log item describing that record, plus the
-AGF/free-space-btree buffer log items that document where the blocks
-came from. Trace a write *without* fsync and the `cil_push` line
-drops out — the alloc still happened, but the CIL push is now
-deferred to the periodic timer.
+Three events, and the *data* never appears in either. The `iext_insert`
+is the in-core extent list growing by one record — a new `xfs_bmbt_rec`
+covering logical block 0..255 of inode 0x84. The `phys` value here is
+a *delalloc* sentinel (high bits set, encoding `NULLSTARTBLOCK`):
+buffered writes register the extent at write time but defer the actual
+physical-block allocation to writeback, so the log item that hits the
+CIL records the size and offset, not a real disk address yet. Trace a
+write *without* fsync and the `cil_push` line drops out — the alloc
+still happened, but the CIL push is now deferred to the periodic timer.
 
 ## `unlink()`
 
@@ -1113,17 +1127,23 @@ Sample output for a workload that exercises both paths — `rm u_closed`
 `exec 9<u_open`:
 
 ```
-remove        dp_ino=128                                          # closed-file rm:
-                                                                  #   inode + extents
-                                                                  #   freed in-line;
-                                                                  #   no iu_bucket
-remove        dp_ino=128                                          # open-file rm:
-  iu_bucket   agno=0 bucket=5 old=0xffffffff new=0x85             #   bucket head set
-                                                                  #   to orphan inode
-  iu_bucket   agno=0 bucket=5 old=0x85 new=0xffffffff             # subshell exits →
-                                                                  #   fd 9 closes →
-                                                                  #   deferred free
-                                                                  #   clears bucket
+remove        dp_ino=128 namelen=8                                # closed-file rm
+                                                                  # ("u_closed", 8 ch):
+                                                                  # inode + extents
+                                                                  # freed in-line;
+                                                                  # no iu_bucket lines
+remove        dp_ino=128 namelen=6                                # open-file rm
+                                                                  # ("u_open", 6 ch)
+  iu_bucket   agno=0 bucket=5 old=0xffffffff new=0x85  (AGI bucket head)
+                                                                  # bucket 5 of AGI[0]
+                                                                  # head goes from
+                                                                  # empty (0xffffffff)
+                                                                  # to agino 0x85
+  iu_bucket   agno=0 bucket=5 old=0x85 new=0xffffffff  (AGI bucket head)
+                                                                  # subshell exits →
+                                                                  # fd 9 closes →
+                                                                  # deferred free
+                                                                  # clears bucket 5
   cil_push    (checkpoint)                                        # ONE push covers
                                                                   # both unlinks
 ```
@@ -1169,10 +1189,13 @@ Observe with [`xfs-meta-observe-rename.sh`]({{ site.baseurl }}/code/xfs/xfs-meta
 ./xfs-meta-observe-rename.sh
 ```
 
-Sample output for `mv /mnt/xfs/r_src /mnt/xfs/r_dst`:
+Sample output for `mv /tmp/xfs-mnt/r_src /tmp/xfs-mnt/r_dst`:
 
 ```
-rename        src_dp=128 -> tgt_dp=128             # both names in root dir
+rename        src_dp=128(namelen=5) -> tgt_dp=128(namelen=5)
+                                                   # both src + tgt in root dir
+                                                   # (dp_ino=128); names are
+                                                   # "r_src" / "r_dst" (5 ch each)
   dir_create  (target dir-block edit)              # new entry "r_dst"
   dir_remove  (source dir-block edit)              # old entry "r_src" gone
   cil_push    (checkpoint)                         # ONE push for the whole rename
@@ -1208,11 +1231,14 @@ Observe with [`xfs-meta-observe-truncate.sh`]({{ site.baseurl }}/code/xfs/xfs-me
 Sample output for `xfs_io -c "truncate 0"` on a 4 MiB file (one extent):
 
 ```
-setattr_size  (VFS truncate entry)            # xfs_setattr_size
-  itrunc      (sub-txn extent free)           # one sub-transaction
-                                              # freed all extents
-  defer       (intent chain advance)          # BUI/EFI drained #1
-  defer       (intent chain advance)          # BUI/EFI drained #2
+setattr_size  (VFS truncate entry)            # xfs_setattr_size: VFS-level
+                                              # truncate enters here
+  itrunc      newsize_fsb=0x0  (sub-txn extent free)
+                                              # one sub-transaction; new size in
+                                              # filesystem blocks is 0 → free
+                                              # everything
+  defer       (intent chain advance)          # BUI/BUD pair drained
+  defer       (intent chain advance)          # EFI/EFD pair drained
   cil_push    (checkpoint)                    # one push commits the lot
 ```
 
