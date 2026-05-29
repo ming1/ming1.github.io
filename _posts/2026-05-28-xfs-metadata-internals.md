@@ -300,13 +300,58 @@ the special owner code `XFS_RMAP_OWN_LOG` (-4ULL):
 
 These negative owner IDs are how rmap distinguishes "owned by *some
 structural part* of the filesystem" from "owned by inode N" (which is
-a positive owner ID). Confirm on a live image:
+a positive owner ID).
+
+[`xfs-meta-parse-logarea.sh`]({{ site.baseurl }}/code/xfs-meta-parse-logarea.sh)
+bundles the three-step verification — superblock fields, derived AG
+location, and rmap record — into one tool:
 
 ```
-xfs_db -r -c "agf 2" -c "addr rmaproot" -c "p" /dev/nvme0n1 \
-  | grep -E "owner|startblock"
-# look for: owner = -4   (= XFS_RMAP_OWN_LOG)
+./xfs-meta-parse-logarea.sh /dev/nvme0n1
 ```
+
+Sample output on the same fresh 2 GiB image used throughout this
+post:
+
+```
+==== log fields from superblock ====
+logstart = 262151                # internal-log start in fs blocks
+logblocks = 25650                # 25650 × 4 KiB ≈ 100 MiB
+logsectsize = 0                  # 0 = use sector size (512 here)
+logsunit = 1                     # log-stripe align, in fs blocks
+blocksize = 4096
+agblocks = 131072
+agblklog = 17                    # ceil(log2(agblocks)) for the bit-split
+
+==== derived AG containing the log ====
+logstart=262151  ->  AG=2  agbno=7  (25650 fs blocks, 105062400 bytes)
+                                 # 262151 >> 17 = 2 (AG number)
+                                 # 262151 & ((1<<17)-1) = 7 (offset in AG)
+
+==== rmap records in AG 2 (look for owner=-4) ====
+magic = 0x524d4233               # "RMB3" — rmap v5 magic
+level = 0                        # leaf (root is the only node)
+numrecs = 7
+recs[1-7] = [startblock,blockcount,owner,offset,extentflag,attrfork,bmbtblock]
+1:[0,1,-3,0,0,0,0]               # OWN_FS  : SB copy sector at AG 2
+2:[1,2,-5,0,0,0,0]               # OWN_AG  : AGF + AGI
+3:[3,2,-6,0,0,0,0]               # OWN_INOBT: inobt block(s)
+4:[5,1,-5,0,0,0,0]               # OWN_AG  : finobt block
+5:[6,1,-8,0,0,0,0]               # OWN_REFC: refcount tree root
+6:[7,25650,-4,0,0,0,0]           # OWN_LOG  : THE LOG — agbno=7, 25650
+                                 #           blocks. agbno + blockcount
+                                 #           match the SB fields above.
+7:[25657,6,-5,0,0,0,0]           # OWN_AG  : freespace btree blocks
+                                 #           sitting AFTER the log
+```
+
+Three pieces of evidence line up exactly: `sb_logstart = 262151`
+decomposes to `(AG=2, agbno=7)`; the rmap record at index 6 has the
+same `startblock = 7` and `blockcount = 25650 = sb_logblocks`; and
+its owner is `-4 = XFS_RMAP_OWN_LOG`. Notice that record 7 shows
+*more* AG-owned blocks after the log — i.e. the log is not at the
+end of its AG, and "everything after `logstart` is free" would be
+wrong.
 
 This is also why rmap is the load-bearing structure for
 [`xfs_repair`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/scrub)
