@@ -589,7 +589,9 @@ recs[1] = [startino,holemask,count,freecount,free]
 #  ^   ^  ^  ^   └─ "free" bitmask: bit i = 1 if inode i in this chunk is free
 #  ^   ^  ^  └──── 23 free inodes inside the chunk
 #  ^   ^  └─────── chunk size (always 64)
-#  ^   └────────── holemask = 0: chunk has no sparse holes (sparse_inodes off here)
+#  ^   └────────── holemask = 0: this chunk is fully allocated on disk
+#                  (sparse_inodes IS enabled fs-wide — see SPARSE_INODES in the
+#                   sb dump — but no chunk has needed a hole yet)
 #  └────────────── chunk starts at inode 128 (the root inode)
 ```
 
