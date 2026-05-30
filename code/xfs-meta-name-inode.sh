@@ -9,30 +9,52 @@
 #
 # Why this works at all
 # ---------------------
-# The "name <-> inode" mapping is not a single on-disk table.  Names
-# live in *directory data* (a directory inode's data fork, in LOCAL,
-# EXTENTS, or BTREE format) and each entry there points at the target
-# inode number.  Reconstructing the full mapping means walking every
-# allocated directory's entries and stitching child-inode -> name and
-# parent links back up to the root.
+# The "name <-> inode" mapping is NOT a single on-disk table.  The
+# only edges that exist on disk are:
 #
-# xfs_ncheck (xfsprogs) does that on an unmounted device:
-#   1. Walks the inobt to enumerate every allocated inode.
-#   2. For each directory inode, parses entries in the data fork.
-#   3. Joins child-inode -> name pairs and builds full paths back to
-#      the root.
+#   - dir entry: (name, child_ino, filetype)    in the parent's data fork
+#   - ".." entry: (parent_ino, name="..")       in the dir's own data fork
+#
+# That's it.  Reconstructing full paths means walking every allocated
+# directory's entries and stitching the (parent, name) edges into a tree.
+#
+# xfs_ncheck (xfsprogs) does this in two passes on an unmounted device:
+#
+#   Pass 1 — enumerate inodes, harvest dir entries into a hash map:
+#     for each AG:
+#       for each allocated inode I in this AG's inobt:
+#         record I in "all inodes" set
+#         if I is a directory:
+#           for each entry E in I's data fork (LOCAL / EXTENTS / BTREE):
+#             if E.name in (".", "..") continue
+#             child_to_parent[E.child_ino] = (I, E.name)
+#
+#   Pass 2 — assemble paths by walking parents:
+#     for each inode I:
+#       components = []
+#       cur = I
+#       while cur != root_inode:
+#         (parent, name) = child_to_parent[cur]
+#         components.prepend(name)
+#         cur = parent
+#       print(I, "/".join(components))
+#
+# The 1:1 nature of child_to_parent is why hard-linked files dedup in
+# the output — a multimap would have surfaced every link, but the
+# implementation chose a 1:1 hash table.  A `find -printf '%i %p\n'`
+# on the mounted filesystem is the authoritative way to enumerate
+# every (path, inode) edge today.
+#
+# Modern XFS supports an optional "parent pointers" feature (incompat
+# bit XFS_SB_FEAT_INCOMPAT_PARENT, not on by default in v7.0) that
+# stores (parent_ino, name) records in each inode's attr fork.  A
+# future xfs_ncheck that consumes parent pointers could enumerate
+# all hardlinks cheaply without scanning every directory.  Today's
+# tool predates parent pointers and still uses the dir-scan algorithm
+# above even when the feature is enabled.
 #
 # For a MOUNTED filesystem the equivalent is one find(1) line:
 #   find /mnt -printf '%i %p\n'
-#
-# Note on hard-linked files
-# -------------------------
-# xfs_ncheck (in current xfsprogs) prints exactly ONE pathname per
-# allocated inode — the first one it sees while walking directories.
-# That means hard-linked files only appear under one of their names
-# in this output.  If you want every (path, inode) edge including
-# duplicates from hardlinks, mount the filesystem and use the find
-# command shown above.
 
 set -euo pipefail
 DEV=${1:?usage: $0 /dev/<device> [-v]}
