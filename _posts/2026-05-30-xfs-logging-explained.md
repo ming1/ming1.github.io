@@ -92,6 +92,61 @@ journaling. Two phrases worth pinning down before the mechanism:
   XFS — every other piece of the logging architecture exists to
   enforce, or take advantage of, this rule.
 
+### Write-ahead logging — the rule in detail
+
+WAL is a *discipline*, not a format. The rule above is the entirety
+of it. Everything else in this section, and most of the rest of the
+post, is a consequence of enforcing that rule mechanically.
+
+**What the rule prevents.** Most metadata changes touch several home
+blocks at once: a `create()` modifies an inode cluster, a dir block,
+the AGI counters, possibly an inode-btree block. If the kernel
+simply wrote those four blocks directly, a power loss mid-sequence
+could leave the dir entry pointing at an inode the AGI counter
+doesn't yet record as allocated — an inconsistency with no on-disk
+evidence of what was *supposed* to happen. WAL eliminates this state
+by writing a second copy of the change to a sequential log *first*;
+recovery can then either replay the log onto the home blocks (if
+the log record made it) or roll back to the pre-transaction state
+(if it didn't). There is no third state where the home blocks
+reflect a half-finished change with no log record to explain it.
+
+**Why two writes is acceptable.** The log write is *sequential*
+(one append to the log ring) and *batched* (one log record carries
+many transactions via the CIL). The home-block writes are random,
+but they can be **delayed and coalesced** because the log already
+carries the change — ten transactions modifying the same AGF buffer
+in one second produce ten log items aggregated into one log record,
+and one home-block write at the AIL's convenience. WAL's cost is one
+extra IO per *checkpoint*, not per *transaction*; for any realistic
+workload that's a rounding error.
+
+**What the log contains.** WAL is a discipline that admits multiple
+encodings:
+
+- *Physical*: log entire modified blocks. Simple to replay, wasteful
+  of log space.
+- *Logical*: log high-level operations ("create inode N"). Compact,
+  but replay re-runs the operation and is hard to make deterministic.
+- *Physiological* (delta): log byte-level deltas keyed to specific
+  blocks. Compact like logical, deterministic-to-replay like
+  physical. **This is what XFS does** — `xfs_buf_log_item` carries
+  a 1-bit-per-128-byte dirty bitmap over the buffer; the dirty bytes
+  follow the format header on the wire. `xfs_inode_log_item`
+  carries the `ilf_fields` mask naming which inode regions changed.
+
+**How the rule is enforced in the kernel.** Every dirty
+[`xfs_buf`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/xfs_buf.h#L150)
+has a pin counter (`b_pin_count`). When the buffer joins a CIL
+context, the counter is incremented; when the matching checkpoint
+reaches the AIL (i.e. the log record describing the change is
+durable on the log device), the counter is decremented. While
+pinned, `xfs_buf_submit` **refuses to write the buffer to its home
+block**. That single `b_pin_count > 0` check is the kernel-side
+enforcement of WAL — every other piece of XFS logging machinery
+(CIL, AIL, the tail pin on log space, fsync's reliance on log force)
+is a consequence or optimisation of this one invariant.
+
 The crucial distinction the rest of this post leans on:
 
 ```
