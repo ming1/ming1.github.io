@@ -678,33 +678,15 @@ The first six fields together let recovery answer five
 questions about any record it walks: "Is this real? Is it intact?
 Where is it? How big is it? How many ops does it carry?"
 
-### Per-sector cycle stamping — how recovery knows where live data ends
+### Per-sector cycle stamping (write side)
 
-The log is a **fixed-size ring** with no explicit "end-of-data"
-marker. So how does recovery know when it has walked past the last
-live record into the stale-from-previous-wrap territory? Answer:
-every sector's *first 4 bytes* are overwritten with the current
-cycle number at write time. The original first-4-bytes-per-sector
-are backed up into `h_cycle_data[]` so replay can restore them.
-
-```
-  during write:                          on disk:
-                                         sector S:
-   original bytes:    [AA BB CC DD ...]   ┌──────────────────┐
-                                          │ cycle (4 B) ...  │
-   ↓ stamp cycle                          │ (original bytes  │
-                                          │  saved in        │
-   stamped on disk:   [cyc cyc cyc cyc    │  h_cycle_data[]) │
-                       AA BB CC DD ...    └──────────────────┘
-                       (after replay)]
-```
-
-When recovery scans, it checks each sector's first 4 bytes
-against the expected cycle. If a sector shows a *lower* cycle, that
-sector is stale junk from a previous wrap that was never overwritten
-— and recovery has reached the end of the live log. No race window
-where a half-written terminator could be mis-parsed; the cycle
-stamp is monotonic by construction.
+Every log sector's *first 4 bytes* are overwritten at write time
+with the current cycle number — including the sectors holding the
+ops payload. The original first-4-bytes-per-sector are backed up
+into the record header's `h_cycle_data[]` so they can be restored
+on replay. This is what powers the ring's self-describing
+end-of-data detection at mount; the detection algorithm itself
+lives in the [Recovery section below](#recovery).
 
 ### LSN packing
 
@@ -917,8 +899,115 @@ submissions when log space pressure builds.
 
 On mount, if the filesystem wasn't cleanly unmounted, XFS reads the
 log and replays it.
-[`xlog_recover`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/xfs_log_recover.c)
-walks the log in several ordered phases:
+[`xlog_recover`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/xfs_log_recover.c#L3419)
+is the entry point. The whole process is self-bootstrapping: the
+only inputs are `sb_logstart` / `sb_logblocks` from the superblock,
+and everything else falls out of the bytes already on disk. No
+shared memory across mounts, no recovery-state stored anywhere
+external to the log itself.
+
+Recovery splits into three phases: **anchor on the log** (find head
+and tail), **walk forward and validate** (CRC + cycle-stamp checks),
+**apply log items in order** (the multi-phase replay).
+
+### Anchor: finding head and tail
+
+The log ring has, at any moment, **at most two adjacent cycles on
+disk**: the older cycle filling the "tail end" of the ring, and the
+newer (current) cycle filling the "head end". The transition between
+the two is the head block.
+
+```
+   log ring (block 0 ────────────────────────────► block N-1)
+   ┌─────────────────────────────────┬───────────────────────────────┐
+   │ cycle = K+1                     │ cycle = K                     │
+   │ (recent writes, after the wrap) │ (older data, never overwritten│
+   │                                 │  after the head wrapped past) │
+   └─────────────────────────────────┴───────────────────────────────┘
+                                     ↑
+                                     head block
+```
+
+[`xlog_find_head`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/xfs_log_recover.c#L498)
+locates that head block at mount:
+
+1. Read the cycle stamp (first 4 bytes) of **block 0** — call it
+   `first_cycle`.
+2. Read the cycle stamp of **block N-1** — call it `last_cycle`.
+3. Three cases:
+   - `first_cycle == last_cycle`: no wrap happened. Head is at the
+     end of the live data (or the log is fresh / cleanly unmounted).
+   - `first_cycle == last_cycle + 1`: log has wrapped exactly once.
+     Use a binary search
+     ([`xlog_find_cycle_start`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/xfs_log_recover.c#L269))
+     to find the transition block where cycle changes.
+   - Anything else (e.g. `last_cycle == first_cycle - 2`): corruption
+     — abort recovery.
+
+After this step recovery knows two values: **the head block** (where
+the cycle transition is) and **the current cycle** (the cycle of the
+block just before the head). It then reads the head record's
+`xlog_rec_header` and pulls **`h_tail_lsn`** — the oldest LSN still
+needed for replay, recorded at write time. That LSN converts to the
+tail block.
+[`xlog_find_tail`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/xfs_log_recover.c#L1235)
+does the conversion.
+
+Recovery now has `(tail_block, head_block, current_cycle)` and walks
+forward from `tail_block`.
+
+### Per-sector cycle stamping (read side)
+
+Recall from [Physical Log](#per-sector-cycle-stamping-write-side):
+every log sector's first 4 bytes are overwritten with the current
+cycle number at write time; the originals are backed up in
+`h_cycle_data[]`. On the read side, recovery uses those stamps to
+detect *exactly* where live data ends — without any explicit
+end-of-data marker on disk.
+
+For each payload sector recovery reads:
+
+```c
+expected_cycle  =  header->h_cycle
+                   /* OR header->h_cycle + 1 if the read just
+                    * wrapped past block N-1 in the ring */
+
+actual_cycle    =  first 4 bytes of the sector
+
+if (actual_cycle < expected_cycle)
+    /* sector is stale junk from a previous wrap;
+     * live data ends here */
+    stop walk;
+
+if (actual_cycle != expected_cycle)
+    /* corruption — abort recovery */
+    return -EFSCORRUPTED;
+
+/* restore the original first-4-bytes from h_cycle_data[]
+ * and apply the ops in this sector */
+```
+
+The check is **strict less-than** for "stale", not `!=`, because
+sectors that were *partially in flight at the crash* can momentarily
+read with a *higher* cycle than expected — recovery treats those
+conservatively and stops. The "lower cycle = stale" rule covers the
+common case (sector never overwritten after head wrapped past it)
+cleanly; the cycle counter never decreases mid-record, so once
+recovery anchors itself with `xlog_find_head` + `h_tail_lsn`, every
+subsequent block has a deterministic expected cycle and there's no
+ambiguity about what "expected" means.
+
+This is also why the *"two cycles at most on disk"* invariant matters:
+if three cycles could coexist, `xlog_find_head`'s bisection would
+become much hairier. The invariant is enforced by the AIL — the tail
+can't fall further than one cycle behind the head, because beyond
+that the head can't write without overwriting still-needed data
+(`xfsaild` pushes home blocks aggressively as the gap closes).
+
+### Replay phases
+
+Once recovery has anchored and validated the live region, it applies
+the log items in ordered phases:
 
 1. **Scan.** Read the log forward, build an in-memory hash of
    checkpoints and their items, and pair intent items with their
@@ -943,7 +1032,9 @@ After phase 4 the log tail advances; the filesystem is consistent
 with what the application saw at the time of the last successful
 commit. Recovery does **not** roll back partial transactions — every
 transaction in the log was atomic at commit time, and the log
-records reflect committed state only.
+records reflect committed state only. Any transaction that crashed
+*before* its `XLOG_COMMIT_TRANS` op reached disk simply doesn't
+appear in the log; recovery never sees it.
 
 Two recovery-correctness rules that are easy to miss:
 
@@ -953,12 +1044,22 @@ Two recovery-correctness rules that are easy to miss:
   the work if the home block is already at-or-newer. Without this,
   a clean buffer that was flushed *before* the crash would get
   re-replayed and possibly corrupted.
-- **Buffer-before-inode ordering.** Inodes log items name an
+- **Buffer-before-inode ordering.** Inode log items name an
   `ilf_blkno` for the cluster buffer that holds them; that buffer
   must already exist and be zero-initialised before the inode
   payload is replayed into it. The phase ordering above guarantees
   this — `ICREATE` and buffer replay both finish before inode replay
   starts.
+
+### The clean-unmount shortcut
+
+Cleanly unmounting XFS writes a single `XLOG_UNMOUNT_TRANS` op as
+the very last log record. On the next mount, recovery sees this
+marker, knows head and tail are at the same point, and skips the
+replay loop entirely. That's why `xfs_logprint` on the captured
+sample showed `state: <CLEAN>` and `log tail: 21 head: 21` — the
+unmount marker made the recovery prologue self-evident, and
+nothing past the head needs replay.
 
 ---
 
