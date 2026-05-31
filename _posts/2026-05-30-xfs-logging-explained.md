@@ -654,11 +654,124 @@ Sizes from BTF on Linux v7.0 `xfs.ko`:
 | `xfs_efi_log_format`    | 16 B (+ N × 16 B records) | EFI intent           |
 | `xfs_icreate_log`       | 28 B fixed | ICREATE intent                       |
 
+### What `xlog_rec_header` carries, field by field
+
+`xlog_rec_header` is the **envelope** for one *physical log record* —
+the bytes a single iclog flushes to the log device in one atomic IO.
+The record is sector-aligned, CRC-protected, and laid out as a 512 B
+header sector followed by `h_len` bytes of ops. The header's fields
+each do exactly one job:
+
+| Field            | Role |
+|------------------|------|
+| `h_magicno`      | `0xfeedbabe` ([`XLOG_HEADER_MAGIC_NUM`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_log_format.h#L42)) + `h_fs_uuid` together identify the bytes as a valid XFS log record *for this specific filesystem*. Recovery skips anything that doesn't match — distinguishes live records from stale ring junk left from a previous wrap. |
+| `h_crc`          | CRC over the whole record (header + ops). Catches torn writes and bit rot; if the CRC fails recovery treats the record as truncated and stops at the last successfully-CRC'd record. |
+| `h_lsn`          | This record's own LSN (`cycle` upper-32, `block` lower-32). Tells recovery *where* this record sits in the ring. |
+| `h_tail_lsn`     | The oldest LSN still needed by recovery at the moment this record was written. Lets recovery decide "have I scanned far enough back?" — without it recovery would have to scan the entire ring. |
+| `h_len`          | Number of payload bytes after the header (= total ops bytes). |
+| `h_num_logops`   | Number of ops to expect after the header. |
+| `h_cycle`        | Cycle number; combined with `h_cycle_data[]` is what makes the per-sector stamping trick (next paragraph) work. |
+| `h_cycle_data[]` | Backed-up first-4-bytes of every data sector in the record — see below. |
+| `h_size`         | iclog buffer size (LOGV2). Lets recovery handle variable-sized log records across kernel versions. |
+
+The first six fields together let recovery answer five
+questions about any record it walks: "Is this real? Is it intact?
+Where is it? How big is it? How many ops does it carry?"
+
+### Per-sector cycle stamping — how recovery knows where live data ends
+
+The log is a **fixed-size ring** with no explicit "end-of-data"
+marker. So how does recovery know when it has walked past the last
+live record into the stale-from-previous-wrap territory? Answer:
+every sector's *first 4 bytes* are overwritten with the current
+cycle number at write time. The original first-4-bytes-per-sector
+are backed up into `h_cycle_data[]` so replay can restore them.
+
+```
+  during write:                          on disk:
+                                         sector S:
+   original bytes:    [AA BB CC DD ...]   ┌──────────────────┐
+                                          │ cycle (4 B) ...  │
+   ↓ stamp cycle                          │ (original bytes  │
+                                          │  saved in        │
+   stamped on disk:   [cyc cyc cyc cyc    │  h_cycle_data[]) │
+                       AA BB CC DD ...    └──────────────────┘
+                       (after replay)]
+```
+
+When recovery scans, it checks each sector's first 4 bytes
+against the expected cycle. If a sector shows a *lower* cycle, that
+sector is stale junk from a previous wrap that was never overwritten
+— and recovery has reached the end of the live log. No race window
+where a half-written terminator could be mis-parsed; the cycle
+stamp is monotonic by construction.
+
+### LSN packing
+
 The **LSN** ([`xfs_lsn_t`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_types.h#L27), `int64_t`) is packed as `(cycle, block)`:
 the upper 32 bits count log wraps (when the head reaches the end of
 the ring, cycle bumps), the lower 32 bits are the block offset
 within the current cycle. The split is what lets [`XFS_LSN_CMP`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/xfs_log.h#L98) stay
 monotone across wraps.
+
+### How the N ops in one record relate to each other
+
+Two facts shape the relationship:
+
+1. **All ops in one record come from one CIL push.** A push takes
+   the current `xfs_cil_ctx` (accumulated log items from many
+   transactions) and serialises them into iclog writes. One push
+   usually fills one or a few records. So the ops in a record
+   share a single **checkpoint** — they were aggregated together
+   by the CIL.
+2. **Each op carries `oh_tid`, and ops with the same TID belong to
+   one transaction.** Transactions are the *logical* unit of
+   atomicity (one user op → one transaction → many log items); the
+   record is the *physical* unit of aggregation. One record can
+   contain ops from *many* transactions, distinguished by their
+   TIDs.
+
+Each op's `oh_flags` field marks its role inside its transaction:
+
+```
+  XLOG_START_TRANS     FIRST op of a transaction in this record
+                       (recovery starts assembling a fresh xact for this tid)
+
+  XLOG_COMMIT_TRANS    LAST op of a transaction
+                       (recovery now applies the assembled xact atomically)
+
+  XLOG_CONTINUE_TRANS  this op begins a transaction whose remainder spans
+                       into the NEXT record (used when a checkpoint is too
+                       big to fit in one iclog)
+
+  XLOG_WAS_CONT_TRANS  this op continues the previous record's transaction
+                       (the matching tail of CONTINUE_TRANS)
+
+  XLOG_UNMOUNT_TRANS   the one-off "filesystem unmounted cleanly" marker
+```
+
+So if you look at one record's ops in order, you see something
+like:
+
+```
+  Oper 0: tid=T1  flags=START_TRANS    len=0       # T1 starts
+  Oper 1: tid=T1  flags=none           len=16      # T1's TRANS header
+  Oper 2: tid=T1  flags=none           len=56      # T1's first log item
+  Oper 3: tid=T1  flags=none           len=176     # T1's INODE CORE
+  ...
+  Oper N: tid=T1  flags=COMMIT_TRANS   len=0       # T1 closes
+```
+
+When the CIL aggregates multiple transactions into one push, the
+record carries multiple START/COMMIT pairs interleaved by TID. The
+**atomicity guarantee fall-out**: a transaction is durable as soon
+as its `COMMIT_TRANS` op makes it into a durably-written record. If
+power fails after `START_TRANS` reaches disk but before
+`COMMIT_TRANS` does, recovery sees a transaction with no commit
+and *discards it* — the on-disk atomicity guarantee that opens this
+post, now visible at the wire-format level.
+
+### Sample: one record from the captured log
 
 The captured `xfs-meta-dump-log.sh` output makes the layering
 concrete (excerpt from `tests/xfs_logging_post_samples.sh`):
