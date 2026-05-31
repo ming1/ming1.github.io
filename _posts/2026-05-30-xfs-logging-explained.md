@@ -36,7 +36,7 @@ specific machinery.
 > inodes) the items in this post describe. This post intentionally
 > cross-links there for byte-level layout rather than restating.
 >
-> Scope: the logging path from `xfs_trans_alloc` to `xlog_recover`,
+> Scope: the logging path from [`xfs_trans_alloc`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/xfs_trans.c#L234) to [`xlog_recover`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/xfs_log_recover.c#L3419),
 > with the user-visible operations (`creat`, `write`, `unlink`,
 > `rename`, `truncate`, `fsync`) as the driving examples. Out of
 > scope: quotas, reflink internals, realtime devices, DAX, online
@@ -130,9 +130,9 @@ encodings:
   but replay re-runs the operation and is hard to make deterministic.
 - *Physiological* (delta): log byte-level deltas keyed to specific
   blocks. Compact like logical, deterministic-to-replay like
-  physical. **This is what XFS does** — `xfs_buf_log_item` carries
+  physical. **This is what XFS does** — [`xfs_buf_log_item`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/xfs_buf_item.h#L39) carries
   a 1-bit-per-128-byte dirty bitmap over the buffer; the dirty bytes
-  follow the format header on the wire. `xfs_inode_log_item`
+  follow the format header on the wire. [`xfs_inode_log_item`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/xfs_inode_item.h#L16)
   carries the `ilf_fields` mask naming which inode regions changed.
 
 **How the rule is enforced in the kernel.** Every dirty
@@ -141,7 +141,7 @@ has a pin counter (`b_pin_count`). When the buffer joins a CIL
 context, the counter is incremented; when the matching checkpoint
 reaches the AIL (i.e. the log record describing the change is
 durable on the log device), the counter is decremented. While
-pinned, `xfs_buf_submit` **refuses to write the buffer to its home
+pinned, [`xfs_buf_submit`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/xfs_buf.c#L1423) **refuses to write the buffer to its home
 block**. That single `b_pin_count > 0` check is the kernel-side
 enforcement of WAL — every other piece of XFS logging machinery
 (CIL, AIL, the tail pin on log space, fsync's reliance on log force)
@@ -271,7 +271,7 @@ The captured bpftrace traces below come from
 which the
 [XFS Metadata Internals post]({{ site.baseurl }}/tech/2026/05/28/xfs-metadata-internals.html#operation-walkthroughs)
 describes in detail. This section highlights what each operation
-*logs* — the items that flow from `xfs_trans_commit` into the CIL.
+*logs* — the items that flow from [`xfs_trans_commit`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/xfs_trans.c#L909) into the CIL.
 
 ## `create()`
 
@@ -284,7 +284,7 @@ opens one transaction that:
 - inserts a dir entry into the parent (modifies the parent inode +
   one dir-block buffer).
 
-The single commit attaches: an `xfs_icreate_log` item, two
+The single commit attaches: an [`xfs_icreate_log`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_log_format.h#L1007) item, two
 `xfs_buf_log_item` instances (AGI + dir-block), and two
 `xfs_inode_log_item` instances (the new inode + the parent dir
 inode). No `EFI/EFD` — `create` allocates, it doesn't free.
@@ -343,9 +343,9 @@ atomicity is the property `renameat2(RENAME_EXCHANGE)` relies on.
 
 ## `truncate()`
 
-[`xfs_setattr_size`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/xfs_iops.c)
+[`xfs_setattr_size`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/xfs_iops.c#L909)
 calls
-[`xfs_itruncate_extents_flags`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/xfs_inode.c)
+[`xfs_itruncate_extents_flags`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/xfs_inode.c#L1036)
 to free file extents. For a heavily-fragmented file the truncation
 runs as a *sequence* of sub-transactions, each freeing a bounded
 number of extents to stay within its log reservation. The
@@ -387,7 +387,7 @@ log_force_seq seq=0x5                        # wait for CIL seq 5 on disk
 cil_push      (checkpoint)                   # push happens to cover it
 ```
 
-Note `xfs_log_force_seq`, not `xfs_log_force` — modern fsync targets a
+Note [`xfs_log_force_seq`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/xfs_log.c#L2970), not [`xfs_log_force`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/xfs_log.c#L2792) — modern fsync targets a
 specific CIL sequence, not "force everything". The home-block
 writeback of the inode cluster is *not* in this sequence; the AIL
 handles it later. fsync's durability promise rests entirely on the
@@ -426,10 +426,13 @@ Three subtypes carry most of the traffic:
 One per dirty in-core inode.
 [`xfs_inode_log_item`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/xfs_inode_item.h#L16)
 tracks an `ili_fields` bitmask of which inode regions changed
-(`XFS_ILOG_CORE`, `XFS_ILOG_DDATA`, `XFS_ILOG_DEXT`,
-`XFS_ILOG_DBROOT`, the analogous attr-fork bits,
-`XFS_ILOG_TIMESTAMP`). On format, only the regions named by the
-mask are emitted as
+([`XFS_ILOG_CORE`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_log_format.h#L316),
+[`XFS_ILOG_DDATA`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_log_format.h#L317),
+[`XFS_ILOG_DEXT`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_log_format.h#L318),
+[`XFS_ILOG_DBROOT`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_log_format.h#L319),
+the analogous attr-fork bits,
+[`XFS_ILOG_TIMESTAMP`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_log_format.h#L334)).
+On format, only the regions named by the mask are emitted as
 [`xfs_inode_log_format`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_log_format.h#L274)
 followed by the dirty bytes.
 
@@ -580,7 +583,7 @@ is the in-memory aggregator that fixes this. It does three things:
 ```
 
 The push runs in
-[`xlog_cil_push_work`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/xfs_log_cil.c#L96).
+[`xlog_cil_push_work`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/xfs_log_cil.c#L1375).
 It's triggered by:
 
 - the CIL growing past a soft threshold (default ~8 MiB per ctx);
@@ -651,10 +654,10 @@ Sizes from BTF on Linux v7.0 `xfs.ko`:
 | `xfs_efi_log_format`    | 16 B (+ N × 16 B records) | EFI intent           |
 | `xfs_icreate_log`       | 28 B fixed | ICREATE intent                       |
 
-The **LSN** (`xfs_lsn_t`, `int64_t`) is packed as `(cycle, block)`:
+The **LSN** ([`xfs_lsn_t`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_types.h#L27), `int64_t`) is packed as `(cycle, block)`:
 the upper 32 bits count log wraps (when the head reaches the end of
 the ring, cycle bumps), the lower 32 bits are the block offset
-within the current cycle. The split is what lets `XFS_LSN_CMP` stay
+within the current cycle. The split is what lets [`XFS_LSN_CMP`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/xfs_log.h#L98) stay
 monotone across wraps.
 
 The captured `xfs-meta-dump-log.sh` output makes the layering
@@ -715,7 +718,7 @@ The crucial property the AIL exists to enforce:
 A log item lives on the AIL until its `iop_push` callback writes
 the underlying home block to disk. For a buffer log item that's a
 `xfs_buf` submit_bio onto the data device; for an inode log item
-it's `xfs_iflush` reformatting the in-core inode back into its
+it's [`xfs_iflush`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/xfs_inode.c#L2368) reformatting the in-core inode back into its
 cluster buffer and writing that.
 
 ```
@@ -920,7 +923,7 @@ Oper (6): AGI Buffer: XAGI
 
 The `blkno: 2` is the AGI sector for AG 0 (after the AGF at sector
 1 and the SB at sector 0). `flags: 0x3800` encodes the buffer's
-**blft** (`XFS_BLFT_AGI_BUF`) in its upper bits, which is what lets
+**blft** ([`XFS_BLFT_AGI_BUF`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_log_format.h#L557)) in its upper bits, which is what lets
 `xfs_logprint` print the friendly `AGI Buffer: XAGI` header rather
 than a hex dump.
 
@@ -1073,9 +1076,9 @@ fsync(fd);
 
 Stage by stage:
 
-1. **`creat("foo", 0644)`** — VFS calls `xfs_vn_create` →
-   `xfs_create`. One transaction opens (`xfs_trans_alloc_icreate`).
-   In-core: allocate a new inode in some AG (`xfs_dialloc`),
+1. **`creat("foo", 0644)`** — VFS calls [`xfs_vn_create`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/xfs_iops.c#L292) →
+   `xfs_create`. One transaction opens ([`xfs_trans_alloc_icreate`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/xfs_trans.c#L1191)).
+   In-core: allocate a new inode in some AG ([`xfs_dialloc`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_ialloc.c#L1889)),
    initialise its `xfs_inode_log_item` with `XFS_ILOG_CORE` set,
    modify the root directory's inline `sfdir3` data fork to add the
    entry `foo → 132`, mark the parent inode dirty too. `xfs_trans_commit`
@@ -1084,9 +1087,9 @@ Stage by stage:
    one `xfs_buf_log_item` for the AGI sector. **The CIL absorbs
    these into its current context.** No log record on disk yet.
 
-2. **`write(fd, data, len)`** — VFS calls `xfs_file_write_iter`.
+2. **`write(fd, data, len)`** — VFS calls [`xfs_file_write_iter`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/xfs_file.c#L1119).
    For a buffered write the bytes go into the page cache; an
-   in-core extent is reserved via `xfs_bmapi_reserve_delalloc` with
+   in-core extent is reserved via [`xfs_bmapi_reserve_delalloc`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/xfs_iomap.c#L1457) with
    a `NULLSTARTBLOCK` sentinel (delayed allocation). **No
    transaction, no log item yet.** The data bytes are not journaled;
    they live in the page cache waiting for writeback.
@@ -1094,7 +1097,7 @@ Stage by stage:
 3. **`fsync(fd)`** — VFS calls `xfs_file_fsync`. It first runs
    `filemap_write_and_wait_range`, which triggers writeback. The
    writeback path is where the delalloc reservation flips to a real
-   physical extent: `xfs_bmapi_convert_delalloc` opens a transaction,
+   physical extent: [`xfs_bmapi_convert_delalloc`](https://elixir.bootlin.com/linux/v7.0/source/fs/xfs/libxfs/xfs_bmap.c#L4487) opens a transaction,
    allocates blocks (touching AGF/free-space btrees), updates the
    inode's bmap, commits — emitting an `xfs_inode_log_item` (with
    `XFS_ILOG_DEXT` or `XFS_ILOG_CORE` set for size/extent count)
