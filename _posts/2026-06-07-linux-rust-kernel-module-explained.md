@@ -847,15 +847,32 @@ unchanged, ordinary kernel tracing works. To watch misc-device opens
 live:
 
 ```sh
-sudo bpftrace -e 'kprobe:misc_open { printf("%s opened a misc dev\n", comm); }'
+bpftrace -e 'kprobe:misc_open { printf("%s (pid %d) opened a misc dev\n", comm, pid); }'
 ```
 
-Expected output, with the workload being the C test program embedded at
-the top of the sample file (Linux v7.0, x86-64):
+Real capture (Linux 7.0.0, x86-64, in a `virtme-ng` VM), with the
+module loaded via `insmod rust_misc_device.ko` and the workload being
+the C test program embedded at the top of the sample file, built as
+`rust_misc_test`:
 
 ```
 Attaching 1 probe...
-<test-program-comm> opened a misc dev
+rust_misc_test (pid 329) opened a misc dev
+```
+
+The whole walkthrough is observable end-to-end in `dmesg` from the same
+run — note the lifecycle methods firing in order (`open`, `ioctl`
+dispatch, the user copies, the unknown-ioctl `ENOTTY`, and
+`PinnedDrop::drop` on close):
+
+```
+rust_misc_device: Initialising Rust Misc Device Sample   # init -> register
+misc rust-misc-device: Opening Rust Misc Device Sample    # T::open
+misc rust-misc-device: -> Hello from the Rust Misc Device # HELLO ioctl
+misc rust-misc-device: -> Copying data to userspace (value: 0)   # GET_VALUE
+misc rust-misc-device: -> Copying data from userspace (value: 1) # SET_VALUE
+misc rust-misc-device: -> IOCTL not recognised: 31744     # FAIL -> ENOTTY
+misc rust-misc-device: Exiting the Rust Misc Device Sample # drop on close
 ```
 
 `misc_register`/`misc_deregister`
