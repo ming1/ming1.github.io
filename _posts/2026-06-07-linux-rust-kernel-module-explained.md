@@ -116,7 +116,8 @@ Two boundaries matter:
    here is safe; it is the literal C ABI expressed in Rust syntax.
 
 2. **kernel crate ↔ bindings.** `rust/kernel/` wraps the raw bindings in
-   safe types. The trick used throughout is `Opaque<T>` — a
+   safe types. The trick used throughout is
+   [`Opaque<T>`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/types.rs#L323) — a
    `#[repr(transparent)]` wrapper around `UnsafeCell<MaybeUninit<T>>`
    that holds a C struct whose internals Rust never touches directly,
    only via C functions. Every C struct that the Rust side must hold but
@@ -152,7 +153,8 @@ not a copy.
 
 ## `struct file_operations`
 
-The vtable of a char device: a struct of function pointers
+[`struct file_operations`](https://elixir.bootlin.com/linux/v7.0/source/include/linux/fs.h#L1926)
+is the vtable of a char device: a struct of function pointers
 (`open`, `release`, `read_iter`, `write_iter`, `unlocked_ioctl`,
 `mmap`, ...). When userspace calls `open("/dev/foo")`, the VFS routes
 through to `fops->open`. The contract is all in the heads of kernel
@@ -162,7 +164,8 @@ types.
 
 ## `private_data`
 
-`struct file` has a `void *private_data` field. By convention a driver
+[`struct file`](https://elixir.bootlin.com/linux/v7.0/source/include/linux/fs.h#L1259)
+has a `void *private_data` field. By convention a driver
 stores its per-open instance pointer there in `open`, retrieves it in
 every other callback, and frees it in `release`. This is hand-rolled
 ownership: the C compiler does nothing to ensure you free it exactly
@@ -170,8 +173,12 @@ once. This convention is exactly what Rust's ownership model formalizes.
 
 ## Sleeping locks and refcounts
 
-`struct mutex` is a sleeping lock — you may block while holding it, but
-not take it in atomic context. `struct kref` / `refcount_t` is the
+[`struct mutex`](https://elixir.bootlin.com/linux/v7.0/source/include/linux/mutex_types.h#L41)
+is a sleeping lock — you may block while holding it, but
+not take it in atomic context.
+[`struct kref`](https://elixir.bootlin.com/linux/v7.0/source/include/linux/kref.h#L19)
+/ [`refcount_t`](https://elixir.bootlin.com/linux/v7.0/source/include/linux/refcount_types.h#L15)
+is the
 kernel's reference count: `*_get()` increments, `*_put()` decrements and
 frees at zero. Both have informal rules ("unlock on every path", "every
 get needs a put") that account for a large fraction of kernel bugs.
@@ -217,7 +224,9 @@ threads). It is initialized on one CPU and dropped on another, so it
 must be `Send`.
 
 [`ThisModule`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/lib.rs#L220)
-is the Rust equivalent of C's `THIS_MODULE`: a wrapper around
+is the Rust equivalent of C's
+[`THIS_MODULE`](https://elixir.bootlin.com/linux/v7.0/source/include/linux/init.h#L174):
+a wrapper around
 `*mut bindings::module`. It is `unsafe impl Sync` because the raw
 pointer is shared but only ever read.
 
@@ -306,7 +315,9 @@ pub trait MiscDevice: Sized {
 Three things to understand:
 
 - **`type Ptr: ForeignOwnable`** is the typed replacement for
-  `void *private_data`. `ForeignOwnable` is the trait for "a pointer
+  `void *private_data`.
+  [`ForeignOwnable`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/types.rs#L27)
+  is the trait for "a pointer
   that can be converted to/from a raw `*mut c_void` and back without
   losing ownership." In the sample, `Ptr = Pin<KBox<Self>>` — a pinned,
   heap-allocated, owned box. `open` returns one; the crate's glue stores
@@ -417,7 +428,9 @@ releases the mutex. Consequences, all compiler-enforced:
 
 `MutexBackend`
 ([`mutex.rs:98`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/sync/lock/mutex.rs#L98))
-implements `Backend` by calling the C `mutex_lock`/`mutex_unlock`. Note
+implements `Backend` by calling the C
+[`mutex_lock`](https://elixir.bootlin.com/linux/v7.0/source/kernel/locking/mutex.c#L285)/`mutex_unlock`.
+Note
 the implication of "sleeping lock": because `lock()` may sleep, you must
 not call it in atomic context — a rule Rust does *not* yet check, and a
 live pitfall (see Debugging).
@@ -437,8 +450,11 @@ lives*.
   its own kernel refcount* — i.e. `T: AlwaysRefCounted`
   ([`aref.rs:40`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/sync/aref.rs#L40)),
   whose `inc_ref`/`dec_ref` call the C `get`/`put` (e.g.
-  `get_device`/`put_device`). `ARef<Device>` is exactly a held
-  reference on a `struct device`: cloning calls `get_device`, dropping
+  [`get_device`](https://elixir.bootlin.com/linux/v7.0/source/drivers/base/core.c#L3784)/[`put_device`](https://elixir.bootlin.com/linux/v7.0/source/drivers/base/core.c#L3794)).
+  `ARef<Device>` is exactly a held
+  reference on a
+  [`struct device`](https://elixir.bootlin.com/linux/v7.0/source/include/linux/device.h#L565):
+  cloning calls `get_device`, dropping
   calls `put_device`. This is the typed version of "balance every get
   with a put." It `Deref`s to `&T`
   ([`aref.rs:149`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/sync/aref.rs#L149)).
@@ -473,9 +489,11 @@ boundary a type:
   ([`uaccess.rs:337`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/uaccess.rs#L337))
   or `writer.write::<T>(&value)`
   ([`uaccess.rs:531`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/uaccess.rs#L531)),
-  which call the checked `copy_from_user`/`copy_to_user` under the hood.
-- `read::<T>` requires `T: FromBytes` and `write::<T>` requires
-  `T: AsBytes` — marker traits asserting the type has no padding/invalid
+  which call the checked `copy_from_user`/[`copy_to_user`](https://elixir.bootlin.com/linux/v7.0/source/include/linux/uaccess.h#L228)
+  under the hood.
+- `read::<T>` requires `T:`&nbsp;[`FromBytes`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/transmute.rs#L38)
+  and `write::<T>` requires
+  `T:`&nbsp;[`AsBytes`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/transmute.rs#L202) — marker traits asserting the type has no padding/invalid
   bit patterns, so copying raw bytes is sound.
 
 # End-to-end implementation walkthrough
@@ -492,7 +510,8 @@ const RUST_MISC_DEV_GET_VALUE: u32 = _IOR::<i32>('|' as u32, 0x81);
 const RUST_MISC_DEV_SET_VALUE: u32 = _IOW::<i32>('|' as u32, 0x82);
 ```
 
-`_IO`/`_IOR`/`_IOW` are the Rust equivalents of the C macros of the same
+[`_IO`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/ioctl.rs#L27)/[`_IOR`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/ioctl.rs#L33)/[`_IOW`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/ioctl.rs#L39)
+are the Rust equivalents of the C macros of the same
 name: they pack direction, type, size, and command number into the
 32-bit ioctl code. `_IOR::<i32>` encodes that this ioctl reads an `i32`
 out to userspace; the generic parameter supplies the size, so it cannot
@@ -732,7 +751,9 @@ userspace: ioctl(fd, RUST_MISC_DEV_SET_VALUE, &v)
         -> set_value(): UserSliceReader::read (copy_from_user) + Mutex::lock
 ```
 
-The single most important detail: `misc_open()` initially stores the
+The single most important detail:
+[`misc_open()`](https://elixir.bootlin.com/linux/v7.0/source/drivers/char/misc.c#L118)
+initially stores the
 `miscdevice` pointer in `private_data`; the Rust `open` shim reads the
 registration from it, then **overwrites** `private_data` with the
 foreign form of your instance. Every later fop reads the instance. This
@@ -765,8 +786,11 @@ kernel::module_platform_driver! {
 
 Differences worth internalizing:
 
-- **Registration model.** `module_platform_driver!` registers a
-  `struct platform_driver` whose `probe`/`remove` are bound by the bus.
+- **Registration model.**
+  [`module_platform_driver!`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/platform.rs#L153)
+  registers a
+  [`struct platform_driver`](https://elixir.bootlin.com/linux/v7.0/source/include/linux/platform_device.h#L234)
+  whose `probe`/`remove` are bound by the bus.
   The module's lifetime registers the *driver*; instances come and go as
   devices are matched, not at module init.
 - **Match tables.** `of_device_table!` / `acpi_device_table!` generate
@@ -782,9 +806,13 @@ Differences worth internalizing:
 
 ## Why pinning is pervasive
 
-Address-sensitive C objects — `struct mutex` (self-referential wait
-list), `struct miscdevice` (kernel stores the pointer), `struct
-list_head` (nodes point at each other) — must never move after they are
+Address-sensitive C objects —
+[`struct mutex`](https://elixir.bootlin.com/linux/v7.0/source/include/linux/mutex_types.h#L41)
+(self-referential wait list),
+[`struct miscdevice`](https://elixir.bootlin.com/linux/v7.0/source/include/linux/miscdevice.h#L84)
+(kernel stores the pointer),
+[`struct list_head`](https://elixir.bootlin.com/linux/v7.0/source/include/linux/types.h#L204)
+(nodes point at each other) — must never move after they are
 "live." Rust's default is that values *can* move (a move is a
 byte-copy). `Pin<P>` is the type-level promise "this will not move," and
 `#[pin_data]` + `<-` in `try_pin_init!` are how you construct such a
@@ -796,7 +824,10 @@ errors.
 ## Error handling and the `?` operator
 
 Kernel C returns negative errnos; Rust returns `Result<T, Error>`.
-`Error` converts to/from errnos (`to_errno`), and the crate's C shims do
+[`Error`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/error.rs#L101)
+converts to/from errnos
+([`to_errno`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/error.rs#L161)),
+and the crate's C shims do
 that conversion at the boundary (see every `Err(err) => err.to_errno()`
 above). Inside your driver you use `?` to propagate — and because of
 RAII, an early `?`-return still drops every guard and owned object on
@@ -826,7 +857,9 @@ the exact version mismatch. See
 
 A Rust `panic!` in the kernel routes through the crate's
 [`#[panic_handler]`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/lib.rs#L245),
-which `pr_emerg!`s the message and calls `BUG()`. So a Rust panic looks
+which `pr_emerg!`s the message and calls
+[`BUG()`](https://elixir.bootlin.com/linux/v7.0/source/include/asm-generic/bug.h#L73).
+So a Rust panic looks
 like a C `BUG` in dmesg, with the panic message on the line above.
 Common triggers: `unwrap()` on an `Err`/`None`, slice index out of
 bounds, integer overflow in debug builds.
@@ -921,3 +954,98 @@ lifetime, or an `Arc` cycle keeps it alive). Since `drop` is what calls
   abstractions written (and reviewed) before they can be expressed
   safely, and APIs like `miscdevice.rs` are recent (2024) and still
   evolving across releases.
+
+# References
+
+Every structure, trait, macro, and function touched above, with its
+Linux **v7.0** source location and role. All links point at
+`elixir.bootlin.com/linux/v7.0/source/`.
+
+## C kernel — data structures
+
+| Symbol | Source | Role |
+|---|---|---|
+| `struct file_operations` | [`include/linux/fs.h:1926`](https://elixir.bootlin.com/linux/v7.0/source/include/linux/fs.h#L1926) | char-device callback vtable the Rust `MiscDevice` trait fills in |
+| `struct file` | [`include/linux/fs.h:1259`](https://elixir.bootlin.com/linux/v7.0/source/include/linux/fs.h#L1259) | open-file object; holds `private_data` |
+| `struct miscdevice` | [`include/linux/miscdevice.h:84`](https://elixir.bootlin.com/linux/v7.0/source/include/linux/miscdevice.h#L84) | misc-device registration record (address-pinned) |
+| `struct mutex` | [`include/linux/mutex_types.h:41`](https://elixir.bootlin.com/linux/v7.0/source/include/linux/mutex_types.h#L41) | sleeping lock wrapped by `Mutex<T>` |
+| `struct kref` | [`include/linux/kref.h:19`](https://elixir.bootlin.com/linux/v7.0/source/include/linux/kref.h#L19) | embeddable object refcount |
+| `refcount_t` | [`include/linux/refcount_types.h:15`](https://elixir.bootlin.com/linux/v7.0/source/include/linux/refcount_types.h#L15) | saturating refcount primitive |
+| `struct device` | [`include/linux/device.h:565`](https://elixir.bootlin.com/linux/v7.0/source/include/linux/device.h#L565) | driver-model device held via `ARef<Device>` |
+| `struct module` | [`include/linux/module.h:397`](https://elixir.bootlin.com/linux/v7.0/source/include/linux/module.h#L397) | loaded-module record behind `ThisModule` |
+| `struct platform_driver` | [`include/linux/platform_device.h:234`](https://elixir.bootlin.com/linux/v7.0/source/include/linux/platform_device.h#L234) | platform-bus driver (advanced section) |
+| `struct list_head` | [`include/linux/types.h:204`](https://elixir.bootlin.com/linux/v7.0/source/include/linux/types.h#L204) | intrusive list node — example address-sensitive object |
+
+## C kernel — functions and macros
+
+| Symbol | Source | Role |
+|---|---|---|
+| `misc_register()` | [`drivers/char/misc.c:209`](https://elixir.bootlin.com/linux/v7.0/source/drivers/char/misc.c#L209) | create `/dev/<name>`; called from `register()` |
+| `misc_deregister()` | [`drivers/char/misc.c:284`](https://elixir.bootlin.com/linux/v7.0/source/drivers/char/misc.c#L284) | tear it down; called from `PinnedDrop` |
+| `misc_open()` | [`drivers/char/misc.c:118`](https://elixir.bootlin.com/linux/v7.0/source/drivers/char/misc.c#L118) | misc-class fop `open` trampoline |
+| `generic_file_open()` | [`fs/open.c:1543`](https://elixir.bootlin.com/linux/v7.0/source/fs/open.c#L1543) | default `open` the Rust shim calls first |
+| `get_device()` | [`drivers/base/core.c:3784`](https://elixir.bootlin.com/linux/v7.0/source/drivers/base/core.c#L3784) | inc device refcount (`ARef::clone`) |
+| `put_device()` | [`drivers/base/core.c:3794`](https://elixir.bootlin.com/linux/v7.0/source/drivers/base/core.c#L3794) | dec device refcount (`ARef::drop`) |
+| `mutex_lock()` | [`kernel/locking/mutex.c:285`](https://elixir.bootlin.com/linux/v7.0/source/kernel/locking/mutex.c#L285) | acquire sleeping lock (`MutexBackend`) |
+| `copy_to_user()` | [`include/linux/uaccess.h:228`](https://elixir.bootlin.com/linux/v7.0/source/include/linux/uaccess.h#L228) | checked kernel→user copy under `UserSliceWriter` |
+| `finit_module()` | [`kernel/module/main.c:3735`](https://elixir.bootlin.com/linux/v7.0/source/kernel/module/main.c#L3735) | module-load syscall (`insmod`) |
+| `load_module()` | [`kernel/module/main.c:3358`](https://elixir.bootlin.com/linux/v7.0/source/kernel/module/main.c#L3358) | core loader |
+| `do_init_module()` | [`kernel/module/main.c:3017`](https://elixir.bootlin.com/linux/v7.0/source/kernel/module/main.c#L3017) | invokes the generated `init_module` |
+| `THIS_MODULE` | [`include/linux/init.h:174`](https://elixir.bootlin.com/linux/v7.0/source/include/linux/init.h#L174) | current-module pointer behind `ThisModule` |
+| `MISC_DYNAMIC_MINOR` | [`include/linux/miscdevice.h:82`](https://elixir.bootlin.com/linux/v7.0/source/include/linux/miscdevice.h#L82) | "allocate a minor for me" sentinel |
+| `MODULE_DEVICE_TABLE` | [`include/linux/module.h:255`](https://elixir.bootlin.com/linux/v7.0/source/include/linux/module.h#L255) | autoload match-table emission |
+| `BUG()` | [`include/asm-generic/bug.h:73`](https://elixir.bootlin.com/linux/v7.0/source/include/asm-generic/bug.h#L73) | fatal assertion a Rust panic ends in |
+
+## Rust `kernel` crate — types and traits
+
+| Symbol | Source | Role |
+|---|---|---|
+| `Module` | [`rust/kernel/lib.rs:178`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/lib.rs#L178) | by-value module entry trait |
+| `InPlaceModule` | [`rust/kernel/lib.rs:189`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/lib.rs#L189) | pinned module entry trait (sample uses this) |
+| `ThisModule` | [`rust/kernel/lib.rs:220`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/lib.rs#L220) | `THIS_MODULE` wrapper |
+| `MiscDevice` | [`rust/kernel/miscdevice.rs:114`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/miscdevice.rs#L114) | safe `file_operations` trait |
+| `MiscDeviceRegistration<T>` | [`rust/kernel/miscdevice.rs:56`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/miscdevice.rs#L56) | RAII registration (register on new, deregister on drop) |
+| `MiscDeviceOptions` | [`rust/kernel/miscdevice.rs:27`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/miscdevice.rs#L27) | name/minor options passed to `register()` |
+| `MiscdeviceVTable<T>` | [`rust/kernel/miscdevice.rs:196`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/miscdevice.rs#L196) | C-ABI shim type building `VTABLE` |
+| `Opaque<T>` | [`rust/kernel/types.rs:323`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/types.rs#L323) | holder for C structs Rust never introspects |
+| `ForeignOwnable` | [`rust/kernel/types.rs:27`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/types.rs#L27) | typed `private_data` ownership transfer |
+| `File` | [`rust/kernel/fs/file.rs:186`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/fs/file.rs#L186) | safe `struct file` reference |
+| `File::from_raw_file` | [`rust/kernel/fs/file.rs:357`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/fs/file.rs#L357) | raw-pointer → `&File` in the shim |
+| `Kiocb<'_, T>` | [`rust/kernel/fs/kiocb.rs:23`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/fs/kiocb.rs#L23) | kernel I/O control block for `read_iter`/`write_iter` |
+| `IovIterDest` | [`rust/kernel/iov.rs:195`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/iov.rs#L195) | write-into iterator (reads serve userspace) |
+| `IovIterSource` | [`rust/kernel/iov.rs:44`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/iov.rs#L44) | read-from iterator (writes come from userspace) |
+| `Device` (rust) | [`rust/kernel/device.rs:170`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/device.rs#L170) | safe `struct device` wrapper |
+| `AlwaysRefCounted` | [`rust/kernel/sync/aref.rs:40`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/sync/aref.rs#L40) | trait for C objects with built-in refcount |
+| `ARef<T>` | [`rust/kernel/sync/aref.rs:68`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/sync/aref.rs#L68) | counted reference to such objects |
+| `Arc<T>` | [`rust/kernel/sync/arc.rs:132`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/sync/arc.rs#L132) | crate's refcounted heap allocation |
+| `ArcInner<T>` | [`rust/kernel/sync/arc.rs:147`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/sync/arc.rs#L147) | `Arc` payload + `Refcount` |
+| `Refcount` | [`rust/kernel/sync/refcount.rs:20`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/sync/refcount.rs#L20) | wrapper over C `refcount_t` |
+| `Lock<T, B>` | [`rust/kernel/sync/lock.rs:106`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/sync/lock.rs#L106) | generic lock fusing state + data |
+| `Guard<'a, T, B>` | [`rust/kernel/sync/lock.rs:201`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/sync/lock.rs#L201) | RAII unlock guard derefs to `&mut T` |
+| `Mutex<T>` | [`rust/kernel/sync/lock/mutex.rs:87`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/sync/lock/mutex.rs#L87) | `Lock<T, MutexBackend>` alias |
+| `MutexBackend` | [`rust/kernel/sync/lock/mutex.rs:98`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/sync/lock/mutex.rs#L98) | binds `Lock` to C `mutex_lock`/`unlock` |
+| `UserSlice` | [`rust/kernel/uaccess.rs:147`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/uaccess.rs#L147) | typed user pointer + length |
+| `UserSliceReader` | [`rust/kernel/uaccess.rs:212`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/uaccess.rs#L212) | `copy_from_user` side |
+| `UserSliceWriter` | [`rust/kernel/uaccess.rs:444`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/uaccess.rs#L444) | `copy_to_user` side |
+| `Error` | [`rust/kernel/error.rs:101`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/error.rs#L101) | errno-backed error type |
+| `Error::to_errno` | [`rust/kernel/error.rs:161`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/error.rs#L161) | error → negative errno at the C boundary |
+| `KBox<T>` | [`rust/kernel/alloc/kbox.rs:118`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/alloc/kbox.rs#L118) | `kmalloc`-backed owned box (`Pin<KBox<Self>>`) |
+| `KVVec<T>` | [`rust/kernel/alloc/kvec.rs:152`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/alloc/kvec.rs#L152) | `kvmalloc`-backed vector (the `buffer` field) |
+| `FromBytes` | [`rust/kernel/transmute.rs:38`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/transmute.rs#L38) | bound for `reader.read::<T>()` |
+| `AsBytes` | [`rust/kernel/transmute.rs:202`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/transmute.rs#L202) | bound for `writer.write::<T>()` |
+| `platform::Driver` | [`rust/kernel/platform.rs:206`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/platform.rs#L206) | platform-bus driver trait (advanced) |
+| `platform::Device` | [`rust/kernel/platform.rs:256`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/platform.rs#L256) | platform device handed to `probe` |
+
+## Rust `kernel` crate — macros and generated entry points
+
+| Symbol | Source | Role |
+|---|---|---|
+| `module!` | [`rust/macros/module.rs`](https://elixir.bootlin.com/linux/v7.0/source/rust/macros/module.rs) | emits modinfo + C entry points |
+| `module_platform_driver!` | [`rust/kernel/platform.rs:153`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/platform.rs#L153) | registers a platform driver as a module |
+| `new_mutex!` | [`rust/kernel/sync/lock/mutex.rs:12`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/sync/lock/mutex.rs#L12) | in-place `Mutex` constructor |
+| `_IO` / `_IOR` / `_IOW` | [`rust/kernel/ioctl.rs:27`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/ioctl.rs#L27) / [`:33`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/ioctl.rs#L33) / [`:39`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/ioctl.rs#L39) | ioctl-number encoders |
+| `_IOC_SIZE` | [`rust/kernel/ioctl.rs:70`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/ioctl.rs#L70) | extract transfer size from a cmd |
+| generated `init_module` | [`rust/macros/module.rs:554`](https://elixir.bootlin.com/linux/v7.0/source/rust/macros/module.rs#L554) | C-ABI load entry |
+| generated `cleanup_module` | [`rust/macros/module.rs:570`](https://elixir.bootlin.com/linux/v7.0/source/rust/macros/module.rs#L570) | C-ABI unload entry |
+| `__init` | [`rust/macros/module.rs:622`](https://elixir.bootlin.com/linux/v7.0/source/rust/macros/module.rs#L622) | runs `InPlaceModule::init` into `__MOD` |
+| `__exit` | [`rust/macros/module.rs:640`](https://elixir.bootlin.com/linux/v7.0/source/rust/macros/module.rs#L640) | drops `__MOD` |
