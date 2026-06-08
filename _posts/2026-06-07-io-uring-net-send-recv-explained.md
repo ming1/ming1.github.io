@@ -17,7 +17,7 @@ caller ever entering `sendmsg(2)`/`recvmsg(2)`. This post follows one request
 end to end: how a net handler in `net.c` is *reached* from the io_uring core,
 how it *calls into* the networking stack, and how the `io_kiocb` is born,
 parked, retried, and freed. The focus is **send and recv and all of their
-variants** — plain, `msg`, bundled, multishot, and zero-copy.
+variants** — plain, `msg`, vectorized, bundled, multishot, and zero-copy.
 
 > Sources: Linux **v7.0** (`git tag v7.0`). Primary files:
 > [`io_uring/net.c`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c),
@@ -286,6 +286,33 @@ calls
 — the same internal entry the `sendmsg(2)` syscall uses, minus the userspace
 copy. Control messages disable partial retry (it can't resume cleanly), so on
 a retried short send it zeroes `msg_controllen` before re-arming.
+
+## Vectorized send — IORING_SEND_VECTORIZED
+
+[`IORING_SEND_VECTORIZED`](https://elixir.bootlin.com/linux/v7.0/A/ident/IORING_SEND_VECTORIZED)
+(bit 5 of `sqe->ioprio`) gives plain `IORING_OP_SEND` scatter-gather *without*
+the `sendmsg` overhead. With the flag set, `sqe->addr` no longer points at a
+single contiguous buffer — it points at an array of `struct iovec`, and
+`sqe->len` is the segment count. The uAPI doc sums it up: *"SEND[_ZC] will
+take a pointer to a io_vec to allow vectorized send operations."* It was added
+by commit `6f02527729bd` ("io_uring/net: Allow to do vectorized send").
+
+The whole effect lives in
+[`io_send_setup()`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L349):
+with the flag, the source is imported by
+[`io_net_import_vec()`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L212)
+(the same `__import_iovec()` machinery `sendmsg` uses); without it, by
+`import_ubuf()` (one linear buffer). The resulting iterator lands in
+`io_async_msghdr.msg.msg_iter` exactly as in the linear case, so a partial
+`MSG_WAITALL` send resumes mid-iovec across poll re-arms.
+
+The value over `IORING_OP_SENDMSG` is that there is no `user_msghdr` copy and
+no `msg_name`/control plumbing — just data segments. For `IORING_OP_SENDMSG`
+the flag is accepted but redundant (that opcode is always vectored). Zero-copy
+`IORING_OP_SEND_ZC` honours it too — it shares `io_send_setup()` — but only
+with a generic iovec: `IORING_SEND_VECTORIZED | IORING_RECVSEND_FIXED_BUF` is
+rejected with `-EINVAL`. There is no recv counterpart; vectored receive is the
+`RECVMSG` path only.
 
 ## Bundles — IORING_RECVSEND_BUNDLE
 
