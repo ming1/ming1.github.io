@@ -61,13 +61,13 @@ send/recv family maps like this:
 
 | Opcode | `.prep` | `.issue` |
 |---|---|---|
-| `IORING_OP_SEND` | `io_sendmsg_prep` | [`io_send`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L642) |
-| `IORING_OP_SENDMSG` | `io_sendmsg_prep` | [`io_sendmsg`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L545) |
-| `IORING_OP_SEND_ZC` | `io_send_zc_prep` | [`io_send_zc`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L1461) |
-| `IORING_OP_SENDMSG_ZC` | `io_send_zc_prep` | [`io_sendmsg_zc`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L1528) |
-| `IORING_OP_RECV` | `io_recvmsg_prep` | [`io_recv`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L1174) |
-| `IORING_OP_RECVMSG` | `io_recvmsg_prep` | [`io_recvmsg`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L1015) |
-| `IORING_OP_RECV_ZC` | `io_recvzc_prep` | [`io_recvzc`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L1278) |
+| [`IORING_OP_SEND`](https://elixir.bootlin.com/linux/v7.0/A/ident/IORING_OP_SEND) | [`io_sendmsg_prep`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L418) | [`io_send`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L642) |
+| [`IORING_OP_SENDMSG`](https://elixir.bootlin.com/linux/v7.0/A/ident/IORING_OP_SENDMSG) | [`io_sendmsg_prep`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L418) | [`io_sendmsg`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L545) |
+| [`IORING_OP_SEND_ZC`](https://elixir.bootlin.com/linux/v7.0/A/ident/IORING_OP_SEND_ZC) | [`io_send_zc_prep`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L1330) | [`io_send_zc`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L1461) |
+| [`IORING_OP_SENDMSG_ZC`](https://elixir.bootlin.com/linux/v7.0/A/ident/IORING_OP_SENDMSG_ZC) | [`io_send_zc_prep`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L1330) | [`io_sendmsg_zc`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L1528) |
+| [`IORING_OP_RECV`](https://elixir.bootlin.com/linux/v7.0/A/ident/IORING_OP_RECV) | [`io_recvmsg_prep`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L785) | [`io_recv`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L1174) |
+| [`IORING_OP_RECVMSG`](https://elixir.bootlin.com/linux/v7.0/A/ident/IORING_OP_RECVMSG) | [`io_recvmsg_prep`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L785) | [`io_recvmsg`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L1015) |
+| [`IORING_OP_RECV_ZC`](https://elixir.bootlin.com/linux/v7.0/A/ident/IORING_OP_RECV_ZC) | [`io_recvzc_prep`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L1250) | [`io_recvzc`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L1278) |
 
 Note the deliberate sharing: `SEND`/`SENDMSG` share one `prep`, both ZC sends
 share one `prep`, and `RECV`/`RECVMSG` share one `prep`. The `prep` functions
@@ -111,13 +111,14 @@ which sub-command view it uses. Fields that matter for net:
 The opcode-private command view is overlaid on the `cmd` union member. For
 networking that view is
 [`struct io_sr_msg`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L65),
-obtained with `io_kiocb_to_cmd(req, struct io_sr_msg)`. It carries the user
+obtained with [`io_kiocb_to_cmd`](https://elixir.bootlin.com/linux/v7.0/source/include/linux/io_uring_types.h#L678)`(req, struct io_sr_msg)`. It carries the user
 buffer/`msghdr` pointer, `len`, `msg_flags`, the io_uring-level `flags`
 (`IORING_RECVSEND_*`), `done_io` (bytes already transferred across retries),
 multishot bookkeeping, and `notif` (the zero-copy notification request).
 
 **Lifetime.** A request is allocated from a per-context cache in the core
-(`io_alloc_req`), initialized by `io_init_req()`, and reference-counted via
+([`io_alloc_req`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/io_uring.h#L529)),
+initialized by `io_init_req()`, and reference-counted via
 `req->refs` (initialized to 1; extra refs taken for async poll, linked
 timeouts, multishot). It is freed back to the cache when the last ref drops
 after the CQE is posted. The whole §"The io_kiocb lifetime" walks this in
@@ -152,7 +153,8 @@ any imported `iovec` is freed first. Caching the `iovec` across reuse is why
 [`io_recvzc`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L111)
 is the much smaller command view for `IORING_OP_RECV_ZC`: just `file`,
 `flags`, `len`, and a pointer to the
-`struct io_zcrx_ifq` (the registered RX interface queue that owns the device
+[`struct io_zcrx_ifq`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/zcrx.h#L41)
+(the registered RX interface queue that owns the device
 memory area). It deliberately does *not* use `io_async_msghdr` — there is no
 userspace buffer and no `msghdr`, because data lands in pre-registered device
 memory and is reported by the zcrx layer.
@@ -179,7 +181,9 @@ for recv,
 Prep validates flags against `SENDMSG_FLAGS`/`RECVMSG_FLAGS`, reads the buffer
 pointer and length from the SQE, allocates the `io_async_msghdr`, and — for
 the `msg` variants — copies the `user_msghdr` header in from userspace once
-(`io_sendmsg_setup` / `io_recvmsg_prep_setup`). Doing the import in `prep`
+([`io_sendmsg_setup`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L392)
+/ [`io_recvmsg_prep_setup`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L754)).
+Doing the import in `prep`
 means the volatile SQE is fully consumed before the request can be parked;
 nothing later re-reads userspace SQE memory.
 
@@ -201,8 +205,9 @@ Because the first issue carries `IO_URING_F_NONBLOCK`, the handler asks the
 socket for a non-blocking transfer. The three outcomes:
 
 - **Completed (or hard error):** the handler fills `req->cqe` and returns
-  `IOU_COMPLETE`. `io_issue_sqe()` posts the completion (deferred to the
-  submit-flush batch) and the request heads toward teardown.
+  `IOU_COMPLETE`. `io_issue_sqe()` posts the completion (deferred via
+  [`io_req_complete_defer()`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/io_uring.h#L487)
+  to the submit-flush batch) and the request heads toward teardown.
 - **Would block (`-EAGAIN`):** the handler returns `-EAGAIN`; the request is
   punted (step 3).
 - **More to do (multishot/bundle/retry):** the handler returns `IOU_RETRY` or
@@ -212,7 +217,9 @@ socket for a non-blocking transfer. The three outcomes:
 
 On `-EAGAIN`, `io_queue_sqe()` calls
 [`io_queue_async()`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/io_uring.c#L1602).
-For a socket the usual outcome is **armed poll**: io_uring registers a poll
+For a socket the usual outcome is **armed poll**
+([`io_arm_poll_handler()`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/poll.c#L701)):
+io_uring registers a poll
 wait on the socket and returns; the submitter syscall is done while the
 request waits. When the socket becomes readable/writable, task-work resumes
 the request via
@@ -228,11 +235,14 @@ re-issues so the final CQE reports the total, not just the last chunk.
 ## 4. Completion and free
 
 When the handler returns `IOU_COMPLETE`, the core posts the CQE
-(`io_req_complete_post` or, batched,
+([`io_req_complete_post`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/io_uring.c#L900)
+or, batched,
 [`__io_submit_flush_completions()`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/io_uring.c#L1120)),
 drops the final reference, runs the opcode `cleanup` callback
-(`io_sendmsg_recvmsg_cleanup` for the plain/msg paths,
-`io_send_zc_cleanup` for ZC), recycles the `io_async_msghdr` to the
+([`io_sendmsg_recvmsg_cleanup`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L342)
+for the plain/msg paths,
+[`io_send_zc_cleanup`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L1313)
+for ZC), recycles the `io_async_msghdr` to the
 `netmsg_cache`, and returns the `io_kiocb` to its cache. If the request failed
 mid-flight, the `.fail` callback
 [`io_sendrecv_fail()`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L1600)
@@ -274,9 +284,13 @@ A bundle lets one send drain *multiple* provided buffers in a single syscall.
 `io_send()` loops at the `retry_bundle` label:
 [`io_send_select_buffer()`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L594)
 pulls a batch of buffers into an `ITER_IOVEC`, the data goes out in one
-`sock_sendmsg()`, and `io_send_finish()` posts a CQE with
+`sock_sendmsg()`, and
+[`io_send_finish()`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L507)
+posts a CQE with
 `IORING_CQE_F_MORE` and loops again if more buffers remain and the socket
-still accepts data. `io_bundle_nbufs()` works out how many provided buffers a
+still accepts data.
+[`io_bundle_nbufs()`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L467)
+works out how many provided buffers a
 short transfer consumed so the right number are committed. Bundles are
 send-only for `IORING_OP_SEND` (rejected for `SENDMSG`).
 
@@ -318,8 +332,9 @@ then calls
 [`sock_recvmsg()`](https://elixir.bootlin.com/linux/v7.0/source/net/socket.c#L1096).
 Like send it handles `-EAGAIN` (retry via poll), partial transfer with
 `MSG_WAITALL` (advance buffer, accumulate `done_io`), and `MSG_TRUNC`/`CTRUNC`
-as failure under `MSG_WAITALL`. `io_recv_finish()` decides whether to loop
-(multishot) or complete.
+as failure under `MSG_WAITALL`.
+[`io_recv_finish()`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L848)
+decides whether to loop (multishot) or complete.
 
 ## io_recvmsg — IORING_OP_RECVMSG
 
@@ -370,19 +385,19 @@ four socket entry points, all in
 
 | net.c handler | socket call | notes |
 |---|---|---|
-| `io_send` | `sock_sendmsg()` | linear/iovec/bundle source |
-| `io_sendmsg` / `io_sendmsg_zc` | `__sys_sendmsg_sock()` | full msghdr incl. cmsg |
-| `io_send_zc` | `sock_sendmsg()` + `msg_ubuf` | pinned pages, notif |
-| `io_recv` | `sock_recvmsg()` | linear/provided buffer |
-| `io_recvmsg` | `__sys_recvmsg_sock()` | full msghdr incl. cmsg |
-| `io_recvzc` | `io_zcrx_recv()` | device memory, not socket.c |
+| `io_send` | [`sock_sendmsg()`](https://elixir.bootlin.com/linux/v7.0/source/net/socket.c#L753) | linear/iovec/bundle source |
+| `io_sendmsg` / `io_sendmsg_zc` | [`__sys_sendmsg_sock()`](https://elixir.bootlin.com/linux/v7.0/source/net/socket.c#L2655) | full msghdr incl. cmsg |
+| `io_send_zc` | [`sock_sendmsg()`](https://elixir.bootlin.com/linux/v7.0/source/net/socket.c#L753) + `msg_ubuf` | pinned pages, notif |
+| `io_recv` | [`sock_recvmsg()`](https://elixir.bootlin.com/linux/v7.0/source/net/socket.c#L1096) | linear/provided buffer |
+| `io_recvmsg` | [`__sys_recvmsg_sock()`](https://elixir.bootlin.com/linux/v7.0/source/net/socket.c#L2863) | full msghdr incl. cmsg |
+| `io_recvzc` | [`io_zcrx_recv()`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/zcrx.c#L1510) | device memory, not socket.c |
 
 The contract is the ordinary `struct socket` one: io_uring builds a
 `struct msghdr` (with an `iov_iter` over user or registered memory), sets
 `MSG_DONTWAIT` for the non-blocking first attempt, and lets the protocol do
 the rest. The only io_uring-specific twist is `msg_ubuf` for zero-copy send
 and the `msg_get_inq`/`msg_inq` plumbing that feeds the multishot decision.
-`sock_from_file()` ([socket.c](https://elixir.bootlin.com/linux/v7.0/source/net/socket.c#L530))
+[`sock_from_file()`](https://elixir.bootlin.com/linux/v7.0/source/net/socket.c#L530)
 recovers the `struct socket` from `req->file` on every issue.
 
 # Putting it together: a recv multishot trace
