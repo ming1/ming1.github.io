@@ -59,15 +59,15 @@ The vtable is [`io_issue_defs[]`](https://elixir.bootlin.com/linux/v7.0/source/i
 in `opdef.c`. Each opcode names a `.prep` and an `.issue` function; the
 send/recv family maps like this:
 
-| Opcode | `.prep` | `.issue` |
-|---|---|---|
-| [`IORING_OP_SEND`](https://elixir.bootlin.com/linux/v7.0/A/ident/IORING_OP_SEND) | [`io_sendmsg_prep`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L418) | [`io_send`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L642) |
-| [`IORING_OP_SENDMSG`](https://elixir.bootlin.com/linux/v7.0/A/ident/IORING_OP_SENDMSG) | [`io_sendmsg_prep`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L418) | [`io_sendmsg`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L545) |
-| [`IORING_OP_SEND_ZC`](https://elixir.bootlin.com/linux/v7.0/A/ident/IORING_OP_SEND_ZC) | [`io_send_zc_prep`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L1330) | [`io_send_zc`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L1461) |
-| [`IORING_OP_SENDMSG_ZC`](https://elixir.bootlin.com/linux/v7.0/A/ident/IORING_OP_SENDMSG_ZC) | [`io_send_zc_prep`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L1330) | [`io_sendmsg_zc`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L1528) |
-| [`IORING_OP_RECV`](https://elixir.bootlin.com/linux/v7.0/A/ident/IORING_OP_RECV) | [`io_recvmsg_prep`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L785) | [`io_recv`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L1174) |
-| [`IORING_OP_RECVMSG`](https://elixir.bootlin.com/linux/v7.0/A/ident/IORING_OP_RECVMSG) | [`io_recvmsg_prep`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L785) | [`io_recvmsg`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L1015) |
-| [`IORING_OP_RECV_ZC`](https://elixir.bootlin.com/linux/v7.0/A/ident/IORING_OP_RECV_ZC) | [`io_recvzc_prep`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L1250) | [`io_recvzc`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L1278) |
+| Opcode | What it does | `.prep` | `.issue` |
+|---|---|---|---|
+| [`IORING_OP_SEND`](https://elixir.bootlin.com/linux/v7.0/A/ident/IORING_OP_SEND) | Send from one linear buffer (also drives provided-buffer / bundle sends). | [`io_sendmsg_prep`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L418) | [`io_send`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L642) |
+| [`IORING_OP_SENDMSG`](https://elixir.bootlin.com/linux/v7.0/A/ident/IORING_OP_SENDMSG) | Send a full `msghdr`: iovec array, ancillary control data, destination address. | [`io_sendmsg_prep`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L418) | [`io_sendmsg`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L545) |
+| [`IORING_OP_SEND_ZC`](https://elixir.bootlin.com/linux/v7.0/A/ident/IORING_OP_SEND_ZC) | Zero-copy send of a linear buffer: pins user pages, posts a second notification CQE when the NIC is done. | [`io_send_zc_prep`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L1330) | [`io_send_zc`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L1461) |
+| [`IORING_OP_SENDMSG_ZC`](https://elixir.bootlin.com/linux/v7.0/A/ident/IORING_OP_SENDMSG_ZC) | Zero-copy `sendmsg`: full `msghdr` with the same pinned-pages + notification model. | [`io_send_zc_prep`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L1330) | [`io_sendmsg_zc`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L1528) |
+| [`IORING_OP_RECV`](https://elixir.bootlin.com/linux/v7.0/A/ident/IORING_OP_RECV) | Receive into one linear/provided buffer; supports multishot and bundles. | [`io_recvmsg_prep`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L785) | [`io_recv`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L1174) |
+| [`IORING_OP_RECVMSG`](https://elixir.bootlin.com/linux/v7.0/A/ident/IORING_OP_RECVMSG) | Receive a full `msghdr`: payload plus peer address and control messages. | [`io_recvmsg_prep`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L785) | [`io_recvmsg`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L1015) |
+| [`IORING_OP_RECV_ZC`](https://elixir.bootlin.com/linux/v7.0/A/ident/IORING_OP_RECV_ZC) | Zero-copy receive: payloads land directly in pre-registered device memory (zcrx), no userspace buffer. | [`io_recvzc_prep`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L1250) | [`io_recvzc`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L1278) |
 
 Note the deliberate sharing: `SEND`/`SENDMSG` share one `prep`, both ZC sends
 share one `prep`, and `RECV`/`RECVMSG` share one `prep`. The `prep` functions
