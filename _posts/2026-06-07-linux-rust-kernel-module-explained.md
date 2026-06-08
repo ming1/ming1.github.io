@@ -191,6 +191,51 @@ Now the layer-2 types. For each: *why it exists*, *which C object it
 wraps*, *lifetime*, *locking/refcount rules*, and *how it interacts with
 Rust ownership*.
 
+## `Opaque<T>` — suspending Rust's assumptions about C structs
+
+Almost every type below wraps a C struct in
+[`Opaque<T>`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/types.rs#L323),
+the one abstraction that makes safe Rust ↔ raw-C interop possible:
+
+```rust
+#[repr(transparent)]
+pub struct Opaque<T> {
+    value: UnsafeCell<MaybeUninit<T>>,
+    _pin: PhantomPinned,
+}
+```
+
+A C struct breaks every assumption Rust makes about a `T`: the kernel
+mutates it behind your back, its bytes may not form a *valid* `T`, and
+its address must often stay fixed. Each part of `Opaque` disables one
+such assumption — read it as four independent opt-outs:
+
+- **`#[repr(transparent)]`** — identical layout to `T`, so
+  `Opaque<bindings::miscdevice>` is byte-for-byte a `miscdevice` and its
+  address is exactly what `misc_register()` expects. No padding, no
+  reordering, zero overhead.
+- **`UnsafeCell<…>`** — opts out of Rust's "no mutation through a shared
+  `&`" rule. C writes the mutex's `owner`/wait-list while Rust holds only
+  `&Opaque` (e.g. `lock()` takes `&self`); without this the optimizer
+  could cache stale bytes — undefined behavior.
+- **`MaybeUninit<T>`** — opts out of Rust's *validity* requirement, so the
+  bytes may be uninitialized padding or patterns illegal for the Rust
+  mirror type. This is precisely why handing C a pointer to
+  not-yet-initialized memory (`ffi_init`) is sound.
+- **`PhantomPinned`** — a zero-size marker making the type `!Unpin`
+  (un-movable once pinned), encoding "the kernel stored this pointer / it
+  self-references, so never relocate it."
+
+Rust never reads the fields. The only access is
+[`get()`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/types.rs#L394),
+which returns a `*mut T` to feed to a C function, and construction goes
+through
+[`try_ffi_init`](https://elixir.bootlin.com/linux/v7.0/source/rust/kernel/types.rs#L383),
+which lets a C initializer fill the slot in place — exactly what
+`MiscDeviceRegistration::register` does with `misc_register`. All the
+danger is concentrated here, behind `get()` and an `unsafe` deref, so
+every driver built on top stays safe.
+
 ## `module!` and the `Module` / `InPlaceModule` traits
 
 `module!`
