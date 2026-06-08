@@ -78,7 +78,9 @@ is a union that serves all of them.
 # What net.c does NOT do
 
 - It is **not** the socket layer. `net.c` never touches TCP state machines or
-  `sk_buff` queues directly; it hands a `struct msghdr` to `sock_sendmsg()` /
+  `sk_buff` queues directly; it hands a
+  [`struct msghdr`](https://elixir.bootlin.com/linux/v7.0/source/include/linux/socket.h#L71)
+  to `sock_sendmsg()` /
   `sock_recvmsg()` and lets `net/` do protocol work.
 - It is **not** the io_uring core. Reference counting, task-work, CQE posting,
   and the SQE ring live in `io_uring.c`; `net.c` only fills in `req->cqe` and
