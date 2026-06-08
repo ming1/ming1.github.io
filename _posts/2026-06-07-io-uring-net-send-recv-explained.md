@@ -355,6 +355,100 @@ via [`io_import_reg_buf()`](https://elixir.bootlin.com/linux/v7.0/source/io_urin
 (vectorized). Registered buffers are imported lazily at *issue* time, not
 prep, because resolving the buffer node needs the issue-time locking context.
 
+# The SEND_ZC lifetime: two requests, two CQEs, two refcounts
+
+Zero-copy send is the one path where the simple "born → issue → complete →
+free" lifetime breaks, because the data is *not* copied — the kernel must keep
+the user pages alive until the network stack is finished with them, which is
+long after the send itself completes. Understanding this matters in practice:
+it determines when a buffer may be reused or unregistered.
+
+## Two io_kiocbs are born at prep
+
+[`io_send_zc_prep()`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L1330)
+allocates a *second* request next to the send via
+[`io_alloc_notif()`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/notif.c#L114).
+The `notif` is a real `io_kiocb` from the same request cache, given
+`opcode = IORING_OP_NOP`, whose command view is
+[`struct io_notif_data`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/notif.h#L13).
+It copies the send's `user_data`, presets `cqe.flags = IORING_CQE_F_NOTIF`,
+takes its own task reference, and embeds a `ubuf_info uarg` whose
+`refcnt` starts at 1 — that 1 is the *submission's* reference. The send
+request keeps it in `zc->notif` and sets `REQ_F_NEED_CLEANUP`.
+
+## Two reference counts govern teardown
+
+This is the crux. Two independent counters, not one, decide when things die:
+
+| Counter | Meaning | Dropped by |
+|---|---|---|
+| `notif`'s `io_kiocb.refs` | the notif object's own lifetime | its completion task-work |
+| `nd->uarg.refcnt` | how many `sk_buff`s + the submission still pin the pages | each skb on free via [`io_tx_ubuf_complete()`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/notif.c#L43); the submission via [`io_notif_flush()`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/notif.h#L35) |
+
+The send `io_kiocb` follows the ordinary lifetime. The **notif outlives it**,
+gated by `uarg.refcnt`.
+
+## Completion is split into two CQEs
+
+[`io_send_zc()`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L1461)
+sets `kmsg->msg.msg_ubuf = &nd->uarg` and sends with `MSG_ZEROCOPY`; the
+network stack fills skb frags from the user pages and bumps `uarg.refcnt` per
+skb. On success the handler posts **CQE #1** (the byte count) carrying
+`IORING_CQE_F_MORE`, then frees the send request. **CQE #2**
+(`IORING_CQE_F_NOTIF`, same `user_data`) is posted only when `uarg.refcnt`
+finally reaches 0 — i.e. after the last skb is freed/acked —
+[`io_tx_ubuf_complete()`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/notif.c#L43)
+queues
+[`io_notif_tw_complete()`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/notif.c#L15),
+which posts the notif CQE and frees the notif. On an io-wq worker
+(`IO_URING_F_UNLOCKED`) the submission's flush is deferred to
+[`io_send_zc_cleanup()`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L1313)
+instead, because task-work ordering can't be relied on there.
+
+`F_MORE` on CQE #1 is the userspace-visible contract: *do not* treat the
+buffer as free until the `F_NOTIF` CQE arrives. That second CQE — not the
+first — is the "pages released" event.
+
+## Registered buffers: safe to unregister after CQE #1
+
+A natural worry: with `IORING_RECVSEND_FIXED_BUF`, what if userspace
+unregisters the buffer after CQE #1 but before the `F_NOTIF` CQE? It is safe,
+and the reason is a third reference — on the buffer node itself.
+
+[`io_send_zc_import()`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L1448)
+imports the fixed buffer against `sr->notif`, **not** the send request.
+[`io_find_buf_node()`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/rsrc.c#L1101)
+does `node->refs++` and stashes it as `notif->buf_node`, so the
+[`io_rsrc_node`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/rsrc.h#L15)
+wrapping the pinned pages now has two references: the `buf_table` slot and the
+notif.
+
+Unregister —
+[`io_sqe_buffers_unregister()`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/rsrc.c#L596)
+→
+[`io_rsrc_data_free()`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/rsrc.c#L186)
+→
+[`io_put_rsrc_node()`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/rsrc.h#L104)
+— only drops the *table's* reference (`if (!--node->refs)`). Because the notif
+still holds one,
+[`io_free_rsrc_node()`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/rsrc.c#L496)
+→
+[`io_buffer_unmap()`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/rsrc.c#L127)
+does **not** run: the index becomes free and reusable, but the pages stay
+pinned. The actual unpin is deferred until the notif completes (after the
+netstack drops its skb refs), at which point `notif->buf_node` is put, `refs`
+hits 0, and the pages are released alongside CQE #2.
+
+Both `io_find_buf_node()` (ref bump) and `io_rsrc_data_free()` (unregister)
+run under `ctx->uring_lock`, so there is no torn state: the import either refs
+a live node or returns `-EFAULT`.
+
+The practical corollary: after unregister the buffer *index* is immediately
+reusable, but the *physical pages* remain pinned and accounted until the
+matching `F_NOTIF` fires. A loop that unregisters and re-registers large ZC
+buffers can hold more pinned memory than the table size implies until the
+outstanding notifications drain.
+
 # Recv path and its variants
 
 Recv mirrors send but adds two features send lacks: **multishot** (one SQE
@@ -489,6 +583,10 @@ and every poll re-arm — that buffer reuse is what makes multishot cheap.
   and a second notification CQE; RECV_ZC needs a registered device-memory
   interface (`io_zcrx_ifq`). Both add setup and completion complexity that
   only pays off at high throughput.
+- **SEND_ZC defers page release past the send completion.** The buffer is not
+  reusable at CQE #1; it is pinned until the `IORING_CQE_F_NOTIF` CQE, and a
+  registered buffer's pages survive `unregister` until then. Misreading the
+  two-CQE contract leads to data corruption or surprise pinned-memory growth.
 - **`net.c` is a catch-all.** Send/recv share the file with accept/connect/
   bind/listen/socket/shutdown; the single translation unit is large and the
   shared `io_sr_msg` union is doing a lot of double duty.
