@@ -509,6 +509,118 @@ completion rings. `io_recvzc()` returns `IOU_RETRY` to stay armed for the next
 batch, or `IOU_COMPLETE`/`IOU_REQUEUE` on terminal conditions. Use it for
 high-throughput RX where even the copy to a provided buffer is too expensive.
 
+# The RECV_ZC lifetime: device memory, the refill ring, and niov ownership
+
+`RECV_ZC` inverts everything about the normal recv path. There is no
+userspace buffer and no `msghdr`; instead the NIC DMAs incoming payloads
+*directly* into kernel memory that userspace has pre-registered and mmap'd,
+and the kernel hands ownership back and forth through a dedicated ring. This
+is the most setup-heavy path in `net.c` — and the only one whose lifetime is a
+*loop* rather than a line.
+
+## Registration builds a device-bound memory area
+
+Before any `RECV_ZC`,
+[`io_register_zcrx_ifq()`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/zcrx.c#L754)
+binds a memory area to one NIC receive queue. It allocates an
+[`io_zcrx_ifq`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/zcrx.h#L41),
+carves the registered
+[`io_zcrx_area`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/zcrx.h#L25)
+into fixed-size chunks — each a
+[`net_iov`](https://elixir.bootlin.com/linux/v7.0/source/include/net/netmem.h#L95)
+("niov") — and installs itself as a **page-pool memory provider** on that
+RX queue, so the driver allocates RX buffers straight from the registered
+area. Two rings connect kernel and user:
+
+- the **refill ring** (`rq_ring` + `rqes`,
+  [`struct io_uring_zcrx_rqe`](https://elixir.bootlin.com/linux/v7.0/source/include/uapi/linux/io_uring.h#L1054)),
+  which userspace fills to *return* buffers it is done reading;
+- the main **completion ring**, where each arrival is posted as an aux CQE
+  with a
+  [`struct io_uring_zcrx_cqe`](https://elixir.bootlin.com/linux/v7.0/source/include/uapi/linux/io_uring.h#L1060)
+  payload pointing at an offset into the area — not a copied buffer.
+
+## One multishot request, many aux CQEs
+
+[`io_recvzc_prep()`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L1250)
+*requires* `IORING_RECV_MULTISHOT` (else `-EINVAL`) and sets
+`REQ_F_APOLL_MULTISHOT`: a single `RECV_ZC` `io_kiocb` is long-lived and emits
+a stream of completions. [`io_recvzc()`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L1278)
+resolves the `ifq` and calls
+[`io_zcrx_recv()`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/zcrx.c#L1510)
+→
+[`io_zcrx_tcp_recvmsg()`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/zcrx.c#L1464),
+which drives `tcp_read_sock()` with
+[`io_zcrx_recv_skb()`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/zcrx.c#L1358)
+as the consumer. The handler returns `IOU_RETRY` to stay armed, or
+`IOU_REQUEUE` when it has processed too many skbs in one go (to avoid starving
+other work).
+
+## The handoff and its two refcounts
+
+For each skb fragment that landed in the registered pool,
+[`io_zcrx_recv_frag()`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/zcrx.c#L1330)
+posts an aux CQE via
+[`io_zcrx_queue_cqe()`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/zcrx.c#L1193)
+(carrying `IORING_CQE_F_MORE` and the area offset), then pins the chunk for
+userspace with **two** references:
+
+```c
+page_pool_ref_netmem(net_iov_to_netmem(niov));   /* keep it out of the pool   */
+io_zcrx_get_niov_uref(niov);                      /* mark it user-owned        */
+```
+
+A fragment that did *not* land in the registered area (TCP headers, or a
+non-ZC NIC) is copied into a fallback niov instead — true zero-copy needs
+driver support for header/data splitting.
+
+## The ownership loop closes via the refill ring
+
+This is the lifetime that distinguishes `RECV_ZC`: a niov cycles
+**pool → user → pool**.
+
+1. NIC DMAs into a niov; the kernel posts its offset and bumps its
+   page-pool ref + per-niov
+   [user ref](https://elixir.bootlin.com/linux/v7.0/source/io_uring/zcrx.c#L363).
+2. Userspace reads the data in place, then writes the niov's offset into the
+   refill ring to give it back.
+3. [`io_zcrx_ring_refill()`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/zcrx.c#L949)
+   (called from the page-pool alloc path) consumes the refill entry,
+   [drops the user ref](https://elixir.bootlin.com/linux/v7.0/source/io_uring/zcrx.c#L349),
+   and once the page-pool ref also clears, recycles the niov back to the
+   device for the next packet.
+
+So a buffer can never be recycled while `user_refs > 0`. The per-niov user
+counter is the analogue of SEND_ZC's `uarg.refcnt`: it is the contract that
+keeps device memory valid while the application is still looking at it.
+
+## Teardown reclaims outstanding buffers
+
+Because buffers can be parked in userspace indefinitely,
+[`io_unregister_zcrx_ifqs()`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/zcrx.c#L888)
+calls
+[`io_zcrx_scrub()`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/zcrx.c#L606),
+which walks every niov, `atomic_xchg`es its user counter to zero, and releases
+the corresponding page-pool references so nothing leaks. The `ifq` itself is
+refcounted (`refs`/`user_refs`) and outlives the page pool that the net stack
+may still be tearing down.
+
+`★ Insight ─────────────────────────────────────`
+- **RECV_ZC has no user buffer at all.** Unlike `RECV` (provided buffers) or
+  even `SEND_ZC` (the app's pages), the data lands in *kernel*-registered,
+  device-bound memory; userspace reads it through an mmap of the area at the
+  offset the CQE reports. The SQE carries a queue index, not an address.
+- **The refill ring is the recv-side mirror of the SEND_ZC notification.**
+  Both exist because zero-copy decouples "the transfer finished" from "the
+  memory is free again." Send signals release with an `F_NOTIF` CQE; recv
+  takes release as *input* on the refill ring.
+- **It is a memory-provider, not just an opcode.** `RECV_ZC` only works
+  because the `ifq` plugs into the NIC's page pool, so the same registered
+  pages serve as both the driver's RX ring buffers and the application's
+  read buffers — which is also why it needs a specific NIC/driver and a bound
+  RX queue, not just a socket.
+`─────────────────────────────────────────────────`
+
 # How net.c calls the networking stack
 
 The lower boundary is small and stable. Every send/recv handler ends in one of
