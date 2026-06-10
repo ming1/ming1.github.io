@@ -282,6 +282,176 @@ alternative to multiple checkouts.
 
 ### Use headless mode with a custom harness
 
+# Usages
+
+Concrete recipes that come up often. Each one names the exact files,
+flags, and prompt patterns rather than gesturing at the idea.
+
+## Subagents: use cases and exact commands
+
+A subagent is a separate Claude invocation with its own context window,
+its own tool allowlist, and its own system prompt. The main session
+dispatches it via the `Task` (a.k.a. `Agent`) tool and gets back a
+single summary message — the agent's intermediate tool output never
+touches the main context. That property is what makes subagents
+worthwhile: they protect the main window from logs, search results,
+and long file reads.
+
+**When to reach for one**
+
+- *Open-ended code search* across many files ("where is X handled?",
+  "find every caller pattern of Y"). Use the built-in `Explore` agent
+  — read-only, fast, won't pollute main context with file dumps.
+- *Independent parallel work* — two refactors that don't share state,
+  a research task plus a code change. Dispatch in one message with
+  multiple `Task` calls so they run concurrently.
+- *Verification / second opinion* — have one agent implement, another
+  review the diff. The reviewer starts cold, so its read is genuinely
+  independent.
+- *Heavy-context one-shots* — auditing a large PR, summarizing a long
+  log, ingesting a paper. The agent returns a digest; you keep the
+  digest, not the raw input.
+
+**Where subagents live**
+
+Per-project: `.claude/agents/<name>.md`. User-global:
+`~/.claude/agents/<name>.md`. The file is a markdown body (the
+agent's system prompt) plus YAML frontmatter:
+
+```markdown
+---
+name: pr-reviewer
+description: Use proactively after a logical chunk of code is written, before opening a PR. Reviews staged + unstaged diff for correctness and project conventions.
+tools: Bash, Read, Grep, Glob
+---
+
+You are a meticulous code reviewer for this repository.
+Steps you must follow:
+1. Run `git diff HEAD` to get the full change.
+2. Cross-check against CLAUDE.md conventions.
+3. Report findings as a punch list, severity-tagged.
+Do not edit files.
+```
+
+The `description` field is what Claude's auto-dispatcher matches
+against — write it like a routing label, not a tagline. Restrict
+`tools:` to the minimum the agent actually needs; omitting the field
+grants all tools.
+
+**Slash commands and prompts**
+
+- `/agents` — list, create, edit, and delete agents from the chat.
+  Easier than hand-editing the YAML when you're prototyping.
+- Explicit dispatch in a prompt: *"Use the `pr-reviewer` subagent to
+  audit the staged diff and return a punch list."* Claude will spawn
+  it through the `Task` tool.
+- Parallel dispatch — ask in one message: *"In parallel, dispatch
+  `Explore` to find all callers of `foo()`, and `Plan` to outline a
+  refactor that removes the third argument."* Claude sends both
+  `Task` calls in a single tool block, and they execute concurrently.
+
+**Headless invocation**
+
+For CI or scripted pipelines, headless mode picks the agent the same
+way an interactive session does — through the prompt's wording:
+
+```bash
+claude -p "Use the pr-reviewer subagent to review the diff against origin/master; \
+emit findings as JSON" \
+  --output-format stream-json
+```
+
+## Use Claude Code with git worktrees
+
+Worktrees let you run several Claude sessions on the same repository
+at the same time, each on its own branch, sharing one `.git`
+directory. This is the lightweight version of "have multiple checkouts
+of your repo" — no second clone, no duplicated object database.
+
+**Bootstrap a worktree session**
+
+```bash
+# from the repo root
+git worktree add ../myrepo-featX -b feat/X        # new branch
+# or attach to an existing branch:
+git worktree add ../myrepo-fix-Y fix/Y
+
+cd ../myrepo-featX
+claude                                            # one Claude session per worktree
+```
+
+Open each worktree in its own terminal (or `tmux` pane). The sessions
+are fully independent: separate context windows, separate `/clear`
+state, separate tool histories. You can have one driving a refactor
+on `feat/X` while another investigates a regression on `fix/Y`.
+
+**When it shines**
+
+- *Trying two approaches to the same problem* — branch A and branch B
+  in parallel worktrees, compare diffs, keep the winner.
+- *Long-running task + interactive work* — kick off a slow refactor in
+  worktree #1, keep coding in worktree #2 without waiting.
+- *Subagent fan-out across worktrees* — main session in the primary
+  checkout dispatches subagents into worktrees so each one operates
+  on an isolated working tree.
+
+**Cleanup**
+
+```bash
+git worktree remove ../myrepo-featX           # safe: refuses if dirty
+git worktree prune                            # drop stale entries
+```
+
+The `superpowers:using-git-worktrees` skill automates the bootstrap
+when starting feature work that needs isolation. The Agent tool also
+accepts `isolation: "worktree"` to spawn a subagent into a fresh
+temporary worktree — useful when a subagent's edits should not race
+the main session's working tree.
+
+## Use team agents
+
+Once an agent earns its keep locally, the next step is sharing it
+across a team or org so everyone gets the same behavior without
+copy-pasting markdown files.
+
+**Option 1 — commit `.claude/` into the repo.** This is the lightest
+path: check in `.claude/agents/*.md`, `.claude/commands/*.md`, and a
+shared `.claude/settings.json`. Anyone who clones the repo
+automatically picks up the agents, slash commands, and tool
+allowlist. Best for project-specific agents — e.g. a "kernel-patch
+reviewer" agent that only makes sense inside a kernel repo.
+
+**Option 2 — distribute as a plugin marketplace.** See the *Plugin*
+section below. A marketplace is a git repo that wraps one or more
+plugins, each plugin a self-contained bundle of agents, commands,
+hooks, and (optional) MCP servers. Team members add the marketplace
+once and install plugins by name:
+
+```text
+/plugin marketplace add github.com/<org>/claude-plugins
+/plugin install pr-reviewer@<org>-tools
+/plugin install kernel-helpers@<org>-tools
+```
+
+Use a marketplace when the agents are cross-cutting (not tied to one
+repo) or when you want versioned, opt-in installation rather than
+"every clone of the repo gets it".
+
+**Option 3 — vendor through user-global settings.** For an individual
+who works across many repos, drop the agent in `~/.claude/agents/`
+and it follows you into every session. Not really "team" sharing, but
+the right answer for personal tooling that doesn't deserve a plugin.
+
+**Discipline that matters once the team scale grows**
+
+- Pin agent `description:` fields carefully — they drive auto-dispatch
+  across everyone's sessions, so a vague description means the wrong
+  agent gets invoked at the wrong time.
+- Constrain `tools:` to the minimum, especially for agents shipped to
+  the team. A reviewer agent does not need `Write`.
+- Treat agent prompts like code: review them in PRs, keep a changelog,
+  call out breaking changes to the dispatch description.
+
 # Plugin
 
 ## How to Build Your Own Claude Code Plugin
