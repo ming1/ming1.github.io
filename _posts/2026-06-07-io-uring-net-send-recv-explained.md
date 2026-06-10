@@ -605,6 +605,43 @@ the corresponding page-pool references so nothing leaks. The `ifq` itself is
 refcounted (`refs`/`user_refs`) and outlives the page pool that the net stack
 may still be tearing down.
 
+## Hardware support: which NICs can do RECV_ZC
+
+`RECV_ZC` is not a software feature you can turn on anywhere — it needs driver
+and NIC support, because the registration path
+[`__net_mp_open_rxq()`](https://elixir.bootlin.com/linux/v7.0/source/net/core/netdev_rx_queue.c#L111)
+gates on three things at once:
+
+1. the driver implements `netdev->queue_mgmt_ops` (the single-queue
+   stop/start/reconfig API) — without it, `-EOPNOTSUPP`;
+2. its RX page pool accepts *unreadable* netmem
+   (`PP_FLAG_ALLOW_UNREADABLE_NETMEM`) — the device/DMA-buf memory the CPU
+   cannot touch;
+3. **TCP header-data split** is enabled (`tcp-data-split on`, `hds-thresh 0`),
+   with no XDP program attached and the queue not bound by AF_XDP.
+
+These are the same prerequisites as **devmem TCP** — zcrx reuses that
+memory-provider stack — so "supports zcrx" is effectively "supports devmem TCP
+RX." Requirement 3 is the hard silicon ask: the NIC must DMA TCP *headers*
+into normal memory and *payload* into the registered area separately.
+
+As of v7.0 the drivers satisfying all three are:
+
+| Driver | NIC | Note |
+|---|---|---|
+| [`bnxt_en`](https://elixir.bootlin.com/linux/v7.0/source/drivers/net/ethernet/broadcom/bnxt/bnxt.c#L16324) | Broadcom NetXtreme | only when `BNXT_SUPPORTS_QUEUE_API` holds; else a stub `queue_mgmt_ops` |
+| [`gve`](https://elixir.bootlin.com/linux/v7.0/source/drivers/net/ethernet/google/gve/gve_main.c#L2695) | Google Compute Engine vNIC | DQO queue format |
+| [`mlx5e`](https://elixir.bootlin.com/linux/v7.0/source/drivers/net/ethernet/mellanox/mlx5/core/en_main.c#L5664) | NVIDIA/Mellanox ConnectX | |
+| [`fbnic`](https://elixir.bootlin.com/linux/v7.0/source/drivers/net/ethernet/meta/fbnic/fbnic_txrx.c#L2949) | Meta NIC | |
+
+Two near-misses are instructive. Broadcom's newer `bnge` driver sets
+`PP_FLAG_ALLOW_UNREADABLE_NETMEM` but has *no* `queue_mgmt_ops` and only
+`netmem_tx = true` — it can do zero-copy TX, not zcrx RX. And `netdevsim`
+implements `queue_mgmt_ops` (for queue-API tests) but its page pool never
+allows unreadable netmem, so it cannot bind the provider; the zcrx selftest
+[`iou-zcrx.py`](https://elixir.bootlin.com/linux/v7.0/source/tools/testing/selftests/drivers/net/hw/iou-zcrx.py)
+lives under `drivers/net/hw/` and targets a real NIC endpoint, not a sim.
+
 `★ Insight ─────────────────────────────────────`
 - **RECV_ZC has no user buffer at all.** Unlike `RECV` (provided buffers) or
   even `SEND_ZC` (the app's pages), the data lands in *kernel*-registered,
