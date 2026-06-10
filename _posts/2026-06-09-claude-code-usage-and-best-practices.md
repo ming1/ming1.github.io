@@ -669,62 +669,90 @@ alternative to multiple checkouts.
 
 ### Use headless mode with a custom harness
 
-## tmux practices with claude code
+## tmux practices with Claude Code
 
-### 1. Persistent Sessions and Context Preservation
+### Persistent sessions across SSH drops
 
-The core benefit of running Claude Code inside tmux is **session persistence**.
+A long Claude run — large refactor, codebase crawl, heavy test sweep —
+dies the moment the terminal does. SSH timeout, laptop sleep, network
+switch: the agent loses its conversation context with no way back.
 
-* **The Problem:** Deep AI coding tasks—like crawling an entire codebase, running 
-massive multi-file refactors, or executing heavy test suites—can take significant time. 
-If your SSH connection drops, your laptop goes to sleep, or your terminal crashes mid-task, 
-you lose the entire agent run and its current conversation context.
+Launching Claude inside tmux decouples the session from the terminal:
 
-* **The tmux Solution:** Launching Claude inside a tmux session (`tmux new -s claude-session`) 
-keeps the AI working on the server in the background. You can detach, close your laptop, change 
-networks, reconnect via SSH, and run `tmux attach -t claude-session` to pick up exactly where 
-you left off.
+```bash
+tmux new -s claude              # start
+# ... work, then detach with Ctrl-b d
+tmux attach -t claude           # resume from anywhere
+```
 
-### 2. Multi-Agent Orchestration ("Swarm" Workflows)
+The Claude process keeps running on the server through detach,
+reconnect, and host changes. This is the single highest-value reason
+to put Claude under tmux.
 
-Advanced developers use tmux to orchestrate multiple parallel instances of Claude Code to act 
-as an autonomous team.
+### Cross-process agent orchestration with `send-keys`
 
-* **Hierarchical Setup:** A "Manager" Claude instance runs in one tmux window, while specialized 
-"Worker" instances (e.g., a Tester, an Architect, or a Researcher) run in separate windows or panes.
+This is the **cross-process** variant of the in-session pattern in
+[Agent teams](#agent-teams-multi-agent-orchestration): a manager
+Claude in one pane drives worker Claudes in other panes by writing
+into their stdin with `tmux send-keys`.
 
-* **Inter-Agent Communication:** These sessions can communicate with each other. By leveraging 
-`tmux send-keys`, a manager agent can programmatically type instructions directly into a worker 
-agent’s tmux pane and execute commands, helping to partition tasks or bypass the default 
-token/context limits of a single session.
+- *Setup* — one tmux window per agent role (manager, tester,
+  architect, researcher). Each pane is its own `claude` process with
+  its own context window.
+- *Dispatch* — the manager runs `tmux send-keys -t worker:0
+  "<prompt>" Enter` to hand a task to a worker pane.
+- *When to choose this over in-session subagents* — different repos,
+  different worktrees, or when each worker genuinely needs to live in
+  its own long-running process (e.g. one watches a server, one
+  watches tests). For everything else, the in-session `Task`-tool
+  variant is simpler and cheaper.
 
-### 3. Multi-Pane Development Dashboards
+### Multi-pane development dashboard
 
-Instead of flipping between browser tabs, terminal windows, and an IDE, developers use tmux to 
-split a single screen into a synchronized cockpit:
+Split one tmux window into three panes so Claude's actions and their
+side-effects are visible without window-switching:
 
-* **Pane 1:** Claude Code actively processing prompts, examining files, or writing code.
-* **Pane 2:** Live server logs running (e.g., `tail -f logs/development.log`), allowing you to see exactly what happens when Claude hits your endpoints.
-* **Pane 3:** A continuous test runner, watch process (`npm run test:watch`), or system monitor (`htop`) to keep an eye on resources during heavy builds.
+- *Pane 1* — `claude`, the active session.
+- *Pane 2* — live logs of whatever Claude is touching:
+  `tail -f logs/development.log`, `journalctl -f -u <unit>`, or a
+  `dmesg -w` for kernel work.
+- *Pane 3* — a continuous validator: `npm run test:watch`,
+  `cargo watch -x test`, or `htop` for resource pressure during heavy
+  builds.
 
-### 4. Asynchronous Background Execution
-If you ask Claude Code to handle a repetitive, long-running task (like updating syntax or refactoring 
-types across dozens of legacy files), you don't want your main terminal blocked while it thinks and executes.
+### Asynchronous background execution
 
-* Developers kick off the task with Claude in tmux, hit the shortcut to detach (`Ctrl+b`, then `d`), and 
-seamlessly continue working on their own manual tasks in their main shell. 
-* Advanced setups use tmux status bar plugins to turn a specific color (like yellow) to visually alert the 
-developer when a background Claude session has finished or is waiting for user approval/input.
+Kick off a long task (mass refactor, bulk syntax update, repo-wide
+audit), detach with `Ctrl-b d`, and keep working in the foreground
+shell. Re-attach when you want to inspect progress.
 
-### 5. Remote and Mobile Workflows
-Because tmux completely decouples the terminal state from the physical display client, it empowers robust 
-remote and on-the-go setups.
+Add a Claude Code `Stop` hook in `.claude/settings.json` that flips
+the tmux status bar so you don't have to re-attach to know the
+session is idle and waiting:
 
-* Developers run their heavy codebases, dev servers, and Claude Code on a centralized cloud instance or 
-local development server.
-* Using a tablet, a mobile SSH client, or a lightweight laptop, they can securely connect to their active 
-tmux session from anywhere, review Claude's proposed git diffs, issue a `/commit` slash command, and 
-deploy on the fly.
+```json
+{
+  "hooks": {
+    "Stop": [
+      { "command": "tmux set -t claude status-style bg=yellow" }
+    ]
+  }
+}
+```
+
+A second hook on session start (or the next user prompt) resets the
+colour. Same trick works for "waiting for permission" prompts via
+the `Notification` hook.
+
+### Remote and mobile workflows
+
+Run Claude on a beefy workstation or cloud VM, attach from anywhere:
+tablet SSH client, lightweight laptop, phone. Because tmux decouples
+session state from the display client, the workflow survives device
+switches mid-task — review diffs from the tablet, finish the commit
+from the laptop. (`/commit` is not a built-in slash command; either
+ask Claude to commit in plain prose or define a custom
+`.claude/commands/commit.md`.)
 
 # Summary
 
@@ -741,6 +769,8 @@ deploy on the fly.
   to learn; an org marketplace is one `marketplace.json` away.
 - Multi-Claude patterns (writer + verifier, git worktrees, separate checkouts)
   scale beyond what a single interactive session can do.
+- Running Claude inside tmux survives SSH drops, host switches, and laptop
+  sleeps — the single cheapest reliability win for long agent runs.
 
 **Main problems / limitations**
 
@@ -751,5 +781,9 @@ deploy on the fly.
   surrenders the human-in-the-loop guardrail.
 - Headless mode does not persist between sessions; configuration has to be
   passed each invocation.
+- Cross-process orchestration via `tmux send-keys` is fragile — panes are not
+  real isolation, the manager has to know each worker's exact pane address, and
+  one rename breaks the pipeline. Prefer in-session `Task`-tool subagents
+  unless you genuinely need separate processes.
 - Best practices evolve quickly — the linked Anthropic engineering post is the
   authority; this page will lag.
