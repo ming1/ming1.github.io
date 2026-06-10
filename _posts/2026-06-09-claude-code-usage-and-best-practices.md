@@ -250,6 +250,46 @@ Claude its role — the manager's prompt or `CLAUDE.md` overlay names
 the worker panes and the dispatch protocol; each worker's overlay
 says it receives tasks via stdin and emits a completion sentinel.
 
+A minimal scaffolding looks like this. Manager overlay
+(`.claude/CLAUDE.team-manager.md`, or just inlined into the boot
+prompt):
+
+```markdown
+You are the team manager. Worker Claude sessions run in tmux panes
+`team.1` and `team.2`. Dispatch tasks with `tmux send-keys -t
+team.<N> "<prompt>; echo __DONE_<rand>__" Enter`, then poll with
+`tmux capture-pane -p -t team.<N> -S -500` until the sentinel
+appears. Integrate worker digests; never paste their raw output
+into your reply. If a worker pane is unresponsive after 5 minutes,
+report it rather than retrying blindly.
+```
+
+Worker overlay:
+
+```markdown
+You are a worker in a tmux-based agent team. Tasks arrive on your
+stdin as plain prompts. Do the work, print a digest as your final
+output, then print the literal `__DONE_<token>__` sentinel that
+was included in the prompt. Do not ask follow-up questions; if a
+task is ambiguous, make the best assumption, note it in your
+digest, and finish.
+```
+
+Both panes also need `tmux` on the `Bash` allowlist. Add to
+`.claude/settings.json`:
+
+```json
+{
+  "permissions": {
+    "allow": ["Bash(tmux:*)"]
+  }
+}
+```
+
+Without that line every `tmux send-keys` and `tmux capture-pane`
+call prompts the manager for permission — the dispatch loop grinds
+to a halt.
+
 After that scaffolding is in place, the manager dispatches
 autonomously through `Bash` calls to `tmux` (protocol detailed in
 *How the agents communicate* below).
