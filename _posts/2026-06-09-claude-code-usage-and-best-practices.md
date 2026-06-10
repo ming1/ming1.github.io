@@ -152,6 +152,11 @@ the main session's working tree.
 
 ## Agent teams: multi-agent orchestration
 
+> Official references:
+> - [Create custom subagents](https://docs.anthropic.com/en/docs/claude-code/sub-agents) — Claude Code docs: subagent file shape, frontmatter (`name`, `description`, `tools`), built-in agents (`Explore`, `Plan`, `general-purpose`), invocation rules.
+> - [How we built our multi-agent research system](https://www.anthropic.com/engineering/multi-agent-research-system) — Anthropic engineering write-up on the deep-research multi-agent system; the closest thing to a production orchestration case study.
+> - [Claude Code Advanced Patterns: Subagents, MCP, and Scaling to Real Codebases](https://www.anthropic.com/webinars/claude-code-advanced-patterns) — Anthropic webinar covering subagent + MCP composition at scale (deck linked from the page).
+
 An *agent team* is a set of specialized subagents that the main
 session composes into a workflow — planner, explorer, implementer,
 reviewer, tester — with a defined topology (pipeline, fan-out, or
