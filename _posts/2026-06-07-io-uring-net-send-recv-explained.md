@@ -300,7 +300,7 @@ by commit `6f02527729bd` ("io_uring/net: Allow to do vectorized send").
 The whole effect lives in
 [`io_send_setup()`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L349):
 with the flag, the source is imported by
-[`io_net_import_vec()`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L212)
+[`io_net_import_vec()`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c#L211)
 (the same `__import_iovec()` machinery `sendmsg` uses); without it, by
 `import_ubuf()` (one linear buffer). The resulting iterator lands in
 `io_async_msghdr.msg.msg_iter` exactly as in the linear case, so a partial
