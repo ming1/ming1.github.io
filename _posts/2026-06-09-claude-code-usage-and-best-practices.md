@@ -680,14 +680,27 @@ switch: the agent loses its conversation context with no way back.
 Launching Claude inside tmux decouples the session from the terminal:
 
 ```bash
-tmux new -s claude              # start
-# ... work, then detach with Ctrl-b d
-tmux attach -t claude           # resume from anywhere
+# First time on the box
+ssh server
+tmux new -s claude              # start a named session
+claude                          # run Claude inside it
+# ... work, then detach with Ctrl-b d, exit SSH
+
+# From anywhere later — laptop, tablet, different network
+ssh server
+tmux attach -t claude           # resume exactly where you left off
 ```
 
 The Claude process keeps running on the server through detach,
 reconnect, and host changes. This is the single highest-value reason
 to put Claude under tmux.
+
+For a fully unattended bootstrap (e.g. from a script), start the
+session detached and inject the command:
+
+```bash
+ssh server 'tmux new -d -s claude && tmux send-keys -t claude "claude" Enter'
+```
 
 ### Cross-process agent orchestration with `send-keys`
 
