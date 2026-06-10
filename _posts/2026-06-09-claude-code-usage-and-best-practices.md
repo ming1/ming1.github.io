@@ -150,49 +150,112 @@ accepts `isolation: "worktree"` to spawn a subagent into a fresh
 temporary worktree — useful when a subagent's edits should not race
 the main session's working tree.
 
-## Use team agents
+## Agent teams: multi-agent orchestration
 
-Once an agent earns its keep locally, the next step is sharing it
-across a team or org so everyone gets the same behavior without
-copy-pasting markdown files.
+An *agent team* is a set of specialized subagents that the main
+session composes into a workflow — planner, explorer, implementer,
+reviewer, tester — with a defined topology (pipeline, fan-out, or
+adversarial loop). The main session is the orchestrator: it
+decomposes the user's request, dispatches subagents through the
+`Task` tool, and integrates their results. Each team member sees only
+its own narrow slice of context, which is what lets the team tackle
+work that would blow past a single session's context budget.
 
-**Option 1 — commit `.claude/` into the repo.** This is the lightest
-path: check in `.claude/agents/*.md`, `.claude/commands/*.md`, and a
-shared `.claude/settings.json`. Anyone who clones the repo
-automatically picks up the agents, slash commands, and tool
-allowlist. Best for project-specific agents — e.g. a "kernel-patch
-reviewer" agent that only makes sense inside a kernel repo.
+**Why bother orchestrating instead of one big agent**
 
-**Option 2 — distribute as a plugin marketplace.** See the *Plugin*
-section below. A marketplace is a git repo that wraps one or more
-plugins, each plugin a self-contained bundle of agents, commands,
-hooks, and (optional) MCP servers. Team members add the marketplace
-once and install plugins by name:
+- Each subagent gets a fresh, focused context — no contamination from
+  earlier phases.
+- Specialized system prompts and tool allowlists raise quality (a
+  reviewer with no `Write` tool *cannot* "fix" code it doesn't
+  understand) and reduce blast radius.
+- Independent work runs in parallel, cutting wall-clock time.
+- The main session's context stays small because it only sees
+  summaries, not the agents' raw tool transcripts.
 
-```text
-/plugin marketplace add github.com/<org>/claude-plugins
-/plugin install pr-reviewer@<org>-tools
-/plugin install kernel-helpers@<org>-tools
+**Common topologies**
+
+- *Pipeline* — `Plan` → `Implementer` → `Reviewer` → `Tester`. Each
+  stage's output is the next stage's input. Use when the work has a
+  clear linear dependency.
+- *Fan-out + fan-in* — dispatch N `Explore`/research agents in
+  parallel, then a single synthesizer agent merges. Best for
+  open-ended questions across many files or sources.
+- *Adversarial loop* — implementer writes, reviewer critiques, loop
+  until clean. The two agents see only the diff, not each other's
+  reasoning.
+- *Hierarchical* — orchestrator dispatches sub-orchestrators, each of
+  which dispatches leaf agents. Reserve for genuinely large work;
+  flat is simpler and usually enough.
+
+**Orchestration patterns from the main session**
+
+Parallel dispatch — one message, multiple `Task` calls, agents run
+concurrently:
+
+> *"In parallel: dispatch `Explore` to map every caller of
+> `blk_mq_submit_bio`, `Plan` to outline a refactor that removes the
+> third argument, and `general-purpose` to summarize how
+> `blk_mq_dispatch_rq_list` interacts with elevators. Return three
+> separate digests."*
+
+Sequential pipeline — dispatch the next stage only after the previous
+one returns, passing its digest as input:
+
+> *"Step 1: have the `Plan` agent produce an implementation outline
+> for migrating callers off the deprecated API. Step 2: pass that
+> outline to an `implementer` subagent that writes the code.
+> Step 3: dispatch `code-reviewer` against the resulting diff. Stop
+> if the reviewer rejects."*
+
+Adversarial loop — same diff, two roles, bounded iterations:
+
+> *"Loop up to 3 times: implementer agent edits to fix the failing
+> test; reviewer agent inspects the diff and either approves or
+> returns specific objections. Stop on approval or after 3 rounds."*
+
+**Persisting a team for reuse**
+
+Bundle the agents into `.claude/agents/*.md` and check them into the
+repo (or ship them as a plugin — see the Plugin section). Pair each
+team with a custom slash command in `.claude/commands/` that names
+the orchestration, so the whole pipeline becomes one prompt:
+
+```markdown
+---
+description: Full PR pipeline — plan, implement, review, test.
+---
+
+Dispatch the following agents in sequence and stop on any rejection:
+
+1. `Plan` agent: outline the change requested in $ARGUMENTS.
+2. `implementer` agent: realize the outline as a diff.
+3. `code-reviewer` agent: audit the diff.
+4. `pr-test-analyzer` agent: confirm test coverage.
+
+Return a final summary keyed by stage.
 ```
 
-Use a marketplace when the agents are cross-cutting (not tied to one
-repo) or when you want versioned, opt-in installation rather than
-"every clone of the repo gets it".
+Stored as `.claude/commands/pipeline.md`, this becomes
+`/project:pipeline <task description>` — one keystroke launches the
+whole team.
 
-**Option 3 — vendor through user-global settings.** For an individual
-who works across many repos, drop the agent in `~/.claude/agents/`
-and it follows you into every session. Not really "team" sharing, but
-the right answer for personal tooling that doesn't deserve a plugin.
+**Discipline that keeps a team coherent**
 
-**Discipline that matters once the team scale grows**
-
-- Pin agent `description:` fields carefully — they drive auto-dispatch
-  across everyone's sessions, so a vague description means the wrong
-  agent gets invoked at the wrong time.
-- Constrain `tools:` to the minimum, especially for agents shipped to
-  the team. A reviewer agent does not need `Write`.
-- Treat agent prompts like code: review them in PRs, keep a changelog,
-  call out breaking changes to the dispatch description.
+- *Narrow `description:` fields* — they drive auto-dispatch routing.
+  A vague description sends the wrong agent at the wrong time.
+- *Minimal `tools:` per role* — reviewer agents do not need `Write`;
+  planner agents do not need `Bash`. The allowlist is a safety rail.
+- *Pass digests, not raw context* — each stage's summary is the
+  hand-off. If you find yourself piping a full file transcript
+  between agents, the boundary is in the wrong place.
+- *Idempotent inputs* — write each agent's prompt so re-running it on
+  the same input yields the same output. That's what makes retry and
+  bounded loops safe.
+- *The relevant superpowers skills*
+  (`superpowers:dispatching-parallel-agents` and
+  `superpowers:subagent-driven-development`) encode the
+  fan-out and plan-driven variants of this pattern; consult them
+  before hand-rolling.
 
 # Plugin
 
