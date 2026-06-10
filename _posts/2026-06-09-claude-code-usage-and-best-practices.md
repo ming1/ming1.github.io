@@ -669,6 +669,63 @@ alternative to multiple checkouts.
 
 ### Use headless mode with a custom harness
 
+## tmux practices with claude code
+
+### 1. Persistent Sessions and Context Preservation
+
+The core benefit of running Claude Code inside tmux is **session persistence**.
+
+* **The Problem:** Deep AI coding tasks—like crawling an entire codebase, running 
+massive multi-file refactors, or executing heavy test suites—can take significant time. 
+If your SSH connection drops, your laptop goes to sleep, or your terminal crashes mid-task, 
+you lose the entire agent run and its current conversation context.
+
+* **The tmux Solution:** Launching Claude inside a tmux session (`tmux new -s claude-session`) 
+keeps the AI working on the server in the background. You can detach, close your laptop, change 
+networks, reconnect via SSH, and run `tmux attach -t claude-session` to pick up exactly where 
+you left off.
+
+### 2. Multi-Agent Orchestration ("Swarm" Workflows)
+
+Advanced developers use tmux to orchestrate multiple parallel instances of Claude Code to act 
+as an autonomous team.
+
+* **Hierarchical Setup:** A "Manager" Claude instance runs in one tmux window, while specialized 
+"Worker" instances (e.g., a Tester, an Architect, or a Researcher) run in separate windows or panes.
+
+* **Inter-Agent Communication:** These sessions can communicate with each other. By leveraging 
+`tmux send-keys`, a manager agent can programmatically type instructions directly into a worker 
+agent’s tmux pane and execute commands, helping to partition tasks or bypass the default 
+token/context limits of a single session.
+
+### 3. Multi-Pane Development Dashboards
+
+Instead of flipping between browser tabs, terminal windows, and an IDE, developers use tmux to 
+split a single screen into a synchronized cockpit:
+
+* **Pane 1:** Claude Code actively processing prompts, examining files, or writing code.
+* **Pane 2:** Live server logs running (e.g., `tail -f logs/development.log`), allowing you to see exactly what happens when Claude hits your endpoints.
+* **Pane 3:** A continuous test runner, watch process (`npm run test:watch`), or system monitor (`htop`) to keep an eye on resources during heavy builds.
+
+### 4. Asynchronous Background Execution
+If you ask Claude Code to handle a repetitive, long-running task (like updating syntax or refactoring 
+types across dozens of legacy files), you don't want your main terminal blocked while it thinks and executes.
+
+* Developers kick off the task with Claude in tmux, hit the shortcut to detach (`Ctrl+b`, then `d`), and 
+seamlessly continue working on their own manual tasks in their main shell. 
+* Advanced setups use tmux status bar plugins to turn a specific color (like yellow) to visually alert the 
+developer when a background Claude session has finished or is waiting for user approval/input.
+
+### 5. Remote and Mobile Workflows
+Because tmux completely decouples the terminal state from the physical display client, it empowers robust 
+remote and on-the-go setups.
+
+* Developers run their heavy codebases, dev servers, and Claude Code on a centralized cloud instance or 
+local development server.
+* Using a tablet, a mobile SSH client, or a lightweight laptop, they can securely connect to their active 
+tmux session from anywhere, review Claude's proposed git diffs, issue a `/commit` slash command, and 
+deploy on the fly.
+
 # Summary
 
 **Main advantages**
