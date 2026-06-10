@@ -157,193 +157,101 @@ the main session's working tree.
 > - [How we built our multi-agent research system](https://www.anthropic.com/engineering/multi-agent-research-system) — Anthropic engineering write-up on the deep-research multi-agent system; the closest thing to a production orchestration case study.
 > - [Claude Code Advanced Patterns: Subagents, MCP, and Scaling to Real Codebases](https://www.anthropic.com/webinars/claude-code-advanced-patterns) — Anthropic webinar covering subagent + MCP composition at scale (deck linked from the page).
 
-An *agent team* is a set of specialized subagents that the main
-session composes into a workflow — planner, explorer, implementer,
-reviewer, tester — with a defined topology (pipeline, fan-out, or
-adversarial loop). The main session is the orchestrator: it
-decomposes the user's request, dispatches subagents through the
-`Task` tool, and integrates their results. Each team member sees only
-its own narrow slice of context, which is what lets the team tackle
-work that would blow past a single session's context budget.
+### Motivation
 
-**Why bother orchestrating instead of one big agent**
+An *agent team* is a set of specialized subagents — planner,
+explorer, implementer, reviewer — that one coordinator dispatches and
+integrates. Each member sees only its own narrow slice of context,
+so the team can handle work that would overflow a single session's
+budget.
 
-- Each subagent gets a fresh, focused context — no contamination from
-  earlier phases.
-- Specialized system prompts and tool allowlists raise quality (a
-  reviewer with no `Write` tool *cannot* "fix" code it doesn't
-  understand) and reduce blast radius.
-- Independent work runs in parallel, cutting wall-clock time.
-- The main session's context stays small because it only sees
-  summaries, not the agents' raw tool transcripts.
+The wins are concrete: a reviewer with no `Write` tool *cannot*
+"fix" code it doesn't understand; an `Explore` agent that reads 200
+files returns one paragraph, not 200 files; two independent
+investigations run in parallel rather than serially. The coordinator
+stays small because it sees digests, not raw tool transcripts.
 
-**Common topologies**
+### How to start the agents
 
-- *Pipeline* — `Plan` → `Implementer` → `Reviewer` → `Tester`. Each
-  stage's output is the next stage's input. Use when the work has a
-  clear linear dependency.
-- *Fan-out + fan-in* — dispatch N `Explore`/research agents in
-  parallel, then a single synthesizer agent merges. Best for
-  open-ended questions across many files or sources.
-- *Adversarial loop* — implementer writes, reviewer critiques, loop
-  until clean. The two agents see only the diff, not each other's
-  reasoning.
-- *Hierarchical* — orchestrator dispatches sub-orchestrators, each of
-  which dispatches leaf agents. Reserve for genuinely large work;
-  flat is simpler and usually enough.
+Pick the mechanism based on whether the agents need to live in
+separate processes.
 
-**Orchestration patterns from the main session**
+**In-session, via the `Task` tool.** The main Claude session spawns
+subagents through `Task` calls; agents run inside the same Claude
+process, each with its own isolated context window. The simplest
+path is to just ask in prose:
 
-Parallel dispatch — one message, multiple `Task` calls, agents run
-concurrently:
+> *"In parallel, dispatch `Explore` to map callers of `foo()` and
+> `Plan` to sketch a refactor. Return one digest each."*
 
-> *"In parallel: dispatch `Explore` to map every caller of
-> `blk_mq_submit_bio`, `Plan` to outline a refactor that removes the
-> third argument, and `general-purpose` to summarize how
-> `blk_mq_dispatch_rq_list` interacts with elevators. Return three
-> separate digests."*
+Multiple `Task` calls in a single message run concurrently;
+sequential calls form a pipeline. Built-in agents (`Explore`,
+`Plan`, `general-purpose`) cover most needs; custom roles live in
+`.claude/agents/<name>.md` (shape covered in *Subagents* above).
 
-Sequential pipeline — dispatch the next stage only after the previous
-one returns, passing its digest as input:
+**Cross-process, via tmux.** Start one `claude` process per role,
+each in its own tmux pane:
 
-> *"Step 1: have the `Plan` agent produce an implementation outline
-> for migrating callers off the deprecated API. Step 2: pass that
-> outline to an `implementer` subagent that writes the code.
-> Step 3: dispatch `code-reviewer` against the resulting diff. Stop
-> if the reviewer rejects."*
-
-Adversarial loop — same diff, two roles, bounded iterations:
-
-> *"Loop up to 3 times: implementer agent edits to fix the failing
-> test; reviewer agent inspects the diff and either approves or
-> returns specific objections. Stop on approval or after 3 rounds."*
-
-**Persisting a team for reuse**
-
-Bundle the agents into `.claude/agents/*.md` and check them into the
-repo (or ship them as a plugin — see the Plugin section). Pair each
-team with a custom slash command in `.claude/commands/` that names
-the orchestration, so the whole pipeline becomes one prompt:
-
-```markdown
----
-description: Full PR pipeline — plan, implement, review, test.
----
-
-Dispatch the following agents in sequence and stop on any rejection:
-
-1. `Plan` agent: outline the change requested in $ARGUMENTS.
-2. `implementer` agent: realize the outline as a diff.
-3. `code-reviewer` agent: audit the diff.
-4. `pr-test-analyzer` agent: confirm test coverage.
-
-Return a final summary keyed by stage.
+```bash
+tmux new -s team
+# split into manager + workers
+tmux split-window -h -t team
+tmux split-window -v -t team
+# launch claude in each pane
+tmux send-keys -t team.0 "claude" Enter   # manager
+tmux send-keys -t team.1 "claude" Enter   # worker 1
+tmux send-keys -t team.2 "claude" Enter   # worker 2
 ```
 
-Stored as `.claude/commands/pipeline.md`, this becomes
-`/project:pipeline <task description>` — one keystroke launches the
-whole team.
+Reach for this when agents need to outlive each other — one watches
+a log, one runs a server, one writes code — or when each agent needs
+a different working tree. For most teams the in-session variant is
+simpler and cheaper; tmux is more powerful but more fragile.
 
-**Discipline that keeps a team coherent**
+### How the agents communicate
 
-- *Narrow `description:` fields* — they drive auto-dispatch routing.
-  A vague description sends the wrong agent at the wrong time.
-- *Minimal `tools:` per role* — reviewer agents do not need `Write`;
-  planner agents do not need `Bash`. The allowlist is a safety rail.
-- *Pass digests, not raw context* — each stage's summary is the
-  hand-off. If you find yourself piping a full file transcript
-  between agents, the boundary is in the wrong place.
-- *Idempotent inputs* — write each agent's prompt so re-running it on
-  the same input yields the same output. That's what makes retry and
-  bounded loops safe.
-- *The relevant superpowers skills*
-  (`superpowers:dispatching-parallel-agents` and
-  `superpowers:subagent-driven-development`) encode the
-  fan-out and plan-driven variants of this pattern; consult them
-  before hand-rolling.
+The orchestrator is the channel. Agents don't talk to each other
+directly; everything goes through the coordinator, which decides
+what to forward where.
 
-**Use case examples**
+**In-session — digest hand-off.** Every `Task` call returns one
+message: the subagent's digest. The coordinator either passes that
+digest into the next `Task` (pipeline), merges digests from parallel
+calls (fan-out + fan-in), or loops two agents over a shared artifact
+like a diff (adversarial review). The discipline is: hand off
+summaries, never raw transcripts. If you catch yourself piping a
+file dump between agents, the boundary is in the wrong place.
 
-These are concrete teams that pay back the setup cost. Each names
-the trigger, the topology, the agents, and the single sentence that
-launches the whole pipeline.
+**Cross-process — tmux send-keys + capture-pane.** Two transports,
+both polled, neither shared-memory:
 
-*Kernel patch-series review* — *fan-out + synthesizer*. Trigger:
-a lore.kernel.org URL with a 6-patch series.
+- *Inject a prompt into a worker's stdin* — the manager pane runs
+  `tmux send-keys -t team.1 "<prompt>" Enter`.
+- *Read the worker's reply* — `tmux capture-pane -p -t team.1 -S -200`
+  dumps the worker pane's last 200 lines back to the manager.
 
-- `kernel-patchset-analysis` skill kicks off the review.
-- In parallel: `code-reviewer` per patch for correctness; an
-  `Explore` agent maps callers of the touched API; a
-  `silent-failure-hunter` audits error paths.
-- A synthesizer agent merges the four streams into one severity-tagged
-  punch list.
+`send-keys` is fire-and-forget, so the manager needs a printable
+sentinel to know the worker actually finished:
 
-> *"Use the kernel-patchset-analysis skill on `<lore URL>`. In
-> parallel, dispatch code-reviewer per patch, an Explore agent
-> against the touched API surface, and silent-failure-hunter on the
-> error paths. Then have one agent merge the findings into a single
-> punch list."*
+```bash
+MARK="__DONE_$RANDOM__"
+tmux send-keys -t team.1 "<your prompt>; echo $MARK" Enter
+# poll capture-pane every couple of seconds until $MARK appears
+```
 
-*Subsystem onboarding* — *pure fan-out + fan-in*. Trigger: "I have
-to ramp up on `fs/iomap/`."
+Without a sentinel the manager reads truncated output mid-run and
+acts on garbage.
 
-- N parallel `Explore` agents, each scoped to one subdirectory or
-  one of {data structures, public API, callers, lifetimes,
-  locking}.
-- A synthesizer produces an architecture map plus a "read these
-  files first" ordered list.
+**Shared scratchpad for large payloads.** When a hand-off is bigger
+than fits cleanly into a `send-keys` invocation — a long plan, a
+file list, a diff — write it to a path both panes agree on
+(`/tmp/claude/<run-id>/handoff-N.md`) and pass only the *filename*
+through `send-keys`. The worker reads the file directly. This also
+makes the hand-off resumable: the file survives if a pane crashes.
 
-> *"Fan out five Explore agents over `fs/iomap/`: one for public API,
-> one for data structures, one for the IO submission path, one for
-> the writeback path, one for callers in fs/xfs. Then have a
-> synthesizer produce an architecture map and a reading order."*
-
-*Bug triage* — *pipeline + adversarial loop*. Trigger: an oops
-trace or a failing reproducer.
-
-- `Plan` agent reads the trace, forms 3–5 ranked hypotheses with
-  the evidence supporting each.
-- Fan-out: one investigator agent per hypothesis, each instructed
-  to falsify (not confirm) its assignment.
-- An adjudicator agent collects the surviving hypotheses and asks
-  for one more reproducer experiment.
-
-> *"Step 1: Plan agent reads the oops trace and produces 5 ranked
-> hypotheses. Step 2: dispatch 5 investigators in parallel, each
-> trying to falsify its hypothesis. Step 3: an adjudicator returns
-> the surviving hypothesis and the minimal experiment that confirms
-> it."*
-
-*Cross-cutting refactor* — *pipeline with bounded review loop*.
-Trigger: rename or signature change with many call sites.
-
-- `Plan` agent produces an ordered migration list.
-- Implementer agent edits one batch.
-- `code-reviewer` audits the diff; on rejection, the implementer
-  re-runs with the objections as input. Cap at three rounds.
-- `pr-test-analyzer` confirms coverage of the changed call sites.
-
-> *"Step 1: Plan a migration off `foo_v1()` → `foo_v2()`, ordered by
-> safety. Step 2: implementer edits batch 1. Step 3: code-reviewer
-> audits; loop with the implementer up to 3 times. Step 4:
-> pr-test-analyzer confirms new tests exist for every touched call
-> site. Repeat for remaining batches."*
-
-*Blog post drafting* — *strict pipeline*. Trigger: "write a deep
-dive on X."
-
-- Researcher agent collects authoritative sources (RFCs, kernel
-  commits, man pages) with citations.
-- Outliner agent turns the source bundle into a top-down section
-  outline.
-- Writer agent drafts each section against the outline and sources.
-- Fact-checker agent re-grounds every claim against the original
-  citations.
-
-> *"Step 1: researcher returns sources for X with citations. Step 2:
-> outliner produces a top-down section plan. Step 3: writer drafts
-> per the outline. Step 4: fact-checker re-grounds every claim and
-> flags anything unsupported."*
+A general rule across all three transports: pass summaries, not raw
+context. The whole point of the team is to keep each member's window
+small.
 
 ## Hooks: shell commands wired into the agent loop
 
