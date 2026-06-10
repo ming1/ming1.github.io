@@ -372,39 +372,35 @@ post-mortems into enforceable rules.
 
 # Plugin
 
-## How to Build Your Own Claude Code Plugin
+> Source: condensed from agnost.ai's [How to Build Your Own Claude Code Plugin (Complete Guide)](https://agnost.ai/blog/claude-code-plugins-guide/).
 
-[How to Build Your Own Claude Code Plugin (Complete Guide)](https://agnost.ai/blog/claude-code-plugins-guide/)
+## What a plugin is
 
-### What Actually is a Claude Code Plugin?
+A plugin is a git repo that lives at `~/.claude/plugins/<name>/` and
+bundles custom slash commands, subagents, hooks, and/or MCP servers
+into one shippable unit:
 
-A plugin is basically a git repo that lives in ~/.claude/plugins/ and tells Claude about
-custom commands, agents, or MCP servers you want available.
-
-Structure:
-
-```
+```text
 my-plugin/
 ├── .claude-plugin/
-│   └── plugin.json       # Plugin metadata
+│   └── plugin.json       # plugin metadata
 ├── commands/
-│   └── hello.md          # Custom slash command
+│   └── hello.md          # custom slash command
 ├── agents/
-│   └── helper.md         # Subagent definition
+│   └── helper.md         # subagent definition
 └── hooks/
-    └── hooks.json        # Workflow hooks
+    └── hooks.json        # workflow hooks
 ```
 
-The key insight: Everything is just markdown files with frontmatter. No complex APIs,
-no build process. Just write markdown and Claude understands it.
+Everything is markdown + JSON. No build step, no plugin SDK to
+learn — write the files, drop them under `.claude-plugin/`, and the
+CLI picks them up.
 
-### Team Plugins: Share Across Your Org
+## Sharing plugins across an org
 
-- Option 1: Team Marketplace
+A *marketplace* is a git repo that wraps multiple plugins. Layout:
 
-Create a repo called claude-plugins in your org:
-
-```
+```text
 claude-plugins/
 ├── .claude-plugin/
 │   └── marketplace.json
@@ -413,9 +409,9 @@ claude-plugins/
 └── code-reviewer/
 ```
 
-marketplace.json:
+The marketplace manifest names and describes each plugin:
 
-```
+```json
 {
   "name": "acme-tools",
   "owner": {"name": "ACME Corp"},
@@ -434,270 +430,120 @@ marketplace.json:
 }
 ```
 
-Team members add it once:
+Team members add the marketplace once, then install plugins by name:
 
-```
+```text
 /plugin marketplace add github.com/acme/claude-plugins
 /plugin install api-generator@acme-tools
 ```
 
 # Best practice
 
+> Source: this section is a condensed digest, in the author's voice, of Anthropic's [Claude Code: Best practices for agentic coding](https://www.anthropic.com/engineering/claude-code-best-practices). The original is authoritative — for any tip that matters, read it there.
+
 ## Customize your setup
 
-- `CLAUDE.md`
+- *`CLAUDE.md` at the repo root* is the primary lever — project
+  conventions, build/test commands, gotchas. Loaded into every
+  session, including subagent sessions.
+- *Tool allowlist.* Pick "Always allow" when prompted during a
+  session, or use `/permissions` to add patterns like `Edit`,
+  `Bash(git commit:*)`, or `mcp__puppeteer__*`. For team-shared
+  defaults, edit `.claude/settings.json` and commit it; for
+  per-session overrides, pass `--allowedTools` on the CLI.
+- *Install `gh`.* Claude uses it for almost every GitHub
+  operation; without it, the workflow degrades to scraping the
+  web UI.
 
-- Curate Claude's list of allowed tools
+## Slash commands
 
-    - Select "Always allow" when prompted during a session.
+Custom slash commands live in `.claude/commands/<name>.md` (project,
+checked into git) or `~/.claude/commands/<name>.md` (personal).
+Body is a prompt template; `$ARGUMENTS` is substituted from the
+invocation. Example `fix-github-issue.md`:
 
-    - Use the /permissions command after starting Claude Code to add or remove tools from the allowlist.
-
-    For example, you can add Edit to always allow file edits, Bash(git commit:*) to allow git commits,
-    or mcp__puppeteer__puppeteer_navigate to allow navigating with the Puppeteer MCP server.
-
-    - Manually edit your .claude/settings.json or ~/.claude.json
-
-    (we recommend checking the former into source control to share with your team). Use the --allowedTools
-    CLI flag for session-specific permissions.
-
-- If using GitHub, install the gh CLI
-
-## Give Claude more tools
-
-- Use Claude with bash tools
-
-Tell Claude the tool name with usage examples
-
-Tell Claude to run --help to see tool documentation
-
-Document frequently used tools in CLAUDE.md
-
-- Use Claude with MCP
-
-- Use custom slash commands
-
-For repeated workflows—debugging loops, log analysis, etc.—store prompt templates
-in Markdown files within the .claude/commands folder. These become available through
-the slash commands menu when you type /. You can check these commands into git to
-make them available for the rest of your team.
-
-Custom slash commands can include the special keyword $ARGUMENTS to pass parameters
-from command invocation.
-
-For example, here's a slash command that you could use to automatically pull and fix a
-Github issue:
-
-```
-Please analyze and fix the GitHub issue: $ARGUMENTS.
+```markdown
+Please analyze and fix GitHub issue: $ARGUMENTS.
 
 Follow these steps:
-
-1. Use `gh issue view` to get the issue details
-2. Understand the problem described in the issue
-3. Search the codebase for relevant files
-4. Implement the necessary changes to fix the issue
-5. Write and run tests to verify the fix
-6. Ensure code passes linting and type checking
-7. Create a descriptive commit message
-8. Push and create a PR
-
-Remember to use the GitHub CLI (`gh`) for all GitHub-related tasks.
+1. `gh issue view` to read the issue.
+2. Find relevant files in the codebase.
+3. Implement the fix.
+4. Write and run tests.
+5. Make linting and type-checking pass.
+6. Write a descriptive commit message.
+7. Push and open a PR.
 ```
 
-Putting the above content into .claude/commands/fix-github-issue.md makes it available
-as the /project:fix-github-issue command in Claude Code. You could then for example
-use /project:fix-github-issue 1234 to have Claude fix issue #1234. Similarly, you
-can add your own personal commands to the ~/.claude/commands folder for commands
-you want available in all of your sessions.
-
-## Try common workflows
-
-### Explore, plan, code, commit
-
-This versatile workflow suits many problems:
-
-- Ask Claude to read relevant files, images, or URLs,
-
-providing either general pointers ("read the file that handles logging") or specific
-filenames ("read logging.py"), but explicitly tell it not to write any code just yet.
-
-- Ask Claude to make a plan for how to approach a specific problem.
-
-"think" < "think hard" < "think harder" < "ultrathink." Each level allocates
-progressively more thinking budget for Claude to use
-
-- Ask Claude to implement its solution in code.
-
-- Ask Claude to commit the result and create a pull request.
-
-### Write tests, commit; code, iterate, commit
-
-This is an Anthropic-favorite workflow for changes that are easily verifiable with
-unit, integration, or end-to-end tests. Test-driven development (TDD) becomes even
-more powerful with agentic coding:
-
-- Ask Claude to write tests based on expected input/output pairs.
-
-- Tell Claude to run the tests and confirm they fail.
-
-- Ask Claude to commit the tests
-
-- Ask Claude to write code that passes the tests,
-
-- Ask Claude to commit the code
-
-Claude performs best when it has a clear target to iterate against—a visual
-mock, a test case, or another kind of output. By providing expected outputs like
-tests, Claude can make changes, evaluate results, and incrementally improve until
-it succeeds.
-
-### Write code, screenshot result, iterate
-
-- Give Claude a way to take browser screenshots
-
-- Give Claude a visual mock
-
-- Ask Claude to implement the design
-
-Ask Claude to implement the design in code, take screenshots of the result, and
-iterate until its result matches the mock
-
-- Ask Claude to commit when you're satisfied.
-
-### Safe YOLO mode
-
-Instead of supervising Claude, you can use claude --dangerously-skip-permissions
-to bypass all permission checks and let Claude work uninterrupted until completion.
-This works well for workflows like fixing lint errors or generating boilerplate code.
-
-### Codebase Q&A
-
-When onboarding to a new codebase, use Claude Code for learning and exploration.
-You can ask Claude the same sorts of questions you would ask another engineer
-on the project when pair programming. Claude can agentically search the codebase
-to answer general questions like:
-
-- How does logging work?
-
-- How do I make a new API endpoint?
-
-- What does async move { ... } do on line 134 of foo.rs?
-
-- What edge cases does CustomerOnboardingFlowImpl handle?
-
-- Why are we calling foo() instead of bar() on line 333?
-
-- What's the equivalent of line 334 of baz.py in Java?
-
-At Anthropic, using Claude Code in this way has become our core onboarding workflow,
-significantly improving ramp-up time and reducing load on other engineers. No
-special prompting is required! Simply ask questions, and Claude will explore the
-code to find answers.
-
-### Use Claude to interact with git
-
-Claude can effectively handle many git operations. Many Anthropic engineers use
-Claude for 90%+ of our git interactions:
-
-- Searching git history
-
-- Writing commit messages
-
-- Handling complex git operations like reverting files, resolving rebase conflicts,
-and comparing and grafting patches
-
-### Use Claude to interact with GitHub
-
-- Creating pull requests
-
-- Implementing one-shot resolutions for simple code review comments
-
-- Fixing failing builds or linter warnings
-
-- Categorizing and triaging open issues by asking Claude to loop over open GitHub issues
-
-## Optimize your workflow
-
-### Be specific in your instructions
-
-### Give Claude images
-
-Claude excels with images and diagrams through several methods:
-
-    - Paste screenshots
-    - Drag and drop
-    - Provide file paths
-
-### Mention files you want Claude to look at or work on
-
-Use tab-completion to quickly reference files or folders anywhere in your repository,
-helping Claude find or update the right resources.
-
-### Give Claude URLs
-
-Paste specific URLs alongside your prompts for Claude to fetch and read. To avoid
-permission prompts for the same domains (e.g., docs.foo.com), use /permissions to
-add domains to your allowlist.
-
-### Course correct early and often
-
-    - Ask Claude to make a plan before coding. Explicitly tell it not to code until
-    you've confirmed its plan looks good.
-
-    - Press Escape to interrupt Claude during any phase (thinking, tool calls, file edits),
-    preserving context so you can redirect or expand instructions.
-
-    - Double-tap Escape to jump back in history, edit a previous prompt, and explore a
-    different direction. You can edit the prompt and repeat until you get the result
-    you're looking for.
-
-    - Ask Claude to undo changes, often in conjunction with option #2 to take a different
-    approach.
-
-### Use /clear to keep context focused
-
-During long sessions, Claude's context window can fill with irrelevant conversation,
-file contents, and commands. This can reduce performance and sometimes distract
-Claude. Use the /clear command frequently between tasks to reset the context window.
-
-### Use checklists and scratchpads for complex workflows
-
-### Pass data into Claude
-
-    - Copy and paste directly into your prompt (most common approach)
-
-    - Pipe into Claude Code (e.g., cat foo.txt | claude), particularly useful for logs, CSVs, and large data
-
-    - Tell Claude to pull data via bash commands, MCP tools, or custom slash commands
-
-    - Ask Claude to read files or fetch URLs (works for images too)
-
-## Use headless mode to automate your infra
-
-Claude Code includes headless mode for non-interactive contexts like CI,
-pre-commit hooks, build scripts, and automation. Use the -p flag with a prompt to
-enable headless mode, and --output-format stream-json for streaming JSON output.
-
-Note that headless mode does not persist between sessions. You have to trigger it
-each session.
-
-### Use Claude for issue triage
-
-### Use Claude as a linter
-
-## Uplevel with multi-Claude workflows
-
-### Have one Claude write code; use another Claude to verify
-
-### Have multiple checkouts of your repo
-
-### Use git worktrees
-
-This approach shines for multiple independent tasks, offering a lighter-weight
-alternative to multiple checkouts.
-
-### Use headless mode with a custom harness
+Now `/project:fix-github-issue 1234` triggers the whole flow.
+Beyond slash commands, give Claude more tools by (a) teaching it a
+bash command's `--help` once and documenting it in `CLAUDE.md`,
+(b) wiring an MCP server, or (c) using the *Hooks* mechanism above
+to enforce constraints around tools rather than just describe them.
+
+## Workflows that work
+
+- *Explore → plan → code → commit.* First ask Claude to read the
+  relevant files (`read logging.py`) but *not* to write code. Then
+  ask for a plan. Escalate thinking budget with `think` /
+  `think hard` / `think harder` / `ultrathink` if the problem
+  warrants it. Approve the plan, then ask for the implementation
+  and commit.
+- *TDD loop.* Ask for tests written against expected
+  input/output pairs; confirm they fail; commit; ask for the
+  implementation; iterate to green; commit. Works whenever the
+  target is mechanically verifiable.
+- *Screenshot iteration.* For UI work, give Claude a screenshot
+  tool and a visual mock; let it iterate the diff against the
+  target until they match.
+- *Safe-YOLO.* `claude --dangerously-skip-permissions` skips
+  every permission prompt. Safe inside a sandboxed or ephemeral
+  environment (Docker, CI, throwaway VM); on a real workstation
+  it surrenders the human-in-the-loop guardrail.
+- *Codebase Q&A.* Treat Claude as a pair-programming colleague
+  who already knows the project — ask "how does logging work",
+  "what does this on line 134 mean", "why `foo()` here instead of
+  `bar()`". Claude agentically searches the code to answer.
+- *Git and GitHub.* Claude is reliable at commit messages,
+  history search, conflict resolution, PR creation, and bulk
+  issue triage. Many engineers route 90%+ of their git
+  interactions through it.
+
+## Optimization tips
+
+- *Be specific.* Vague prompts get vague output.
+- *Images.* Paste screenshots, drag-and-drop, or pass file paths.
+- *Mention files explicitly* by tab-completing repo paths.
+- *URLs in prompts get fetched* — allowlist domains in
+  `/permissions` to skip the per-request prompt.
+- *Course-correct with Escape.* Single-Escape pauses Claude mid-action;
+  double-Escape jumps back to a prior prompt for editing. Use it
+  freely — cheaper than letting a wrong path run to completion.
+- *`/clear` between tasks.* Context fills with irrelevant
+  history; clearing it sharply improves quality on the next task.
+- *Pass data in* via copy-paste, `cat foo.txt | claude`, or by
+  asking Claude to fetch/read directly. The pipe is best for
+  large logs and CSVs.
+
+## Headless mode for automation
+
+`claude -p "<prompt>"` runs Claude non-interactively. Add
+`--output-format stream-json` for machine-parsable streaming
+output. Useful for CI, pre-commit hooks, build scripts, and
+one-shot automation. Each invocation is independent — no session
+state carries over, so configuration has to be passed every time.
+
+## Multi-Claude workflows
+
+The Anthropic post's "Uplevel with multi-Claude workflows" section
+covers patterns already documented above:
+
+- *One Claude writes, another verifies* → see *Subagents* and
+  *Agent teams: multi-agent orchestration* under *Usages*.
+- *Multiple checkouts of the repo* and *git worktrees* → see
+  *Use Claude Code with git worktrees* under *Usages*.
+- *Headless mode with a custom harness* → headless mode above,
+  composed with whatever orchestrator your CI uses.
 
 ## tmux practices with Claude Code
 
