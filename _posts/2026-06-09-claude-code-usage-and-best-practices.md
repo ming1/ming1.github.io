@@ -153,7 +153,8 @@ the main session's working tree.
 ## Agent teams: multi-agent orchestration
 
 > Official references:
-> - [Create custom subagents](https://docs.anthropic.com/en/docs/claude-code/sub-agents) — Claude Code docs: subagent file shape, frontmatter (`name`, `description`, `tools`), built-in agents (`Explore`, `Plan`, `general-purpose`), invocation rules.
+> - [Orchestrate teams of Claude Code sessions](https://code.claude.com/docs/en/agent-teams) — Claude Code docs: the *native, experimental* Agent teams feature (lead + teammates, shared task list, mailbox messaging, in-process vs. split-pane display, dedicated hooks). Requires `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` and Claude Code v2.1.32+.
+> - [Create custom subagents](https://docs.anthropic.com/en/docs/claude-code/sub-agents) — Claude Code docs: subagent file shape, frontmatter (`name`, `description`, `tools`), built-in agents (`Explore`, `Plan`, `general-purpose`), invocation rules. Subagent definitions can be reused as teammate roles.
 > - [How we built our multi-agent research system](https://www.anthropic.com/engineering/multi-agent-research-system) — Anthropic engineering write-up on the deep-research multi-agent system; the closest thing to a production orchestration case study.
 > - [Claude Code Advanced Patterns: Subagents, MCP, and Scaling to Real Codebases](https://www.anthropic.com/webinars/claude-code-advanced-patterns) — Anthropic webinar covering subagent + MCP composition at scale (deck linked from the page).
 
@@ -174,8 +175,7 @@ transcripts.
 
 ### How to start the agents
 
-Pick the mechanism based on whether the agents need to live in
-separate processes.
+Three mechanisms, ordered from most autonomous to most manual.
 
 **In-session, via the `Task` tool.** The main Claude session spawns
 subagents through `Task` calls; agents run inside the same Claude
@@ -193,8 +193,45 @@ This path is **fully autonomous**: dispatch routing is driven by
 each agent's `description:` field and the main session selects,
 spawns, and integrates without human intervention.
 
-**Cross-process, via tmux.** Start one `claude` process per role,
-each in its own tmux pane:
+**Cross-process, via the native Agent teams feature.** Claude Code
+v2.1.32+ ships an experimental `Agent teams` mode: a *lead* session
+coordinates multiple *teammates*, each its own full Claude Code
+instance with its own context window and the project's `CLAUDE.md`
+loaded. Unlike subagents, teammates can message each other directly
+through a built-in mailbox and self-claim work from a shared task
+list. Enable it once in `~/.claude/settings.json`:
+
+```json
+{
+  "env": { "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1" }
+}
+```
+
+Then just ask the lead to spawn a team in prose:
+
+> *"Create an agent team to review PR #142: one teammate on
+> security, one on performance, one on test coverage. Have each
+> review and report findings."*
+
+The lead spawns teammates, assigns or lets them self-claim tasks,
+and synthesizes results. Display mode defaults to in-process
+(Shift-Down cycles teammates in one terminal); set `teammateMode`
+to `"tmux"` for split-pane (or pass `--teammate-mode tmux`) and
+Claude Code manages the tmux session itself. Quality gates wire in
+through three dedicated hooks: `TeammateIdle`, `TaskCreated`,
+`TaskCompleted`. Subagent definitions in `.claude/agents/*.md`
+double as teammate types — reference one by name in the spawn
+prompt to reuse its `tools:` allowlist and `model:`.
+
+This is the right cross-process path on v2.1.32+ unless the
+experimental flag is off-limits in your environment.
+
+**Cross-process, hand-rolled via tmux.** For pre-v2.1.32 deployments,
+environments where the experimental flag is forbidden, or topologies
+the native feature doesn't yet support (long-running watchers
+sharing a pane with workers, custom out-of-band scratchpads), the
+older recipe still works: one `claude` process per role, each in its
+own tmux pane, manager dispatches with `send-keys`.
 
 ```bash
 tmux new -s team
@@ -207,41 +244,56 @@ tmux send-keys -t team.1 "claude" Enter   # worker 1
 tmux send-keys -t team.2 "claude" Enter   # worker 2
 ```
 
-This path is **only semi-autonomous**: the human builds the topology
-once (creating panes, launching workers), and tells each Claude its
-role (the manager prompt or its `CLAUDE.md` overlay says "you have
-workers in panes `team.1` and `team.2`; dispatch via `tmux
-send-keys`, poll with `tmux capture-pane`, use a `__DONE_<rand>__`
-sentinel"). After that scaffolding is in place, the manager
-dispatches autonomously through `Bash` calls to `tmux`. A common
-pattern is to wrap the setup in a one-shot `team-up.sh` and the
-dispatch loop in a `/team-dispatch <task>` slash command, so the
-human is out of the loop once the team is live; open-source
-wrappers like `claude-squad` automate roughly this.
+This path is **only semi-autonomous**. The human builds the
+topology once (creating panes, launching workers) and tells each
+Claude its role — the manager's prompt or `CLAUDE.md` overlay names
+the worker panes and the dispatch protocol; each worker's overlay
+says it receives tasks via stdin and emits a completion sentinel.
 
-Reach for this when agents need to outlive each other — one watches
-a log, one runs a server, one writes code — or when each agent needs
-a different working tree. For most teams the in-session variant is
-simpler: a tmux pane crash loses the worker's context window with
-no way to recover, and the manager has to address every worker by
-its exact pane id, so one rename breaks the pipeline.
+After that scaffolding is in place, the manager dispatches
+autonomously through `Bash` calls to `tmux` (protocol detailed in
+*How the agents communicate* below).
+
+A useful packaging pattern is to wrap the bootstrap in a one-shot
+script (`team-up.sh` creates the panes, launches the workers, and
+drops the overlays into place) and the dispatch loop in a custom
+slash command, so the human is out of the loop once the team is
+live. Open-source wrappers such as [smtg-ai/claude-squad](https://github.com/smtg-ai/claude-squad)
+automate roughly this.
+
+Reach for the hand-rolled path only when the native feature is
+unavailable. A tmux pane crash loses the worker's context window
+with no way to recover, and the manager has to address every
+worker by its exact pane id, so one rename breaks the pipeline —
+problems the native feature solves end-to-end.
 
 ### How the agents communicate
 
-The orchestrator is the channel. Agents don't talk to each other
-directly; everything goes through the coordinator, which decides
-what to forward where.
+The transport differs by mechanism, but one rule spans all three:
+hand off digests, never raw transcripts. The whole point of the
+team is to keep each member's window small.
 
 **In-session — digest hand-off.** Every `Task` call returns one
 message: the subagent's digest. The coordinator either passes that
 digest into the next `Task` (pipeline), merges digests from parallel
 calls (fan-out + fan-in), or loops two agents over a shared artifact
-like a diff (adversarial review). The discipline is: hand off
-summaries, never raw transcripts. If you catch yourself piping a
+like a diff (adversarial review). If you catch yourself piping a
 file dump between agents, the boundary is in the wrong place.
 
-**Cross-process — tmux send-keys + capture-pane.** Two transports,
-both polled, neither shared-memory:
+**Native Agent teams — mailbox + shared task list.** Teammates send
+messages to each other (or to the lead) by name, and the runtime
+delivers them automatically — no polling. The shared task list is
+the second channel: any teammate can claim an unblocked task with
+file-locked semantics (no race), mark it in-progress, then complete.
+Idle teammates notify the lead on their own. Team config lives at
+`~/.claude/teams/<name>/config.json` and tasks at
+`~/.claude/tasks/<name>/` — both managed by Claude Code; don't
+hand-edit. Known limitations are listed in the docs: no nested
+teams, the lead is fixed for the team's lifetime, in-process
+teammates don't survive `/resume` or `/rewind`.
+
+**Hand-rolled tmux — send-keys + capture-pane + sentinel.** Two
+transports, both polled, neither shared-memory:
 
 - *Inject a prompt into a worker's stdin* — the manager pane runs
   `tmux send-keys -t team.1 "<prompt>" Enter`.
@@ -260,12 +312,13 @@ tmux send-keys -t team.1 "<your prompt>; echo $MARK" Enter
 Without a sentinel the manager reads truncated output mid-run and
 acts on garbage.
 
-**Shared scratchpad for large payloads.** When a hand-off is bigger
-than fits cleanly into a `send-keys` invocation — a long plan, a
-file list, a diff — write it to a path both panes agree on
-(`/tmp/claude/<run-id>/handoff-N.md`) and pass only the *filename*
-through `send-keys`. The worker reads the file directly. This also
-makes the hand-off resumable: the file survives if a pane crashes.
+**Shared scratchpad for large payloads (hand-rolled tmux).** When a
+hand-off is bigger than fits cleanly into a `send-keys` invocation —
+a long plan, a file list, a diff — write it to a path both panes
+agree on (`/tmp/claude/<run-id>/handoff-N.md`) and pass only the
+*filename* through `send-keys`. The worker reads the file directly.
+This also makes the hand-off resumable: the file survives if a pane
+crashes.
 
 ## Hooks: shell commands wired into the agent loop
 
