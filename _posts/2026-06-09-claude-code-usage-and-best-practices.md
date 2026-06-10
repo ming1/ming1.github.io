@@ -189,6 +189,9 @@ Multiple `Task` calls in a single message run concurrently;
 sequential calls form a pipeline. Built-in agents (`Explore`,
 `Plan`, `general-purpose`) cover most needs; custom roles live in
 `.claude/agents/<name>.md` (shape covered in *Subagents* above).
+This path is **fully autonomous**: dispatch routing is driven by
+each agent's `description:` field and the main session selects,
+spawns, and integrates without human intervention.
 
 **Cross-process, via tmux.** Start one `claude` process per role,
 each in its own tmux pane:
@@ -203,6 +206,18 @@ tmux send-keys -t team.0 "claude" Enter   # manager
 tmux send-keys -t team.1 "claude" Enter   # worker 1
 tmux send-keys -t team.2 "claude" Enter   # worker 2
 ```
+
+This path is **only semi-autonomous**: the human builds the topology
+once (creating panes, launching workers), and tells each Claude its
+role (the manager prompt or its `CLAUDE.md` overlay says "you have
+workers in panes `team.1` and `team.2`; dispatch via `tmux
+send-keys`, poll with `tmux capture-pane`, use a `__DONE_<rand>__`
+sentinel"). After that scaffolding is in place, the manager
+dispatches autonomously through `Bash` calls to `tmux`. A common
+pattern is to wrap the setup in a one-shot `team-up.sh` and the
+dispatch loop in a `/team-dispatch <task>` slash command, so the
+human is out of the loop once the team is live; open-source
+wrappers like `claude-squad` automate roughly this.
 
 Reach for this when agents need to outlive each other — one watches
 a log, one runs a server, one writes code — or when each agent needs
