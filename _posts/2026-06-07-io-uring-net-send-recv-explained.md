@@ -635,8 +635,9 @@ As of v7.0 the drivers satisfying all three are:
 | [`fbnic`](https://elixir.bootlin.com/linux/v7.0/source/drivers/net/ethernet/meta/fbnic/fbnic_txrx.c#L2949) | Meta NIC | |
 
 Two near-misses are instructive. Broadcom's newer `bnge` driver sets
-`PP_FLAG_ALLOW_UNREADABLE_NETMEM` but has *no* `queue_mgmt_ops` and only
-`netmem_tx = true` — it can do zero-copy TX, not zcrx RX. And `netdevsim`
+`PP_FLAG_ALLOW_UNREADABLE_NETMEM` on its RX page pool but has *no*
+`queue_mgmt_ops`, so `__net_mp_open_rxq()` rejects it with `-EOPNOTSUPP` — the
+unreadable-netmem capability alone is not enough. And `netdevsim`
 implements `queue_mgmt_ops` (for queue-API tests) but its page pool never
 allows unreadable netmem, so it cannot bind the provider; the zcrx selftest
 [`iou-zcrx.py`](https://elixir.bootlin.com/linux/v7.0/source/tools/testing/selftests/drivers/net/hw/iou-zcrx.py)
