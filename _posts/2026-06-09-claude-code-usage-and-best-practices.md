@@ -165,11 +165,12 @@ integrates. Each member sees only its own narrow slice of context,
 so the team can handle work that would overflow a single session's
 budget.
 
-The wins are concrete: a reviewer with no `Write` tool *cannot*
-"fix" code it doesn't understand; an `Explore` agent that reads 200
-files returns one paragraph, not 200 files; two independent
-investigations run in parallel rather than serially. The coordinator
-stays small because it sees digests, not raw tool transcripts.
+Three things this buys you: a reviewer with no `Write` tool
+*cannot* "fix" code it doesn't understand; an `Explore` agent that
+reads 200 files returns one paragraph, not 200 files; two
+independent investigations run in parallel rather than serially.
+The coordinator stays small because it sees digests, not raw tool
+transcripts.
 
 ### How to start the agents
 
@@ -206,7 +207,9 @@ tmux send-keys -t team.2 "claude" Enter   # worker 2
 Reach for this when agents need to outlive each other — one watches
 a log, one runs a server, one writes code — or when each agent needs
 a different working tree. For most teams the in-session variant is
-simpler and cheaper; tmux is more powerful but more fragile.
+simpler: a tmux pane crash loses the worker's context window with
+no way to recover, and the manager has to address every worker by
+its exact pane id, so one rename breaks the pipeline.
 
 ### How the agents communicate
 
@@ -248,10 +251,6 @@ file list, a diff — write it to a path both panes agree on
 (`/tmp/claude/<run-id>/handoff-N.md`) and pass only the *filename*
 through `send-keys`. The worker reads the file directly. This also
 makes the hand-off resumable: the file survives if a pane crashes.
-
-A general rule across all three transports: pass summaries, not raw
-context. The whole point of the team is to keep each member's window
-small.
 
 ## Hooks: shell commands wired into the agent loop
 
@@ -735,21 +734,15 @@ ssh server 'tmux new -d -s claude && tmux send-keys -t claude "claude" Enter'
 
 ### Cross-process agent orchestration with `send-keys`
 
-This is the **cross-process** variant of the in-session pattern in
-[Agent teams](#agent-teams-multi-agent-orchestration): a manager
-Claude in one pane drives worker Claudes in other panes by writing
-into their stdin with `tmux send-keys`.
-
-- *Setup* — one tmux window per agent role (manager, tester,
-  architect, researcher). Each pane is its own `claude` process with
-  its own context window.
-- *Dispatch* — the manager runs `tmux send-keys -t worker:0
-  "<prompt>" Enter` to hand a task to a worker pane.
-- *When to choose this over in-session subagents* — different repos,
-  different worktrees, or when each worker genuinely needs to live in
-  its own long-running process (e.g. one watches a server, one
-  watches tests). For everything else, the in-session `Task`-tool
-  variant is simpler and cheaper.
+A second use of tmux: running multiple `claude` processes in
+parallel panes and orchestrating them with `tmux send-keys` (manager
+types into worker stdin) plus `tmux capture-pane` (manager reads
+worker output). This is the **cross-process** variant of the
+in-session subagent pattern. Pane layout, dispatch protocol, the
+`$MARK` sentinel for completion, and the shared-scratchpad transport
+all live in the *Agent teams: multi-agent orchestration* section
+above — the tmux mechanics are just the transport for that pattern,
+not a separate technique.
 
 ### Multi-pane development dashboard
 
