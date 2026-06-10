@@ -345,6 +345,124 @@ dive on X."
 > per the outline. Step 4: fact-checker re-grounds every claim and
 > flags anything unsupported."*
 
+## Hooks: shell commands wired into the agent loop
+
+> Official reference:
+> - [Hooks reference](https://docs.anthropic.com/en/docs/claude-code/hooks) — Claude Code docs: full event list, matcher syntax, JSON I/O schema, decision-control fields.
+
+Hooks are shell commands the Claude Code harness runs at fixed
+lifecycle events: when a tool is about to execute, when it finishes,
+when the assistant's turn ends, when the user submits a prompt, when
+a session starts, and so on. They are configured in
+`.claude/settings.json` (project, checked into git) or
+`~/.claude/settings.json` (user-global) — *not* in `CLAUDE.md`, which
+is just instructions to the model and cannot enforce anything.
+
+The distinction that matters: hooks run *outside* the model. They
+execute even if Claude "decides" not to call them. That is what makes
+them the right tool for enforcement — formatting on save, blocking
+edits to sensitive paths, audit logging — anywhere "trust the model
+to remember" is too weak.
+
+**Event cadences**
+
+- *Per session* — `SessionStart`, `SessionEnd`. Bootstrap or
+  tear-down: load secrets, warm a cache, dump a summary.
+- *Per turn* — `UserPromptSubmit`, `Stop`, `StopFailure`,
+  `Notification`. React to user input or end-of-turn state (the
+  tmux-status-yellow trick uses `Stop`).
+- *Per tool call* — `PreToolUse`, `PostToolUse`. Fire inside the
+  agentic loop, on every tool invocation that matches the matcher.
+
+**Schema**
+
+```json
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "command": "prettier --write \"$CLAUDE_FILE_PATHS\" 2>/dev/null || true"
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "command": "/path/to/scripts/block-dangerous-bash.sh"
+      }
+    ],
+    "Stop": [
+      { "command": "tmux set -t claude status-style bg=yellow" }
+    ]
+  }
+}
+```
+
+The matcher is a regex against the tool name (`Edit`, `Write`,
+`Bash`, `Read`, …); omit it to match every tool of that event.
+Context is delivered to the hook as JSON on stdin — full schema in
+the docs reference linked above.
+
+**Decision control**
+
+A `PreToolUse` hook can *block* the tool: exit non-zero with a JSON
+body like `{"decision": "block", "reason": "…"}` and the call is
+denied; the model sees the reason and adjusts. This is how you
+enforce "no `rm -rf` outside `/tmp`" or "no edits to
+`prod/config/*`" *as a hard rule*, independent of what the prompt
+told the model.
+
+`PostToolUse` can transform a tool's output before the model sees it
+via `updatedToolOutput`; `PreToolUse` can rewrite arguments via
+`updatedInput`. These exist for the rare cases where filtering at the
+boundary is cleaner than instructing the model.
+
+**Typical recipes**
+
+- *Auto-format on edit* — `PostToolUse` on `Edit|Write` runs the
+  project formatter against the touched files. Eliminates the
+  "Claude wrote unformatted code, lint complains, Claude reformats"
+  loop entirely.
+- *Path-based deny rule* — `PreToolUse` on `Edit|Write` checks the
+  target path against an allowlist; exits with `"decision":
+  "block"` for anything under `.env`, `secrets/`, `prod/`. Survives
+  Claude "forgetting" the rule.
+- *Bash safety gate* — `PreToolUse` on `Bash` rejects commands
+  matching `rm -rf /`, `sudo`, `git push --force` unless an
+  override env var is set.
+- *Audit log* — `PostToolUse` (no matcher) appends every tool call
+  to a JSONL file. Useful post-mortem when an agent run went
+  sideways.
+- *Tmux status flip on idle* — `Stop` hook flips the status bar so
+  you can see from across the room that the session is waiting;
+  `Notification` hook does the same for permission prompts.
+- *Context injection at prompt time* — `UserPromptSubmit` writes
+  extra context (current branch, last build status, today's date)
+  into the conversation before Claude sees the prompt.
+
+**Hookify**
+
+The `hookify:writing-rules` skill (`/hookify` command from the
+hookify plugin) generates hook rules from observed mistakes — point
+it at a transcript where Claude did something wrong and it proposes
+a `PreToolUse` hook that would have prevented it. Useful for turning
+post-mortems into enforceable rules.
+
+**Discipline**
+
+- *Hooks run with your shell's privileges.* A buggy `PreToolUse`
+  command that always exits non-zero will block every matching tool
+  call until you fix it.
+- *Keep hooks fast.* They run synchronously inside the agentic
+  loop; a slow hook becomes a slow agent.
+- *Prefer project-scoped hooks (`.claude/settings.json` checked
+  into git)* for team-wide rules so they survive cloning. Reserve
+  `~/.claude/settings.json` for personal hooks (notifications,
+  shell-status tweaks).
+- *Hooks are not where to teach the model conventions* — they are
+  where to enforce constraints. Style guidance still belongs in
+  `CLAUDE.md`. Treat hooks as the guardrail, not the manual.
+
 # Plugin
 
 ## How to Build Your Own Claude Code Plugin
@@ -789,6 +907,9 @@ ask Claude to commit in plain prose or define a custom
   scale beyond what a single interactive session can do.
 - Running Claude inside tmux survives SSH drops, host switches, and laptop
   sleeps — the single cheapest reliability win for long agent runs.
+- Hooks in `.claude/settings.json` enforce hard rules outside the model
+  (formatters, path-based deny, audit logs, idle indicators) — guardrails
+  the prompt cannot drift away from.
 
 **Main problems / limitations**
 
