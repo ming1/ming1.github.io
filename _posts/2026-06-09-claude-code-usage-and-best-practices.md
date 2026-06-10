@@ -214,17 +214,24 @@ Then just ask the lead to spawn a team in prose:
 > review and report findings."*
 
 The lead spawns teammates, assigns or lets them self-claim tasks,
-and synthesizes results. Display mode defaults to in-process
-(Shift-Down cycles teammates in one terminal); set `teammateMode`
-to `"tmux"` for split-pane (or pass `--teammate-mode tmux`) and
-Claude Code manages the tmux session itself. Quality gates wire in
-through three dedicated hooks: `TeammateIdle`, `TaskCreated`,
-`TaskCompleted`. Subagent definitions in `.claude/agents/*.md`
-double as teammate types — reference one by name in the spawn
-prompt to reuse its `tools:` allowlist and `model:`.
+and synthesizes results. Display mode defaults to `"auto"` —
+split panes when you're already inside tmux or iTerm2, in-process
+(one terminal, Shift-Down cycles teammates) otherwise. Set
+`teammateMode` to `"tmux"` (or pass `--teammate-mode tmux`) to
+force split-pane; the docs flag known OS limits on tmux split-pane
+and recommend `tmux -CC` in iTerm2 as the smoothest entrypoint.
+Quality gates wire in through three dedicated hooks: `TeammateIdle`,
+`TaskCreated`, `TaskCompleted`. Subagent definitions in
+`.claude/agents/*.md` double as teammate types — reference one by
+name in the spawn prompt to reuse its `tools:` allowlist and
+`model:`. Two caveats here: `skills` and `mcpServers` frontmatter do
+*not* carry over to a teammate, and the definition body is
+*appended* to the teammate's system prompt rather than substituted.
 
 This is the right cross-process path on v2.1.32+ unless the
-experimental flag is off-limits in your environment.
+experimental flag is off-limits or the documented limitations bite
+(no nested teams, the lead cannot be transferred, in-process
+teammates don't survive `/resume` or `/rewind`).
 
 **Cross-process, hand-rolled via tmux.** For pre-v2.1.32 deployments,
 environments where the experimental flag is forbidden, or topologies
@@ -260,8 +267,9 @@ You are the team manager. Worker Claude sessions run in tmux panes
 team.<N> "<prompt>; echo __DONE_<rand>__" Enter`, then poll with
 `tmux capture-pane -p -t team.<N> -S -500` until the sentinel
 appears. Integrate worker digests; never paste their raw output
-into your reply. If a worker pane is unresponsive after 5 minutes,
-report it rather than retrying blindly.
+into your reply. If a worker pane stays unresponsive past a
+reasonable timeout for the task, report it rather than retrying
+blindly.
 ```
 
 Worker overlay:
@@ -305,7 +313,8 @@ Reach for the hand-rolled path only when the native feature is
 unavailable. A tmux pane crash loses the worker's context window
 with no way to recover, and the manager has to address every
 worker by its exact pane id, so one rename breaks the pipeline —
-problems the native feature solves end-to-end.
+problems the native feature avoids by managing pane identity and
+teammate lifecycle for you.
 
 ### How the agents communicate
 
