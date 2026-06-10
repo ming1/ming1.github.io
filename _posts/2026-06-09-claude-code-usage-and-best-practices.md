@@ -257,6 +257,89 @@ whole team.
   fan-out and plan-driven variants of this pattern; consult them
   before hand-rolling.
 
+**Use case examples**
+
+These are concrete teams that pay back the setup cost. Each names
+the trigger, the topology, the agents, and the single sentence that
+launches the whole pipeline.
+
+*Kernel patch-series review* — *fan-out + synthesizer*. Trigger:
+a lore.kernel.org URL with a 6-patch series.
+
+- `kernel-patchset-analysis` skill kicks off the review.
+- In parallel: `code-reviewer` per patch for correctness; an
+  `Explore` agent maps callers of the touched API; a
+  `silent-failure-hunter` audits error paths.
+- A synthesizer agent merges the four streams into one severity-tagged
+  punch list.
+
+> *"Use the kernel-patchset-analysis skill on `<lore URL>`. In
+> parallel, dispatch code-reviewer per patch, an Explore agent
+> against the touched API surface, and silent-failure-hunter on the
+> error paths. Then have one agent merge the findings into a single
+> punch list."*
+
+*Subsystem onboarding* — *pure fan-out + fan-in*. Trigger: "I have
+to ramp up on `fs/iomap/`."
+
+- N parallel `Explore` agents, each scoped to one subdirectory or
+  one of {data structures, public API, callers, lifetimes,
+  locking}.
+- A synthesizer produces an architecture map plus a "read these
+  files first" ordered list.
+
+> *"Fan out five Explore agents over `fs/iomap/`: one for public API,
+> one for data structures, one for the IO submission path, one for
+> the writeback path, one for callers in fs/xfs. Then have a
+> synthesizer produce an architecture map and a reading order."*
+
+*Bug triage* — *pipeline + adversarial loop*. Trigger: an oops
+trace or a failing reproducer.
+
+- `Plan` agent reads the trace, forms 3–5 ranked hypotheses with
+  the evidence supporting each.
+- Fan-out: one investigator agent per hypothesis, each instructed
+  to falsify (not confirm) its assignment.
+- An adjudicator agent collects the surviving hypotheses and asks
+  for one more reproducer experiment.
+
+> *"Step 1: Plan agent reads the oops trace and produces 5 ranked
+> hypotheses. Step 2: dispatch 5 investigators in parallel, each
+> trying to falsify its hypothesis. Step 3: an adjudicator returns
+> the surviving hypothesis and the minimal experiment that confirms
+> it."*
+
+*Cross-cutting refactor* — *pipeline with bounded review loop*.
+Trigger: rename or signature change with many call sites.
+
+- `Plan` agent produces an ordered migration list.
+- Implementer agent edits one batch.
+- `code-reviewer` audits the diff; on rejection, the implementer
+  re-runs with the objections as input. Cap at three rounds.
+- `pr-test-analyzer` confirms coverage of the changed call sites.
+
+> *"Step 1: Plan a migration off `foo_v1()` → `foo_v2()`, ordered by
+> safety. Step 2: implementer edits batch 1. Step 3: code-reviewer
+> audits; loop with the implementer up to 3 times. Step 4:
+> pr-test-analyzer confirms new tests exist for every touched call
+> site. Repeat for remaining batches."*
+
+*Blog post drafting* — *strict pipeline*. Trigger: "write a deep
+dive on X."
+
+- Researcher agent collects authoritative sources (RFCs, kernel
+  commits, man pages) with citations.
+- Outliner agent turns the source bundle into a top-down section
+  outline.
+- Writer agent drafts each section against the outline and sources.
+- Fact-checker agent re-grounds every claim against the original
+  citations.
+
+> *"Step 1: researcher returns sources for X with citations. Step 2:
+> outliner produces a top-down section plan. Step 3: writer drafts
+> per the outline. Step 4: fact-checker re-grounds every claim and
+> flags anything unsupported."*
+
 # Plugin
 
 ## How to Build Your Own Claude Code Plugin
