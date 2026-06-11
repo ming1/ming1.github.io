@@ -2929,8 +2929,6 @@ Key Points:
     - Lifetime: Tied to the scope where the Future is created
     - Zero-cost: No additional heap allocation unless you explicitly box it
 
-```
-
 
 ### Async Functions and Await Expressions
 
