@@ -369,6 +369,74 @@ agree on (`/tmp/claude/<run-id>/handoff-N.md`) and pass only the
 This also makes the hand-off resumable: the file survives if a pane
 crashes.
 
+## Unattended runs: `/loop` and `/goal`
+
+Both turn a one-shot session into something that keeps running on its
+own. `/loop` repeats work on a schedule; `/goal` keeps a single run
+going until a condition holds. They are the unattended-operation
+primitives — pair them and Claude drives toward a target without you
+approving each turn.
+
+**`/loop` — repeat a prompt, two modes**
+
+- *Cron mode (fixed interval)* — `/loop 5m /foo` runs the command or
+  prompt every five minutes on a schedule. Use it for recurring
+  chores: poll CI status, re-run a flaky test, sweep for newly-filed
+  issues.
+- *Dynamic mode (self-paced)* — `/loop <prompt>` with no interval: the
+  whole input is the prompt and Claude picks its own delay before the
+  next tick — longer when it is waiting on something slow, shorter when
+  there is work queued. Use it when the cadence follows the task, not
+  the clock.
+- Iterations run inside the same session, so earlier context carries
+  across ticks — unlike a subagent, which starts cold every time.
+
+Worked example — link-rot sweep over this blog, in dynamic mode:
+
+```
+/loop Read the three most recent posts under _posts/. Check every
+elixir.bootlin.com and man7.org link with `curl -sI`; for any that
+return 404 or 301, find the current stable URL and fix it in place.
+Report the diff each tick.
+```
+
+No interval, so Claude pulls a post, runs the (slow) network checks,
+then self-paces the next tick; the carried context means it remembers
+which posts it already swept.
+
+**`/goal` — a stop condition Claude checks before it ends**
+
+- `/goal <condition>` sets a target; Claude re-checks it before
+  stopping and keeps working if it is not met yet. `/goal clear`
+  removes it.
+- Best with a mechanically checkable condition — *"all tests green"*,
+  *"no `TODO(perf)` left under `src/`"*, *"the benchmark prints under
+  200ms"* — not a vague *"make it good"* the agent can't evaluate.
+- Trusted-workspace only, and it needs hooks enabled
+  (`disableAllHooks` or safe mode disables it).
+
+Worked example — gate a session on a clean Jekyll build:
+
+```
+/goal `bundle exec jekyll build` finishes with zero warnings and _site/
+contains the rendered claude-code-usage post
+```
+
+Then keep working normally ("fix the Liquid error in the TOC include").
+After each edit Claude re-runs the build, re-checks the condition, and
+refuses to stop until it actually holds — exit status plus a file
+existing is something it can test, which is what makes the goal
+reliable. `/goal clear` cancels it.
+
+**Combine them**
+
+- `/goal all integration tests pass` plus `/loop fix the next failing
+  test, then run the suite` runs the TDD loop unattended and stops the
+  moment the suite is green — instead of pausing for approval after
+  every fix.
+- Division of labour: `/loop` decides *when* the next iteration fires,
+  `/goal` decides *whether* there should be one at all.
+
 ## Hooks: shell commands wired into the agent loop
 
 > Official reference:
