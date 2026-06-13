@@ -61,7 +61,42 @@ not SCSI LUNs.
 
 ---
 
-## 2. Top View: The Object Graph
+## 2. Glossary: NVMe/TCP Terms
+
+A quick reference for the vocabulary used throughout this post, grouped
+by role. Kernel struct, configfs, and section pointers tie each term
+back to where it is developed.
+
+**Topology objects**
+
+| Term | What it is |
+|------|-----------|
+| **Initiator** (host) | The client side of NVMe-oF — [`drivers/nvme/host/`](https://elixir.bootlin.com/linux/latest/source/drivers/nvme/host). Opens connections, issues the fabrics `Connect`, and surfaces a remote namespace as `/dev/nvmeXnY`. "Host" and "initiator" are interchangeable (§1). |
+| **Controller** | `nvmet_ctrl` — one host↔subsystem session, created by the fabrics `Connect`. Owns the SQ/CQ arrays, `cntlid`, keep-alive timeout (`kato`), and async-event slots. A host that connects twice gets two controllers (§3). |
+| **Subsystem** | `nvmet_subsys` — the logical "device" a host attaches to, named by its NQN. Holds the namespace `xarray` and the list of live controllers (§3). |
+| **Namespace** | `nvmet_ns` — one exported volume inside a subsystem, identified by its NSID and backed by a block device *or* a file. Becomes `/dev/nvmeXnY` on the host (§3, §5). |
+
+**Naming and addressing**
+
+| Term | What it is |
+|------|-----------|
+| **NQN** (NVMe Qualified Name) | The globally-unique UTF-8 string naming a subsystem or a host, ≤ 223 bytes. Conventional form `nqn.YYYY-MM.reverse.domain:identifier`, e.g. `nqn.2026-05.org.example:storage`. The NVMe analogue of an iSCSI IQN. |
+| **subnqn** (subsysnqn) | The NQN of a *subsystem* specifically — the value a host names in `Connect` to choose what to attach, and the configfs directory name under `subsystems/<subnqn>/` (§7). |
+| **listening_address** | The local address the target binds for incoming connections. configfs `addr_traddr` (nvmetcli `traddr`); for TCP an IPv4/IPv6 address, paired with `addr_adrfam` (§7). |
+| **listening_port** | The TCP service port the target listens on. configfs `addr_trsvcid` (nvmetcli `trsvcid`). NVMe/TCP's IANA default is **4420** for I/O, **8009** for a discovery controller (§7). |
+
+**Connection and data integrity**
+
+| Term | What it is |
+|------|-----------|
+| **Connection** | The fabrics association a host sets up with the `Connect` admin command — it creates a controller and binds one queue (qid). In NVMe/TCP each NVMe queue is exactly one TCP connection: qid 0 (admin) first, then I/O queues, each opened with an ICReq/ICResp handshake (§13.11). |
+| **Discovery** | How a host learns which subsystems a target exports without pre-knowing their NQNs. It connects to the well-known discovery subsystem `nqn.2014-08.org.nvmexpress.discovery`, reads the Discovery Log Page, and re-reads it on an AEN when config changes (§8). |
+| **HDGST** (header digest) | Optional CRC32C over each NVMe/TCP PDU *header*, negotiated in the ICReq/ICResp `digest` bitmap. Catches header corruption the TCP checksum can miss; stays off unless both sides request it (§13.3, §13.11). |
+| **DDGST** (data digest) | The same idea for the PDU *data* payload — a CRC32C over the bytes, negotiated alongside HDGST. Adds CPU cost per PDU, so it is opt-in (§13.3, §13.11). |
+
+---
+
+## 3. Top View: The Object Graph
 
 Everything in `nvmet` revolves around six core objects, defined in
 [`nvmet.h`](https://elixir.bootlin.com/linux/latest/source/drivers/nvme/target/nvmet.h):
@@ -154,7 +189,7 @@ See: [`nvmet.h` ~ line 380](https://elixir.bootlin.com/linux/latest/source/drive
 
 ---
 
-## 3. The Command Lifecycle (Top to Bottom)
+## 4. The Command Lifecycle (Top to Bottom)
 
 Here is the journey of a single NVMe `Write` from wire to backing storage:
 
@@ -254,7 +289,7 @@ default:                return nvmet_report_invalid_opcode(req);
 
 ---
 
-## 4. Two Backends: Block Device and File
+## 5. Two Backends: Block Device and File
 
 NVMe-oF targets need to put bytes *somewhere*. `nvmet` supports three
 backend styles, picked per namespace:
@@ -265,7 +300,7 @@ backend styles, picked per namespace:
 | **File**         | `device_path` = `/data/img.raw`  | `filp_open()` + `vfs_iter_*` via `kiocb`  |
 | **Passthru**     | `passthru/device_path` = real `/dev/nvmeX` | forward the NVMe command itself to a local NVMe ctrl |
 
-### 4.1 Block device backend
+### 5.1 Block device backend
 [`io-cmd-bdev.c`](https://elixir.bootlin.com/linux/latest/source/drivers/nvme/target/io-cmd-bdev.c)
 
 `nvmet_bdev_execute_rw()` is the canonical example of the zero-copy path:
@@ -294,7 +329,7 @@ Notable details:
   routed into
   [`zns.c`](https://elixir.bootlin.com/linux/latest/source/drivers/nvme/target/zns.c).
 
-### 4.2 File backend
+### 5.2 File backend
 [`io-cmd-file.c`](https://elixir.bootlin.com/linux/latest/source/drivers/nvme/target/io-cmd-file.c)
 
 ```c
@@ -308,7 +343,7 @@ By default the file is opened with `O_DIRECT`; setting the `buffered_io=1`
 configfs attribute drops `O_DIRECT` and lets the page cache do its thing
 (useful for files on top of tiered/networked filesystems).
 
-### 4.3 Picking a backend
+### 5.3 Picking a backend
 
 `nvmet_ns_enable()` (in `core.c`) tries each backend in order until one
 opens the path successfully — typically bdev first, then file. The choice
@@ -316,7 +351,7 @@ is sticky for the namespace's lifetime.
 
 ---
 
-## 5. The Transport Abstraction
+## 6. The Transport Abstraction
 
 All transports register a vtable:
 
@@ -390,7 +425,7 @@ present compute-side storage as a PCIe NVMe device.
 
 ---
 
-## 6. configfs: How Userspace Wires it Up
+## 7. configfs: How Userspace Wires it Up
 
 `nvmet` has no ioctls. Configuration lives entirely under
 `/sys/kernel/config/nvmet/`, served by
@@ -454,7 +489,7 @@ the subsystem discoverable on that endpoint.
 
 ---
 
-## 7. Discovery and ANA
+## 8. Discovery and ANA
 
 When a host doesn't know which subsystems exist yet, it connects to a
 **Discovery Controller** at the fixed NQN
@@ -476,7 +511,7 @@ state lives in `nvmet_port->ana_state[grpid]`.
 
 ---
 
-## 8. Authentication
+## 9. Authentication
 
 Optional, gated by `CONFIG_NVME_TARGET_AUTH`. The mechanism is
 **DH-HMAC-CHAP** — Diffie-Hellman key exchange followed by HMAC-based
@@ -504,7 +539,7 @@ without certificates.
 
 ---
 
-## 9. Source Tree Cheat Sheet
+## 10. Source Tree Cheat Sheet
 
 | File | LOC | Role |
 |------|-----|------|
@@ -534,7 +569,7 @@ reflection of how cleanly the transport/backend split was drawn.
 
 ---
 
-## 10. Going Userspace: a Zero-Copy NVMe Target with io_uring + AF_XDP
+## 11. Going Userspace: a Zero-Copy NVMe Target with io_uring + AF_XDP
 
 Everything above lives in the kernel. But there is a parallel universe —
 **userspace NVMe targets** — where the same protocol is served by a
@@ -558,7 +593,7 @@ When you make those two interfaces share **the same memory**, you get an
 end-to-end zero-copy data path with no kernel networking stack on the
 hot path.
 
-### 10.1 Why userspace at all?
+### 11.1 Why userspace at all?
 
 | Pain point in kernel `nvmet`                | Userspace win                     |
 |---------------------------------------------|-----------------------------------|
@@ -571,7 +606,7 @@ hot path.
 The price is fragility: you own NIC reset, page pinning lifetimes,
 hugepage allocation, and NUMA placement.
 
-### 10.2 The data path at 30,000 feet
+### 11.2 The data path at 30,000 feet
 
 ```
                 ┌────────────────────────────────────────────────────┐
@@ -612,7 +647,7 @@ The userspace worker thread:
 No `read()`, no `recv()`, no `memcpy()` on the data path. The CPU only
 touches PDU headers.
 
-### 10.3 The storage half: io_uring done right
+### 11.3 The storage half: io_uring done right
 
 Three `io_uring` features matter for this design:
 
@@ -644,7 +679,7 @@ without the kernel hop. Useful when the local drive's command set
 already matches what the remote host requests (vendor specific opcodes,
 ZNS, KV).
 
-### 10.4 The network half: AF_XDP with zero-copy mode
+### 11.4 The network half: AF_XDP with zero-copy mode
 
 ```c
 struct xsk_umem_config ucfg = {
@@ -681,7 +716,7 @@ int nvme_tcp_filter(struct xdp_md *ctx)
 With `XDP_ZEROCOPY`, the NIC's RX descriptor ring is populated with UMEM
 chunk addresses; no `skb` is ever allocated for redirected frames.
 
-### 10.5 The hard part: TCP framing
+### 11.5 The hard part: TCP framing
 
 A `WRITE` capsule may carry a 16 KB data block. That block will be split
 by TCP into multiple segments, each landing in a separate UMEM chunk —
@@ -706,7 +741,7 @@ Three options, in increasing order of complexity:
 Option (1) is the sweet spot for an "io_uring + AF_XDP" prototype: you
 get true zero-copy with a few hundred lines of TCP state machine.
 
-### 10.6 Completion path
+### 11.6 Completion path
 
 Sending a response is symmetric:
 
@@ -734,7 +769,7 @@ sendto(xsk_fd, NULL, 0, MSG_DONTWAIT, NULL, 0);   /* kick TX */
 The same physical pages that the SSD DMA'd into are now DMA'd back out
 by the NIC. The CPU only wrote 24 bytes of header.
 
-### 10.7 Where this design lands
+### 11.7 Where this design lands
 
 | Concern                | SPDK (DPDK+TCP)        | io_uring + AF_XDP      | Kernel `nvmet-tcp`         |
 |------------------------|------------------------|------------------------|----------------------------|
@@ -750,7 +785,7 @@ The `io_uring + AF_XDP` design is the **interesting middle ground**:
 near-SPDK performance, but you keep the kernel's NIC and block drivers,
 and most of your code is application logic — not driver re-implementation.
 
-### 10.8 Practical hints if you build one
+### 11.8 Practical hints if you build one
 
 - **Hugepages, always.** 2 MB pages give you 512 UMEM chunks per page;
   fewer TLB misses on the NIC's IOMMU walk.
@@ -768,7 +803,7 @@ and most of your code is application logic — not driver re-implementation.
   register the *full* UMEM in each — registration is cheap and lets any
   worker complete I/O on any buffer.
 
-### 10.9 What's still missing
+### 11.9 What's still missing
 
 A few features kernel `nvmet` gives you for free and a userspace target
 must reimplement:
@@ -789,13 +824,13 @@ target rivals `nvmet` in size.
 
 ---
 
-## 11. Benchmarking Methodology
+## 12. Benchmarking Methodology
 
 An NVMe target — kernel or userspace — is only as credible as the
 numbers you publish for it. The measurement setup is at least as easy
 to get wrong as the implementation, and the failure modes are sneakier.
 
-### 11.1 What to measure, in priority order
+### 12.1 What to measure, in priority order
 
 1. **Tail latency at fixed sub-saturation load** — p99, p99.9, p99.99 at
    ~70 % of peak. This is the engineering number.
@@ -810,7 +845,7 @@ is too coarse — request your own:
 --percentile_list=50:90:99:99.9:99.99
 ```
 
-### 11.2 Topology — pick three points on the curve
+### 12.2 Topology — pick three points on the curve
 
 ```
 A) nvme-loop                  no NIC, no TCP   → measures bare nvmet core
@@ -823,7 +858,7 @@ backend ceiling, and (B) is the one you ship. **Skip nvmet-tcp over
 `lo`** — it has none of the interesting NIC behaviors and the numbers
 look better than reality.
 
-### 11.3 Eliminate the noise floor first
+### 12.3 Eliminate the noise floor first
 
 The single biggest source of variance on a modern server is power
 management, not your code. Before *any* measurement run:
@@ -858,7 +893,7 @@ For sub-microsecond claims, also:
 - `echo never > /sys/kernel/mm/transparent_hugepage/defrag` to stop
   compaction stalls
 
-### 11.4 Tooling
+### 12.4 Tooling
 
 | Tool | Use for |
 |------|---------|
@@ -875,7 +910,7 @@ Use `t/io_uring` (not plain `fio --ioengine=io_uring`) when you want to
 attribute observed latency to the **target** rather than the host
 driver. It strips fio of everything except the submit/complete loop.
 
-### 11.5 Backend choice and SSD preconditioning
+### 12.5 Backend choice and SSD preconditioning
 
 To measure target overhead in isolation, use `null_blk` as backend:
 
@@ -899,7 +934,7 @@ fio --name=precond --filename=/dev/nvme0n1 --rw=write \
 A fresh NVMe SSD does ~1M IOPS sequential write; preconditioned, ~300k.
 Both numbers are honest — pick one, label it loudly.
 
-### 11.6 Workload matrix
+### 12.6 Workload matrix
 
 Minimum credible matrix:
 
@@ -920,7 +955,7 @@ The two **must-publish** points:
 
 Together they pin both ends of the curve. Everything else interpolates.
 
-### 11.7 A representative fio invocation
+### 12.7 A representative fio invocation
 
 ```bash
 fio --name=nvmeof --filename=/dev/nvme1n1 \
@@ -945,7 +980,7 @@ Knobs that matter:
 - `--output-format=json+` archives histograms, not just summary stats.
   Never throw away raw data.
 
-### 11.8 Watching the target during a run
+### 12.8 Watching the target during a run
 
 On the **target** machine, while `fio` is running:
 
@@ -977,7 +1012,7 @@ perf record -F 999 -a -g -- sleep 10
 perf script | stackcollapse-perf.pl | flamegraph.pl > target.svg
 ```
 
-For an `io_uring + AF_XDP` userspace target (the §10 design), substitute:
+For an `io_uring + AF_XDP` userspace target (the §11 design), substitute:
 
 - `ethtool -S eth0 | grep -i xdp` for XDP drop reasons
 - `bpftrace` on `tracepoint:io_uring:io_uring_submit_req` /
@@ -985,7 +1020,7 @@ For an `io_uring + AF_XDP` userspace target (the §10 design), substitute:
 - `perf stat -e instructions,cycles,cache-misses -p $pid` for per-process
   efficiency
 
-### 11.9 Common pitfalls
+### 12.9 Common pitfalls
 
 - **No `--direct=1`** → measuring page cache, not the device.
 - **Fresh SSD without preconditioning** → measuring the empty-state cliff.
@@ -1006,7 +1041,7 @@ For an `io_uring + AF_XDP` userspace target (the §10 design), substitute:
 - **Forgetting to pin fio** → an unpinned host moves between cores under
   load and adds 5–20 µs of variance.
 
-### 11.10 What a defensible report contains
+### 12.10 What a defensible report contains
 
 If you publish numbers, the writeup should include:
 
@@ -1028,7 +1063,7 @@ If a report is missing items 1–3 and 6, treat the numbers as decorative.
 
 ---
 
-## 12. NVMe-TCP Wire Protocol for READ / WRITE
+## 13. NVMe-TCP Wire Protocol for READ / WRITE
 
 The call trace in the next section is much easier to follow once you can
 picture the bytes on the wire. This section is the **PDU-level reference**
@@ -1039,13 +1074,13 @@ All structs live in
 NVMe-TCP layers framed PDUs on top of a plain TCP byte stream — TCP
 segmentation is invisible at the NVMe layer.
 
-### 12.1 Common PDU header
+### 13.1 Common PDU header
 
 Every PDU starts with the same 8-byte header:
 
 ```c
 struct nvme_tcp_hdr {
-    __u8    type;     /* PDU type — see §12.2 table */
+    __u8    type;     /* PDU type — see §13.2 table */
     __u8    flags;    /* HDGST | DDGST | DATA_LAST | DATA_SUCCESS */
     __u8    hlen;     /* header length (varies by PDU type) */
     __u8    pdo;      /* PDU Data Offset — where payload begins */
@@ -1059,7 +1094,7 @@ boundary, no matter how TCP slices the stream. `pdo` says where the
 padding (per the negotiated alignment), and after the data there may be
 an optional 4-byte digest.
 
-### 12.2 PDU types involved in I/O
+### 13.2 PDU types involved in I/O
 
 | Code | Name (enum)        | Dir | Used for                              |
 |------|--------------------|-----|---------------------------------------|
@@ -1074,7 +1109,7 @@ an optional 4-byte digest.
 The READ path uses `cmd`, `c2h_data`, `rsp`. The WRITE path uses `cmd`
 plus either inline data, or `r2t` + `h2c_data` + `rsp`.
 
-### 12.3 Flag bits (`hdr.flags`)
+### 13.3 Flag bits (`hdr.flags`)
 
 ```c
 enum nvme_tcp_pdu_flags {
@@ -1088,7 +1123,7 @@ enum nvme_tcp_pdu_flags {
 `DATA_SUCCESS` on a final `c2h_data` lets the target **omit the
 RspPDU** for successful READs — a real round-trip saving on the hot path.
 
-### 12.4 The CapsuleCmd PDU (READ / WRITE)
+### 13.4 The CapsuleCmd PDU (READ / WRITE)
 
 ```c
 struct nvme_tcp_cmd_pdu {
@@ -1121,7 +1156,7 @@ struct nvme_rw_command {
 };
 ```
 
-### 12.5 The SGL descriptor — the routing byte
+### 13.5 The SGL descriptor — the routing byte
 
 For fabrics commands `dptr` is a single SGL descriptor (16 bytes):
 
@@ -1145,7 +1180,7 @@ versus "needs R2T":
 So the target's choice of inline-vs-R2T is not a heuristic; the host
 literally writes one of two byte values into `dptr.sgl.type`.
 
-### 12.6 READ on the wire
+### 13.6 READ on the wire
 
 ```
    Host                                                  Target
@@ -1188,7 +1223,7 @@ struct nvme_tcp_data_pdu {
 A large READ may be split into multiple `c2h_data` PDUs; the last one
 sets `NVME_TCP_F_DATA_LAST`.
 
-### 12.7 WRITE on the wire — inline (small I/O)
+### 13.7 WRITE on the wire — inline (small I/O)
 
 When the total data length fits in the negotiated **inline data size**
 (configfs `param_inline_data_size`, default 16 KiB), the host puts the
@@ -1213,7 +1248,7 @@ data directly into the CapsuleCmd PDU and uses `SGL_FMT_OFFSET`:
 One PDU in, one PDU out. This is the fast path NVMe-TCP was designed
 around.
 
-### 12.8 WRITE on the wire — R2T (large I/O)
+### 13.8 WRITE on the wire — R2T (large I/O)
 
 When the data exceeds the inline limit, the host uses
 `SGL_FMT_ADDRESS`. The target sends back an **R2T** PDU to "ask for"
@@ -1277,7 +1312,7 @@ Three details that matter:
   so the payload lands on the receiver's preferred alignment. The
   receiver uses `hdr.pdo` to skip past them.
 
-### 12.9 The response capsule
+### 13.9 The response capsule
 
 The RspPDU is the smallest of the lot — a header plus the 16-byte CQE:
 
@@ -1300,7 +1335,7 @@ struct nvme_completion {
 back to the in-flight request. `sq_head` doubles as the target's
 credit return — it tells the host how many SQEs may now be reclaimed.
 
-### 12.10 PDU byte layout (CapsuleCmd, inline WRITE, both digests on)
+### 13.10 PDU byte layout (CapsuleCmd, inline WRITE, both digests on)
 
 ```
  byte offset
@@ -1324,7 +1359,7 @@ plen  └───────────────────────�
 HDGST + pad). `hdr.pdo` is what the receiver uses to find the data;
 `hdr.plen` is what it uses to find the *next* PDU.
 
-### 12.11 Connection setup — ICReq / ICResp
+### 13.11 Connection setup — ICReq / ICResp
 
 Before any I/O may flow, exactly one ICReq/ICResp pair is exchanged:
 
@@ -1351,7 +1386,7 @@ struct nvme_tcp_icresp_pdu {
 After this exchange both sides know whether HDGST/DDGST are on, how to
 align payload, and how to chunk large WRITEs.
 
-### 12.12 Wire concept → kernel code
+### 13.12 Wire concept → kernel code
 
 Quick map from "the byte on the wire" to "the function that handles it
 in `nvmet`":
@@ -1365,14 +1400,14 @@ in `nvmet`":
 | `rsp`      | `nvme_tcp_rsp_pdu`  | `nvmet_setup_response_pdu` (send) |
 | `icreq`    | `nvme_tcp_icreq_pdu`| [`nvmet_tcp_handle_icreq`](https://elixir.bootlin.com/linux/latest/source/drivers/nvme/target/tcp.c#L879) |
 
-With this map in mind, §13 below traces the same READ / WRITE
+With this map in mind, §14 below traces the same READ / WRITE
 operations through the kernel, function by function.
 
 ---
 
-## 13. Appendix: NVMe-TCP Call Trace, Host → Target → Host
+## 14. Appendix: NVMe-TCP Call Trace, Host → Target → Host
 
-§3 showed the lifecycle in the abstract. This appendix nails it down with
+§4 showed the lifecycle in the abstract. This appendix nails it down with
 the **actual function names and line numbers** in
 [`drivers/nvme/target/tcp.c`](https://elixir.bootlin.com/linux/latest/source/drivers/nvme/target/tcp.c)
 (commit `eb2e9cefdee5`) so you can trace it under `ftrace` or
@@ -1389,7 +1424,7 @@ All four start from the same socket-callback entry. The TCP transport
 runs everything (recv, parse, execute, send) on a single per-queue
 workqueue `nvmet_tcp_wq`, so the whole flow is observable from one CPU.
 
-### 13.1 Entry: socket data → workqueue
+### 14.1 Entry: socket data → workqueue
 
 Inbound bytes arrive through the kernel TCP stack and wake the socket's
 `sk_data_ready` callback, which `nvmet` overrode at `accept()` time:
@@ -1413,7 +1448,7 @@ is the heart of the transport: bounded recv/send loops with a re-queue
 at the end if either side made progress. Same worker drains both
 directions; no separate RX/TX threads.
 
-### 13.2 (A) READ command: PDU → execute
+### 14.2 (A) READ command: PDU → execute
 
 [`nvmet_tcp_try_recv_one`](https://elixir.bootlin.com/linux/latest/source/drivers/nvme/target/tcp.c#L1340)
 is a small state machine over `queue->rcv_state ∈ {PDU, DATA, DDGST}`.
@@ -1456,7 +1491,7 @@ Two things to notice:
 - `submit_bio()` is **asynchronous** — the worker thread continues to
   the next recv on the budget loop while the I/O is still in flight.
 
-### 13.3 (B) WRITE with inline data
+### 14.3 (B) WRITE with inline data
 
 Inline data means: the command capsule and the data both fit inside the
 host's *single* CapsuleCmd PDU, so the data is appended right after the
@@ -1488,7 +1523,7 @@ the payload. (`req->sg` here is allocated by `nvmet_tcp_map_data()`; for
 the bdev backend those same pages are then handed to the block layer
 via `bio_add_page()`.)
 
-### 13.4 (C) WRITE that needs R2T
+### 14.4 (C) WRITE that needs R2T
 
 When inline space isn't enough (`len > port->inline_data_size`), the
 target must *ask* for the data by sending an **R2T** (Ready To Transfer)
@@ -1544,7 +1579,7 @@ For large I/O the host may send multiple `H2C Data` PDUs per command;
 each one re-enters the `try_recv_pdu → handle_h2c_data → try_recv_data`
 mini-loop until `rbytes_done` catches up to `transfer_len`.
 
-### 13.5 (D) Completion path — block-layer back to socket
+### 14.5 (D) Completion path — block-layer back to socket
 
 This path is identical for A/B/C. Trigger: NVMe SSD finishes the I/O,
 the block layer fires the bio's end-io callback:
@@ -1592,7 +1627,7 @@ The key calls:
   sendpage-equivalent), so READ data leaves the box without a copy from
   the bio pages into the socket's send buffer.
 
-### 13.6 Putting it under a debugger
+### 14.6 Putting it under a debugger
 
 Three useful one-liners on a running target:
 
@@ -1613,11 +1648,11 @@ trace-cmd record -e nvmet:nvmet_req_init -e nvmet:nvmet_req_complete -e tcp:*
 For a single-request capture, the cleanest setup is `t/io_uring` (in
 fio's source tree) on the host with `--depth=1`, then a `funcgraph` on
 the target rooted at `nvmet_tcp_io_work` — you get the full chain from
-the §13.1 entry down to `submit_bio` in one trace.
+the §14.1 entry down to `submit_bio` in one trace.
 
 ---
 
-## 14. Mental Model in One Paragraph
+## 15. Mental Model in One Paragraph
 
 `nvmet` is a thin, opcode-driven dispatcher with two pluggable edges. On
 the **outer edge**, a transport vtable (`tcp`, `rdma`, `fc`, `loop`,
