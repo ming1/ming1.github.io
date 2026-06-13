@@ -61,38 +61,136 @@ not SCSI LUNs.
 
 ---
 
-## 2. Glossary: NVMe/TCP Terms
+## 2. NVMe/TCP Terminology
 
-A quick reference for the vocabulary used throughout this post, grouped
-by role. Kernel struct, configfs, and section pointers tie each term
-back to where it is developed.
+The vocabulary the rest of this post leans on, built from the
+client/server roles down to the wire-level flags. Section pointers tie
+each term to where it is developed in code below.
 
-**Topology objects**
+### 2.1 Structural architecture (who's who)
 
-| Term | What it is |
-|------|-----------|
-| **Initiator** (host) | The client side of NVMe-oF — [`drivers/nvme/host/`](https://elixir.bootlin.com/linux/latest/source/drivers/nvme/host). Opens connections, issues the fabrics `Connect`, and surfaces a remote namespace as `/dev/nvmeXnY`. "Host" and "initiator" are interchangeable (§1). |
-| **Controller** | `nvmet_ctrl` — one host↔subsystem session, created by the fabrics `Connect`. Owns the SQ/CQ arrays, `cntlid`, keep-alive timeout (`kato`), and async-event slots. A host that connects twice gets two controllers (§3). |
-| **Subsystem** | `nvmet_subsys` — the logical "device" a host attaches to, named by its NQN. Holds the namespace `xarray` and the list of live controllers (§3). |
-| **Namespace** | `nvmet_ns` — one exported volume inside a subsystem, identified by its NSID and backed by a block device *or* a file. Becomes `/dev/nvmeXnY` on the host (§3, §5). |
+The storage hierarchy, top to bottom — how data flows from a client
+machine down to the physical backend.
 
-**Naming and addressing**
+- **Initiator** (host) — the client side: the machine consuming the
+  storage, e.g. a Fedora box running the `nvme` CLI. It opens the
+  connection and issues commands. Kernel code lives in
+  [`drivers/nvme/host/`](https://elixir.bootlin.com/linux/latest/source/drivers/nvme/host).
+- **Subsystem** — a logical grouping on the target that acts as a
+  *virtual storage array*: it bundles one or more namespaces, ports,
+  and controllers and exposes them as one unit (`nvmet_subsys`).
+  Detailed in §2.6.
+- **Controller** — the virtual engine that executes NVMe commands
+  (Read, Write, admin). In NVMe/TCP a controller (`nvmet_ctrl`) is
+  spawned dynamically the moment an initiator connects to a subsystem.
+- **Namespace** — the actual storage volume (the NVMe analogue of a
+  SCSI LUN or a disk partition), `nvmet_ns`. It maps to a backend block
+  device, file, or RAM disk on the target; the initiator can put a
+  filesystem (ext4, xfs) on it. Backends are covered in §5.
 
-| Term | What it is |
-|------|-----------|
-| **NQN** (NVMe Qualified Name) | The globally-unique UTF-8 string naming a subsystem or a host, ≤ 223 bytes. Conventional form `nqn.YYYY-MM.reverse.domain:identifier`, e.g. `nqn.2026-05.org.example:storage`. The NVMe analogue of an iSCSI IQN. |
-| **subnqn** (subsysnqn) | The NQN of a *subsystem* specifically — the value a host names in `Connect` to choose what to attach, and the configfs directory name under `subsystems/<subnqn>/` (§7). |
-| **listening_address** | The local address the target binds for incoming connections. configfs `addr_traddr` (nvmetcli `traddr`); for TCP an IPv4/IPv6 address, paired with `addr_adrfam` (§7). |
-| **listening_port** | The TCP service port the target listens on. configfs `addr_trsvcid` (nvmetcli `trsvcid`). NVMe/TCP's IANA default is **4420** for I/O, **8009** for a discovery controller (§7). |
+### 2.2 Identifiers (naming)
 
-**Connection and data integrity**
+- **NQN (NVMe Qualified Name)** — a globally-unique string that names
+  any fabric entity, host or subsystem, so names never collide on a
+  network. Conventional form:
 
-| Term | What it is |
-|------|-----------|
-| **Connection** | The fabrics association a host sets up with the `Connect` admin command — it creates a controller and binds one queue (qid). In NVMe/TCP each NVMe queue is exactly one TCP connection: qid 0 (admin) first, then I/O queues, each opened with an ICReq/ICResp handshake (§13.11). |
-| **Discovery** | How a host learns which subsystems a target exports without pre-knowing their NQNs. It connects to the well-known discovery subsystem `nqn.2014-08.org.nvmexpress.discovery`, reads the Discovery Log Page, and re-reads it on an AEN when config changes (§8). |
-| **HDGST** (header digest) | Optional CRC32C over each NVMe/TCP PDU *header*, negotiated in the ICReq/ICResp `digest` bitmap. Catches header corruption the TCP checksum can miss; stays off unless both sides request it (§13.3, §13.11). |
-| **DDGST** (data digest) | The same idea for the PDU *data* payload — a CRC32C over the bytes, negotiated alongside HDGST. Adds CPU cost per PDU, so it is opt-in (§13.3, §13.11). |
+  ```text
+  nqn.2014-08.org.nvmexpress:uuid:f81d4fae-7dec-11d0-a765-00a0c91e6bf6
+  ```
+
+- **subnqn (subsystem NQN)** — the NQN of a specific subsystem. An
+  initiator passes it (`nvme connect -n <subnqn>`) so the target knows
+  exactly which virtual array to attach it to. It is also the configfs
+  directory name under `subsystems/` (§7).
+
+### 2.3 Network settings (where to go)
+
+- **listening_address** — the local IP the target binds its socket to
+  for incoming connections (`127.0.0.1` for local-only,
+  `192.168.1.100` for a physical NIC). configfs attribute `addr_traddr`
+  (§7).
+- **listening_port** — the TCP port that listener uses. The IANA
+  standard for NVMe-over-Fabrics is **4420**. configfs attribute
+  `addr_trsvcid` (§7).
+
+### 2.4 Data integrity (safety)
+
+NVMe/TCP can attach **CRC32C checksums** to network PDUs, catching bit
+flips a faulty switch or router slips past the TCP checksum. Both are
+negotiated at connection setup (§13.11) and off by default.
+
+- **HDGST (header digest)** — a 4-byte checksum appended to every PDU
+  *header* (command metadata), so routing and config info cannot be
+  silently corrupted in transit.
+- **DDGST (data digest)** — a 4-byte checksum appended to the PDU
+  *data payload* (the file bytes you read or write), preventing silent
+  data corruption over the wire.
+
+### 2.5 Protocol phases (how it communicates)
+
+An NVMe/TCP session splits into two phases:
+
+- **Discovery** — the reconnaissance phase. The initiator connects to a
+  built-in **Discovery service** on the target and gets back a Log Page
+  listing every available subsystem, its NQN, and the ports to reach it
+  (§8).
+- **Connection (Connect)** — the operational phase. Armed with that
+  info, the initiator opens a connection to a specific subsystem NQN via
+  the fabrics `Connect` command. Once connected, the remote namespaces
+  appear on the host as local block devices (`/dev/nvme0n1`).
+
+### 2.6 The subsystem, in depth
+
+In `nvmet` a **subsystem** is a *virtual NVMe storage array* — the
+logical entity that bundles backend devices (namespaces) and defines who
+is allowed to see them.
+
+**A container of storage.** A subsystem stores no data itself; it is a
+management boundary, like a JBOD chassis inside the kernel. It manages
+three things:
+
+- **Namespaces** — the virtual disks (mapping to `/dev/loop0`, a raw
+  partition, or a file).
+- **Access control** — a list of host NQNs whitelisted to talk to this
+  subsystem (`allowed_hosts/`).
+- **Virtual hardware identity** — serial, model (e.g. "Linux"), and
+  firmware strings the client sees in `nvme list`.
+
+**Decoupled from the network.** A subsystem has *no* concept of IP
+addresses, ports, or transport type — it is purely a storage definition.
+It stays inert until you symlink it to a **port**. Because of that split:
+
+- one subsystem can link to many ports at once (the same virtual drive
+  over TCP on 4420 *and* over RDMA on another NIC for multipathing);
+- many subsystems can link to one port (NQN multiplexing).
+
+**The configfs representation.** Creating a subsystem `storage-array-1`
+populates this layout under `/sys/kernel/config/nvmet/` (§7):
+
+```text
+/sys/kernel/config/nvmet/subsystems/storage-array-1/
+├── allowed_hosts/         ← symlinks to whitelisted client NQNs
+├── attr_allow_any_host    ← "1" public, "0" restricted by ACL
+├── attr_firmware          ← reported firmware string
+├── attr_model             ← reported model string (e.g. "Linux")
+├── attr_serial            ← reported serial string
+└── namespaces/
+    ├── 1/                 ← namespace ID 1
+    │   ├── device_path    ← e.g. "/dev/ram0" or "/mnt/disk.img"
+    │   └── enable         ← "1" to activate this virtual drive
+    └── 2/                 ← namespace ID 2
+```
+
+Putting it together — when a client runs
+
+```bash
+nvme connect -t tcp -a 127.0.0.1 -s 4420 -n my-subsystem
+```
+
+it tells the initiator: reach `127.0.0.1:4420`, and connect me to the
+enclosure named `my-subsystem`. The target creates a **controller** on
+the fly, hooks it to that **subsystem**, and exposes the underlying
+**namespaces** to the client.
 
 ---
 
