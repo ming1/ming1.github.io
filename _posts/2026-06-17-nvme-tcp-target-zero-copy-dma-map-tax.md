@@ -499,6 +499,38 @@ last reuse-safety guardrail for a modest cut in CQ-ring pressure (the
 notif object and its accounting task-work still run; only the CQE is
 elided).
 
+## 5.5 Overwrite safety: pinning protects the page, not its contents
+
+The reuse contract is sharper than it first looks, because *can* and *may*
+come apart. `MSG_ZEROCOPY` neither copies the buffer nor write-protects
+it: `iov_iter_get_pages2` (→ `get_user_pages_fast`) takes only a
+*reference*. That keeps the page resident and unmigrated — it does **not**
+make the page read-only in your address space, and does **not** snapshot
+it. Your virtual mapping still points at the *same physical page* the NIC
+will DMA from.
+
+So you physically **can** store into an in-flight buffer — nothing stops
+the write — but you **must not**, and the kernel says so
+([`Documentation/networking/msg_zerocopy.rst`](https://elixir.bootlin.com/linux/v7.0/source/Documentation/networking/msg_zerocopy.rst)):
+
+> Page pinning … temporarily shares the buffer between process and network
+> stack. … The kernel returns a notification when it is safe to modify
+> data.
+
+An early store corrupts the wire silently, and worst on a **retransmit**:
+TCP re-reads the frags and ships whatever bytes are in the page *now*, not
+what you sent. This is the §4.7 distinction made concrete for user memory
+— a pin guarantees the page's *existence and location*, never its
+*contents* against the page's own owner. That gap is exactly why
+`MSG_ZEROCOPY` needs a notification and kernel splice does not.
+
+One timing subtlety: the buffer is *actually* reusable the instant the skb
+is freed on ACK; the notification lands slightly later. A store after ACK
+but before the notification would happen to be harmless — but you cannot
+observe the ACK without the notification (or an equivalent signal such as
+the request/response reply of §5.4), so the safe rule keys off the
+notification, not the invisible ACK.
+
 # 6. Where the CPU goes: loopback vs real NIC
 
 Same code, opposite verdict.
