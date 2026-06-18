@@ -81,7 +81,7 @@ Two costs dominate the payload path, and they trade against each other:
   down. Scales with the *number of mappings*, not bytes.
 
 Zero-copy removes the copy but can *add* DMA maps. Whether that's a win
-depends entirely on the wire (§5). First, the four send mechanisms.
+depends entirely on the wire (§6). First, the four send mechanisms.
 
 # 3. Four ways to send the C2HData payload
 
@@ -267,8 +267,8 @@ Three things to respect:
   references the caller's pages instead of copying into a frag), which is
   exactly consistent with `sk_use_task_frag = false`.
 - **Same trade-offs as the rest of this post.** The loopback `skb_copy_ubufs`
-  relocation (§5.1) and the per-send DMA-map tax under IOMMU translation
-  (§5.2) apply unchanged. NBD has no data digest, so it is actually
+  relocation (§6.1) and the per-send DMA-map tax under IOMMU translation
+  (§6.2) apply unchanged. NBD has no data digest, so it is actually
   *simpler* than nvme — no CRC read of the payload to worry about.
 
 No upstream patch wires this in as of v7.0; it is a plausible, low-risk
@@ -323,7 +323,7 @@ already builds page-descriptor frags from the pre-pinned bvec with
 The thing to notice: this choice is about copy-avoidance and *lifetime
 signalling* only. **Neither** mode changes the per-send DMA map — both
 hand the NIC scattered per-command pages to map every send. So swapping
-`send_zc` to splice would not touch the map tax that §5 and §6 identify
+`send_zc` to splice would not touch the map tax that §6 and §7 identify
 as the real cost.
 
 ## 4.7 Is splice safe before TCP ACKs? Lifetime vs content
@@ -377,11 +377,113 @@ discipline rule out: slab/stack buffers, in-place rewrite before
 completion, or a private page pool that recycles without honoring
 `get_page`.
 
-# 5. Where the CPU goes: loopback vs real NIC
+# 5. `MSG_ZEROCOPY` up close
+
+`MSG_SPLICE_PAGES` is the *kernel's* zero-copy send (§4); `MSG_ZEROCOPY`
+is the *userspace* one. They look similar — both attach the caller's
+pages to the skb as frags instead of copying — but `MSG_ZEROCOPY` has to
+solve a problem splice doesn't: the buffer belongs to a user task that
+can rewrite it at any time, so the kernel must **pin** it and **tell
+userspace** when it is safe to touch again. That notification is the
+entire reason the mechanism is heavier (it is the 2nd CQE of §3.3).
+
+## 5.1 Motivation and use cases
+
+Copying a large send buffer from user space into socket memory costs one
+pass over every byte. `MSG_ZEROCOPY` removes that pass — but the kernel
+documentation is blunt about the trade
+([`Documentation/networking/msg_zerocopy.rst`](https://elixir.bootlin.com/linux/v7.0/source/Documentation/networking/msg_zerocopy.rst)):
+
+> Copy avoidance is not a free lunch. As implemented, with page pinning,
+> it replaces per byte copy cost with page accounting and completion
+> notification overhead. As a result, MSG_ZEROCOPY is generally only
+> effective at writes over around 10 KB.
+
+So the use case is **large, bulk, streaming sends from user space** where
+the per-byte copy dominates and the per-send bookkeeping amortizes — which
+is exactly the IO-size verdict the rest of this post reaches for the
+NVMe/TCP target. It is opt-in twice: a process sets `SO_ZEROCOPY` on the
+socket (TCP, UDP, or RDS only —
+[`net/core/sock.c`](https://elixir.bootlin.com/linux/v7.0/source/net/core/sock.c)),
+then passes `MSG_ZEROCOPY` per `send`. The two-level opt-in exists because
+zero-copy changes syscall semantics: the buffer is temporarily shared, so
+legacy code that reuses the buffer right after `send()` would break.
+
+## 5.2 Principle: pin, share, notify
+
+Three steps, and the third is what distinguishes it from splice:
+
+1. **Pin** the user pages so they stay resident and at a stable physical
+   address while the NIC reads them. ("Pin" here is §3.3's sense — the
+   `get_user_pages_fast`/`FOLL_GET` reference, not the `pin_user_pages`
+   API.)
+2. **Share** them — attach the pages to the skb as frags; no copy. The
+   buffer is now referenced by both the process and the network stack.
+3. **Notify** when the last skb referencing those pages is freed (i.e.
+   after TCP ACK), so user space knows the bytes are on the wire and the
+   buffer may be reused.
+
+Step 3 is mandatory here precisely because of the §4.7 distinction: a page
+refcount keeps memory *allocated* but cannot stop the owning task from
+*overwriting* it. For an in-kernel splice caller that never mutates its
+buffer, no signal is needed; for a user buffer, the signal is the whole
+contract.
+
+## 5.3 Implementation: `ubuf_info` and the send path
+
+The shared state is a
+[`struct ubuf_info`](https://elixir.bootlin.com/linux/v7.0/source/include/linux/skbuff.h)
+(its `ubuf_info_msgzc` form) — a refcounted control block carrying a
+completion callback, a 32-bit send counter `id`, a coalescing `len`, and
+`mmp` page-accounting state. `tcp_sendmsg_locked` allocates or reuses it
+via `msg_zerocopy_realloc`
+([`net/core/skbuff.c`](https://elixir.bootlin.com/linux/v7.0/source/net/core/skbuff.c)),
+then `skb_zerocopy_iter_stream` → `__zerocopy_sg_from_iter`
+([`net/core/datagram.c`](https://elixir.bootlin.com/linux/v7.0/source/net/core/datagram.c))
+grabs the pages with `iov_iter_get_pages2` (→ `get_user_pages_fast`) and
+fills the skb frags, and `skb_zcopy_set` attaches the `ubuf_info` to the
+skb. Pinned pages are charged against `RLIMIT_MEMLOCK` via
+`mm_account_pinned_pages`.
+
+The key amortization is in `msg_zerocopy_realloc`: consecutive
+`MSG_ZEROCOPY` sends on a stream socket **coalesce into one
+`ubuf_info`** — it bumps `uarg->len` and accumulates `bytelen` rather than
+allocating a fresh control block per send, up to `byte_limit = 1 << 19`
+(512 KB, "a few TSO") or `USHRT_MAX - 1` sends. One notification can then
+cover many sends, which is how the completion overhead is kept sub-linear.
+
+## 5.4 The completion notification
+
+When the last skb frag referencing the buffer is released on ACK, the
+skb's `ubuf_info_ops->complete` callback `msg_zerocopy_complete` runs;
+`refcount_dec_and_test` fires `__msg_zerocopy_callback`
+([`net/core/skbuff.c`](https://elixir.bootlin.com/linux/v7.0/source/net/core/skbuff.c)).
+It does **not** wake the sender directly — it queues a `sock_exterr_skb`
+on the socket's **error queue** with `ee_origin = SO_EE_ORIGIN_ZEROCOPY`
+([`include/uapi/linux/errqueue.h`](https://elixir.bootlin.com/linux/v7.0/source/include/uapi/linux/errqueue.h))
+and `ee_info..ee_data` set to the `[lo, hi]` range of the send counter.
+User space reads it with `recvmsg(MSG_ERRQUEUE)` and learns *which* sends
+completed. Consecutive completions are merged by
+`skb_zerocopy_notify_extend`, so the common case is one errqueue entry for
+a run of sends — the read side of the same coalescing.
+
+Two details matter:
+
+- **Copy fallback is reported, not hidden.** If the stack had to copy
+  after all — device without scatter-gather, or the loopback
+  `skb_copy_ubufs` of §6.1 — the `zerocopy` bit is cleared and the
+  notification carries `SO_EE_CODE_ZEROCOPY_COPIED`. User space can detect
+  that zero-copy isn't paying off and stop requesting it.
+- **io_uring replaces the error queue with a CQE.** `IORING_OP_SEND_ZC`
+  uses the same `ubuf_info` machinery but delivers the completion as the
+  second CQE (§3.3, §4.6) instead of `MSG_ERRQUEUE` — same notification,
+  friendlier delivery.
+
+# 6. Where the CPU goes: loopback vs real NIC
 
 Same code, opposite verdict.
 
-## 5.1 Loopback — zero-copy is a *loss*
+## 6.1 Loopback — zero-copy is a *loss*
 
 There is no DMA on `lo`. The sent skb still references the sender's pinned
 pages, sitting in the local receive queue. To release those pages for the
@@ -404,7 +506,7 @@ Measured (4 KiB READ): `send_zc` calls `skb_copy_ubufs` ~once per IO;
 plain send **never** does. Same total copies, plus the zero-copy tax →
 zero-copy is a net loss on `lo` in this test.
 
-## 5.2 Real NIC — the DMA map becomes the cost
+## 6.2 Real NIC — the DMA map becomes the cost
 
 The NIC DMAs straight from the pages → **no `skb_copy_ubufs`**. Zero-copy
 genuinely removes the copy. But with the IOMMU translating, every send now
@@ -431,7 +533,7 @@ So at **4 KiB** the per-send map tax outweighs the copy it saved → ZC
 ZC *wins* (line rate at ~−35% target CPU). Zero-copy send is a
 **large-IO** optimization on an IOMMU-translating box.
 
-# 6. The DMA map, `get_user_pages`, and "map once"
+# 7. The DMA map, `get_user_pages`, and "map once"
 
 Three facts that explain the above and point at the real fix:
 
@@ -454,7 +556,7 @@ Three facts that explain the above and point at the real fix:
   map**. io_uring `send_zc` registered buffers are simply not wired into
   this path yet (`io_sg_from_iter` emits plain page frags).
 
-# 7. What to do about it
+# 8. What to do about it
 
 - **`iommu=pt`** (passthrough / identity mappings) → zero per-send map.
   This should flip small-IO `send_zc` from a loss to a win (a direct
