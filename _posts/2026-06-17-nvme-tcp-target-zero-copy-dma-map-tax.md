@@ -81,7 +81,7 @@ Two costs dominate the payload path, and they trade against each other:
   down. Scales with the *number of mappings*, not bytes.
 
 Zero-copy removes the copy but can *add* DMA maps. Whether that's a win
-depends entirely on the wire (§4). First, the four send mechanisms.
+depends entirely on the wire (§5). First, the four send mechanisms.
 
 # 3. Four ways to send the C2HData payload
 
@@ -107,6 +107,7 @@ nvmet splices the header + data and copies only the tiny DDGST via
 - No copy. No `get_user_pages`. **No completion notification.**
 - The NIC still DMA-maps the spliced pages per send.
 - Cost: a page refcount + the per-send DMA map. The lightest zero-copy.
+  (Mechanism, the `sendpage_ok` constraint, and host/target/NBD use in §4.)
 
 ## 3.3 `MSG_ZEROCOPY` / io_uring `send_zc`
 
@@ -149,11 +150,187 @@ Note what registered buffers do *not* fix: the **per-send DMA map**.
 Pinning and DMA-mapping are different operations — pin keeps the page
 resident; the map is the IOVA the device actually uses.
 
-# 4. Where the CPU goes: loopback vs real NIC
+# 4. `MSG_SPLICE_PAGES` up close
+
+The mechanism nvmet actually ships deserves its own look: where it came
+from, what it requires of the caller, how host and target use it
+differently, and whether NBD could use it too.
+
+## 4.1 Motivation — it replaced `sendpage`
+
+Before mid-2023 the kernel's zero-copy *internal* send was `sendpage` —
+a `->sendpage` proto-op and `kernel_sendpage()` wrapper that pushed **one
+page at a time** down a path that duplicated much of `sendmsg`'s logic.
+That duplication was the problem: every feature `sendmsg` grew (TLS,
+splice, MSG flags, iterators) had to be re-plumbed, or simply didn't work,
+for `sendpage`.
+
+David Howells' series folded the whole thing into `sendmsg` behind one
+flag. The helper
+[`skb_splice_from_iter`](https://elixir.bootlin.com/linux/v7.0/source/net/core/skbuff.c)
+landed in commit `2e910b95329c` (May 2023); nvme converted both sides in
+`7769887817c3` (nvme-tcp host) and `c336a79983c7` (nvmet-tcp), both June
+2023. `->sendpage` was then deleted tree-wide. So `MSG_SPLICE_PAGES` is
+not a new capability so much as the *one* surviving spelling of "send
+these pages without copying."
+
+## 4.2 Mechanism and the `sendpage_ok` constraint
+
+`sock_sendmsg` with `MSG_SPLICE_PAGES` and a bvec/page iterator routes
+through `tcp_sendmsg_locked` to `skb_splice_from_iter`
+([`net/ipv4/tcp.c`](https://elixir.bootlin.com/linux/v7.0/source/net/ipv4/tcp.c)
+line ~1370). That helper calls `iov_iter_extract_pages` to take page
+references, then `skb_append_pagefrags` to attach them to the skb as
+frags — a refcount bump, no `memcpy` — coalescing into existing frags up
+to `sysctl_max_skb_frags`.
+
+The catch is that splicing is only legal for pages the network stack can
+safely hold by reference and later drop via the frag destructor. The gate
+is
+[`sendpage_ok`](https://elixir.bootlin.com/linux/v7.0/source/include/linux/net.h):
+
+```c
+static inline bool sendpage_ok(struct page *page)
+{
+	return !PageSlab(page) && page_count(page) >= 1;
+}
+```
+
+Slab memory and non-refcounted pages are excluded: a slab page has no
+usable refcount and could be freed/reused while the NIC still references
+it, and the put-page on TX completion would corrupt the slab.
+`skb_splice_from_iter` `WARN`s if a bad page slips through — so
+`MSG_SPLICE_PAGES` is a *request*, and the **caller** is responsible for
+not handing it slab/stack memory. This single predicate explains the
+difference between the two nvme sides below.
+
+## 4.3 In the nvme/tcp **target**
+
+nvmet splices everything that is page-backed and copies only what isn't.
+In `nvmet_try_send_data`
+([`drivers/nvme/target/tcp.c`](https://elixir.bootlin.com/linux/v7.0/source/drivers/nvme/target/tcp.c))
+the C2HData payload SG pages go out with
+`sock_sendmsg(MSG_SPLICE_PAGES)`, and the same flag carries the data-PDU
+header, the response PDU, and the R2T PDU (built with `bvec_set_virt` over
+driver-allocated pages). `MSG_MORE` chains them so header and payload
+coalesce into one segment.
+
+The one thing it does **not** splice is the data digest (DDGST): a 4-byte
+CRC living in the command struct, sent with a plain `kernel_sendmsg`
+(copy) because it is tiny and computed on the fly. The target can splice
+freely because it *owns* its buffers — they are always page-backed, never
+slab.
+
+## 4.4 In the nvme/tcp **host**
+
+The host uses splice on the WRITE path (H2CData) in
+`nvme_tcp_try_send_data`
+([`drivers/nvme/host/tcp.c`](https://elixir.bootlin.com/linux/v7.0/source/drivers/nvme/host/tcp.c)
+line ~1148) — but with a guard the target doesn't need:
+
+```c
+if (!sendpages_ok(page, len, offset))
+	msg.msg_flags &= ~MSG_SPLICE_PAGES;
+```
+
+The host's payload comes from arbitrary block-layer requests, so a given
+page may fail `sendpage_ok`; the host clears the flag per send and lets
+`tcp_sendmsg` fall back to a copy. That **try-splice-else-copy** pattern is
+the template any block driver should follow. (The host also reads each
+page to update the send-side digest, and sets `MSG_EOR`/`MSG_MORE` to mark
+batch boundaries.)
+
+## 4.5 Can we use it in the **NBD** driver?
+
+**Mechanically, yes — and NBD's send path is already shaped for it.**
+`nbd_send_cmd`
+([`drivers/block/nbd.c`](https://elixir.bootlin.com/linux/v7.0/source/drivers/block/nbd.c))
+walks the request with `bio_for_each_segment`, builds a one-bvec
+`ITER_SOURCE` iterator per segment, and hands it to `__sock_xmit` →
+`sock_sendmsg` — structurally identical to nvme-host's WRITE path. The
+only difference is the flags: `__sock_xmit` sets just `MSG_NOSIGNAL`
+(plus the caller's `MSG_MORE`), **never `MSG_SPLICE_PAGES`**. So today
+every NBD WRITE payload byte is copied into the socket.
+
+Adding `MSG_SPLICE_PAGES` for the **data** segments — guarded by
+`sendpages_ok`, exactly like nvme host — would make NBD WRITE zero-copy.
+Three things to respect:
+
+- **Data only, not the header.** The NBD request header is sent from a
+  kvec over stack/slab memory (`iov_iter_kvec`); it fails `sendpage_ok`
+  and must stay a copy. Only the `bio_vec` data segments are splice-able.
+- **Reclaim context.** `__sock_xmit` runs under
+  `memalloc_noreclaim_save()` with `sk->sk_allocation = GFP_NOIO |
+  __GFP_MEMALLOC` and `sk->sk_use_task_frag = false`, because NBD can sit
+  in the writeback/swap path and must not recurse into reclaim. Splicing
+  is *friendly* to this: it allocates no socket-side `sk_page_frag` (it
+  references the caller's pages instead of copying into a frag), which is
+  exactly consistent with `sk_use_task_frag = false`.
+- **Same trade-offs as the rest of this post.** The loopback `skb_copy_ubufs`
+  relocation (§5.1) and the per-send DMA-map tax under IOMMU translation
+  (§5.2) apply unchanged. NBD has no data digest, so it is actually
+  *simpler* than nvme — no CRC read of the payload to worry about.
+
+No upstream patch wires this in as of v7.0; it is a plausible, low-risk
+improvement, and the nvme-host code is a drop-in pattern to copy.
+
+## 4.6 Why `send_zc` can't just splice
+
+A natural question from the §3 table: `send_zc` (§3.3) and
+`MSG_SPLICE_PAGES` are both "zero-copy send" — could `send_zc` use the
+cheaper splice path and skip the `ubuf_info` + 2nd CQE? **No**, on three
+layers.
+
+**Mechanically, they're mutually exclusive.** `tcp_sendmsg_locked`
+([`net/ipv4/tcp.c`](https://elixir.bootlin.com/linux/v7.0/source/net/ipv4/tcp.c))
+selects a *single* zero-copy mode with an `if / else if`:
+
+```c
+if ((flags & MSG_ZEROCOPY) && size) {
+        ...                 zc = MSG_ZEROCOPY;
+} else if (unlikely(msg->msg_flags & MSG_SPLICE_PAGES) && size) {
+        ...                 zc = MSG_SPLICE_PAGES;
+}
+```
+
+`MSG_ZEROCOPY` has priority; splice is the `else` arm. And io_uring
+*unconditionally* sets `MSG_ZEROCOPY` on the op
+([`io_uring/net.c`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c):
+`zc->msg_flags = ... | MSG_NOSIGNAL | MSG_ZEROCOPY`), so the splice branch
+is unreachable for `send_zc` — the two flags map to one exclusive `zc`
+enum.
+
+**Semantically, splice omits the one thing `send_zc` exists for: the
+notification.** `MSG_SPLICE_PAGES` holds the payload alive by a page
+*refcount* and tells the caller nothing. That is safe for an in-kernel
+producer (nvmet) that never rewrites the buffer behind the NIC. It is
+*unsafe* for a userspace buffer: a refcount keeps the page **allocated**
+but does not stop the owning task from **overwriting its contents** — the
+page is mapped in user space. Without the `ubuf_info` completion,
+userspace would reuse the buffer while the NIC is still reading it. The
+2nd CQE is precisely the "safe to reuse" signal, and refcounting can't
+substitute for it.
+
+**Even rewired, splice would be a downgrade.** The registered-buffer path
+`io_sg_from_iter`
+([`io_uring/net.c`](https://elixir.bootlin.com/linux/v7.0/source/io_uring/net.c))
+already builds page-descriptor frags from the pre-pinned bvec with
+`SKBFL_MANAGED_FRAG_REFS` and `__skb_fill_page_desc_noacc` — no per-send
+`get_user_pages`, not even a per-page refcount. `MSG_SPLICE_PAGES`
+(`iov_iter_extract_pages` → a fresh ref per page, every send) is strictly
+*more* work and still drops the notification.
+
+The thing to notice: this choice is about copy-avoidance and *lifetime
+signalling* only. **Neither** mode changes the per-send DMA map — both
+hand the NIC scattered per-command pages to map every send. So swapping
+`send_zc` to splice would not touch the map tax that §5 and §6 identify
+as the real cost.
+
+# 5. Where the CPU goes: loopback vs real NIC
 
 Same code, opposite verdict.
 
-## 4.1 Loopback — zero-copy is a *loss*
+## 5.1 Loopback — zero-copy is a *loss*
 
 There is no DMA on `lo`. The sent skb still references the sender's pinned
 pages, sitting in the local receive queue. To release those pages for the
@@ -176,7 +353,7 @@ Measured (4 KiB READ): `send_zc` calls `skb_copy_ubufs` ~once per IO;
 plain send **never** does. Same total copies, plus the zero-copy tax →
 zero-copy is a net loss on `lo` in this test.
 
-## 4.2 Real NIC — the DMA map becomes the cost
+## 5.2 Real NIC — the DMA map becomes the cost
 
 The NIC DMAs straight from the pages → **no `skb_copy_ubufs`**. Zero-copy
 genuinely removes the copy. But with the IOMMU translating, every send now
@@ -203,7 +380,7 @@ So at **4 KiB** the per-send map tax outweighs the copy it saved → ZC
 ZC *wins* (line rate at ~−35% target CPU). Zero-copy send is a
 **large-IO** optimization on an IOMMU-translating box.
 
-# 5. The DMA map, `get_user_pages`, and "map once"
+# 6. The DMA map, `get_user_pages`, and "map once"
 
 Three facts that explain the above and point at the real fix:
 
@@ -226,7 +403,7 @@ Three facts that explain the above and point at the real fix:
   map**. io_uring `send_zc` registered buffers are simply not wired into
   this path yet (`io_sg_from_iter` emits plain page frags).
 
-# 6. What to do about it
+# 7. What to do about it
 
 - **`iommu=pt`** (passthrough / identity mappings) → zero per-send map.
   This should flip small-IO `send_zc` from a loss to a win (a direct
