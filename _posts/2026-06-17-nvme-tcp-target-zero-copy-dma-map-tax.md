@@ -326,6 +326,57 @@ hand the NIC scattered per-command pages to map every send. So swapping
 `send_zc` to splice would not touch the map tax that §5 and §6 identify
 as the real cost.
 
+## 4.7 Is splice safe before TCP ACKs? Lifetime vs content
+
+`sock_sendmsg(MSG_SPLICE_PAGES)` returns when the data is *queued*, not
+when it is transmitted or ACKed — TCP may still hold those pages in its
+retransmit queue. So the worry is real: after the call returns, can the
+caller's buffer be freed or reused out from under TCP? Split it in two.
+
+**Lifetime — handled by a refcount.** The bvec extraction takes *no*
+reference (`iov_iter_extract_pages` for `ITER_BVEC` "merely lists" the
+pages,
+[`lib/iov_iter.c`](https://elixir.bootlin.com/linux/v7.0/source/lib/iov_iter.c)),
+but `skb_append_pagefrags`
+([`net/core/skbuff.c`](https://elixir.bootlin.com/linux/v7.0/source/net/core/skbuff.c))
+takes the skb's *own*:
+
+```c
+get_page(page);
+skb_fill_page_desc_noacc(skb, i, page, offset, size);
+```
+
+That ref is dropped only when the skb leaves the retransmit queue on ACK
+(`tcp_clean_rtx_queue` → `skb_release_data` → `__skb_frag_unref` →
+`put_page`). So even if the caller releases its own reference the instant
+`sock_sendmsg` returns, the page's refcount stays ≥ 1 and the allocator
+**cannot hand the page to anyone else** until TCP is done. No
+use-after-free, no premature reuse. This is exactly why
+[`sendpage_ok`](https://elixir.bootlin.com/linux/v7.0/source/include/linux/net.h)
+demands `!PageSlab && page_count >= 1`: a slab *object* returns to the
+slab freelist regardless of the page's refcount, so slab (and stack/static)
+memory could be recycled while TCP still references the page — hence it is
+excluded.
+
+**Content — the caller's contract.** Splice does no copy, so whatever
+bytes are in the page at (re)transmit time go on the wire. The refcount
+keeps the page *allocated*; it does nothing to stop the caller from
+*overwriting* it. A caller that rewrites a spliced buffer before ACK would
+corrupt a retransmit. The kernel cannot prevent this — splice is safe only
+for callers that treat the buffer as immutable until TCP is finished.
+
+The existing users satisfy both halves by construction. nvmet's READ
+payload is the command's own SGL — filled once, never rewritten, and
+`sgl_free`d via `put_page` (the skb's ref defers the real free past ACK,
+so completing the command "early" is harmless). nvme-host's WRITE pages
+belong to a block request that does not complete — and whose pages the
+upper layer therefore cannot reuse — until the NVMe response arrives,
+which the target sends only after receiving the data over the reliable,
+in-order connection. The unsafe patterns are the ones `sendpage_ok` or
+discipline rule out: slab/stack buffers, in-place rewrite before
+completion, or a private page pool that recycles without honoring
+`get_page`.
+
 # 5. Where the CPU goes: loopback vs real NIC
 
 Same code, opposite verdict.
