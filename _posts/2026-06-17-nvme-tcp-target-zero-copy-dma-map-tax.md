@@ -479,6 +479,26 @@ Two details matter:
   second CQE (§3.3, §4.6) instead of `MSG_ERRQUEUE` — same notification,
   friendlier delivery.
 
+**Can you skip the notification?** Not for safety's sake — you must,
+because *something* has to tell user space when the buffer is reusable.
+But the buffer becomes reusable on ACK regardless. When TCP frees the skb
+in the ACK softirq, `skb_release_data` releases the skb's claim on the
+pages — `__skb_frag_unref` (→ `put_page`) for plain `MSG_ZEROCOPY`, or the
+`ubuf` refcount drop in `skb_zcopy_clear` for io_uring's managed frags —
+well before the notification is consumed. The notification is *deferred*
+(an errqueue read, or io_uring's task-work CQE, which also finishes the
+pin accounting), so it only *reports* a release that already happened —
+and a caller with an independent happens-before edge can ignore it. A strict request/response
+protocol has exactly that edge: on one TCP connection the peer's reply
+carries a cumulative ACK ≥ your last sent byte, processed before `recv`
+returns it, so *reply observed ⇒ data ACKed ⇒ buffer already free*. That
+is the userspace mirror of nvmet's §4.7 argument, and it is why an
+`io_uring send_zc` "suppress the notif CQE" flag would be *sound* for such
+protocols — though no such flag exists as of v7.0, and it would trade the
+last reuse-safety guardrail for a modest cut in CQ-ring pressure (the
+notif object and its accounting task-work still run; only the CQE is
+elided).
+
 # 6. Where the CPU goes: loopback vs real NIC
 
 Same code, opposite verdict.
