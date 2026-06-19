@@ -56,6 +56,8 @@ Check `journalctl -r` log
 
 # Fedora
 
+## setup one good network
+
 ## dnf config
   
 - Make sure /etc/dnf/dnf.conf is updated for trying fast mirror
@@ -70,5 +72,16 @@ skip_if_unavailable=True
 max_parallel_downloads=10
 fastestmirror=true
 deltarpm=true
+proxy=http://127.0.0.1:8118
 ```
+
+## update to latest release
+
+```
+sudo dnf upgrade --refresh
+sudo reboot
+sudo dnf install dnf-plugin-system-upgrade
+sudo dnf system-upgrade download --releasever=43
+```
+
 
