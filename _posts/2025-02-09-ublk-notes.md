@@ -1,7 +1,7 @@
 ---
 title: ublk notes
 category: tech
-tags: [linux kernel, block, ublk, io_uring]
+tags: [linux kernel, block layer, ublk, io_uring]
 ---
 
 Title: ublk notes
