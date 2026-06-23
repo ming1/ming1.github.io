@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Ming's personal tech blog — a Jekyll site (jekyll ~3.6.2, `rdiscount` markdown) deployed to `ming1.github.io`. It is built on the legacy **Jekyll-Bootstrap** scaffold, so layouts/includes go through the `JB` Liquid namespace (`{% include JB/setup %}`, `_includes/JB/...`, `_includes/themes/twitter-modified/...`) rather than the modern `jekyll new` template. The `JB:` hash in `_config.yml` is Jekyll-Bootstrap configuration, not stock Jekyll.
 
-GitHub Pages' server-side build is **not** used (the `gem "github-pages"` line in `Gemfile` is intentionally commented out) — the site is built locally and the rendered output is what ships.
+Deployment is GitHub Pages' **server-side** Jekyll build from the `master` branch source: there is no committed `_site/`, no `.nojekyll`, no GitHub Actions workflow, and no `gh-pages` branch, so GitHub rebuilds the site itself on every push. The commented-out `gem "github-pages"` line in `Gemfile` only affects the **local** bundle (so `jekyll serve` runs plain jekyll ~3.6.2 for preview); it does **not** disable GitHub's build. Practical consequences: `_site/` is local preview output only — never commit it; publishing is just pushing source to both remotes (`./update`), after which GitHub regenerates the live pages (including the `/category/` and `/tags/` archives and each post's `/:category/:title` URL).
 
 ## Common commands
 
