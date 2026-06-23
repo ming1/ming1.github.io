@@ -1,7 +1,7 @@
 ---
 title: Linux BPF Open-Coded Iterators Explained
 category: tech
-tags: [linux kernel, bpf, ebpf, iterator, kfunc, verifier]
+tags: [linux kernel, bpf, iterator, kfunc, verifier]
 ---
 
 title: Linux BPF Open-Coded Iterators Explained
