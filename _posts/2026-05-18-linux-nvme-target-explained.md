@@ -1,7 +1,7 @@
 ---
 title: "Linux NVMe Target Explained"
 category: tech
-tags: [linux kernel, NVMe, NVMe-oF, storage, nvmet, target]
+tags: [linux kernel, nvme, nvme-of, storage, nvmet, target]
 ---
 
 title: Linux NVMe Target Explained
@@ -1220,6 +1220,22 @@ enum nvme_tcp_pdu_flags {
 
 `DATA_SUCCESS` on a final `c2h_data` lets the target **omit the
 RspPDU** for successful READs — a real round-trip saving on the hot path.
+
+But the target may set it only when the host has **disabled SQ flow
+control**. The RspPDU it would otherwise send is a completion capsule
+whose CQE carries the **SQ Head Pointer (SQHD)** — the host's signal that
+a submission-queue slot has been consumed. Skip the RspPDU and the host
+never sees SQHD advance, so the optimization is legal only when the host
+isn't relying on it. The host opts in at Connect via the `DISABLE_SQFLOW`
+connect attribute; `nvmet_install_queue`
+(`drivers/nvme/target/fabrics-cmd.c`) records it as `sq->sqhd_disabled`
+and returns `sq_head = 0xffff` as the "don't track SQHD" sentinel.
+Thereafter `nvmet_setup_c2h_data_pdu` sets `DATA_SUCCESS` *iff*
+`sqhd_disabled`, and after the data is sent `nvmet_try_send_data` either
+drops the command outright (no RspPDU) or falls through to
+`nvmet_setup_response_pdu` — so with SQ flow control left on, every READ
+still gets its own RspPDU. The trick is also READ-only: a WRITE has no
+`c2h_data` to ride on, so its completion always travels in a RspPDU.
 
 ### 13.4 The CapsuleCmd PDU (READ / WRITE)
 
