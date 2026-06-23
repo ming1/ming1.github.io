@@ -1,7 +1,7 @@
 ---
 title: "Linux VFS Subsystem Explained"
 categories: tech
-tags: [linux kernel, file system, storage]
+tags: [linux kernel, filesystem, storage]
 ---
 
 * TOC

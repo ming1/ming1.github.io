@@ -1,7 +1,7 @@
 ---
 title: IO performance analysis note
 category: tech
-tags: [block layer, io, file system, performance]
+tags: [block layer, io, filesystem, performance]
 ---
 
 * TOC
