@@ -1,7 +1,7 @@
 ---
 title: "OpenShift Architecture: Deep Dive from Platform to Large Model Inference"
 category: tech
-tags: [openshift, kubernetes, containers, gpu, llm, inference, vllm, kserve, ai, cloud-native]
+tags: [openshift, kubernetes, container, gpu, llm, inference, vllm, kserve, ai, cloud-native]
 ---
 
 > **Note**: This article was generated entirely by AI (Claude) through an
