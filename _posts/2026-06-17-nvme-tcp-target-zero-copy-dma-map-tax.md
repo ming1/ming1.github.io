@@ -1,7 +1,7 @@
 ---
 title: "NVMe/TCP Target Data Path: Copy, Zero-Copy, and the DMA-Map Tax"
 category: tech
-tags: [linux kernel, nvme, nvme-of, io_uring, networking, zero copy, storage]
+tags: [linux kernel, nvme, nvme-of, io_uring, network, zero copy, storage]
 ---
 
 * TOC
