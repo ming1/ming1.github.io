@@ -1,7 +1,7 @@
 ---
 title: Rust For Linux
 category: tech
-tags: [rust, programming, kernel]
+tags: [rust, programming, linux kernel]
 ---
 
 title: Rust For Linux

@@ -1,7 +1,7 @@
 ---
 title: pNFS and NFSv4.2 Explained
 category: tech
-tags: [linux kernel, nfs, pnfs, file system, distributed storage]
+tags: [linux kernel, nfs, pnfs, filesystem, distributed storage]
 ---
 
 title: pNFS and NFSv4.2 Explained
