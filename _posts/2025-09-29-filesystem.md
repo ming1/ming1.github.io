@@ -1,7 +1,7 @@
 ---
 title: Filesystem notes
 category: tech
-tags: [linux kernel, filesystem, io]
+tags: [linux kernel, file system, io]
 ---
 
 * TOC

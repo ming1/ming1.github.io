@@ -1,7 +1,7 @@
 ---
 title: Linux Kernel OverlayFS Subsystem
 category: tech
-tags: [linux kernel, filesystem, overlayfs, container]
+tags: [linux kernel, file system, overlayfs, container]
 ---
 
 title: Linux Kernel OverlayFS Subsystem
