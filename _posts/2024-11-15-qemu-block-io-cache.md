@@ -1,7 +1,7 @@
 ---
 title: Qemu block device cache emulation
 category: operation
-tags: [qemu, virt, block layer, filesystem]
+tags: [qemu, virt, block layer, file system]
 ---
 
 * TOC
