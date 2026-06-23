@@ -1,7 +1,7 @@
 ---
 title: Linux Kernel SLUB Slab Allocator
 category: tech
-tags: [linux kernel, memory management, memory, slab]
+tags: [linux kernel, memory management, slab]
 ---
 
 title: Linux Kernel SLUB Slab Allocator
