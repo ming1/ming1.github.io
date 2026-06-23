@@ -1,6 +1,6 @@
 ---
 title: Linux BPF Ring Buffer Explained
-category: tech
+category: bpf
 tags: [linux kernel, bpf, ringbuf, perf, event]
 ---
 

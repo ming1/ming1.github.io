@@ -1,6 +1,6 @@
 ---
 title: block layer notes
-category: tech
+category: storage
 tags: [linux kernel, block layer, storage]
 ---
 

@@ -1,6 +1,6 @@
 ---
 title: "Inside Claude Code: How an Agentic Coding Harness Actually Works"
-category: tech
+category: ai
 tags: [ai, claude code, agent, llm, architecture, mcp, best practice]
 ---
 

@@ -1,6 +1,6 @@
 ---
 title: block layer debugfs rework
-category: tech
+category: storage
 tags: [linux kernel, block layer]
 ---
 

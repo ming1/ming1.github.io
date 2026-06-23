@@ -1,6 +1,6 @@
 ---
 title: Linux memfd Explained
-category: tech
+category: linux kernel
 tags: [linux kernel, memfd, shared memory, file sealing, memory management]
 ---
 

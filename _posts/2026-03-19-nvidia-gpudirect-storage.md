@@ -1,6 +1,6 @@
 ---
 title: "NVIDIA GPUDirect Storage: Architecture, Design, and Deep Dive"
-category: tech
+category: hardware
 tags: [gpu, nvidia, storage, dma, gpudirect, cuda, nvme]
 ---
 

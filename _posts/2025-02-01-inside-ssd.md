@@ -1,6 +1,6 @@
 ---
 title: Inside SSD
-category: tech
+category: hardware
 tags: [storage, ssd, block layer, nvme, pcie]
 ---
 

@@ -1,6 +1,6 @@
 ---
 title: "XFS Metadata Internals"
-category: tech
+category: filesystem
 tags: [linux kernel, xfs, filesystem, storage, journaling]
 ---
 

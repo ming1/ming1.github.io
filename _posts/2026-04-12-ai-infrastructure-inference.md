@@ -1,6 +1,6 @@
 ---
 title: AI Infrastructure for Large Model Inference
-category: tech
+category: ai
 tags: [ai, llm, inference, gpu, vllm, infrastructure]
 ---
 

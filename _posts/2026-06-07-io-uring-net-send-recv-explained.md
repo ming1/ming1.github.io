@@ -1,6 +1,6 @@
 ---
 title: "io_uring/net.c Explained: How send/recv Requests Flow Through the Kernel"
-category: tech
+category: linux kernel
 tags: [linux kernel, io_uring, network, io]
 ---
 

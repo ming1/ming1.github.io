@@ -1,6 +1,6 @@
 ---
 title: Linux kernel debug note
-category: tech
+category: linux kernel
 tags: [linux kernel, troubleshoot]
 ---
 

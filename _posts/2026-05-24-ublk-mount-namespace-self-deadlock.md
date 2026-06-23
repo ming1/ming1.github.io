@@ -1,6 +1,6 @@
 ---
 title: Why the Last Process in a Mount Namespace Cleans Up — and How That Hangs ublk
-category: tech
+category: storage
 tags: [linux kernel, ublk, mount namespace, vfs, io_uring, kubernetes, deadlock]
 ---
 

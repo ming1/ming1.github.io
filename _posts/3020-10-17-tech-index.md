@@ -1,7 +1,7 @@
 ---
 title: Technical paper index
 date: 2020-10-17 00:18:03
-category: tech
+category: others
 tags: [reference, link]
 ---
 

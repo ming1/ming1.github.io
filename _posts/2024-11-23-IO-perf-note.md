@@ -1,6 +1,6 @@
 ---
 title: IO performance analysis note
-category: tech
+category: storage
 tags: [block layer, io, filesystem, perf]
 ---
 

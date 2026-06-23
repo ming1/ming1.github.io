@@ -1,6 +1,6 @@
 ---
 title: Linux kernel development note(per each dev cycle)
-category: tech
+category: linux kernel
 tags: [linux kernel, news]
 ---
 

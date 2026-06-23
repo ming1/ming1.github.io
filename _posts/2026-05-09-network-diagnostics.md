@@ -1,6 +1,6 @@
 ---
 title: Diagnosing Network Routing, Latency and Congestion Issues
-category: tech
+category: operation
 tags: [network, diagnostics, linux, troubleshoot]
 ---
 

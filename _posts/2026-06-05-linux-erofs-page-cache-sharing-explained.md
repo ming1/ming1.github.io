@@ -1,6 +1,6 @@
 ---
 title: "EROFS Page Cache Sharing Across Inodes Explained"
-category: tech
+category: filesystem
 tags: [linux kernel, erofs, page cache, folio, memory management, storage]
 ---
 

@@ -1,6 +1,6 @@
 ---
 title: Note on IO storage papers
-category: tech
+category: storage
 tags: [paper, io, storage]
 ---
 

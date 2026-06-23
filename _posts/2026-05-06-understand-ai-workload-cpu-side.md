@@ -1,6 +1,6 @@
 ---
 title: "Understand AI Workload: CPU Side"
-category: tech
+category: ai
 tags: [ai, cpu, linux kernel, training, inference, perf, memory management, storage, network]
 ---
 

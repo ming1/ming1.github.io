@@ -1,6 +1,6 @@
 ---
 title: "Linux Kernel Writeback Explained"
-category: tech
+category: filesystem
 tags: [linux kernel, writeback, memory management, vfs, storage]
 ---
 
