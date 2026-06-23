@@ -1,7 +1,7 @@
 ---
 title: Linux kernel index
 date: 2020-10-17 00:18:03
-category: linux kernel
+category: tech
 tags: [reference, link]
 ---
 
