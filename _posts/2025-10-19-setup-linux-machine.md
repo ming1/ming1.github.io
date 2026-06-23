@@ -1,7 +1,7 @@
 ---
 title: Setup Linux environment
 category: operation
-tags: [linux, system adaministration]
+tags: [linux, system administration]
 ---
 
 Setup Linux environment
