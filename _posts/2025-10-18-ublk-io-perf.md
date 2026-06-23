@@ -1,7 +1,7 @@
 ---
 title: UBLK IO perf
 category: tech
-tags: [IO, storage, UBLK, perf, NUMA]
+tags: [io, storage, ublk, perf, numa]
 ---
 
 title:  UBLK IO perf

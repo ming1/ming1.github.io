@@ -1,7 +1,7 @@
 ---
 title: block layer issues with 64K page size
 category: tech
-tags: [linux kernel, IO]
+tags: [linux kernel, io]
 ---
 
 * TOC

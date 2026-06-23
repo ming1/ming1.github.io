@@ -1,7 +1,7 @@
 ---
 title: Rust Error Handling
 category: tech
-tags: [Rust, programming, Error]
+tags: [rust, programming, error]
 ---
 
 title: Rust Error Handling
