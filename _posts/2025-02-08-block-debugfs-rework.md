@@ -1,7 +1,7 @@
 ---
 title: block layer debugfs rework
 category: tech
-tags: [linux kernel, block]
+tags: [linux kernel, block layer]
 ---
 
 Title: block layer debugfs rework

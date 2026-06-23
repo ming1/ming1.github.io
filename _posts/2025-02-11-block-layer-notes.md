@@ -1,7 +1,7 @@
 ---
 title: block layer notes
 category: tech
-tags: [linux kernel, block, storage]
+tags: [linux kernel, block layer, storage]
 ---
 
 Title: block layer notes

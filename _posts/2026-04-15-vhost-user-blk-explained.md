@@ -1,7 +1,7 @@
 ---
 title: "vhost-user-blk: Architecture, Data Flow, and Deep Dive into the Linux Kernel"
 category: tech
-tags: [linux kernel, virtio, vhost, vdpa, block, virt, storage]
+tags: [linux kernel, virtio, vhost, vdpa, block layer, virt, storage]
 ---
 
 > **Note**: This article was generated entirely by AI by studying
