@@ -1,7 +1,7 @@
 ---
 title: Linux kernel debug note
 category: tech
-tags: [linux kernel, bug, debug]
+tags: [linux kernel, bug, troubleshoot]
 ---
 
 Title: Linux kernel debug note
