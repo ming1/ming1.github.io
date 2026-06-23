@@ -1,6 +1,6 @@
 ---
 title: "Linux NVMe Target Explained"
-category: tech
+category: storage
 tags: [linux kernel, nvme, nvme-of, storage, nvmet, target]
 ---
 

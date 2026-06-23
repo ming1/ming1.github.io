@@ -1,6 +1,6 @@
 ---
 title: Rust learning notes
-category: tech
+category: programming
 tags: [rust, programming]
 ---
 

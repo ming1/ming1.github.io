@@ -1,6 +1,6 @@
 ---
 title: "NFS in the Linux Kernel: Source Code Walkthrough"
-category: tech
+category: filesystem
 tags: [linux kernel, nfs, filesystem, nfsd, sunrpc, pnfs]
 ---
 

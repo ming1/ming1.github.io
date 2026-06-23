@@ -1,6 +1,6 @@
 ---
 title: Filesystem notes
-category: tech
+category: filesystem
 tags: [linux kernel, filesystem, io]
 ---
 

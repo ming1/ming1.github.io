@@ -1,6 +1,6 @@
 ---
 title: Understanding LLM and Transformer
-category: tech
+category: ai
 tags: [ai, llm, transformer]
 ---
 

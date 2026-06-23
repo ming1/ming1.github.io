@@ -1,6 +1,6 @@
 ---
 title: "Linux Kernel Module Development in Rust"
-category: tech
+category: linux kernel
 tags: [linux kernel, rust, driver, miscdevice, modules]
 ---
 

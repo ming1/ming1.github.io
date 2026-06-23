@@ -30,7 +30,8 @@ There are no tests or linters configured.
   layout: post
   title: "..."
   description: "..."
-  category: tech            # one of: tech | operation | life (use singular `category:`, not `categories:`)
+  category: linux kernel    # one of: linux kernel | bpf | filesystem | storage | hardware | ai | programming | operation | life | others
+                            # (use singular `category:`, not `categories:`)
   tags: [tag1, tag2, ...]
   ---
   ```

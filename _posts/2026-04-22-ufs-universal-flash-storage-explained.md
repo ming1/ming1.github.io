@@ -1,6 +1,6 @@
 ---
 title: "UFS (Universal Flash Storage): Architecture, Interfaces, and Performance Deep Dive"
-category: tech
+category: hardware
 tags: [storage, flash, ufs, emmc, nvme, mobile, embedded, scsi, mipi, linux kernel]
 ---
 

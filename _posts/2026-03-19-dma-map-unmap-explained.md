@@ -1,6 +1,6 @@
 ---
 title: Linux Kernel DMA Map/Unmap API
-category: tech
+category: linux kernel
 tags: [linux kernel, dma, iommu, iova, nvme, driver]
 ---
 

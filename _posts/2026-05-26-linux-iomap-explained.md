@@ -1,6 +1,6 @@
 ---
 title: "Linux iomap Explained"
-category: tech
+category: filesystem
 tags: [linux kernel, iomap, vfs, memory management, storage, folio]
 ---
 

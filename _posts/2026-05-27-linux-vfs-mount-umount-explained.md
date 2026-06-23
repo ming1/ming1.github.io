@@ -1,6 +1,6 @@
 ---
 title: "Linux VFS Mount and Umount Explained"
-category: tech
+category: filesystem
 tags: [linux kernel, vfs, mount, namespace, xfs, storage]
 ---
 

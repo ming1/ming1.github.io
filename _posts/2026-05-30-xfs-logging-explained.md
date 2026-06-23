@@ -1,6 +1,6 @@
 ---
 title: "XFS Logging Explained"
-category: tech
+category: filesystem
 tags: [linux kernel, xfs, filesystem, storage, journaling]
 ---
 

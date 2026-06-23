@@ -1,6 +1,6 @@
 ---
 title: Linux BPF Dynptr (Dynamic Pointer) Explained
-category: tech
+category: bpf
 tags: [linux kernel, bpf, dynptr, network, verifier]
 ---
 

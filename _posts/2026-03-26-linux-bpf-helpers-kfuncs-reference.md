@@ -1,6 +1,6 @@
 ---
 title: Linux BPF Helpers & Kfuncs Complete Reference
-category: tech
+category: bpf
 tags: [linux kernel, bpf, kfunc, helpers, reference]
 ---
 
