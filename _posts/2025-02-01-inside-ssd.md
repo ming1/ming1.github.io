@@ -1,7 +1,7 @@
 ---
 title: Inside SSD
 category: tech
-tags: [storage, SSD, block, NVMe, PCIe]
+tags: [storage, ssd, block, nvme, pcie]
 ---
 
 title:  Inside SSD

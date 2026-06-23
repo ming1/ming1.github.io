@@ -1,7 +1,7 @@
 ---
 title: Fedora packaging guide
 category: operation
-tags: [Fedora, package]
+tags: [fedora, package]
 ---
 
 Fedora packaging guide

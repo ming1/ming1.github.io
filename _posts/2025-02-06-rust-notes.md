@@ -1,7 +1,7 @@
 ---
 title: Rust learning notes
 category: tech
-tags: [Rust, programming]
+tags: [rust, programming]
 ---
 
 title: Rust learning notes 

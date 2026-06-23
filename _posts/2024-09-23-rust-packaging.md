@@ -1,7 +1,7 @@
 ---
 title: Fedora Rust packaging tips
 category: operation
-tags: [Fedora, package, Rust]
+tags: [fedora, package, rust]
 ---
 
 Fedora Rust packaging tips
