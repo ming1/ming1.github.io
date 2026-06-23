@@ -1,7 +1,7 @@
 ---
 title: Linux kernel driver core & sysfs note
 category: tech
-tags: [linux kernel, driver core, sysfs]
+tags: [linux kernel, driver, sysfs]
 ---
 
 Title: Linux kernel driver core & sysfs note
