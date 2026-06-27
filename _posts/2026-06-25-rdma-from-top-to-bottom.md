@@ -46,20 +46,21 @@ TCP/IP send of one app buffer:
 
 Each copy burns memory bandwidth and pollutes CPU caches; each protocol step
 burns cycles; each packet wakes a CPU via interrupt and softirq. At 100 Gb/s a
-single core cannot even *memcpy* fast enough to keep the wire full, let alone run
-the protocol. The CPU is the bottleneck, not the network.
+single core cannot even *memcpy* fast enough to keep the wire full, let alone
+run the protocol. The CPU is the bottleneck, not the network.
 
 RDMA removes the CPU from the steady-state path with three ideas working
 together:
 
 - **Kernel bypass.** After setup, the application talks *directly* to the NIC
-  through memory-mapped queues. Posting a send and reaping a completion are plain
-  memory operations — **no system call**.
-- **Zero copy.** The NIC's DMA engine reads/writes the application's own buffers.
-  There is no socket buffer, no `skb`, no intermediate staging.
+  through memory-mapped queues. Posting a send and reaping a completion are
+  plain memory operations — **no system call**.
+- **Zero copy.** The NIC's DMA engine reads/writes the application's own
+  buffers. There is no socket buffer, no `skb`, no intermediate staging.
 - **CPU bypass on the remote side.** An RDMA WRITE or READ lands in (or is
   fetched from) the remote machine's registered memory by *its NIC*. The remote
-  CPU is never interrupted and never runs a single instruction for that transfer.
+  CPU is never interrupted and never runs a single instruction for that
+  transfer.
 
 The payoff is what datacenters care about: **~1–2 µs round-trip latency** for
 small messages (versus tens of µs for tuned TCP), **line-rate throughput at near
@@ -67,6 +68,11 @@ zero CPU**, and freed cache/memory bandwidth. That is why RDMA underpins HPC
 (MPI), distributed storage (NVMe-oF, Ceph, Lustre, SMB Direct), and AI training
 fabrics (GPUDirect RDMA). The cost is complexity and a network that must behave
 (see §7).
+
+For a concrete consumer — how the Linux kernel NVMe target drives one-sided RDMA
+via keyed SGLs and the `rdma_rw` API — see
+[Linux NVMe Target Explained]({{ site.baseurl }}/storage/linux-nvme-target-explained),
+§15 (the RDMA transport).
 
 # 2. The Full RDMA Stack (Top → Bottom)
 
@@ -100,13 +106,13 @@ Four layers, each with a sharply different role. The crucial structural fact is
 
 - **(a) Application** speaks *verbs*: "post a work request," "poll for
   completions." It never sees packets.
-- **(b) User-space verbs** is `libibverbs` (the generic API) plus a
-  vendor *provider* library (`libmlx5` for ConnectX). **This is where the data
-  path lives.** `ibv_post_send` writes a hardware descriptor into an mmap'd queue
-  and rings a doorbell — entirely in user space.
+- **(b) User-space verbs** is `libibverbs` (the generic API) plus a vendor
+  *provider* library (`libmlx5` for ConnectX). **This is where the data path
+  lives.** `ibv_post_send` writes a hardware descriptor into an mmap'd queue and
+  rings a doorbell — entirely in user space.
 - **(c) Kernel** runs only the *control plane*: it creates the hardware objects,
-  pins and DMA-maps memory, and programs the NIC. `mlx5_core` owns the PCI device
-  and transport; `mlx5_ib` implements the verbs objects; `ib_core` is the
+  pins and DMA-maps memory, and programs the NIC. `mlx5_core` owns the PCI
+  device and transport; `mlx5_ib` implements the verbs objects; `ib_core` is the
   midlayer and `ib_uverbs` provides the `/dev/infiniband/uverbsN` char device
   (the syscall surface). RDMA CM handles connection setup.
 - **(d) Hardware** does the actual transfer.
@@ -129,8 +135,8 @@ Top-down: you build a few long-lived **objects** once, then run a tight
   *register* so the NIC may DMA to/from it. Registration pins the pages and
   returns two keys: an **lkey** (local key, used by your own WQEs) and an
   **rkey** (remote key, which you hand to a peer so *it* may RDMA into this
-  region). `ibv_reg_mr()`. This is the single most important setup step — without
-  a valid MR/key, the NIC will not touch the memory.
+  region). `ibv_reg_mr()`. This is the single most important setup step —
+  without a valid MR/key, the NIC will not touch the memory.
 - **QP — Queue Pair.** A send queue (SQ) + receive queue (RQ). This *is* the
   connection endpoint. You post work to it. Transport types: **RC** (Reliable
   Connected — ordered, acked, one peer; what storage uses), **UD** (Unreliable
@@ -162,18 +168,18 @@ resolve addresses and exchange QP information, because raw QP bring-up requires
 trading QP numbers, packet sequence numbers, and GIDs out-of-band.
 
 ```
- SETUP (once per connection)                  STEADY STATE (per message)
- ───────────────────────────                  ──────────────────────────
- rdma_create_id()                             ibv_post_send(qp, wr)   ─┐ no
- rdma_resolve_addr()  ── ARP / GID lookup      (writes WQE, rings DB)   │ syscall
- rdma_resolve_route()                          ...                      │ no copy
- ibv_alloc_pd()                                ibv_poll_cq(cq, &wc)   ─┘ no kernel
- ibv_reg_mr()         ── pin pages (kernel)     (reads CQE from ring)
+ SETUP (once per connection)               STEADY STATE (per message)
+ ───────────────────────────               ──────────────────────────
+ rdma_create_id()                          ibv_post_send(qp, wr)  ─┐ no
+ rdma_resolve_addr()  ─ ARP/GID lookup     (writes WQE, rings DB) │ syscall
+ rdma_resolve_route()                      ...                    │ no copy
+ ibv_alloc_pd()                            ibv_poll_cq(cq, &wc)   ─┘ no kernel
+ ibv_reg_mr()         ─ pin pages (kernel) (reads CQE from ring)
  ibv_create_cq()
  ibv_create_qp()
- rdma_connect()       ── CM handshake
+ rdma_connect()       ─ CM handshake
    │
-   └── kernel + a few control packets         └── pure user-space + hardware
+   └── kernel + a few control packets        └── pure user-space + hardware
 ```
 
 After `rdma_connect()` returns, the kernel is done. The message loop is just
@@ -194,7 +200,7 @@ Two cooperating drivers for one card:
         ┌────────┴─────────┐
         │    mlx5_core     │  drivers/net/ethernet/mellanox/mlx5/core
         │  - owns PCI BARs │  - command interface to NIC firmware
-        │  - EQs/IRQs      │  - resource allocator (PD/QP/CQ/MR firmware objects)
+        │  - EQs/IRQs      │  - allocates PD/QP/CQ/MR firmware objects
         └───┬──────────┬───┘
             │          │
    ┌────────┴───┐  ┌───┴─────────┐
@@ -204,31 +210,31 @@ Two cooperating drivers for one card:
    └────────────┘  └─────────────┘
 ```
 
-`mlx5_core` is the foundation: it owns the PCI BARs, talks to NIC firmware over a
-command interface, manages interrupt vectors/event queues, and hands out
+`mlx5_core` is the foundation: it owns the PCI BARs, talks to NIC firmware over
+a command interface, manages interrupt vectors/event queues, and hands out
 firmware-backed objects. `mlx5_ib` sits on top and implements the verbs object
 model (`mlx5_ib_create_qp`, `mlx5_ib_reg_user_mr`, …) by asking `mlx5_core` to
-create the corresponding hardware objects. The *same card* simultaneously exposes
-a normal Ethernet `netdev` (for TCP/IP and RoCE's underlay) and the RDMA device.
+create the corresponding hardware objects. The *same card* simultaneously
+exposes a normal Ethernet `netdev` (for TCP/IP and RoCE's underlay) and the RDMA
+device.
 
 ### 4.2 Memory registration: pinning + DMA mapping
 
 This is the kernel's heaviest lifting and the reason MRs exist. When user space
 calls `ibv_reg_mr(pd, addr, length, access)`, the kernel must guarantee the NIC
-can DMA those pages **at any later instant without the CPU's help**. Two problems
-to solve:
+can DMA those pages **at any later instant without the CPU's help**. Two
+problems to solve:
 
-1. **The pages must not move or be reclaimed.** The kernel calls
-   [`ib_umem_get()`](https://elixir.bootlin.com/linux/latest/source/drivers/infiniband/core/umem.c),
-   which pins the user pages with `pin_user_pages_fast()` (the `FOLL_PIN`
-   successor to `get_user_pages`). Pinned pages are excluded from swap, migration,
-   and
-   compaction for the MR's entire lifetime.
+1. **The pages must not move or be reclaimed.** The kernel calls `ib_umem_get()`
+   (linked in the sources above), which pins the user pages with
+   `pin_user_pages_fast()` (the `FOLL_PIN` successor to `get_user_pages`).
+   Pinned pages are excluded from swap, migration, and compaction for the MR's
+   entire lifetime.
 2. **Virtual addresses must become bus addresses.** The pinned pages are built
    into a scatter/gather table and `dma_map`'d, producing the DMA addresses the
    NIC actually uses. The driver then programs the NIC's address-translation
-   tables (MTT/MKey) so the NIC can translate the I/O virtual address in a WQE to
-   physical/bus pages, and binds the lkey/rkey to that mapping.
+   tables (MTT/MKey) so the NIC can translate the I/O virtual address in a WQE
+   to physical/bus pages, and binds the lkey/rkey to that mapping.
 
 ```
  ibv_reg_mr(addr, len)              user VA range
@@ -252,19 +258,19 @@ large buffers once rather than per-I/O.
 
 ### 4.3 RDMA CM: connection setup, not data
 
-RDMA CM (`rdma_cm`, exposed via `/dev/infiniband/rdma_cm`) resolves an IP address
-to an RDMA path and runs the connection handshake that swaps QP numbers, initial
-packet sequence numbers, and GIDs between the two ends. For RoCEv2 the address
-resolution piggybacks on the normal IP/ARP/neighbour machinery of the underlay
-Ethernet. This is inherently asynchronous (it involves network round-trips), so
-applications drive it with an event channel. **It runs only at connection
-establishment — never per message.**
+RDMA CM (`rdma_cm`, exposed via `/dev/infiniband/rdma_cm`) resolves an IP
+address to an RDMA path and runs the connection handshake that swaps QP numbers,
+initial packet sequence numbers, and GIDs between the two ends. For RoCEv2 the
+address resolution piggybacks on the normal IP/ARP/neighbour machinery of the
+underlay Ethernet. This is inherently asynchronous (it involves network
+round-trips), so applications drive it with an event channel. **It runs only at
+connection establishment — never per message.**
 
 ### 4.4 Why the kernel is absent from the data path
 
 Put 4.1–4.3 together: by the time the first `post_send` happens, the QP's SQ/RQ
-and the CQ live in memory the application has mmap'd, and the NIC's doorbell sits
-in a BAR page the application has mmap'd (with PD/key checks enforced by
+and the CQ live in memory the application has mmap'd, and the NIC's doorbell
+sits in a BAR page the application has mmap'd (with PD/key checks enforced by
 hardware). There is nothing left for the kernel to do. Posting and reaping are
 loads and stores. **The kernel made the fast path safe; it does not run on it.**
 
@@ -275,17 +281,17 @@ queue/key model in silicon. Its responsibilities:
 
 - **Queue Pair (QP) engine** — reads WQEs from the SQ, executes the requested
   operation, generates packets, and on the receive side consumes RQ WQEs.
-- **Completion Queue (CQ)** — the NIC writes a CQE per finished WQE and (if armed)
-  raises an interrupt.
+- **Completion Queue (CQ)** — the NIC writes a CQE per finished WQE and (if
+  armed) raises an interrupt.
 - **Work Queue Entry (WQE)** — a fixed-format descriptor: opcode, local
-  scatter/gather list (address + length + lkey), and for one-sided ops the remote
-  `{addr, rkey}`. **A WQE is an instruction to the NIC.**
+  scatter/gather list (address + length + lkey), and for one-sided ops the
+  remote `{addr, rkey}`. **A WQE is an instruction to the NIC.**
 - **Doorbell** — an MMIO register the host writes to say "new WQEs are ready."
 - **DMA engines** — the NIC is a **PCIe bus master**: it reads WQEs and payload
   from host memory and writes payload and CQEs back, all without the CPU.
 - **Address translation + protection** — the NIC validates every access against
-  the MR keys and PD, and translates I/O virtual addresses to bus addresses using
-  the tables the kernel programmed (§4.2).
+  the MR keys and PD, and translates I/O virtual addresses to bus addresses
+  using the tables the kernel programmed (§4.2).
 - **Transport + RoCE encapsulation** — for RoCEv2 the NIC wraps the InfiniBand
   transport (BTH + payload) inside **UDP/IP/Ethernet**, using **UDP destination
   port 4791**, so RDMA rides on a routable Ethernet/IP fabric.
@@ -341,14 +347,14 @@ Step by step:
    ConnectX-5 supports **BlueFlame**: for small WQEs the driver copies the WQE
    bytes *directly into a write-combining doorbell region*, so the NIC need not
    DMA-read the WQE at all — shaving a PCIe round-trip and minimizing latency.
-   For larger or batched WQEs, the doorbell just announces the new producer index
-   and the NIC DMA-reads the WQEs from the SQ.
+   For larger or batched WQEs, the doorbell just announces the new producer
+   index and the NIC DMA-reads the WQEs from the SQ.
 3. The NIC's **QP engine** executes the WQE: it gathers the payload from the
    registered buffers via DMA (validating lkey + PD, translating the I/O virtual
    address through the MTT/MKey tables the kernel programmed).
-4. It builds the packet. For RoCEv2 that means InfiniBand transport headers (BTH,
-   etc.) encapsulated in **UDP(4791)/IP/Ethernet**; for native InfiniBand it's
-   the IB link layer.
+4. It builds the packet. For RoCEv2 that means InfiniBand transport headers
+   (BTH, etc.) encapsulated in **UDP(4791)/IP/Ethernet**; for native InfiniBand
+   it's the IB link layer.
 5. The packet goes out on the wire. For an RDMA WRITE it carries the remote
    `{addr, rkey}`; the remote NIC will place the payload directly.
 
@@ -380,16 +386,17 @@ Two cases:
 - **One-sided (RDMA WRITE/READ):** the incoming packet already names the target
   `{addr, rkey}`. The NIC validates the key/PD and DMA-writes the payload
   straight into the registered buffer. **The remote CPU and kernel do nothing.**
-  By default no CQE is generated on the passive side (unless WRITE-with-immediate
-  is used).
-- **Two-sided (SEND):** the NIC consumes the next pre-posted **RQ WQE**, DMA-writes
-  the payload into that buffer, and posts a **CQE** to the receiver's CQ so the
-  app learns a message arrived.
+  By default no CQE is generated on the passive side (unless
+  WRITE-with-immediate is used).
+- **Two-sided (SEND):** the NIC consumes the next pre-posted **RQ WQE**,
+  DMA-writes the payload into that buffer, and posts a **CQE** to the receiver's
+  CQ so the app learns a message arrived.
 
 The application either **busy-polls** `ibv_poll_cq` (lowest latency, burns a
-core) or asks for a **completion event** via `ibv_req_notify_cq` and sleeps on the
-completion channel fd until the NIC raises an interrupt (better CPU efficiency,
-higher latency). This is exactly the latency/CPU trade-off every RDMA app tunes.
+core) or asks for a **completion event** via `ibv_req_notify_cq` and sleeps on
+the completion channel fd until the NIC raises an interrupt (better CPU
+efficiency, higher latency). This is exactly the latency/CPU trade-off every
+RDMA app tunes.
 
 ## 6.3 WQE / CQE / CQ lifecycle
 
@@ -401,13 +408,13 @@ Three objects, one cycle:
 - **CQE (Completion Queue Entry)** — *the result.* Produced by the NIC into the
   CQ, consumed by the host. Encodes status (success/error), the originating WQE,
   byte count, and for inbound SENDs the immediate data / source info.
-- **CQ (Completion Queue)** — *the ring* of CQEs, with producer (NIC) and consumer
-  (host) indices.
+- **CQ (Completion Queue)** — *the ring* of CQEs, with producer (NIC) and
+  consumer (host) indices.
 
 ```
- host posts WQE ─► NIC executes ─► NIC posts CQE ─► host polls CQE ─► host frees WQE slot
-      (SQ/RQ)          (DMA)           (CQ)            (CQ)
-   └──────────────────────── one work request's life ───────────────────────┘
+ host posts WQE ─► NIC exec ─► NIC posts CQE ─► host polls CQE ─► frees slot
+    (SQ/RQ)         (DMA)         (CQ)            (CQ)
+   └───────────────────── one work request's life ──────────────────────┘
 ```
 
 The producer/consumer indices on each ring are how host and NIC stay in sync
@@ -415,25 +422,26 @@ without locks — each side owns one index and reads the other's.
 
 ## 6.4 The doorbell mechanism
 
-The doorbell is the *only* host→NIC signal on the fast path, so its cost matters.
+The doorbell is the *only* host→NIC signal on the fast path, so its cost
+matters.
 
 - It is an **MMIO write** to a page of the NIC's PCIe BAR that the kernel mmap'd
   into the process (protected per-QP). Writing it tells the NIC "the SQ producer
   index advanced."
-- **Batching:** if the app posts several WQEs and rings the doorbell once, the NIC
-  fetches them together — amortizing the MMIO and the PCIe WQE-read. High
+- **Batching:** if the app posts several WQEs and rings the doorbell once, the
+  NIC fetches them together — amortizing the MMIO and the PCIe WQE-read. High
   message-rate code deliberately batches.
 - **BlueFlame** (ConnectX specialty): instead of *only* announcing an index, the
   driver writes the small WQE's *bytes* into a write-combining doorbell region.
   The NIC reads the WQE from the register write itself, eliminating the
-  subsequent DMA read of the SQ — the lowest-latency path for small messages. The
-  trade-off is more CPU/PCIe write bandwidth per op, so it's used for small,
+  subsequent DMA read of the SQ — the lowest-latency path for small messages.
+  The trade-off is more CPU/PCIe write bandwidth per op, so it's used for small,
   latency-critical WQEs, not bulk.
 
-Why it matters: an MMIO write is ordered and relatively expensive; the difference
-between "doorbell per WQE" and "doorbell per batch," and between BlueFlame and
-plain doorbell, is the difference between a few hundred ns and a µs at the top of
-the message-rate curve.
+Why it matters: an MMIO write is ordered and relatively expensive; the
+difference between "doorbell per WQE" and "doorbell per batch," and between
+BlueFlame and plain doorbell, is the difference between a few hundred ns and a
+µs at the top of the message-rate curve.
 
 ## 6.5 The PCIe DMA path
 
@@ -447,8 +455,8 @@ the NIC as bus master**:
 
 The CPU and the kernel networking stack are **not on this path** — no `skb`, no
 softirq, no copy. This is why **memory registration is mandatory**: for the NIC
-to DMA safely and asynchronously, the target pages must be pinned and their
-bus addresses pre-translated and key-protected (§4.2). The MR is precisely the
+to DMA safely and asynchronously, the target pages must be pinned and their bus
+addresses pre-translated and key-protected (§4.2). The MR is precisely the
 contract that makes bus-master DMA into application memory safe.
 
 # 7. Performance Model
@@ -467,19 +475,21 @@ Why RDMA is fast, stated as causes, then the costs.
   The remote machine's cache and CPU are untouched, so latency is independent of
   remote CPU load.
 - **Cache efficiency.** Because payload isn't copied through kernel buffers, it
-  doesn't evict the application's working set; the NIC can even steer data toward
-  the right cache (DDIO-style) on supporting platforms.
+  doesn't evict the application's working set; the NIC can even steer data
+  toward the right cache (DDIO-style) on supporting platforms.
 
-The result: **~1 µs one-way (~2 µs RTT)** for small RC messages and **line rate at near-zero
-host CPU** for bulk transfers — numbers TCP cannot reach because its costs are
-per-packet CPU work.
+The result: **~1 µs one-way (~2 µs RTT)** for small RC messages and **line rate
+at near-zero host CPU** for bulk transfers — numbers TCP cannot reach because
+its costs are per-packet CPU work.
 
 **The trade-offs (nothing is free):**
 
-- **Complexity.** The verbs model (PD/MR/QP/CQ, RC vs UD, keys) is far harder than
-  `read()`/`write()`. Connection setup and memory management are the app's job.
+- **Complexity.** The verbs model (PD/MR/QP/CQ, RC vs UD, keys) is far harder
+  than `read()`/`write()`. Connection setup and memory management are the app's
+  job.
 - **Pinned memory.** MRs hold pages pinned for their lifetime, pressuring the VM
-  subsystem; registration itself is costly, so buffer lifecycle must be designed.
+  subsystem; registration itself is costly, so buffer lifecycle must be
+  designed.
 - **Lossless-ish network required (RoCEv2).** RDMA's transport assumes very low
   loss. On Ethernet that means a tuned fabric: **PFC** (priority flow control)
   and/or **ECN-based congestion control (DCQCN)**. Get this wrong and you see
@@ -528,9 +538,9 @@ ib_send_bw -d mlx5_0 -F
 ib_send_bw -d mlx5_0 -F 192.168.1.10
 ```
 
-Useful flags: `-d <dev>` selects the RDMA device (`ibv_devices` lists them),
-`-s <bytes>` sets message size, `-F` ignores CPU frequency-scaling warnings,
-`-R` uses the RDMA CM for connection setup, and `--report_gbits` prints Gb/s. For
+Useful flags: `-d <dev>` selects the RDMA device (`ibv_devices` lists them), `-s
+<bytes>` sets message size, `-F` ignores CPU frequency-scaling warnings, `-R`
+uses the RDMA CM for connection setup, and `--report_gbits` prints Gb/s. For
 latency instead of bandwidth, swap in `ib_write_lat` / `ib_read_lat` /
 `ib_send_lat` (these `*_lat` tools report **one-way** latency, i.e. half the
 ping-pong RTT). Watching `ib_write_lat` report ~1-µs one-way latency while the
@@ -539,14 +549,14 @@ server CPU sits idle is the whole thesis of this post in one command.
 # 9. Mental Model Summary
 
 One paragraph: **RDMA is a contract that lets a NIC move data directly between
-application buffers on two machines, with the kernel present only at setup.** The
-application registers memory (pinning pages and obtaining keys), creates a queue
-pair and completion queue, and connects via RDMA CM — all kernel-mediated, once.
-After that it writes work-queue entries into mmap'd queues and rings a doorbell;
-the NIC fetches those WQEs by DMA, validates them against the memory keys, builds
-RoCEv2 or InfiniBand packets, and DMA-writes payload into (or reads it from) the
-remote machine's registered memory — posting completions back to the queue the
-app polls. No syscall, no copy, no remote CPU on the data path.
+application buffers on two machines, with the kernel present only at setup.**
+The application registers memory (pinning pages and obtaining keys), creates a
+queue pair and completion queue, and connects via RDMA CM — all kernel-mediated,
+once. After that it writes work-queue entries into mmap'd queues and rings a
+doorbell; the NIC fetches those WQEs by DMA, validates them against the memory
+keys, builds RoCEv2 or InfiniBand packets, and DMA-writes payload into (or reads
+it from) the remote machine's registered memory — posting completions back to
+the queue the app polls. No syscall, no copy, no remote CPU on the data path.
 
 ```
  ┌── SETUP (kernel) ──────────────┐   ┌── DATA PATH (bypass) ─────────────┐
@@ -554,11 +564,12 @@ app polls. No syscall, no copy, no remote CPU on the data path.
  create_qp/cq → hw queues              doorbell  → MMIO to NIC BAR
  rdma_connect → CM handshake           NIC DMA   → fetch WQE, gather payload
         │                              build pkt → RoCEv2(UDP:4791)/IB → wire
-        ▼                              remote NIC→ DMA into peer MR (no peer CPU)
+        ▼                              remote NIC→ DMA into peer MR (no CPU)
    kernel done                         CQE       → CQ → poll_cq
                                               (all user-space + hardware)
 
- App ─verbs─► [kernel: setup once] ─► NIC ─DMA/PCIe─► memory ⇄ wire ⇄ remote NIC ─► remote memory
+ App ─verbs─► [kernel: setup once] ─► NIC ─DMA/PCIe─► memory ⇄ wire ⇄
+                                          remote NIC ─► remote memory
 ```
 
 # Summary
@@ -578,9 +589,9 @@ app polls. No syscall, no copy, no remote CPU on the data path.
 
 **Main problems / limitations**
 
-- **Programming complexity** — PD/MR/QP/CQ, RC-vs-UD, and explicit key management
-  are far harder than `read()`/`write()`; setup and buffer lifecycle are the
-  application's responsibility.
+- **Programming complexity** — PD/MR/QP/CQ, RC-vs-UD, and explicit key
+  management are far harder than `read()`/`write()`; setup and buffer lifecycle
+  are the application's responsibility.
 - **Pinned-memory pressure** — MRs hold pages pinned for their lifetime and
   registration is expensive, forcing careful buffer reuse and stressing the VM
   subsystem.

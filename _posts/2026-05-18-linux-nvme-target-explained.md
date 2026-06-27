@@ -1777,6 +1777,10 @@ engine** instead of streaming bytes through a socket. This section walks
 the same top-to-bottom path for RDMA: the design idea first, then the
 objects, then one command end to end.
 
+For the RDMA fundamentals underneath this — verbs, memory registration,
+doorbells, and the ConnectX-5 datapath — see the companion post
+[RDMA from Top to Bottom]({{ site.baseurl }}/hardware/rdma-from-top-to-bottom).
+
 > Source: [`drivers/nvme/target/rdma.c`](https://elixir.bootlin.com/linux/latest/source/drivers/nvme/target/rdma.c)
 > plus the generic RDMA-RW helper
 > [`drivers/infiniband/core/rw.c`](https://elixir.bootlin.com/linux/latest/source/drivers/infiniband/core/rw.c),
