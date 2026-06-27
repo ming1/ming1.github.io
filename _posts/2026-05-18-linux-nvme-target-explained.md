@@ -511,7 +511,8 @@ up real fabric hardware.
 Each queue is an RDMA QP. The host's command capsule carries a *keyed
 SGL* — basically "here is a remote key and address, please fetch the data
 yourself." The target then issues RDMA `Read` to pull WRITE data, or RDMA
-`Write` to push READ data, before signalling the CQE with a SEND.
+`Write` to push READ data, before signalling the CQE with a SEND. §15
+covers the full design and call trace.
 
 ### PCI-EPF transport ([`pci-epf.c`](https://elixir.bootlin.com/linux/latest/source/drivers/nvme/target/pci-epf.c))
 
@@ -1766,7 +1767,292 @@ the §14.1 entry down to `submit_bio` in one trace.
 
 ---
 
-## 15. Mental Model in One Paragraph
+## 15. The RDMA Transport: Design and Implementation
+
+§13 and §14 dissected NVMe-TCP from the wire up. The RDMA transport
+([`rdma.c`](https://elixir.bootlin.com/linux/latest/source/drivers/nvme/target/rdma.c),
+~2130 lines) solves the same problem — move command, data, and completion
+between host and target — but hands the **data movement to the NIC's RDMA
+engine** instead of streaming bytes through a socket. This section walks
+the same top-to-bottom path for RDMA: the design idea first, then the
+objects, then one command end to end.
+
+> Source: [`drivers/nvme/target/rdma.c`](https://elixir.bootlin.com/linux/latest/source/drivers/nvme/target/rdma.c)
+> plus the generic RDMA-RW helper
+> [`drivers/infiniband/core/rw.c`](https://elixir.bootlin.com/linux/latest/source/drivers/infiniband/core/rw.c),
+> read against linux-next (commit `c425609d6ac4`, Jun 2026). Line numbers
+> are from that tree; function names are the stable anchors.
+
+### 15.1 The one big idea: one-sided transfers
+
+In NVMe-TCP, a large WRITE is a conversation: the host sends the command,
+the target replies **R2T** ("send me the data now"), the host streams
+**H2CData** PDUs, and the target copies them out of the socket into
+`req->sg` (§13.8, §14.4). Three PDU types, a round-trip, a copy.
+
+RDMA collapses all of that. The host's command capsule carries a **keyed
+SGL** — a `{remote address, remote key, length}` triple naming a buffer in
+the *host's own* memory. The target then moves the data itself, without
+asking and without the host CPU:
+
+- **WRITE** → the target issues an **RDMA READ**, pulling the data out of
+  host memory into its scatterlists.
+- **READ** → the target issues an **RDMA WRITE**, pushing data straight
+  into host memory.
+
+Only after that one-sided transfer does the target post a **SEND** carrying
+the 16-byte NVMe completion. No R2T, no data PDU, no framing, no copy: the
+HCA DMAs between the two machines' memory, and each CPU touches only the
+64-byte command and the 16-byte CQE.
+
+```
+   NVMe-TCP WRITE (large)             NVMe-RDMA WRITE
+   ──────────────────────             ───────────────
+   Host ── CapsuleCmd ──▶ Target      Host ── SEND(cmd+ksgl) ──▶ Target
+   Host ◀───── R2T ────── Target                                  │ RDMA READ
+   Host ── H2CData ─────▶ Target      Host ◀═══ data pulled ══════╡ (one-sided,
+   Host ── H2CData ─────▶ Target            (host CPU idle)        │  no host CPU)
+        (target copies out)                                       │
+   Host ◀───── Rsp ────── Target      Host ◀──── SEND(cqe) ─────── Target
+```
+
+This is why RDMA advertises `NVMF_KEYED_SGLS` in its ops flags
+(`rdma.c:2046`) — the keyed SGL *is* the transport's defining capability.
+
+### 15.2 The keyed SGL: a remote-memory handle
+
+The capsule's data pointer is a `nvme_keyed_sgl_desc`, not TCP's plain
+offset SGL (§13.5):
+
+```c
+struct nvme_keyed_sgl_desc {
+    __le64  addr;       /* remote virtual address, in HOST memory */
+    __u8    length[3];  /* transfer length (24-bit)               */
+    __u8    key[4];     /* remote key (rkey) protecting that VA    */
+    __u8    type;       /* KEY_SGL_FMT_DATA_DESC | ADDRESS[+INVALIDATE] */
+};
+```
+
+[`nvmet_rdma_map_sgl`](https://elixir.bootlin.com/linux/latest/source/drivers/nvme/target/rdma.c#L908)
+(`rdma.c:908`) decodes `type` and routes:
+
+```c
+switch (sgl->type >> 4) {
+case NVME_SGL_FMT_DATA_DESC:        /* inline — data sits in the recv buffer */
+    return nvmet_rdma_map_sgl_inline(rsp);
+case NVME_KEY_SGL_FMT_DATA_DESC:    /* keyed — fetch it over RDMA */
+    return nvmet_rdma_map_sgl_keyed(rsp, sgl, invalidate);
+}
+```
+
+`nvmet_rdma_map_sgl_keyed` (`rdma.c:872`) reads `addr` and `key`, allocates
+target-side scatterlists (`nvmet_req_alloc_sgls`), then builds an
+`rdma_rw_ctx` describing the READ-or-WRITE the HCA must perform. The
+`INVALIDATE` subtype also records `rsp->invalidate_rkey`, so the completion
+SEND can remotely invalidate the host's memory region for free (§15.8).
+
+### 15.3 The object model
+
+RDMA's objects map onto the core graph from §3, with the transport
+plumbing bolted on. Read the diagram top-down — listener, then per-queue
+QP, then the two per-command structures:
+
+```
+  nvmet_rdma_port            one rdma_cm_id, listens on traddr:trsvcid
+        │  CONNECT_REQUEST (rdma_cm)
+        ▼
+  nvmet_rdma_queue   ◀────── one per NVMe queue  ==  one RC QP
+   ├─ cm_id, qp, cq          (IB_QPT_RC; CQ runs IB_POLL_WORKQUEUE)
+   ├─ nvme_sq / nvme_cq      the core queue objects (§3)
+   ├─ cmds[] : nvmet_rdma_cmd    preposted RECV slots (or a shared SRQ)
+   └─ rsps[] : nvmet_rdma_rsp    per-command state, pooled via sbitmap
+                   │
+                   └─ embeds struct nvmet_req   ── the §3 workhorse
+                      + rdma_rw_ctx rw           ── the data mover
+                      + send_wr / read_cqe / write_cqe
+```
+
+- **`nvmet_rdma_cmd`** (`rdma.c:46`) — a **receive slot**: an `ib_recv_wr`
+  + SGEs + a 64-byte command buffer. Preposted to the QP's receive queue
+  (or a shared SRQ); the HCA lands an inbound capsule here.
+- **`nvmet_rdma_rsp`** (`rdma.c:60`) — **one command in flight**. Embeds
+  `struct nvmet_req`, the `rdma_rw_ctx rw`, a send WR, and three `ib_cqe`
+  callbacks (send / read / write). Drawn from a per-queue pool indexed by
+  an `sbitmap` (`rsp_tags`) — no per-command allocation, like TCP's
+  preallocated `queue->cmds[]`.
+- **`nvmet_rdma_queue`** (`rdma.c:89`) — the QP, its single CQ, a
+  `sq_wr_avail` credit counter, and a three-state lifecycle
+  (`CONNECTING → LIVE → DISCONNECTING`).
+- **`nvmet_rdma_device`** (`rdma.c:133`) — wraps an `ib_device` + a
+  protection domain (`ib_pd`) + an optional SRQ pool; one per HCA, shared
+  across queues.
+
+### 15.4 The completion model: typed CQEs, not a recv loop
+
+TCP runs one `nvmet_tcp_io_work` that does recv → parse → execute → send on
+a workqueue (§14.1). RDMA has **no recv loop**: the HCA completes each work
+request asynchronously, and every WR carries an `ib_cqe` whose `.done`
+points at the handler for *that* kind of completion. One CQ per queue, run
+in `IB_POLL_WORKQUEUE` context (`rdma.c:1273`):
+
+| Work request | Completion handler | Meaning |
+|--------------|--------------------|---------|
+| RECV       | [`nvmet_rdma_recv_done`](https://elixir.bootlin.com/linux/latest/source/drivers/nvme/target/rdma.c#L1018) (`:1018`) | a command capsule arrived |
+| RDMA READ  | [`nvmet_rdma_read_data_done`](https://elixir.bootlin.com/linux/latest/source/drivers/nvme/target/rdma.c#L745) (`:745`) | WRITE data pulled in |
+| RDMA WRITE | `nvmet_rdma_write_data_done` (`:778`) | READ data pushed out (PI check) |
+| SEND       | `nvmet_rdma_send_done` (`:692`) | CQE delivered, command done |
+
+The CQ is sized `recv_queue_size + 2 * send_queue_size + 1` (`rdma.c:1271`)
+— every command may need a RECV, an RDMA data WR, and a SEND.
+
+### 15.5 Connection setup: rdma_cm, not accept()
+
+A port opens by binding a listening `rdma_cm_id` (`nvmet_rdma_add_port`);
+the RDMA connection manager then drives a callback state machine
+([`nvmet_rdma_cm_handler`](https://elixir.bootlin.com/linux/latest/source/drivers/nvme/target/rdma.c#L1769),
+`rdma.c:1769`):
+
+```
+  Host: nvme connect -t rdma          Target: nvmet_rdma_cm_handler
+        │
+        │  CM CONNECT_REQUEST ────────▶ RDMA_CM_EVENT_CONNECT_REQUEST
+        │                               └─ nvmet_rdma_queue_connect
+        │                                  └─ nvmet_rdma_create_queue_ib   :1262
+        │                                     ├─ ib_cq_pool_get   (one CQ)
+        │                                     ├─ rdma_create_qp   (RC QP)
+        │                                     └─ post recv_queue_size RECVs
+        │  ◀─────────  CM ACCEPT  ───────  nvmet_rdma_cm_accept
+        │  CM ESTABLISHED ────────────▶ RDMA_CM_EVENT_ESTABLISHED
+        │                               └─ state = LIVE; drain rsp_wait_list
+        ▼
+   I/O may now flow
+```
+
+The QP type is **`IB_QPT_RC`** — Reliable Connected (`rdma.c:1287`) —
+RDMA's in-order, acknowledged channel, which is what lets the target treat
+each one-sided transfer as reliable without its own retransmit logic.
+Receive buffers are posted *before* the accept, so the HCA can land the
+host's first capsule the instant the link goes LIVE.
+
+### 15.6 A command, top to bottom
+
+A **WRITE** (the interesting case — it needs an RDMA READ) and a **READ**,
+function by function:
+
+```
+HCA completes a RECV
+└─ nvmet_rdma_recv_done(cq, wc)                              rdma.c:1018
+   ├─ rsp = nvmet_rdma_get_rsp(queue)        /* pool, sbitmap */
+   ├─ rsp->req.cmd = cmd->nvme_cmd
+   └─ nvmet_rdma_handle_command(queue, rsp)                 rdma.c:966
+      ├─ ib_dma_sync_single_for_cpu(...)      /* CPU may read the capsule */
+      ├─ nvmet_req_init(&rsp->req, sq, &nvmet_rdma_ops)     core.c
+      │     → parser sets req->execute (e.g. nvmet_bdev_execute_rw)
+      ├─ nvmet_rdma_map_sgl(rsp)                            rdma.c:908
+      │     → keyed: nvmet_rdma_rw_ctx_init builds rsp->rw  rdma.c:625
+      │       (rdma_rw_ctx_init → READ or WRITE WRs); n_rdma = #WRs
+      └─ nvmet_rdma_execute_command(rsp)                    rdma.c:942
+         ├─ atomic_sub(1 + n_rdma, &sq_wr_avail)   /* reserve SQ credits */
+         │
+         ├─ WRITE: nvmet_rdma_need_data_in(rsp) == true
+         │   └─ rdma_rw_ctx_post(&rsp->rw, qp, ..., &rsp->read_cqe)
+         │        → HCA issues RDMA READ(s); host CPU untouched
+         │      ┄┄ completion ┄┄▶ nvmet_rdma_read_data_done   rdma.c:745
+         │                         └─ rsp->req.execute(req)  /* data is now local */
+         │                            └─ submit_bio(REQ_OP_WRITE)
+         │
+         └─ READ: need_data_in == false
+             └─ rsp->req.execute(req)
+                └─ submit_bio(REQ_OP_READ)
+
+backend completes (block layer)
+└─ nvmet_req_complete → ops->queue_response
+   = nvmet_rdma_queue_response(req)                          rdma.c:708
+     ├─ READ (need_data_out): first_wr = rdma_rw_ctx_wrs(... &send_wr)
+     │     → chain the RDMA WRITE(s) THEN the SEND, one ib_post_send
+     ├─ WRITE: first_wr = &send_wr          /* just the CQE-bearing SEND */
+     ├─ nvmet_rdma_post_recv(...)           /* recycle the recv slot */
+     └─ ib_post_send(qp, first_wr)
+        ┄┄ SEND completion ┄┄▶ nvmet_rdma_send_done           rdma.c:692
+                                └─ nvmet_rdma_release_rsp
+                                   (free sgls, return credits, free rsp)
+```
+
+The pivots mirror §14's TCP trace, but the data step is a hardware DMA, not
+a `sock_recvmsg`/`sock_sendmsg`:
+
+- **WRITE**: the data arrives via `rdma_rw_ctx_post` of the READ;
+  `nvmet_rdma_read_data_done` is the gate that runs `req->execute()` once
+  the bytes are local.
+- **READ**: `nvmet_rdma_queue_response` chains the RDMA WRITE *and* the SEND
+  in one `ib_post_send` — `rdma_rw_ctx_wrs` links the data WRs ahead of
+  `&send_wr` (`rdma.c:724`), so payload and completion ride out
+  back-to-back.
+
+### 15.7 Why `rdma_rw_ctx`: no hand-rolled memory registration
+
+`nvmet` never builds RDMA READ/WRITE work requests by hand. It drives the
+kernel's generic **RDMA-RW API**
+([`drivers/infiniband/core/rw.c`](https://elixir.bootlin.com/linux/latest/source/drivers/infiniband/core/rw.c))
+through four entry points:
+
+| Call | Site | Does |
+|------|------|------|
+| `rdma_rw_ctx_init`    | map_sgl_keyed (`:625`) | turn target SGL + remote `{addr,key}` into a WR chain |
+| `rdma_rw_ctx_post`    | execute_command (`:956`) | fire the RDMA READ (WRITE-data path) |
+| `rdma_rw_ctx_wrs`     | queue_response (`:724`) | splice RDMA WRITE WRs ahead of the SEND |
+| `rdma_rw_ctx_destroy` | release_rsp (`:645`) | tear the registrations down |
+
+The payoff: `rw.c` decides **per device** whether a transfer can use plain
+SGEs or must register a memory region (MR) first — iWARP always needs a
+local MR to read; many RoCE/IB HCAs scatter directly. `nvmet` stays
+oblivious; `n_rdma` simply counts however many WRs the helper produced, and
+that count feeds the `sq_wr_avail` credit accounting.
+
+### 15.8 The details that matter
+
+- **Inline data.** Small WRITEs skip RDMA entirely: if the host marks the
+  SGL `NVME_SGL_FMT_OFFSET`, the data rides inside the recv buffer, exactly
+  like TCP inline. `nvmet_rdma_map_sgl_inline` (`rdma.c:845`) caps it at the
+  device `inline_data_size` (configfs `param_inline_data_size`).
+- **Remote invalidation.** When the host tags the SGL `INVALIDATE`, the
+  completion is posted as `IB_WR_SEND_WITH_INV` carrying the host's rkey
+  (`rdma.c:716`), so the HCA invalidates the host's MR as a side effect of
+  the SEND — one fewer host-side operation per command.
+- **Send-queue credits.** `sq_wr_avail` (`rdma.c:94`) is an atomic count of
+  free SQ slots. A command reserves `1 + n_rdma`; if the SQ is full,
+  `nvmet_rdma_handle_command` parks it on `rsp_wr_wait_list` and retries as
+  completions free slots — RDMA's backpressure, in place of TCP's socket
+  buffer.
+- **T10-PI / signature.** With `pi_enable`, metadata flows through
+  `rdma_rw_ctx_signature_init`, and the WRITE path verifies guard/app tags
+  in `nvmet_rdma_write_data_done` (`rdma.c:778`) before sending a good CQE —
+  data-integrity offloaded to the HCA.
+- **SRQ.** With `use_srq`, many queues share one receive queue
+  (`nvmet_rdma_srq`), cutting per-queue buffer memory on targets fielding
+  thousands of connections.
+
+### 15.9 TCP vs RDMA at a glance
+
+| Aspect | NVMe-TCP (§13–14) | NVMe-RDMA (§15) |
+|--------|-------------------|------------------|
+| Framing | PDUs with `plen`, parsed in SW | none — HCA delivers whole capsules |
+| Large WRITE | R2T + H2CData round-trip | one-sided RDMA READ |
+| READ data | C2HData PDU(s) | one-sided RDMA WRITE |
+| Data copy | recv into `req->sg` (HW-offloaded via splice) | zero — HCA DMA to/from registered memory |
+| Completion driver | one `io_work` recv/send loop | per-WR `ib_cqe` callbacks on a CQ |
+| In-flight unit | `nvmet_tcp_cmd` + socket | `nvmet_rdma_rsp` + RC QP |
+| CPU per I/O | header + (offloaded) data | 64 B command + 16 B CQE only |
+| Reliability | TCP | RC QP (HCA-level ack/retransmit) |
+
+RDMA's cost is the flip side of its benefit: it needs an RDMA-capable
+fabric (RoCE, iWARP, or InfiniBand), pinned and registered memory, and HCA
+resources — QPs, CQs, MRs — that scale with connection count. SRQ and the
+`rdma_rw` MR pooling exist precisely to contain that cost.
+
+---
+
+## 16. Mental Model in One Paragraph
 
 `nvmet` is a thin, opcode-driven dispatcher with two pluggable edges. On
 the **outer edge**, a transport vtable (`tcp`, `rdma`, `fc`, `loop`,
