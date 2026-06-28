@@ -635,8 +635,9 @@ pool — the refcounts that make it safe are the next subsection.
 A minimal, **read-don't-run** server using exactly these steps —
 registration, multishot `RECV_ZC`, read-in-place, refill — is in
 [`code/iou-recvzc-min.c`]({{ site.baseurl }}/code/iou-recvzc-min.c).
-It needs a zcrx-capable NIC and a recent liburing to build and run; the
-file header lists the prerequisites.
+It needs a zcrx-capable NIC and a recent liburing to build and run; see
+[`iou-recvzc-min.README.md`]({{ site.baseurl }}/code/iou-recvzc-min.README.md)
+for the hardware prerequisites and step-by-step test instructions.
 
 ## The RECV_ZC lifetime: device memory, the refill ring, and niov ownership
 
