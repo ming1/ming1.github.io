@@ -632,6 +632,12 @@ which pulls returned niovs off the refill ring via
 and hands them back to the NIC. That closes the loop pool → user →
 pool — the refcounts that make it safe are the next subsection.
 
+A minimal, **read-don't-run** server using exactly these steps —
+registration, multishot `RECV_ZC`, read-in-place, refill — is in
+[`code/iou-recvzc-min.c`]({{ site.baseurl }}/code/iou-recvzc-min.c).
+It needs a zcrx-capable NIC and a recent liburing to build and run; the
+file header lists the prerequisites.
+
 ## The RECV_ZC lifetime: device memory, the refill ring, and niov ownership
 
 `RECV_ZC` inverts everything about the normal recv path. There is no
