@@ -11,8 +11,11 @@
  *   "Zero-copy receive (RECV_ZC), top to bottom" section.
  *
  * This WILL NOT run on an arbitrary machine. RECV_ZC is hardware-gated:
- *   - Linux >= 6.15 and a liburing built with zcrx support
- *     (provides io_uring_register_ifq()).
+ *   - Linux kernel >= 6.15 with CONFIG_IO_URING_ZCRX=y, and kernel uapi
+ *     headers recent enough to define the zcrx structs (a recent
+ *     linux-libc-dev / kernel-headers). Any liburing with the base
+ *     io_uring_register() works -- this file uses the raw
+ *     IORING_REGISTER_ZCRX_IFQ, not the newer io_uring_register_ifq().
  *   - A NIC/driver with TCP header-data split + unreadable netmem:
  *     mlx5e, bnxt_en (queue API), gve (DQO), or fbnic.
  *   - The RX queue prepared and a flow steered onto it, e.g.:
@@ -40,6 +43,15 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <net/if.h>
+/*
+ * Include the kernel uapi header BEFORE <liburing.h>. Both share the
+ * LINUX_IO_URING_H include guard, so the first one wins; pulling the
+ * system header first gives the complete zcrx struct definitions even
+ * when an older liburing bundles an incomplete copy. Needs recent kernel
+ * uapi headers (linux-libc-dev / kernel-headers). If your liburing is new
+ * enough to define zcrx itself, this include is harmless.
+ */
+#include <linux/io_uring.h>
 #include <liburing.h>
 
 #define AREA_SIZE   (16u << 20)   /* 16 MiB registered receive area */
@@ -101,8 +113,10 @@ static void setup_zcrx(struct io_uring *ring, unsigned ifindex, unsigned rxq)
 		.region_ptr  = (uint64_t)(uintptr_t)&region_desc,
 	};
 
-	if (io_uring_register_ifq(ring, &reg))
-		die("io_uring_register_ifq");
+	/* Raw register avoids needing liburing's newer io_uring_register_ifq()
+	 * helper; the kernel requires nr_args == 1 for ZCRX_IFQ. */
+	if (io_uring_register(ring->ring_fd, IORING_REGISTER_ZCRX_IFQ, &reg, 1))
+		die("IORING_REGISTER_ZCRX_IFQ");
 
 	/* The kernel filled in reg.offsets and area_reg.rq_area_token. Wire
 	 * up our refill-ring pointers into the mmap'd region. */
