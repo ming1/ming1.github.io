@@ -24,9 +24,14 @@ provider). You cannot run it on an arbitrary box.
   ```
   grep IO_URING_ZCRX /boot/config-$(uname -r)
   ```
-- **liburing ≥ 2.9 / git master** — must provide `io_uring_register_ifq()`.
-  Distro liburing is usually too old; build from source and link against
-  it. (The example fails to build *only* because of an old liburing.)
+- Recent **kernel uapi headers** (linux-libc-dev / kernel-headers) that
+  define the zcrx structs — usually present once the kernel is ≥ 6.15.
+- Any **liburing** with the base `io_uring_register()` (essentially any
+  version). The example uses the raw `IORING_REGISTER_ZCRX_IFQ`, so it
+  does *not* need the newer `io_uring_register_ifq()` helper. If the build
+  still reports incomplete `io_uring_zcrx_*` structs, your linux-libc-dev
+  is older than your kernel — update it, or build against liburing git
+  master.
 
 ## 2. Validate the environment first (recommended)
 
