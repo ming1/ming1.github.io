@@ -660,6 +660,13 @@ For latency instead of bandwidth, swap in `ib_write_lat` / `ib_read_lat` /
 ping-pong RTT). Watching `ib_write_lat` report ~1-µs one-way latency while
 the server CPU sits idle is the whole thesis of this post in one command.
 
+To go from *using* the tools to *writing* the verbs yourself, a minimal
+SEND/RECV program built on libibverbs — manual QP bring-up, no `rdma_cm` —
+is in [`code/rdma-hello.c`]({{ site.baseurl }}/code/rdma-hello.c); see
+[`rdma-hello.README.md`]({{ site.baseurl }}/code/rdma-hello.README.md) for
+environment setup (it runs on an ordinary box via Soft-RoCE) and how to run
+it.
+
 # 9. Mental Model Summary
 
 One paragraph: **RDMA is a contract that lets a NIC move data directly between
