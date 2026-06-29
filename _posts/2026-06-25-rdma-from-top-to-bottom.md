@@ -28,6 +28,115 @@ ending with a step-by-step datapath walk through a Mellanox/NVIDIA ConnectX-5
 connection and registers memory, then gets out of the way — every byte of the
 data path runs hardware-to-memory over PCIe, bypassing the kernel entirely.**
 
+# Terms and abbreviations
+
+This post is dense with RDMA vocabulary. Skim this once and refer back as
+needed; the groups run roughly top to bottom — core concepts, the verbs
+object model, the wire/fabric, then the software stack.
+
+**Core**
+
+| Term | Meaning |
+|------|---------|
+| RDMA | Remote Direct Memory Access — a NIC reads/writes remote memory with no remote CPU |
+| NIC | Network Interface Card (here, an RDMA-capable one) |
+| CPU | Central Processing Unit |
+| DMA | Direct Memory Access — a device moving data to/from memory without the CPU |
+| API | Application Programming Interface |
+
+**Verbs object model**
+
+| Term | Meaning |
+|------|---------|
+| PD | Protection Domain — isolation container; MRs and QPs belong to one |
+| MR | Memory Region — registered (pinned) memory the NIC may DMA |
+| lkey / rkey | local / remote key — gate the NIC's access to an MR (rkey is handed to a peer) |
+| QP | Queue Pair — a send queue + receive queue; the connection endpoint |
+| SQ / RQ | Send Queue / Receive Queue inside a QP |
+| CQ | Completion Queue — where the NIC posts a CQE per finished work request |
+| SRQ | Shared Receive Queue — one RQ feeding many QPs |
+| WR | Work Request — a posted operation (becomes a WQE on the wire) |
+| WQE | Work Queue Entry — the hardware descriptor in the SQ/RQ ("an instruction to the NIC") |
+| CQE | Completion Queue Entry — the result the NIC writes into the CQ |
+
+**QP transport types**
+
+| Term | Meaning |
+|------|---------|
+| RC | Reliable Connected — ordered, acked, one peer (what storage uses) |
+| UC | Unreliable Connected |
+| UD | Unreliable Datagram — connectionless |
+
+**Operations**
+
+| Term | Meaning |
+|------|---------|
+| SEND / RECV | two-sided message; the receiver must pre-post a RECV buffer |
+| RDMA WRITE / READ | one-sided push/pull into/out of a peer's memory; peer CPU uninvolved |
+| Atomics | one-sided fetch-add / compare-swap on remote memory |
+
+**Memory & address translation**
+
+| Term | Meaning |
+|------|---------|
+| VA | Virtual Address |
+| MTT | Memory Translation Table — NIC table mapping I/O virtual addresses to bus pages (mlx5) |
+| MKey | Memory Key — mlx5 object binding an lkey/rkey to a translation |
+
+**Hardware / PCIe path**
+
+| Term | Meaning |
+|------|---------|
+| PCIe / PCI | Peripheral Component Interconnect (Express) — the host bus; the NIC is a bus master on it |
+| BAR | Base Address Register — a NIC register window mmap'd into a process |
+| MMIO | Memory-Mapped I/O — a CPU load/store to device registers (e.g. the doorbell) |
+| DB | Doorbell — the MMIO write telling the NIC new WQEs are ready |
+| BlueFlame | mlx5 fast doorbell that inlines a small WQE's bytes, skipping a DMA read |
+| DDIO | Data Direct I/O — steer DMA'd data straight into CPU cache (Intel) |
+
+**Connection setup**
+
+| Term | Meaning |
+|------|---------|
+| CM / rdma_cm | (RDMA) Connection Manager — resolves address/route, swaps QP info |
+| GID | Global IDentifier — an RDMA endpoint address (IB / RoCE) |
+| ARP | Address Resolution Protocol — the IP→MAC lookup the RoCE underlay reuses |
+
+**Fabric & transport**
+
+| Term | Meaning |
+|------|---------|
+| IB / InfiniBand | a lossless RDMA fabric with link-layer flow control |
+| RoCE / RoCEv2 | RDMA over Converged Ethernet (v2 = routable, over UDP/IP) |
+| BTH | Base Transport Header — the InfiniBand transport header (carried over UDP in RoCEv2) |
+| ICRC | Invariant CRC — the RDMA packet's end-to-end checksum |
+| TCP / UDP / IP | standard Internet transport/network protocols |
+| MTU | Maximum Transmission Unit |
+| RTT | Round-Trip Time |
+| PFC | Priority Flow Control — pause-based losslessness on Ethernet |
+| ECN / DCQCN | Explicit Congestion Notification / Data Center QCN — RoCE congestion control |
+
+**Software stack**
+
+| Term | Meaning |
+|------|---------|
+| libibverbs | the generic userspace verbs API (`ibv_*`) |
+| libmlx5 | the mlx5 userspace provider behind libibverbs |
+| mlx5_core | mlx5 PCI/transport driver — owns BARs, firmware command interface, objects |
+| mlx5_ib | mlx5 InfiniBand/verbs provider on top of mlx5_core |
+| ib_core / ib_uverbs | kernel RDMA midlayer / the `/dev/infiniband/uverbsN` syscall surface |
+| `ibv_*` / `rdma_*` | verbs calls (`ibv_reg_mr`, `ibv_post_send`…) / RDMA CM calls (`rdma_connect`…) |
+
+**Workloads**
+
+| Term | Meaning |
+|------|---------|
+| HPC / MPI | High-Performance Computing / Message Passing Interface |
+| NVMe / NVMe-oF | NVM express / NVMe over Fabrics (storage over RDMA) |
+| GPUDirect | direct NIC↔GPU-memory RDMA (GPUDirect RDMA) |
+| AI | Artificial Intelligence (training / inference fabrics) |
+| VM | Virtual Machine |
+
 # 1. Why RDMA Exists (Intuition)
 
 Start with what's wrong with TCP/IP for low-latency, high-throughput
