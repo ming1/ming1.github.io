@@ -34,7 +34,7 @@ This post is dense with RDMA vocabulary. Skim this once and refer back as
 needed; the groups run roughly top to bottom — core concepts, the verbs
 object model, the wire/fabric, then the software stack.
 
-**Core**
+### Core
 
 | Term | Meaning |
 |------|---------|
@@ -44,7 +44,7 @@ object model, the wire/fabric, then the software stack.
 | DMA | Direct Memory Access — a device moving data to/from memory without the CPU |
 | API | Application Programming Interface |
 
-**Verbs object model**
+### Verbs object model
 
 | Term | Meaning |
 |------|---------|
@@ -59,7 +59,7 @@ object model, the wire/fabric, then the software stack.
 | WQE | Work Queue Entry — the hardware descriptor in the SQ/RQ ("an instruction to the NIC") |
 | CQE | Completion Queue Entry — the result the NIC writes into the CQ |
 
-**QP transport types**
+### QP transport types
 
 | Term | Meaning |
 |------|---------|
@@ -67,7 +67,7 @@ object model, the wire/fabric, then the software stack.
 | UC | Unreliable Connected |
 | UD | Unreliable Datagram — connectionless |
 
-**Operations**
+### Operations
 
 | Term | Meaning |
 |------|---------|
@@ -75,7 +75,7 @@ object model, the wire/fabric, then the software stack.
 | RDMA WRITE / READ | one-sided push/pull into/out of a peer's memory; peer CPU uninvolved |
 | Atomics | one-sided fetch-add / compare-swap on remote memory |
 
-**Memory & address translation**
+### Memory & address translation
 
 | Term | Meaning |
 |------|---------|
@@ -83,7 +83,7 @@ object model, the wire/fabric, then the software stack.
 | MTT | Memory Translation Table — NIC table mapping I/O virtual addresses to bus pages (mlx5) |
 | MKey | Memory Key — mlx5 object binding an lkey/rkey to a translation |
 
-**Hardware / PCIe path**
+### Hardware / PCIe path
 
 | Term | Meaning |
 |------|---------|
@@ -94,7 +94,7 @@ object model, the wire/fabric, then the software stack.
 | BlueFlame | mlx5 fast doorbell that inlines a small WQE's bytes, skipping a DMA read |
 | DDIO | Data Direct I/O — steer DMA'd data straight into CPU cache (Intel) |
 
-**Connection setup**
+### Connection setup
 
 | Term | Meaning |
 |------|---------|
@@ -102,7 +102,7 @@ object model, the wire/fabric, then the software stack.
 | GID | Global IDentifier — an RDMA endpoint address (IB / RoCE) |
 | ARP | Address Resolution Protocol — the IP→MAC lookup the RoCE underlay reuses |
 
-**Fabric & transport**
+### Fabric & transport
 
 | Term | Meaning |
 |------|---------|
@@ -116,7 +116,7 @@ object model, the wire/fabric, then the software stack.
 | PFC | Priority Flow Control — pause-based losslessness on Ethernet |
 | ECN / DCQCN | Explicit Congestion Notification / Data Center QCN — RoCE congestion control |
 
-**Software stack**
+### Software stack
 
 | Term | Meaning |
 |------|---------|
@@ -127,7 +127,7 @@ object model, the wire/fabric, then the software stack.
 | ib_core / ib_uverbs | kernel RDMA midlayer / the `/dev/infiniband/uverbsN` syscall surface |
 | `ibv_*` / `rdma_*` | verbs calls (`ibv_reg_mr`, `ibv_post_send`…) / RDMA CM calls (`rdma_connect`…) |
 
-**Workloads**
+### Workloads
 
 | Term | Meaning |
 |------|---------|
