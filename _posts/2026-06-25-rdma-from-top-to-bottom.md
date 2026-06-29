@@ -647,13 +647,18 @@ ib_send_bw -d mlx5_0 -F
 ib_send_bw -d mlx5_0 -F 192.168.1.10
 ```
 
-Useful flags: `-d <dev>` selects the RDMA device (`ibv_devices` lists them), `-s
-<bytes>` sets message size, `-F` ignores CPU frequency-scaling warnings, `-R`
-uses the RDMA CM for connection setup, and `--report_gbits` prints Gb/s. For
-latency instead of bandwidth, swap in `ib_write_lat` / `ib_read_lat` /
-`ib_send_lat` (these `*_lat` tools report **one-way** latency, i.e. half the
-ping-pong RTT). Watching `ib_write_lat` report ~1-µs one-way latency while the
-server CPU sits idle is the whole thesis of this post in one command.
+Useful flags (shared by the `ib_*_bw` and `ib_*_lat` tools):
+
+- `-d <dev>` — pick the RDMA device (`ibv_devices` lists them)
+- `-s <bytes>` — message size
+- `-F` — ignore CPU frequency-scaling warnings
+- `-R` — use the RDMA CM for connection setup
+- `--report_gbits` — report throughput in Gb/s
+
+For latency instead of bandwidth, swap in `ib_write_lat` / `ib_read_lat` /
+`ib_send_lat`; the `*_lat` tools report **one-way** latency (half the
+ping-pong RTT). Watching `ib_write_lat` report ~1-µs one-way latency while
+the server CPU sits idle is the whole thesis of this post in one command.
 
 # 9. Mental Model Summary
 
