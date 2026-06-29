@@ -1853,7 +1853,7 @@ case NVME_KEY_SGL_FMT_DATA_DESC:    /* keyed — fetch it over RDMA */
 target-side scatterlists (`nvmet_req_alloc_sgls`), then builds an
 `rdma_rw_ctx` describing the READ-or-WRITE the HCA must perform. The
 `INVALIDATE` subtype also records `rsp->invalidate_rkey`, so the completion
-SEND can remotely invalidate the host's memory region for free (§15.8).
+SEND can remotely invalidate the host's memory region for free (§15.9).
 
 ### 15.3 The object model
 
@@ -1938,7 +1938,111 @@ each one-sided transfer as reliable without its own retransmit logic.
 Receive buffers are posted *before* the accept, so the HCA can land the
 host's first capsule the instant the link goes LIVE.
 
-### 15.6 A command, top to bottom
+### 15.6 NVMe-RDMA wire protocol for READ / WRITE
+
+§13 gave the byte-level wire reference for NVMe-TCP. RDMA's "wire" is not
+PDUs on a byte stream but **RDMA verbs on a reliable QP** (§15.5). Three
+operations carry everything:
+
+| Verb | Direction | Carries |
+|------|-----------|---------|
+| `SEND`      | host → target     | command capsule: 64-byte SQE [+ inline data] |
+| `SEND`      | target → host     | response capsule: 16-byte CQE |
+| RDMA `WRITE`| target → host mem | READ data, pushed into host memory |
+| RDMA `READ` | host mem → target | WRITE data, pulled from host memory |
+
+There is no R2T/H2CData handshake and no data PDU: the target moves the
+payload itself with one-sided RDMA, named by the **keyed SGL** in the
+command (§15.2). Compare §13.2's seven PDU types — RDMA needs none of them.
+
+**The command capsule.** A `SEND` delivers the 64-byte NVMe SQE (the same
+`nvme_rw_command` as §13.4) into a receive buffer the target preposted
+(`nvmet_rdma_cmd`). Its data pointer is one SGL descriptor whose `type`
+picks how data moves — the routing byte of §13.5, plus a *keyed* form:
+
+| SGL `type` | Meaning on NVMe-RDMA |
+|------------|----------------------|
+| in-capsule (`DATA_DESC` + `OFFSET`) | small WRITE data rides in the SEND, after the SQE (inline) |
+| keyed (`KEY_SGL_FMT_DATA_DESC` + `ADDRESS`) | `{addr, rkey, length}` — target RDMAs to/from host memory |
+| keyed + `INVALIDATE` | as above, and the response SEND invalidates the host's rkey (§15.9) |
+
+`nvmet_rdma_map_sgl()` decodes this: it either points the request at the
+inline data or builds an `rdma_rw_ctx` for the transfer (§15.2).
+
+**READ on the wire.** The target pushes the data into host memory with an
+RDMA `WRITE`, then signals completion with a `SEND`:
+
+```
+   Host                                            Target
+    │── SEND  CapsuleCmd ───────────────────────────▶│ nvmet_rdma_recv_done
+    │   SQE: opcode=READ, slba, length               │ map_sgl (keyed)
+    │   dptr.ksgl = { addr, rkey, len }              │ execute → submit_bio
+    │                                                 │ … backend completes …
+    │◀═════════ RDMA WRITE  (payload) ════════════════│ rdma_rw_ctx_wrs: WRITEs…
+    │   data DMA'd straight into host {addr}          │
+    │◀── SEND  Response (CQE) ────────────────────────│ …then the SEND
+    │   cqe.command_id, status                        │ (one ib_post_send)
+```
+
+The data WRITE and the CQE SEND are chained in a single `ib_post_send`
+(`rdma_rw_ctx_wrs(..., &send_wr)`), so payload and completion leave
+back-to-back.
+
+**WRITE on the wire — inline (small I/O).** When the data fits the
+negotiated in-capsule size, the host appends it to the `SEND` (SGL
+`OFFSET`); the target reads it from the recv buffer — no RDMA step:
+
+```
+   Host                                            Target
+    │── SEND  CapsuleCmd + data ─────────────────────▶│ data already local
+    │   SQE: opcode=WRITE, dptr.sgl.type=OFFSET       │ execute → submit_bio
+    │   < inline WRITE bytes >                        │ … backend completes …
+    │◀── SEND  Response (CQE) ────────────────────────│ nvmet_rdma_queue_response
+```
+
+**WRITE on the wire — keyed (large I/O).** Here RDMA replaces TCP's
+R2T/H2CData round-trip (§13.8) with one **one-sided RDMA READ** — the
+target pulls the data out of host memory itself:
+
+```
+   Host                                            Target
+    │── SEND  CapsuleCmd ───────────────────────────▶│ map_sgl (keyed)
+    │   SQE: opcode=WRITE                             │ execute_command:
+    │   dptr.ksgl = { addr, rkey, len }               │
+    │═════════ RDMA READ  (pull payload) ════════════▶│ rdma_rw_ctx_post(read_cqe)
+    │   target DMAs data out of host {addr}           │ … read_data_done →
+    │                                                 │ execute → submit_bio
+    │◀── SEND  Response (CQE) ────────────────────────│ nvmet_rdma_queue_response
+```
+
+The host CPU is idle during the RDMA READ — the contrast with §13.8, where
+the host must stream `H2CData` PDUs back.
+
+**The response capsule.** The 16-byte NVMe CQE (the same `nvme_completion`
+as §13.9) travels in a `SEND`. If the command's SGL was tagged
+`INVALIDATE`, the target sends it as `IB_WR_SEND_WITH_INV` carrying the
+host's rkey, so the host's memory region is invalidated as a side effect
+of the completion (§15.9).
+
+**Connection setup.** There is no ICReq/ICResp (§13.11). The queue pair is
+established through `rdma_cm` (§15.5); the NVMe parameters (queue sizes,
+`cntlid`, host/controller identifiers) ride in the **RDMA-CM private data**
+(`nvme_rdma_cm_req` / `nvme_rdma_cm_rep`) exchanged in the connect/accept
+handshake.
+
+**Wire concept → kernel code** (the §13.12 analog):
+
+| On the wire | Target-side function |
+|-------------|----------------------|
+| inbound `SEND` (capsule) | `nvmet_rdma_recv_done` → `nvmet_rdma_handle_command` |
+| SGL decode | `nvmet_rdma_map_sgl` / `nvmet_rdma_map_sgl_keyed` |
+| RDMA `READ` (pull WRITE data) | `rdma_rw_ctx_post(&rsp->rw, …, &read_cqe)` |
+| RDMA `WRITE` (push READ data) | `rdma_rw_ctx_wrs(&rsp->rw, …, &send_wr)` |
+| outbound `SEND` (CQE) | `nvmet_rdma_queue_response` (`IB_WR_SEND[_WITH_INV]`) |
+
+§15.7 traces these same operations through the code, function by function.
+
+### 15.7 A command, top to bottom
 
 A **WRITE** (the interesting case — it needs an RDMA READ) and a **READ**,
 function by function:
@@ -1993,7 +2097,7 @@ a `sock_recvmsg`/`sock_sendmsg`:
   `&send_wr` (`rdma.c:724`), so payload and completion ride out
   back-to-back.
 
-### 15.7 Why `rdma_rw_ctx`: no hand-rolled memory registration
+### 15.8 Why `rdma_rw_ctx`: no hand-rolled memory registration
 
 `nvmet` never builds RDMA READ/WRITE work requests by hand. It drives the
 kernel's generic **RDMA-RW API**
@@ -2013,7 +2117,7 @@ local MR to read; many RoCE/IB HCAs scatter directly. `nvmet` stays
 oblivious; `n_rdma` simply counts however many WRs the helper produced, and
 that count feeds the `sq_wr_avail` credit accounting.
 
-### 15.8 The details that matter
+### 15.9 The details that matter
 
 - **Inline data.** Small WRITEs skip RDMA entirely: if the host marks the
   SGL `NVME_SGL_FMT_OFFSET`, the data rides inside the recv buffer, exactly
@@ -2036,7 +2140,7 @@ that count feeds the `sq_wr_avail` credit accounting.
   (`nvmet_rdma_srq`), cutting per-queue buffer memory on targets fielding
   thousands of connections.
 
-### 15.9 TCP vs RDMA at a glance
+### 15.10 TCP vs RDMA at a glance
 
 | Aspect | NVMe-TCP (§13–14) | NVMe-RDMA (§15) |
 |--------|-------------------|------------------|
