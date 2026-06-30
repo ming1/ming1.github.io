@@ -1815,8 +1815,22 @@ HCA DMAs between the two machines' memory, and each CPU touches only the
    Host ── CapsuleCmd ──▶ Target      Host ── SEND(cmd+ksgl) ──▶ Target
    Host ◀───── R2T ────── Target                                  │ RDMA READ
    Host ── H2CData ─────▶ Target      Host ◀═══ data pulled ══════╡ (one-sided,
-   Host ── H2CData ─────▶ Target            (host CPU idle)        │  no host CPU)
+   Host ── H2CData ─────▶ Target            (host CPU idle)       │  no host CPU)
         (target copies out)                                       │
+   Host ◀───── Rsp ────── Target      Host ◀──── SEND(cqe) ─────── Target
+```
+
+The READ direction is the mirror image — the target pushes the data with a
+one-sided RDMA WRITE instead of streaming C2HData PDUs:
+
+```
+   NVMe-TCP READ                      NVMe-RDMA READ
+   ─────────────                      ──────────────
+   Host ── CapsuleCmd ──▶ Target      Host ── SEND(cmd+ksgl) ──▶ Target
+                                                                  │ RDMA WRITE
+   Host ◀── C2HData ───── Target      Host ◀═══ data pushed ══════╡ (one-sided,
+   Host ◀── C2HData ───── Target            (host CPU idle)       │  no host CPU)
+        (target streams PDUs)                                     │
    Host ◀───── Rsp ────── Target      Host ◀──── SEND(cqe) ─────── Target
 ```
 
