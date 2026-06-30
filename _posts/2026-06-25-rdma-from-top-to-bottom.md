@@ -28,6 +28,18 @@ ending with a step-by-step datapath walk through a Mellanox/NVIDIA ConnectX-5
 connection and registers memory, then gets out of the way — every byte of the
 data path runs hardware-to-memory over PCIe, bypassing the kernel entirely.**
 
+[Introduction to Remote Direct Memory Access (RDMA)](https://www.rdmamojo.com/2014/03/31/remote-direct-memory-access-rdma/)
+
+**Message based transactions - the data is handled as discrete messages and
+not as a stream, which eliminates the need of the application to separate
+the stream into different messages/transactions.**
+
+[An In-Depth Understanding of RDMA Interaction Mechanism between Software and Hardware](https://www.alibabacloud.com/blog/601598)
+
+
+[RDMA Tutorial](https://www.doc.ic.ac.uk/~jgiceva/teaching/ssc18-rdma.pdf)
+
+
 # Terms and abbreviations
 
 This post is dense with RDMA vocabulary. Skim this once and refer back as
