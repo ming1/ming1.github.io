@@ -106,7 +106,7 @@ object model, the wire/fabric, then the software stack.
 
 | Term | Meaning |
 |------|---------|
-| IB / InfiniBand | a lossless RDMA fabric with link-layer flow control |
+| InfiniBand (IB) | a purpose-built RDMA network architecture — its own link/network/transport layers, LID addressing, and a subnet manager; the native, link-layer-lossless RDMA fabric that RoCE later carried over Ethernet |
 | RoCE / RoCEv2 | RDMA over Converged Ethernet (v2 = routable, over UDP/IP) |
 | BTH | Base Transport Header — the InfiniBand transport header (carried over UDP in RoCEv2) |
 | ICRC | Invariant CRC — the RDMA packet's end-to-end checksum |
