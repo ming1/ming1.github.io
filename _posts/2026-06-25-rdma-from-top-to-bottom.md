@@ -641,7 +641,7 @@ context; **PSN** is how it detects loss and reordering.
 
 ## 7.3 Opcodes and message segmentation
 
-The OpCode's top 3 bits select the **transport service** (RC / UC / UD / RD),
+The OpCode's top 3 bits select the **transport service** (RC / UC / RD / UD),
 and the low 5 bits the **operation** — and, crucially, *where this packet sits
 in a multi-packet message*:
 
@@ -783,10 +783,12 @@ completion carries a fatal status:
 | `np_ecn_marked_roce_packets`, `rp_cnp_handled` | DCQCN congestion is actually happening |
 | `roce_adp_retrans` | adaptive retransmission kicking in (real loss) |
 
-Pair those with the netdev's physical counters (`ethtool -S <netdev>`:
-`rx_discards*`, `rx_pause`/`tx_pause`, CRC/`rx_crc_errors`) and the switch port's
-drop and PAUSE counts. The tell-tale: if `local_ack_timeout_err` climbs while
-one hop shows high `rx_pause` **and** non-zero drops, PFC isn't holding there
+Pair those with the netdev's physical counters. On mlx5, `ethtool -S <netdev>`
+reports `rx_discards_phy`, the PAUSE counters `rx_pause_ctrl_phy` /
+`tx_pause_ctrl_phy` (and per-priority `rx_prioN_pause` / `tx_prioN_pause`), and
+`rx_crc_errors_phy`; add the switch port's drop and PAUSE counts. The tell-tale:
+if `local_ack_timeout_err` climbs while one hop shows a rising
+`*_pause_ctrl_phy` **and** non-zero `rx_discards_phy`, PFC isn't holding there
 and packets are dropping — chase that hop. If `local_ack_timeout_err` climbs
 with **no** loss anywhere, your `timeout` is just too small.
 
