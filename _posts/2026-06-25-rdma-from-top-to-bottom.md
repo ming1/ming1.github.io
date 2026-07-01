@@ -188,7 +188,7 @@ small messages (versus tens of µs for tuned TCP), **line-rate throughput at nea
 zero CPU**, and freed cache/memory bandwidth. That is why RDMA underpins HPC
 (MPI), distributed storage (NVMe-oF, Ceph, Lustre, SMB Direct), and AI training
 fabrics (GPUDirect RDMA). The cost is complexity and a network that must behave
-(see §7).
+(see §8).
 
 For a concrete consumer — how the Linux kernel NVMe target drives one-sided RDMA
 via keyed SGLs and the `rdma_rw` API — see
@@ -592,7 +592,144 @@ to DMA safely and asynchronously, the target pages must be pinned and their bus
 addresses pre-translated and key-protected (§4.2). The MR is precisely the
 contract that makes bus-master DMA into application memory safe.
 
-# 7. Performance Model
+# 7. The RDMA Wire Protocol (IB / RoCEv2 packets)
+
+Everything so far described *what* the NIC does; this section is *what it puts
+on the wire*. RDMA's transport is defined by the InfiniBand Architecture
+(IBTA, Vol. 1); **RoCEv2** carries those exact transport packets over UDP/IP so
+they route on Ethernet. Below the verbs and the doorbell, a queue pair is just
+two endpoints exchanging these packets — and the packet's ACK/flow-control
+rules are what make RoCE's fabric requirements (§8) make sense.
+
+## 7.1 Packet anatomy (and RoCEv2 encapsulation)
+
+A RoCEv2 packet is an ordinary UDP datagram whose payload is an InfiniBand
+transport packet:
+
+```
+ RoCEv2:  Ethernet [+VLAN] │ IPv4/IPv6 │ UDP dport=4791    ← routable encap
+             └──▶ BTH(12B) │ [RETH/AETH/ImmDt…] │ payload(≤MTU) │ ICRC(4B)
+                  the InfiniBand transport packet (opaque to routers)
+```
+
+- **RoCEv2** = `Ethernet | IP | UDP(4791) | BTH | … | ICRC`, so it routes like
+  any UDP flow (v1 used a raw Ethertype and did not route). Native
+  **InfiniBand** instead prefixes an **LRH** (LID-addressed local route header)
+  and optional **GRH**, and ends with a VCRC — but the transport part (BTH
+  onward) is byte-for-byte identical.
+- The **ICRC** is an *invariant* CRC over the fields that don't change hop to
+  hop; it protects the RDMA payload end-to-end, independent of the Ethernet FCS.
+- Routers see only UDP; only the endpoint NICs parse BTH and below.
+
+## 7.2 The Base Transport Header (BTH)
+
+Every transport packet starts with a 12-byte BTH — RDMA's equivalent of a TCP
+header:
+
+| Field | Meaning |
+|-------|---------|
+| **OpCode** (8b) | transport service + operation + position in message (§7.3) |
+| **SE** (1b) | Solicited Event — wake a solicited-only receiver (§6.2) |
+| **PadCount / TVer** | payload pad bytes; transport header version |
+| **P_Key** (16b) | partition key — a coarse "VLAN for RDMA" |
+| **DestQP** (24b) | destination queue-pair number on the peer |
+| **AckReq** (1b) | responder must return an ACK for this packet |
+| **PSN** (24b) | Packet Sequence Number — per-QP; drives ordering + retransmit |
+
+`DestQP` plus the source address is how the receiving NIC finds the right QP
+context; **PSN** is how it detects loss and reordering.
+
+## 7.3 Opcodes and message segmentation
+
+The OpCode's top 3 bits select the **transport service** (RC / UC / UD / RD),
+and the low 5 bits the **operation** — and, crucially, *where this packet sits
+in a multi-packet message*:
+
+- `SEND First / Middle / Last / Only`
+- `RDMA WRITE First / Middle / Last / Only`
+- `RDMA READ Request`, `RDMA READ Response First / Middle / Last / Only`
+- `Acknowledge`, `Atomic` (CmpSwap / FetchAdd), `…-with-Immediate`,
+  `SEND-with-Invalidate`
+
+A message larger than the **path MTU** (256 B – 4 KB) is chopped into
+`First → Middle* → Last` packets with consecutive PSNs; a message that fits one
+MTU is a single **Only** packet. The receiver reassembles by PSN.
+
+## 7.4 Extended transport headers
+
+Right after the BTH, some operations carry an extra header:
+
+| Header | On | Fields |
+|--------|----|--------|
+| **RETH** | RDMA WRITE/READ *first/only request* | Virtual Address (64), R_Key (32), DMA Length (32) |
+| **AETH** | ACK, RDMA READ *response* | Syndrome (ACK/NAK code, or SEND credits) + MSN |
+| **ImmDt** | *-with-Immediate | 32-bit immediate value delivered in the CQE |
+| **IETH** | SEND-with-Invalidate | R_Key to invalidate on the remote |
+| **DETH** | UD | Q_Key + source QP (datagrams carry no connection) |
+
+The **RETH** is the on-the-wire form of the `{addr, rkey, length}` you handed
+to `ibv_post_send` for a one-sided op — this is literally how "one-sided"
+travels: the request packet names the remote memory.
+
+## 7.5 Reliable Connected on the wire: PSN, ACK, retransmit, flow control
+
+RC is the interesting service: in-order, acknowledged, exactly-once, with
+PSN-based loss recovery. The three operations map to these packet exchanges
+(single-MTU shown):
+
+```
+ SEND        Req ── SEND Only ─────────────▶  consumes an RQ WQE
+                 ◀──────── ACK (AETH) ───────
+
+ RDMA WRITE  Req ── WRITE Only (RETH+data) ▶  lands at {VA, R_Key}
+                 ◀──────── ACK (AETH) ───────
+
+ RDMA READ   Req ── READ Request (RETH) ────▶
+                 ◀── READ Response (AETH+data)   (responses are the ack)
+```
+
+- **ACK / PSN.** The responder tracks the expected PSN. ACKs are *coalesced* —
+  one `Acknowledge` can acknowledge many packets — and the `AckReq` bit lets a
+  requester force one (e.g. on a message's Last packet). READ responses need no
+  separate ACK: the response packets themselves advance the requester.
+- **NAK & retransmit.** A PSN gap makes the responder return a **NAK-Sequence-
+  Error** (an AETH syndrome); the requester does **go-back-N**, retransmitting
+  from the expected PSN. A retransmit timeout does the same.
+- **RNR (Receiver Not Ready).** A SEND that finds no posted RQ WQE draws an
+  **RNR NAK** carrying a back-off timer; the requester waits, then retries.
+  This is the `min_rnr_timer` you set at RTR.
+- **End-to-end flow control.** For SENDs the ACK's AETH syndrome also returns
+  **credits** — how many more receive buffers the peer has — so a fast sender
+  can't overrun the receiver. One-sided WRITE/READ need no credits (the RETH
+  names the target memory directly).
+
+The NIC runs this whole ACK/PSN/retransmit state machine in silicon, which is
+why the application sees only completions, never a packet.
+
+## 7.6 RoCEv2 on Ethernet: PFC, ECN, and head-of-line blocking
+
+RC's go-back-N assumes a **near-lossless** link — over a drop-happy network it
+collapses. Native InfiniBand gets losslessness from credit-based flow control
+in the fabric itself. RoCEv2 rides Ethernet, which drops under congestion, so
+the underlay must be made lossless two ways:
+
+- **PFC (Priority Flow Control, 802.1Qbb)** — a switch nearing buffer
+  exhaustion sends a PAUSE for a traffic class, stopping the upstream port. It
+  is lossless but blunt: it pauses *the whole priority*, so one congested
+  destination can stall unrelated flows sharing that class — classic
+  **head-of-line (HoL) blocking** — and if PAUSEs form a cycle, **PFC
+  deadlock**.
+- **ECN + DCQCN** — switches ECN-mark packets under load; the receiver reflects
+  a **CNP** to the sender, which throttles that flow (DCQCN). This keeps queues
+  short so PFC rarely has to fire, which is what keeps HoL blocking rare.
+
+HoL blocking also lives in the transport: RC delivers **in order per QP**, so
+with plain go-back-N a single dropped packet forces retransmission of every
+packet after it in the message — the tail waits on the head. (Modern NICs add
+selective-retransmit to soften this.) Getting §8's "tuned lossless fabric"
+right is largely the work of keeping *both* forms of HoL blocking from biting.
+
+# 8. Performance Model
 
 Why RDMA is fast, stated as causes, then the costs.
 
@@ -635,7 +772,7 @@ The honest summary: RDMA trades **operational and programming complexity** for
 **latency and CPU efficiency**. It wins decisively when the workload is
 latency-sensitive or CPU-bound on networking, and is overkill when it isn't.
 
-# 8. Practical RDMA Example
+# 9. Practical RDMA Example
 
 The quickest way to *see* RDMA is the `perftest` suite (package `perftest`),
 which exercises the datapath end to end. Each tool is a server/client pair; the
@@ -691,7 +828,7 @@ is in [`code/rdma-hello.c`]({{ site.baseurl }}/code/rdma-hello.c); see
 environment setup (it runs on an ordinary box via Soft-RoCE) and how to run
 it.
 
-# 9. Mental Model Summary
+# 10. Mental Model Summary
 
 One paragraph: **RDMA is a contract that lets a NIC move data directly between
 application buffers on two machines, with the kernel present only at setup.**
