@@ -729,6 +729,67 @@ packet after it in the message — the tail waits on the head. (Modern NICs add
 selective-retransmit to soften this.) Getting §8's "tuned lossless fabric"
 right is largely the work of keeping *both* forms of HoL blocking from biting.
 
+## 7.7 ACK timeouts, retries, and diagnosing loss
+
+This is where the wire protocol turns into real-world pain, and the failure
+you are most likely to hit on RoCE. Two QP timers govern recovery, both
+configured when the QP is moved to RTS (`ibv_modify_qp`, or the CM's defaults):
+
+- **`timeout`** — the *local ACK timeout*. The requester waits
+  `4.096 µs × 2^timeout` for an ACK before retransmitting. It is exponential and
+  easy to set too small: `timeout=14` ≈ 67 ms, `timeout=18` ≈ 1 s; `0` means
+  *wait forever*.
+- **`retry_cnt`** — how many times the requester retransmits after ACK timeouts
+  before giving up (0–7). **`rnr_retry`** is the parallel count for RNR NAKs
+  (`7` = infinite).
+
+When those are exhausted the QP transitions to **ERROR** and the next
+completion carries a fatal status:
+
+- **`IBV_WC_RETRY_EXC_ERR`** ("transport retry counter exceeded") — the
+  requester retransmitted `retry_cnt` times and *never got an ACK*. The ACKs or
+  the data packets are being **lost**, or the peer isn't answering. This is the
+  completion you see behind an "ACK timeout."
+- **`IBV_WC_RNR_RETRY_EXC_ERR`** — the receiver kept returning **RNR NAK** (no
+  RQ WQE) until `rnr_retry` ran out: the app isn't posting receives fast enough
+  — an application problem, not a fabric one.
+
+**Why an ACK timeout usually happens on RoCE** (roughly in order):
+
+1. **The fabric isn't actually lossless.** PFC must be enabled and *matched on
+   every hop* and on the right priority (the DSCP/PCP your RoCE traffic uses).
+   One switch or NIC that drops the RoCE class silently loses packets → the ACK
+   never comes. This is the #1 cause.
+2. **`timeout` too small for the path RTT** (multi-hop, congested, or
+   long-distance): the timer fires before a legitimately slow ACK returns,
+   burning retries until `retry_cnt` is gone. Raise `timeout`/`retry_cnt`.
+3. **A black-holed path** — wrong GID index (RoCEv1 vs v2, wrong subnet), MTU
+   mismatch, or an ACL/firewall dropping **UDP 4791** — so some packets never
+   arrive.
+4. **Peer QP in error or gone** (crash; or a one-sided WRITE that hit an MR
+   without `REMOTE_WRITE` or used a stale `rkey`, so the responder NAKs — repeat
+   it and it looks like a stall).
+
+**Where to look.** mlx5 exposes per-port RoCE counters under
+`/sys/class/infiniband/<dev>/ports/1/hw_counters/`:
+
+| Counter | Rising means |
+|---------|--------------|
+| `local_ack_timeout_err` | your requester's ACK timer is firing — the smoking gun |
+| `packet_seq_err` | packets arrived with an unexpected PSN → loss/reorder upstream |
+| `out_of_buffer` | responder had no RQ WQE (the RNR path) |
+| `rnr_nak_retry_err` | RNR NAKs sent — receiver kept running out of buffers |
+| `req_cqe_error` / `resp_cqe_error` | requester/responder completions ending in error |
+| `np_ecn_marked_roce_packets`, `rp_cnp_handled` | DCQCN congestion is actually happening |
+| `roce_adp_retrans` | adaptive retransmission kicking in (real loss) |
+
+Pair those with the netdev's physical counters (`ethtool -S <netdev>`:
+`rx_discards*`, `rx_pause`/`tx_pause`, CRC/`rx_crc_errors`) and the switch port's
+drop and PAUSE counts. The tell-tale: if `local_ack_timeout_err` climbs while
+one hop shows high `rx_pause` **and** non-zero drops, PFC isn't holding there
+and packets are dropping — chase that hop. If `local_ack_timeout_err` climbs
+with **no** loss anywhere, your `timeout` is just too small.
+
 # 8. Performance Model
 
 Why RDMA is fast, stated as causes, then the costs.
