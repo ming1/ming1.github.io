@@ -519,6 +519,18 @@ the completion channel fd until the NIC raises an interrupt (better CPU
 efficiency, higher latency). This is exactly the latency/CPU trade-off every
 RDMA app tunes.
 
+A refinement on the event path is the **solicited** bit. A sender can post a
+SEND with `IBV_SEND_SOLICITED` (the SE bit in the packet's transport header);
+on the receiver that completion is flagged *solicited*, and
+`ibv_req_notify_cq(cq, solicited_only=1)` arms the CQ to raise a
+completion-channel event **only** for solicited completions — unsolicited ones
+still land in the CQ but don't wake the sleeper. So a receiver can stay
+event-driven yet be woken just once for what matters: the sender streams a
+batch of RDMA WRITEs (which post no receiver CQE at all), then fires a single
+solicited SEND as the "it's ready" doorbell — instead of taking an interrupt
+per message. (Only SEND and Write-with-immediate can be solicited; pure
+one-sided WRITE/READ generate no receiver completion to signal.)
+
 ## 6.3 WQE / CQE / CQ lifecycle
 
 Three objects, one cycle:
