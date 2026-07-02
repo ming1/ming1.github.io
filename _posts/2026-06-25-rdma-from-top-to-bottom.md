@@ -336,12 +336,15 @@ bottom — the kernel for setup, mmap'd hardware for data:
         │ ioctl/write()  │ plain loads + stores
         ▼                ▼
  /dev/infiniband/uverbsN    mmap'd SQ/RQ/CQ rings + doorbell page
-   (kernel ib_uverbs, §5)        (no kernel involvement)
+   (kernel ib_uverbs, §5)      (no kernel — hardware providers)
 ```
 
-`ibv_open_device()` is where the two halves meet: libibverbs matches the
-device to its provider library, the provider opens `uverbsN`, and everything
-after that dispatches through a per-device function table.
+`ibv_open_device()` is where the two halves meet: libibverbs opens `uverbsN`
+and hands the fd to the provider's context setup, and everything after that
+dispatches through a per-device function table. One caveat on the right-hand
+exit: software providers (rxe, siw) have no silicon to ring, so their
+"doorbell" is itself a small command `write()` into the kernel — the
+no-syscall data path is a hardware-provider property.
 
 ### 4.2 The interface: three families of calls
 
@@ -350,12 +353,14 @@ only one allowed on the hot path:
 
 | Family | Calls | Enters kernel? |
 |--------|-------|----------------|
-| setup / teardown | `ibv_get_device_list`, `ibv_open_device`, `ibv_alloc_pd`, `ibv_reg_mr`, `ibv_create_cq`, `ibv_create_qp`, `ibv_modify_qp`, `ibv_query_*`, destroy/dealloc | yes — one command syscall each |
+| setup / teardown | `ibv_get_device_list`, `ibv_open_device`, `ibv_alloc_pd`, `ibv_reg_mr`, `ibv_create_cq`, `ibv_create_qp`, `ibv_modify_qp`, `ibv_query_*`, destroy/dealloc | yes — a uverbs command syscall (device enumeration: sysfs reads) |
 | data path | `ibv_post_send`, `ibv_post_recv`, `ibv_poll_cq`, `ibv_req_notify_cq` | **no** — memory ops + MMIO only |
-| events | `ibv_get_cq_event` / `ibv_ack_cq_events`, `ibv_get_async_event` | yes — blocking `read()` on an fd |
+| events | `ibv_get_cq_event`, `ibv_get_async_event` | yes — blocking `read()` on an fd |
 
 Everything in row one happens once per connection or buffer; row two runs per
 I/O; row three is for threads that want to sleep instead of poll.
+(`ibv_ack_cq_events`, the bookkeeping partner of `get_cq_event`, is a pure
+userspace counter — no syscall.)
 
 ### 4.3 The objects: public structs, private containers
 
@@ -423,7 +428,7 @@ and mixing them up is the classic verbs performance bug:
 
 ```
  app ── ibv_create_qp(pd, attr)
-   └─ libibverbs → ctx->ops.create_qp()          dispatch
+   └─ libibverbs → provider verbs_context_ops    dispatch
        └─ libmlx5: allocate SQ/RQ ring buffers +
           doorbell record in ordinary host memory
           └─ marshal create-QP command (with those
@@ -437,7 +442,10 @@ and mixing them up is the classic verbs performance bug:
 
 The kernel validates and programs the NIC, but the queues themselves live in
 memory the *provider* allocated — which is exactly what lets the data path
-skip the kernel afterwards.
+skip the kernel afterwards. (A dispatch detail: control verbs like
+`ibv_create_qp` are exported functions that route through the provider's
+extended `verbs_context_ops` table; the legacy `ibv_context.ops` slots stay
+live only for the data-path entries quoted below.)
 
 **Data path** — `ibv_post_send()` is, in its entirety, an inline dispatch:
 
@@ -544,7 +552,7 @@ connection establishment — never per message.**
 
 ### 5.4 Why the kernel is absent from the data path
 
-Put 4.1–4.3 together: by the time the first `post_send` happens, the QP's SQ/RQ
+Put 5.1–5.3 together: by the time the first `post_send` happens, the QP's SQ/RQ
 and the CQ live in memory the application has mmap'd, and the NIC's doorbell
 sits in a BAR page the application has mmap'd (with PD/key checks enforced by
 hardware). There is nothing left for the kernel to do. Posting and reaping are
@@ -1071,6 +1079,7 @@ the queue the app polls. No syscall, no copy, no remote CPU on the data path.
  App ─verbs─► [kernel: setup once] ─► NIC ─DMA/PCIe─► memory ⇄ wire ⇄
                                           remote NIC ─► remote memory
 ```
+
 
 # Summary
 
