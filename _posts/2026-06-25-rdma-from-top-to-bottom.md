@@ -188,7 +188,7 @@ small messages (versus tens of µs for tuned TCP), **line-rate throughput at nea
 zero CPU**, and freed cache/memory bandwidth. That is why RDMA underpins HPC
 (MPI), distributed storage (NVMe-oF, Ceph, Lustre, SMB Direct), and AI training
 fabrics (GPUDirect RDMA). The cost is complexity and a network that must behave
-(see §8).
+(see §9).
 
 For a concrete consumer — how the Linux kernel NVMe target drives one-sided RDMA
 via keyed SGLs and the `rdma_rw` API — see
@@ -306,12 +306,167 @@ trading QP numbers, packet sequence numbers, and GIDs out-of-band.
 After `rdma_connect()` returns, the kernel is done. The message loop is just
 "write a descriptor, ring a bell, later read a result" — all in user space.
 
-# 4. Kernel Internals (Linux RDMA Stack)
+# 4. Inside libibverbs: Interface, Objects, Contexts, Implementation
+
+§3 *used* the verbs API; this section opens the library itself. libibverbs
+(part of [rdma-core](https://github.com/linux-rdma/rdma-core)) is the
+userspace half of the RDMA stack: one vendor-neutral API that applications
+link against, plus a per-device **provider** plugin (`libmlx5`, `librxe`, …)
+that knows the silicon's descriptor formats. Top to bottom: the architecture,
+the API surface, the objects behind it, who calls it from where, and what a
+call actually does.
+
+### 4.1 The library at a glance
+
+One stable API on top; a provider underneath; two very different exits at the
+bottom — the kernel for setup, mmap'd hardware for data:
+
+```
+        application
+             │  ibv_* calls (stable API/ABI)
+             ▼
+ ┌─ libibverbs ─────────────────┐  vendor-neutral core: scans
+ │  device list, ABI checks,    │  /sys/class/infiniband, loads the
+ │  dispatch: ctx->ops.xxx()    │  matching provider, owns event fds
+ └───────────────┬──────────────┘
+                 ▼
+ ┌─ provider (libmlx5, librxe…)─┐  knows WQE/CQE layout and the
+ │  control path │  data path   │  doorbell protocol of the device
+ └──────┬────────┴───────┬──────┘
+        │ ioctl/write()  │ plain loads + stores
+        ▼                ▼
+ /dev/infiniband/uverbsN    mmap'd SQ/RQ/CQ rings + doorbell page
+   (kernel ib_uverbs, §5)        (no kernel involvement)
+```
+
+`ibv_open_device()` is where the two halves meet: libibverbs matches the
+device to its provider library, the provider opens `uverbsN`, and everything
+after that dispatches through a per-device function table.
+
+### 4.2 The interface: three families of calls
+
+The API is small, and the split below *is* the design — the middle row is the
+only one allowed on the hot path:
+
+| Family | Calls | Enters kernel? |
+|--------|-------|----------------|
+| setup / teardown | `ibv_get_device_list`, `ibv_open_device`, `ibv_alloc_pd`, `ibv_reg_mr`, `ibv_create_cq`, `ibv_create_qp`, `ibv_modify_qp`, `ibv_query_*`, destroy/dealloc | yes — one command syscall each |
+| data path | `ibv_post_send`, `ibv_post_recv`, `ibv_poll_cq`, `ibv_req_notify_cq` | **no** — memory ops + MMIO only |
+| events | `ibv_get_cq_event` / `ibv_ack_cq_events`, `ibv_get_async_event` | yes — blocking `read()` on an fd |
+
+Everything in row one happens once per connection or buffer; row two runs per
+I/O; row three is for threads that want to sleep instead of poll.
+
+### 4.3 The objects: public structs, private containers
+
+The public structs in `<infiniband/verbs.h>` are deliberately thin — an
+`ibv_qp` is little more than the QP number, state, and back-pointers. The
+provider embeds each one in a private container holding the real machinery:
+
+```
+ public (verbs.h)                    provider-private (libmlx5)
+ ────────────────                    ─────────────────────────
+ struct ibv_context ◄─container_of── struct mlx5_context
+   .ops  = dispatch table              └─ UAR pages, clock info…
+   .cmd_fd = uverbsN fd
+   .async_fd
+        ▲ .context back-pointer
+ struct ibv_pd      — PD handle
+ struct ibv_mr      — .lkey / .rkey  (returned by ibv_reg_mr)
+ struct ibv_cq  ◄───container_of──── struct mlx5_cq
+   .cqe, .channel                      ├─ CQE ring buffer + ci
+                                       └─ CQ doorbell record
+ struct ibv_qp  ◄───container_of──── struct mlx5_qp
+   .qp_num, .state, .pd                ├─ SQ ring buffer, head/tail
+   .send_cq / .recv_cq                 ├─ RQ ring buffer
+                                       ├─ doorbell record (host mem)
+                                       └─ BlueFlame/UAR ptr (mmap'd BAR)
+```
+
+Work travels through three small value types: `ibv_sge` (`{addr, length,
+lkey}` — one scatter/gather element), `ibv_send_wr` / `ibv_recv_wr` (the work
+request: opcode, SGE list, flags, and for one-sided ops
+`wr.rdma.remote_addr` / `wr.rdma.rkey`), and `ibv_wc` (the completion:
+`wr_id`, `status`, opcode, byte count).
+
+### 4.4 Typical execution contexts
+
+A real application touches the library from three or four distinct contexts,
+and mixing them up is the classic verbs performance bug:
+
+```
+ init/control thread        data-path thread × N        event thread
+ (runs once, slow ok)       (hot loop, no syscalls)     (sleeps, rare wakeups)
+ ──────────────────         ─────────────────────       ──────────────────
+ open device, alloc PD      loop:                       epoll on: completion
+ reg MRs (pins pages!)        ibv_post_send/recv          channel fd, async
+ create CQ + QP               ibv_poll_cq                 fd, rdma_cm fd
+ modify_qp → RTS              handle completions        ibv_get_cq_event
+ rdma_cm handshake          (one QP+CQ per thread        → poll_cq → re-arm
+                             = no lock contention)        ibv_req_notify_cq
+```
+
+- **Init/control** — every create/register call may allocate, pin memory, and
+  syscall; do it at startup, never per I/O (§5.2 explains why `ibv_reg_mr`
+  is the most expensive call in the library).
+- **Data path** — all verbs are thread-safe, but two threads posting to one QP
+  serialize on the provider's ring lock; the scaling pattern is one QP + CQ
+  per worker thread.
+- **Events** — the completion channel and async-event fds are ordinary
+  pollable fds: sleep in `epoll`, wake on a (solicited, §7.2) completion,
+  drain the CQ, re-arm. Async events (`IBV_EVENT_QP_FATAL`, port down…) and
+  `rdma_cm` connection events arrive the same way.
+
+### 4.5 How a call is implemented
+
+**Control path** — `ibv_create_qp()` end to end:
+
+```
+ app ── ibv_create_qp(pd, attr)
+   └─ libibverbs → ctx->ops.create_qp()          dispatch
+       └─ libmlx5: allocate SQ/RQ ring buffers +
+          doorbell record in ordinary host memory
+          └─ marshal create-QP command (with those
+             addresses) → ioctl(cmd_fd)          ← the one syscall
+              └─ kernel ib_uverbs → mlx5_ib:
+                 pin buffers, program firmware,
+                 return qp_num + mmap offsets
+          mmap doorbell/UAR page if new
+   ◄── struct ibv_qp* (inside a filled-in mlx5_qp)
+```
+
+The kernel validates and programs the NIC, but the queues themselves live in
+memory the *provider* allocated — which is exactly what lets the data path
+skip the kernel afterwards.
+
+**Data path** — `ibv_post_send()` is, in its entirety, an inline dispatch:
+
+```c
+static inline int ibv_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr,
+                                struct ibv_send_wr **bad_wr)
+{
+        return qp->context->ops.post_send(qp, wr, bad_wr);
+}
+```
+
+The provider's `post_send` then does five steps, all in userspace: validate
+the WR → build the device WQE in the next SQ slot (control segment + one
+address segment per SGE) → write-barrier → bump the doorbell record → MMIO
+doorbell write (or BlueFlame copy, §7.4). `ibv_poll_cq` is the mirror image:
+read the CQE at the consumer index, check its ownership bit, read-barrier,
+translate to `ibv_wc`, advance the CQ doorbell record so the NIC can reuse
+the slot. No locks beyond the ring's own, no syscalls, no copies.
+
+When the generic API is not enough, providers expose **direct verbs**
+(`mlx5dv_*`): the application gets the raw ring and doorbell addresses and
+builds WQEs itself — trading portability for the last bit of latency.
+
+# 5. Kernel Internals (Linux RDMA Stack)
 
 The kernel's job is to make hardware-direct user-space access **safe** and to
 broker connection setup. Three responsibilities.
 
-### 4.1 mlx5_core vs mlx5_ib
+### 5.1 mlx5_core vs mlx5_ib
 
 Two cooperating drivers for one card:
 
@@ -339,7 +494,7 @@ create the corresponding hardware objects. The *same card* simultaneously
 exposes a normal Ethernet `netdev` (for TCP/IP and RoCE's underlay) and the RDMA
 device.
 
-### 4.2 Memory registration: pinning + DMA mapping
+### 5.2 Memory registration: pinning + DMA mapping
 
 This is the kernel's heaviest lifting and the reason MRs exist. When user space
 calls `ibv_reg_mr(pd, addr, length, access)`, the kernel must guarantee the NIC
@@ -377,7 +532,7 @@ Because pinning is expensive and MRs are long-lived, registration is a *setup*
 cost you amortize over millions of transfers — and a real motivation to register
 large buffers once rather than per-I/O.
 
-### 4.3 RDMA CM: connection setup, not data
+### 5.3 RDMA CM: connection setup, not data
 
 RDMA CM (`rdma_cm`, exposed via `/dev/infiniband/rdma_cm`) resolves an IP
 address to an RDMA path and runs the connection handshake that swaps QP numbers,
@@ -387,7 +542,7 @@ underlay Ethernet. This is inherently asynchronous (it involves network
 round-trips), so applications drive it with an event channel. **It runs only at
 connection establishment — never per message.**
 
-### 4.4 Why the kernel is absent from the data path
+### 5.4 Why the kernel is absent from the data path
 
 Put 4.1–4.3 together: by the time the first `post_send` happens, the QP's SQ/RQ
 and the CQ live in memory the application has mmap'd, and the NIC's doorbell
@@ -395,7 +550,7 @@ sits in a BAR page the application has mmap'd (with PD/key checks enforced by
 hardware). There is nothing left for the kernel to do. Posting and reaping are
 loads and stores. **The kernel made the fast path safe; it does not run on it.**
 
-# 5. RDMA NIC Hardware Architecture
+# 6. RDMA NIC Hardware Architecture
 
 The NIC is not a dumb framer — it is a programmable engine that executes the
 queue/key model in silicon. Its responsibilities:
@@ -412,7 +567,7 @@ queue/key model in silicon. Its responsibilities:
   from host memory and writes payload and CQEs back, all without the CPU.
 - **Address translation + protection** — the NIC validates every access against
   the MR keys and PD, and translates I/O virtual addresses to bus addresses
-  using the tables the kernel programmed (§4.2).
+  using the tables the kernel programmed (§5.2).
 - **Transport + RoCE encapsulation** — for RoCEv2 the NIC wraps the InfiniBand
   transport (BTH + payload) inside **UDP/IP/Ethernet**, using **UDP destination
   port 4791**, so RDMA rides on a routable Ethernet/IP fabric.
@@ -421,13 +576,13 @@ The dividing line restated in hardware terms: the kernel programmed the
 translation/protection tables and created the queues; from then on the NIC's
 engines drive the transfer and only touch the host through DMA and the doorbell.
 
-# 6. ConnectX-5 Internal Datapath Deep Dive
+# 7. ConnectX-5 Internal Datapath Deep Dive
 
 Now the detailed walk, using mlx5/ConnectX-5 mechanics. Keep the queue model in
 mind: SQ and RQ are ring buffers in **host** memory; the CQ is a ring in host
 memory; the doorbell is in NIC **BAR** memory.
 
-## 6.1 Send path (TX)
+## 7.1 Send path (TX)
 
 ```
  Application          Host memory (mmap'd)             ConnectX-5
@@ -479,7 +634,7 @@ Step by step:
 5. The packet goes out on the wire. For an RDMA WRITE it carries the remote
    `{addr, rkey}`; the remote NIC will place the payload directly.
 
-## 6.2 Receive path (RX)
+## 7.2 Receive path (RX)
 
 ```
         wire ──►  ConnectX-5 RX                  Host memory
@@ -531,7 +686,7 @@ solicited SEND as the "it's ready" doorbell — instead of taking an interrupt
 per message. (Only SEND and Write-with-immediate can be solicited; pure
 one-sided WRITE/READ generate no receiver completion to signal.)
 
-## 6.3 WQE / CQE / CQ lifecycle
+## 7.3 WQE / CQE / CQ lifecycle
 
 Three objects, one cycle:
 
@@ -553,7 +708,7 @@ Three objects, one cycle:
 The producer/consumer indices on each ring are how host and NIC stay in sync
 without locks — each side owns one index and reads the other's.
 
-## 6.4 The doorbell mechanism
+## 7.4 The doorbell mechanism
 
 The doorbell is the *only* host→NIC signal on the fast path, so its cost
 matters.
@@ -576,7 +731,7 @@ difference between "doorbell per WQE" and "doorbell per batch," and between
 BlueFlame and plain doorbell, is the difference between a few hundred ns and a
 µs at the top of the message-rate curve.
 
-## 6.5 The PCIe DMA path
+## 7.5 The PCIe DMA path
 
 Everything the NIC reads or writes in host memory is a **PCIe transaction with
 the NIC as bus master**:
@@ -589,19 +744,19 @@ the NIC as bus master**:
 The CPU and the kernel networking stack are **not on this path** — no `skb`, no
 softirq, no copy. This is why **memory registration is mandatory**: for the NIC
 to DMA safely and asynchronously, the target pages must be pinned and their bus
-addresses pre-translated and key-protected (§4.2). The MR is precisely the
+addresses pre-translated and key-protected (§5.2). The MR is precisely the
 contract that makes bus-master DMA into application memory safe.
 
-# 7. The RDMA Wire Protocol (IB / RoCEv2 packets)
+# 8. The RDMA Wire Protocol (IB / RoCEv2 packets)
 
 Everything so far described *what* the NIC does; this section is *what it puts
 on the wire*. RDMA's transport is defined by the InfiniBand Architecture
 (IBTA, Vol. 1); **RoCEv2** carries those exact transport packets over UDP/IP so
 they route on Ethernet. Below the verbs and the doorbell, a queue pair is just
 two endpoints exchanging these packets — and the packet's ACK/flow-control
-rules are what make RoCE's fabric requirements (§8) make sense.
+rules are what make RoCE's fabric requirements (§9) make sense.
 
-## 7.1 Packet anatomy (and RoCEv2 encapsulation)
+## 8.1 Packet anatomy (and RoCEv2 encapsulation)
 
 A RoCEv2 packet is an ordinary UDP datagram whose payload is an InfiniBand
 transport packet:
@@ -621,15 +776,15 @@ transport packet:
   hop; it protects the RDMA payload end-to-end, independent of the Ethernet FCS.
 - Routers see only UDP; only the endpoint NICs parse BTH and below.
 
-## 7.2 The Base Transport Header (BTH)
+## 8.2 The Base Transport Header (BTH)
 
 Every transport packet starts with a 12-byte BTH — RDMA's equivalent of a TCP
 header:
 
 | Field | Meaning |
 |-------|---------|
-| **OpCode** (8b) | transport service + operation + position in message (§7.3) |
-| **SE** (1b) | Solicited Event — wake a solicited-only receiver (§6.2) |
+| **OpCode** (8b) | transport service + operation + position in message (§8.3) |
+| **SE** (1b) | Solicited Event — wake a solicited-only receiver (§7.2) |
 | **PadCount / TVer** | payload pad bytes; transport header version |
 | **P_Key** (16b) | partition key — a coarse "VLAN for RDMA" |
 | **DestQP** (24b) | destination queue-pair number on the peer |
@@ -639,7 +794,7 @@ header:
 `DestQP` plus the source address is how the receiving NIC finds the right QP
 context; **PSN** is how it detects loss and reordering.
 
-## 7.3 Opcodes and message segmentation
+## 8.3 Opcodes and message segmentation
 
 The OpCode's top 3 bits select the **transport service** (RC / UC / RD / UD),
 and the low 5 bits the **operation** — and, crucially, *where this packet sits
@@ -655,7 +810,7 @@ A message larger than the **path MTU** (256 B – 4 KB) is chopped into
 `First → Middle* → Last` packets with consecutive PSNs; a message that fits one
 MTU is a single **Only** packet. The receiver reassembles by PSN.
 
-## 7.4 Extended transport headers
+## 8.4 Extended transport headers
 
 Right after the BTH, some operations carry an extra header:
 
@@ -671,7 +826,7 @@ The **RETH** is the on-the-wire form of the `{addr, rkey, length}` you handed
 to `ibv_post_send` for a one-sided op — this is literally how "one-sided"
 travels: the request packet names the remote memory.
 
-## 7.5 Reliable Connected on the wire: PSN, ACK, retransmit, flow control
+## 8.5 Reliable Connected on the wire: PSN, ACK, retransmit, flow control
 
 RC is the interesting service: in-order, acknowledged, exactly-once, with
 PSN-based loss recovery. The three operations map to these packet exchanges
@@ -706,7 +861,7 @@ PSN-based loss recovery. The three operations map to these packet exchanges
 The NIC runs this whole ACK/PSN/retransmit state machine in silicon, which is
 why the application sees only completions, never a packet.
 
-## 7.6 RoCEv2 on Ethernet: PFC, ECN, and head-of-line blocking
+## 8.6 RoCEv2 on Ethernet: PFC, ECN, and head-of-line blocking
 
 RC's go-back-N assumes a **near-lossless** link — over a drop-happy network it
 collapses. Native InfiniBand gets losslessness from credit-based flow control
@@ -726,10 +881,10 @@ the underlay must be made lossless two ways:
 HoL blocking also lives in the transport: RC delivers **in order per QP**, so
 with plain go-back-N a single dropped packet forces retransmission of every
 packet after it in the message — the tail waits on the head. (Modern NICs add
-selective-retransmit to soften this.) Getting §8's "tuned lossless fabric"
+selective-retransmit to soften this.) Getting §9's "tuned lossless fabric"
 right is largely the work of keeping *both* forms of HoL blocking from biting.
 
-## 7.7 ACK timeouts, retries, and diagnosing loss
+## 8.7 ACK timeouts, retries, and diagnosing loss
 
 This is where the wire protocol turns into real-world pain, and the failure
 you are most likely to hit on RoCE. Two QP timers govern recovery, both
@@ -792,7 +947,7 @@ if `local_ack_timeout_err` climbs while one hop shows a rising
 and packets are dropping — chase that hop. If `local_ack_timeout_err` climbs
 with **no** loss anywhere, your `timeout` is just too small.
 
-# 8. Performance Model
+# 9. Performance Model
 
 Why RDMA is fast, stated as causes, then the costs.
 
@@ -835,7 +990,7 @@ The honest summary: RDMA trades **operational and programming complexity** for
 **latency and CPU efficiency**. It wins decisively when the workload is
 latency-sensitive or CPU-bound on networking, and is overkill when it isn't.
 
-# 9. Practical RDMA Example
+# 10. Practical RDMA Example
 
 The quickest way to *see* RDMA is the `perftest` suite (package `perftest`),
 which exercises the datapath end to end. Each tool is a server/client pair; the
@@ -891,7 +1046,7 @@ is in [`code/rdma-hello.c`]({{ site.baseurl }}/code/rdma-hello.c); see
 environment setup (it runs on an ordinary box via Soft-RoCE) and how to run
 it.
 
-# 10. Mental Model Summary
+# 11. Mental Model Summary
 
 One paragraph: **RDMA is a contract that lets a NIC move data directly between
 application buffers on two machines, with the kernel present only at setup.**
