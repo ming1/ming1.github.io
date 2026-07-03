@@ -11,7 +11,7 @@ tags: [rdma, network, linux kernel, zero copy, dma, infiniband]
 > - Kernel RDMA core (control plane, memory pinning): [`drivers/infiniband/core/uverbs_main.c`](https://elixir.bootlin.com/linux/latest/source/drivers/infiniband/core/uverbs_main.c), [`drivers/infiniband/core/umem.c`](https://elixir.bootlin.com/linux/latest/source/drivers/infiniband/core/umem.c) (`ib_umem_get`).
 > - mlx5 InfiniBand provider: [`drivers/infiniband/hw/mlx5/`](https://elixir.bootlin.com/linux/latest/source/drivers/infiniband/hw/mlx5) (`mlx5_ib_reg_user_mr` in `mr.c`).
 > - mlx5 core transport driver: [`drivers/net/ethernet/mellanox/mlx5/core/`](https://elixir.bootlin.com/linux/latest/source/drivers/net/ethernet/mellanox/mlx5/core).
-> - Userspace verbs and the data-path fast path: [rdma-core](https://github.com/linux-rdma/rdma-core), `man ibv_post_send(3)`, `man ibv_reg_mr(3)`, `man rdma_cm(7)`.
+> - Userspace verbs and the data-path fast path: [rdma-core](https://github.com/linux-rdma/rdma-core); official API man pages in [`libibverbs/man/`](https://github.com/linux-rdma/rdma-core/tree/master/libibverbs/man), public structs in [`libibverbs/verbs.h`](https://github.com/linux-rdma/rdma-core/blob/master/libibverbs/verbs.h).
 > - QP state machine & connection management: `man ibv_modify_qp(3)`, `man rdma_connect(3)`; kernel CM [`drivers/infiniband/core/cma.c`](https://elixir.bootlin.com/linux/latest/source/drivers/infiniband/core/cma.c) (`rdma_init_qp_attr`) and [`ucma.c`](https://elixir.bootlin.com/linux/latest/source/drivers/infiniband/core/ucma.c); IBTA Vol 1 ch. 12 (CM REQ/REP/RTU).
 > - RoCE GID table management: [`drivers/infiniband/core/roce_gid_mgmt.c`](https://elixir.bootlin.com/linux/latest/source/drivers/infiniband/core/roce_gid_mgmt.c), [`cache.c`](https://elixir.bootlin.com/linux/latest/source/drivers/infiniband/core/cache.c).
 > - RoCEv2 transport: IBTA Annex A17; UDP destination port **4791** ([IANA service registry](https://www.iana.org/assignments/service-names-port-numbers/service-names-port-numbers.xhtml)).
@@ -369,23 +369,33 @@ Call by call:
 **Setup / teardown** — each is a uverbs command into `ib_uverbs`; expensive
 but amortized (§4.5's rule: do it at startup, never per I/O).
 
-- `ibv_get_device_list` — enumerate the RDMA devices present (sysfs reads);
+- [`ibv_get_device_list`](https://github.com/linux-rdma/rdma-core/blob/master/libibverbs/man/ibv_get_device_list.3.md)
+  — enumerate the RDMA devices present (sysfs reads);
   returns the `ibv_device*` array to choose from.
-- `ibv_open_device` — create the `ibv_context` root handle; establishes the
+- [`ibv_open_device`](https://github.com/linux-rdma/rdma-core/blob/master/libibverbs/man/ibv_open_device.3)
+  — create the `ibv_context` root handle; establishes the
   `cmd_fd` every later command travels through, plus the `async_fd` (§4.4).
-- `ibv_alloc_pd` — allocate a Protection Domain, the security boundary:
+- [`ibv_alloc_pd`](https://github.com/linux-rdma/rdma-core/blob/master/libibverbs/man/ibv_alloc_pd.3)
+  — allocate a Protection Domain, the security boundary:
   objects in one PD may reference each other; cross-PD access is rejected by
   the NIC in hardware.
-- `ibv_reg_mr` — pin the pages and set up their DMA mapping, returning the
+- [`ibv_reg_mr`](https://github.com/linux-rdma/rdma-core/blob/master/libibverbs/man/ibv_reg_mr.3)
+  — pin the pages and set up their DMA mapping, returning the
   `lkey`/`rkey` every later WR quotes. The most expensive call in the
   library (§5.2).
-- `ibv_create_cq` — allocate the CQE ring the NIC DMA-writes completions
+- [`ibv_create_cq`](https://github.com/linux-rdma/rdma-core/blob/master/libibverbs/man/ibv_create_cq.3)
+  — allocate the CQE ring the NIC DMA-writes completions
   into; optionally bound to a completion channel fd for the event family.
-- `ibv_create_qp` — allocate the SQ/RQ rings (in *provider* memory — §4.6
+- [`ibv_create_qp`](https://github.com/linux-rdma/rdma-core/blob/master/libibverbs/man/ibv_create_qp.3)
+  — allocate the SQ/RQ rings (in *provider* memory — §4.6
   traces this call end to end) and have the kernel program the NIC.
-- `ibv_modify_qp` — walk the QP's state machine RESET→INIT→RTR→RTS (§4.3);
+- [`ibv_modify_qp`](https://github.com/linux-rdma/rdma-core/blob/master/libibverbs/man/ibv_modify_qp.3)
+  — walk the QP's state machine RESET→INIT→RTR→RTS (§4.3);
   the QP carries no traffic until RTS.
-- `ibv_query_*` — read-only introspection (`_device`, `_port`, `_gid`, …):
+- `ibv_query_*` — read-only introspection
+  ([`_device`](https://github.com/linux-rdma/rdma-core/blob/master/libibverbs/man/ibv_query_device.3),
+  [`_port`](https://github.com/linux-rdma/rdma-core/blob/master/libibverbs/man/ibv_query_port.3),
+  [`_gid`](https://github.com/linux-rdma/rdma-core/blob/master/libibverbs/man/ibv_query_gid.3.md), …):
   the capabilities and addressing you feed into `modify_qp`.
 - destroy / dealloc — the teardown mirror, in reverse creation order;
   `ibv_dereg_mr` is what unpins the pages.
@@ -393,25 +403,31 @@ but amortized (§4.5's rule: do it at startup, never per I/O).
 **Data path** — no kernel, possible only because setup left the rings in
 user memory and mmap'd the doorbell page:
 
-- `ibv_post_send` — enqueue a send WR: build the WQE in the next SQ slot,
+- [`ibv_post_send`](https://github.com/linux-rdma/rdma-core/blob/master/libibverbs/man/ibv_post_send.3)
+  — enqueue a send WR: build the WQE in the next SQ slot,
   write barrier, ring the doorbell (§4.6 shows the five steps). Launches
   SEND / RDMA WRITE / RDMA READ alike.
-- `ibv_post_recv` — hand the RQ a buffer for an incoming SEND to land in.
+- [`ibv_post_recv`](https://github.com/linux-rdma/rdma-core/blob/master/libibverbs/man/ibv_post_recv.3)
+  — hand the RQ a buffer for an incoming SEND to land in.
   One-sided WRITE/READ never consume these; letting the RQ run dry is what
   triggers RNR NAKs (§8.5).
-- `ibv_poll_cq` — reap completions: read the CQE at the consumer index,
+- [`ibv_poll_cq`](https://github.com/linux-rdma/rdma-core/blob/master/libibverbs/man/ibv_poll_cq.3)
+  — reap completions: read the CQE at the consumer index,
   check its ownership bit, translate to `ibv_wc`, advance the CQ doorbell
   record so the NIC can reuse the slot. The busy-poll loop.
-- `ibv_req_notify_cq` — arm the CQ to raise one event on its channel at the
+- [`ibv_req_notify_cq`](https://github.com/linux-rdma/rdma-core/blob/master/libibverbs/man/ibv_req_notify_cq.3.md)
+  — arm the CQ to raise one event on its channel at the
   next (optionally solicited-only, §7.2) completion — the bridge from
   polling to sleeping. One-shot: re-arm after every event.
 
 **Events** — the syscall here buys a sleeping thread, never an I/O:
 
-- `ibv_get_cq_event` — blocking `read()` on the completion channel; wakes
+- [`ibv_get_cq_event`](https://github.com/linux-rdma/rdma-core/blob/master/libibverbs/man/ibv_get_cq_event.3)
+  — blocking `read()` on the completion channel; wakes
   when an armed CQ completes. The pattern: arm → sleep → wake → drain with
   `poll_cq` → re-arm.
-- `ibv_get_async_event` — blocking `read()` on the `async_fd` for
+- [`ibv_get_async_event`](https://github.com/linux-rdma/rdma-core/blob/master/libibverbs/man/ibv_get_async_event.3)
+  — blocking `read()` on the `async_fd` for
   out-of-band state: `IBV_EVENT_QP_FATAL` (the ERR-state flush of §4.3),
   port down, path migration.
 
@@ -514,7 +530,9 @@ driving a QP to ERR/RESET in recovery paths.
 
 ### 4.4 The objects: public structs, private containers
 
-The public structs in `<infiniband/verbs.h>` are deliberately thin — an
+The public structs in
+[`<infiniband/verbs.h>`](https://github.com/linux-rdma/rdma-core/blob/master/libibverbs/verbs.h)
+are deliberately thin — an
 `ibv_qp` is little more than the QP number, state, and back-pointers. The
 provider embeds each one in a private container holding the real machinery:
 
@@ -539,10 +557,14 @@ provider embeds each one in a private container holding the real machinery:
 ```
 
 Work travels through three small value types: `ibv_sge` (`{addr, length,
-lkey}` — one scatter/gather element), `ibv_send_wr` / `ibv_recv_wr` (the work
-request: opcode, SGE list, flags, and for one-sided ops
-`wr.rdma.remote_addr` / `wr.rdma.rkey`), and `ibv_wc` (the completion:
-`wr_id`, `status`, opcode, byte count).
+lkey}` — one scatter/gather element),
+[`ibv_send_wr`](https://github.com/linux-rdma/rdma-core/blob/master/libibverbs/man/ibv_post_send.3) /
+[`ibv_recv_wr`](https://github.com/linux-rdma/rdma-core/blob/master/libibverbs/man/ibv_post_recv.3)
+(the work request: opcode, SGE list, flags, and for one-sided ops
+`wr.rdma.remote_addr` / `wr.rdma.rkey`), and
+[`ibv_wc`](https://github.com/linux-rdma/rdma-core/blob/master/libibverbs/man/ibv_poll_cq.3)
+(the completion: `wr_id`, `status`, opcode, byte count) — all laid out in
+the man pages of the verbs that consume them.
 
 ### 4.5 Typical execution contexts
 
