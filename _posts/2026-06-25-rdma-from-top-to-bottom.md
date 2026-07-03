@@ -420,6 +420,47 @@ user memory and mmap'd the doorbell page:
   next (optionally solicited-only, §7.2) completion — the bridge from
   polling to sleeping. One-shot: re-arm after every event.
 
+These four calls carry the whole performance story. The man pages and the
+provider source (`providers/mlx5/qp.c`, `cq.c`) spell out the levers that
+decide it — the theme of all five is the same: **the only expensive things
+left on this path are the MMIO doorbell and the CQE, so spend them as
+rarely as possible**:
+
+1. **Batch WRs — one doorbell per call, not per WR.** `ibv_post_send` takes
+   a *linked list* (`wr->next`); mlx5 builds every WQE in a loop and rings
+   the doorbell once after it (`post_send_db()` at the end of
+   `_mlx5_post_send`). N chained WRs pay the §7.4 MMIO cost once; N separate
+   calls pay it N times.
+2. **`IBV_SEND_INLINE` for small payloads** (Send and RDMA Write only). The
+   provider memcpys the data into the WQE itself (`set_data_inl_seg()`), so
+   the NIC skips the second DMA fetch of the buffer and the lkey is not even
+   checked — and the buffer-reuse rule flips from "after a completion" to
+   "immediately after the call returns" (`ibv_post_send(3)` NOTES). Bounded
+   by `cap.max_inline_data` requested at QP create.
+3. **Selective signaling — but never stop signaling.** Create the QP with
+   `sq_sig_all=0` and set `IBV_SEND_SIGNALED` on every Nth WR: one CQE per N
+   sends instead of per send. The trap is in the provider: SQ slots are
+   reclaimed only when a completion is *polled* — `mlx5_parse_cqe` advances
+   `wq->tail` from the CQE's `wqe_ctr`, freeing all earlier unsignaled slots
+   with it. Signal nothing (or post without ever polling) and `post_send`
+   returns `ENOMEM` on a "full" SQ whose work finished long ago.
+4. **Poll in batches; never overrun the CQ.** `ibv_poll_cq` returns up to
+   `num_entries` per call — drain with an array, not one at a time. If CQEs
+   outrun consumption the CQ overruns: `IBV_EVENT_CQ_ERR`, and the CQ is
+   dead, not degraded (`ibv_poll_cq(3)` NOTES) — size it for the worst case
+   of CQE producers: outstanding *signaled* sends plus posted receives
+   (unsignaled successes write no CQE; WRs that fail always do). In event
+   mode, `ibv_ack_cq_events` takes a mutex: count events and ack them in one
+   batched call (`ibv_get_cq_event(3)` NOTES).
+5. **Keep the RQ pre-posted, respect buffer lifetime.** An empty RQ turns
+   incoming SENDs into RNR NAKs and sender back-off (§8.5) — pre-post before
+   RTR, repost as you poll. And a WR's buffers are only safe to touch again
+   once a completion *covering it* is harvested (`ibv_post_send(3)` NOTES):
+   its own CQE if signaled — or, for an unsignaled WR, the CQE of a later
+   signaled WR on the same SQ, since an RC send queue completes in posted
+   order. Reusing early corrupts data in flight; INLINE is the one
+   exception.
+
 **Events** — the syscall here buys a sleeping thread, never an I/O:
 
 - [`ibv_get_cq_event`](https://github.com/linux-rdma/rdma-core/blob/master/libibverbs/man/ibv_get_cq_event.3)
