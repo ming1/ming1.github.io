@@ -12,6 +12,8 @@ tags: [rdma, network, linux kernel, zero copy, dma, infiniband]
 > - mlx5 InfiniBand provider: [`drivers/infiniband/hw/mlx5/`](https://elixir.bootlin.com/linux/latest/source/drivers/infiniband/hw/mlx5) (`mlx5_ib_reg_user_mr` in `mr.c`).
 > - mlx5 core transport driver: [`drivers/net/ethernet/mellanox/mlx5/core/`](https://elixir.bootlin.com/linux/latest/source/drivers/net/ethernet/mellanox/mlx5/core).
 > - Userspace verbs and the data-path fast path: [rdma-core](https://github.com/linux-rdma/rdma-core), `man ibv_post_send(3)`, `man ibv_reg_mr(3)`, `man rdma_cm(7)`.
+> - QP state machine & connection management: `man ibv_modify_qp(3)`, `man rdma_connect(3)`; kernel CM [`drivers/infiniband/core/cma.c`](https://elixir.bootlin.com/linux/latest/source/drivers/infiniband/core/cma.c) (`rdma_init_qp_attr`) and [`ucma.c`](https://elixir.bootlin.com/linux/latest/source/drivers/infiniband/core/ucma.c); IBTA Vol 1 ch. 12 (CM REQ/REP/RTU).
+> - RoCE GID table management: [`drivers/infiniband/core/roce_gid_mgmt.c`](https://elixir.bootlin.com/linux/latest/source/drivers/infiniband/core/roce_gid_mgmt.c), [`cache.c`](https://elixir.bootlin.com/linux/latest/source/drivers/infiniband/core/cache.c).
 > - RoCEv2 transport: IBTA Annex A17; UDP destination port **4791** ([IANA service registry](https://www.iana.org/assignments/service-names-port-numbers/service-names-port-numbers.xhtml)).
 > - ConnectX-5 / mlx5 doorbell + BlueFlame mechanism: NVIDIA mlx5 *Programmer's Reference Manual (PRM)*; `man mlx5dv(7)`.
 
@@ -362,7 +364,155 @@ I/O; row three is for threads that want to sleep instead of poll.
 (`ibv_ack_cq_events`, the bookkeeping partner of `get_cq_event`, is a pure
 userspace counter — no syscall.)
 
-### 4.3 The objects: public structs, private containers
+Call by call:
+
+**Setup / teardown** — each is a uverbs command into `ib_uverbs`; expensive
+but amortized (§4.5's rule: do it at startup, never per I/O).
+
+- `ibv_get_device_list` — enumerate the RDMA devices present (sysfs reads);
+  returns the `ibv_device*` array to choose from.
+- `ibv_open_device` — create the `ibv_context` root handle; establishes the
+  `cmd_fd` every later command travels through, plus the `async_fd` (§4.4).
+- `ibv_alloc_pd` — allocate a Protection Domain, the security boundary:
+  objects in one PD may reference each other; cross-PD access is rejected by
+  the NIC in hardware.
+- `ibv_reg_mr` — pin the pages and set up their DMA mapping, returning the
+  `lkey`/`rkey` every later WR quotes. The most expensive call in the
+  library (§5.2).
+- `ibv_create_cq` — allocate the CQE ring the NIC DMA-writes completions
+  into; optionally bound to a completion channel fd for the event family.
+- `ibv_create_qp` — allocate the SQ/RQ rings (in *provider* memory — §4.6
+  traces this call end to end) and have the kernel program the NIC.
+- `ibv_modify_qp` — walk the QP's state machine RESET→INIT→RTR→RTS (§4.3);
+  the QP carries no traffic until RTS.
+- `ibv_query_*` — read-only introspection (`_device`, `_port`, `_gid`, …):
+  the capabilities and addressing you feed into `modify_qp`.
+- destroy / dealloc — the teardown mirror, in reverse creation order;
+  `ibv_dereg_mr` is what unpins the pages.
+
+**Data path** — no kernel, possible only because setup left the rings in
+user memory and mmap'd the doorbell page:
+
+- `ibv_post_send` — enqueue a send WR: build the WQE in the next SQ slot,
+  write barrier, ring the doorbell (§4.6 shows the five steps). Launches
+  SEND / RDMA WRITE / RDMA READ alike.
+- `ibv_post_recv` — hand the RQ a buffer for an incoming SEND to land in.
+  One-sided WRITE/READ never consume these; letting the RQ run dry is what
+  triggers RNR NAKs (§8.5).
+- `ibv_poll_cq` — reap completions: read the CQE at the consumer index,
+  check its ownership bit, translate to `ibv_wc`, advance the CQ doorbell
+  record so the NIC can reuse the slot. The busy-poll loop.
+- `ibv_req_notify_cq` — arm the CQ to raise one event on its channel at the
+  next (optionally solicited-only, §7.2) completion — the bridge from
+  polling to sleeping. One-shot: re-arm after every event.
+
+**Events** — the syscall here buys a sleeping thread, never an I/O:
+
+- `ibv_get_cq_event` — blocking `read()` on the completion channel; wakes
+  when an armed CQ completes. The pattern: arm → sleep → wake → drain with
+  `poll_cq` → re-arm.
+- `ibv_get_async_event` — blocking `read()` on the `async_fd` for
+  out-of-band state: `IBV_EVENT_QP_FATAL` (the ERR-state flush of §4.3),
+  port down, path migration.
+
+### 4.3 The QP state machine: `ibv_modify_qp` and `attr_mask`
+
+`ibv_modify_qp` is one function driving a five-state machine. An RC QP is
+created in **RESET** and must be walked to **RTS**, one call per arrow,
+before it can carry a single packet:
+
+```
+ RESET ──▶ INIT ──▶ RTR ──▶ RTS ──▶ (running)
+   ▲                                   │
+   │         SQD ◀──────────── (drain) │
+   └───────────── ERR ◀────────────────┘
+              (any state, on fatal error)
+```
+
+The ratchet mirrors what you *know* at each point of bring-up, and the
+hardware accepts each parameter class only at its own transition — so a
+half-configured QP can never put an unaddressed packet on the wire:
+
+| Transition | Parameters | Why here |
+|---|---|---|
+| RESET→INIT | `port_num`, `pkey_index`, `qp_access_flags` | local facts only — you may not know the peer yet. Receives may be *posted* after INIT (nothing arrives yet). |
+| INIT→RTR | `dest_qp_num`, `rq_psn`, `ah_attr` (GID/path), `path_mtu`, `max_dest_rd_atomic`, `min_rnr_timer` | the peer's identity — must be exchanged out-of-band first (§3, §5.3). Receiving works after RTR. |
+| RTR→RTS | `sq_psn`, `timeout`, `retry_cnt`, `rnr_retry`, `max_rd_atomic` | your send-side retransmit policy — §8.5's ACK/NAK machine and §8.8's timers run on exactly these constants. Sending works after RTS. |
+
+A fatal transport error (or an explicit modify) drops the QP to **ERR**: all
+outstanding WRs flush to the CQ with error status, so a poll loop *sees* the
+failure instead of hanging — this is also where §4.2's
+`IBV_EVENT_QP_FATAL` async event originates. From ERR the QP goes back to
+RESET for reuse, or is destroyed. **SQD** (send-queue drain) quiesces sends
+for live reconfiguration; most applications never touch it.
+
+The `attr_mask` is how one call serves five transitions: `struct ibv_qp_attr`
+has a field for *every* transition, the mask tells the driver which fields
+are live, and the driver validates that exactly the required set for this
+transition is present — a set bit without its field (or vice versa) is
+`EINVAL`. INIT→RTR in full; every value on the right side of the exchange
+came from the peer:
+
+```c
+/* Exchanged with the peer out-of-band (or by rdma_cm, §5.3):
+ *   remote_qpn, remote_psn, remote_gid
+ */
+struct ibv_qp_attr attr = {
+    .qp_state           = IBV_QPS_RTR,
+    .path_mtu           = IBV_MTU_1024,     /* must match both ends         */
+    .dest_qp_num        = remote_qpn,       /* peer's QP number             */
+    .rq_psn             = remote_psn,       /* expected first inbound PSN   */
+    .max_dest_rd_atomic = 1,                /* inbound READs in flight      */
+    .min_rnr_timer      = 12,               /* RNR back-off (§8.5)          */
+    .ah_attr = {
+        .is_global      = 1,                /* RoCE: GRH/GID addressing     */
+        .dlid           = 0,                /* 0 on RoCE (no LIDs)          */
+        .port_num       = 1,
+        .grh = {
+            .dgid       = remote_gid,       /* peer's GID = its IP (§8.7)   */
+            .sgid_index = my_gid_index,     /* which local GID row — §8.7   */
+            .hop_limit  = 1,
+        },
+    },
+};
+int attr_mask = IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU |
+                IBV_QP_DEST_QPN | IBV_QP_RQ_PSN |
+                IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER;
+ibv_modify_qp(qp, &attr, attr_mask);
+```
+
+RTR→RTS arms the send side. Note the two masks share only `IBV_QP_STATE` —
+RTR carried "who is the peer", RTS carries "how do I behave when packets go
+missing":
+
+```c
+struct ibv_qp_attr attr = {
+    .qp_state      = IBV_QPS_RTS,
+    .sq_psn        = my_psn,        /* MUST equal the peer's rq_psn         */
+    .timeout       = 14,            /* ACK timeout: 4.096 µs × 2^14 ≈ 67 ms */
+    .retry_cnt     = 7,             /* retransmits on timeout before fatal  */
+    .rnr_retry     = 7,             /* retries on peer RNR (7 = infinite)   */
+    .max_rd_atomic = 1,             /* outbound READs in flight             */
+};
+int attr_mask = IBV_QP_STATE | IBV_QP_SQ_PSN | IBV_QP_TIMEOUT |
+                IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY |
+                IBV_QP_MAX_QP_RD_ATOMIC;
+ibv_modify_qp(qp, &attr, attr_mask);
+```
+
+Two crossed constraints tie the ends together. The PSNs form a crossed
+handshake — your `sq_psn` must equal the peer's `rq_psn` and vice versa;
+mismatch one and every packet lands as an out-of-sequence PSN → NAK →
+retransmit storm → `IBV_WC_RETRY_EXC_ERR` (§8.8). And your `max_rd_atomic`
+must not exceed the peer's `max_dest_rd_atomic`, because the responder sized
+its in-flight-READ tracking at RTR.
+
+You rarely write this by hand: `rdma_connect()` / `rdma_accept()` run exactly
+these three calls, sourcing the values from the CM handshake (§5.3). Manual
+`ibv_modify_qp` remains for bring-up over your own side channel — and for
+driving a QP to ERR/RESET in recovery paths.
+
+### 4.4 The objects: public structs, private containers
 
 The public structs in `<infiniband/verbs.h>` are deliberately thin — an
 `ibv_qp` is little more than the QP number, state, and back-pointers. The
@@ -394,7 +544,7 @@ request: opcode, SGE list, flags, and for one-sided ops
 `wr.rdma.remote_addr` / `wr.rdma.rkey`), and `ibv_wc` (the completion:
 `wr_id`, `status`, opcode, byte count).
 
-### 4.4 Typical execution contexts
+### 4.5 Typical execution contexts
 
 A real application touches the library from three or four distinct contexts,
 and mixing them up is the classic verbs performance bug:
@@ -422,7 +572,7 @@ and mixing them up is the classic verbs performance bug:
   drain the CQ, re-arm. Async events (`IBV_EVENT_QP_FATAL`, port down…) and
   `rdma_cm` connection events arrive the same way.
 
-### 4.5 How a call is implemented
+### 4.6 How a call is implemented
 
 **Control path** — `ibv_create_qp()` end to end:
 
@@ -549,6 +699,44 @@ address resolution piggybacks on the normal IP/ARP/neighbour machinery of the
 underlay Ethernet. This is inherently asynchronous (it involves network
 round-trips), so applications drive it with an event channel. **It runs only at
 connection establishment — never per message.**
+
+Under the hood the CM automates exactly the three `ibv_modify_qp` calls of
+§4.3: the kernel runs the wire handshake and *computes* the attributes;
+userspace librdmacm still *issues* the modifies. The handshake is the IB CM
+protocol (IBTA Vol 1 ch. 12) — three messages, and REQ/REP carry precisely
+the values §4.3's manual code needed out-of-band:
+
+```
+   client (active)                        server (passive)
+        │──────────  REQ  ───────────────────▶│   client QPN, PSN, GID, MTU
+        │◀─────────  REP  ────────────────────│   server QPN, PSN
+        │──────────  RTU  ───────────────────▶│   "ready to use"
+    ESTABLISHED                           ESTABLISHED
+```
+
+The two ends fire the transitions at different CM events because the
+handshake is asymmetric:
+
+- **Server** — REQ arrives → `RDMA_CM_EVENT_CONNECT_REQUEST` on a new child
+  `cm_id`. Your handler's `rdma_create_qp()` performs RESET→INIT, and
+  `rdma_accept()` runs INIT→RTR and RTR→RTS *before* the kernel sends REP —
+  it already has the client's QPN/PSN/GID from REQ.
+- **Client** — `rdma_create_qp()` → RESET→INIT; `rdma_connect()` sends REQ.
+  It must wait for REP to learn the server's QPN/PSN: when REP arrives,
+  librdmacm runs INIT→RTR and RTR→RTS, then the kernel sends RTU and hands
+  you `RDMA_CM_EVENT_ESTABLISHED`. By the time you see that event the QP is
+  already in RTS.
+
+The kernel/user split is one ioctl pair per transition: librdmacm asks the
+kernel CM for the attributes (`RDMA_USER_CM_CMD_INIT_QP_ATTR` →
+`rdma_init_qp_attr()` in `cma.c`), which fills in `dest_qp_num`, the PSNs,
+`ah_attr`, and MTU from handshake state — then issues the same
+`ibv_modify_qp` uverbs command you would have written by hand. The local PSN
+is generated (randomized) by the CM; `ah_attr` comes from the path record
+resolved during `rdma_resolve_addr`/`rdma_resolve_route`; the retry knobs
+come from `struct rdma_conn_param` (`retry_count`, `rnr_retry_count`), and
+`initiator_depth`/`responder_resources` are negotiated across REQ/REP into
+the crossed `max_rd_atomic`/`max_dest_rd_atomic` pair.
 
 ### 5.4 Why the kernel is absent from the data path
 
@@ -860,7 +1048,7 @@ PSN-based loss recovery. The three operations map to these packet exchanges
   from the expected PSN. A retransmit timeout does the same.
 - **RNR (Receiver Not Ready).** A SEND that finds no posted RQ WQE draws an
   **RNR NAK** carrying a back-off timer; the requester waits, then retries.
-  This is the `min_rnr_timer` you set at RTR.
+  This is the `min_rnr_timer` you set at RTR (§4.3).
 - **End-to-end flow control.** For SENDs the ACK's AETH syndrome also returns
   **credits** — how many more receive buffers the peer has — so a fast sender
   can't overrun the receiver. One-sided WRITE/READ need no credits (the RETH
@@ -892,11 +1080,70 @@ packet after it in the message — the tail waits on the head. (Modern NICs add
 selective-retransmit to soften this.) Getting §9's "tuned lossless fabric"
 right is largely the work of keeping *both* forms of HoL blocking from biting.
 
-## 8.7 ACK timeouts, retries, and diagnosing loss
+## 8.7 RoCEv2 addressing: the GID table and `sgid_index`
+
+On RoCE a GID is an IP address in disguise: the 128-bit GID field holds the
+port's IPv6 address, or an IPv4 address in IPv4-mapped form. So
+`ah_attr.grh.dgid` (§4.3) is simply "the peer's IP" — and `sgid_index`
+selects a row of the local **GID table**, which silently fixes three things
+at once: **source IP, RoCE version, and VLAN**.
+
+The table has many rows per port — one per (IP × RoCE version × VLAN),
+populated from the netdevs by the kernel (`roce_gid_mgmt.c`). `show_gids`
+decodes it; raw entries live under
+`/sys/class/infiniband/<dev>/ports/1/gids/`:
+
+```
+ idx  GID (decoded)          type     netdev
+ ───  ─────────────────────  ───────  ───────
+  0   fe80::…  (link-local)  RoCE v1  eth0
+  1   fe80::…  (link-local)  RoCE v2  eth0
+  2   ::ffff:192.168.1.10    RoCE v1  eth0
+  3   ::ffff:192.168.1.10    RoCE v2  eth0     ← usually what you want
+  4   ::ffff:192.168.20.10   RoCE v2  eth0.20  (VLAN 20)
+```
+
+Rows 2 and 3 send to the same peer from the same source IP but with
+different encapsulation: v2 is UDP/4791 and routes (§8.1); v1 is a raw
+Ethertype (0x8915) and does not — and the receiving NIC only parses the
+version its QP was configured for. A VLAN row tags frames; a native row
+doesn't. **None of this errors at `ibv_modify_qp` time**: the QP reaches RTS
+happily, and the mistake surfaces only as §8.8's black-holed path
+(`IBV_WC_RETRY_EXC_ERR`) — the packets left, and nothing ever ACKed.
+
+Where the wrong index typically comes from:
+
+- **Manual bring-up** defaulting to index 0 — usually the *link-local
+  RoCEv1* row: non-routable and likely version-mismatched.
+- **Multi-homed hosts** — several routable GIDs; the "obvious" low index is
+  on the wrong subnet.
+- **Containers / network namespaces** — GID rows are tied to netdevs in a
+  specific netns, so an index valid on the host points at a different row
+  (or nothing) inside a container.
+- **RoCEv1↔v2 mixed ends** — there is no version negotiation at the GID
+  layer; both sides must pick the same version's row.
+
+`rdma_cm` avoids all of this: `rdma_resolve_addr`/`rdma_resolve_route` run
+the normal IP-routing + neighbour lookup on the underlay (§5.3), so the
+kernel picks the egress netdev and source IP for the destination and maps
+them back to the GID row. Choosing by hand is doing that routing lookup
+yourself — take the row whose **netdev is your egress interface for the
+peer's IP**, whose **type is RoCE v2**, and whose **subnet routes to the
+peer**.
+
+The same `grh` sub-struct carries two more wire-visible knobs:
+`traffic_class` becomes the IP **DSCP** — i.e. whether your flow rides the
+PFC/ECN lossless class of §8.6 at every hop — and `flow_label` feeds the
+UDP *source* port, so ECMP spreads different QPs across paths while keeping
+any one QP (and its ordering) on a single path. One `ah_attr`, chosen at
+RTR, decides every RoCEv2 delivery property the rest of §8 depends on.
+
+## 8.8 ACK timeouts, retries, and diagnosing loss
 
 This is where the wire protocol turns into real-world pain, and the failure
 you are most likely to hit on RoCE. Two QP timers govern recovery, both
-configured when the QP is moved to RTS (`ibv_modify_qp`, or the CM's defaults):
+configured when the QP is moved to RTS (§4.3's `ibv_modify_qp`, or the CM's
+defaults):
 
 - **`timeout`** — the *local ACK timeout*. The requester waits
   `4.096 µs × 2^timeout` for an ACK before retransmitting. It is exponential and
@@ -926,7 +1173,8 @@ completion carries a fatal status:
 2. **`timeout` too small for the path RTT** (multi-hop, congested, or
    long-distance): the timer fires before a legitimately slow ACK returns,
    burning retries until `retry_cnt` is gone. Raise `timeout`/`retry_cnt`.
-3. **A black-holed path** — wrong GID index (RoCEv1 vs v2, wrong subnet), MTU
+3. **A black-holed path** — wrong GID index (RoCEv1 vs v2, wrong subnet —
+   §8.7), MTU
    mismatch, or an ACL/firewall dropping **UDP 4791** — so some packets never
    arrive.
 4. **Peer QP in error or gone** (crash; or a one-sided WRITE that hit an MR
