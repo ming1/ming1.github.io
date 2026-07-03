@@ -1,5 +1,5 @@
 ---
-title: "RDMA from Top to Bottom: How Applications, Kernel, and Hardware Work Together (with ConnectX-5 Internal Deep Dive)"
+title: "RDMA from Top to Bottom: How Applications, Kernel, and Hardware Work Together"
 category: hardware
 tags: [rdma, network, linux kernel, zero copy, dma, infiniband]
 ---
