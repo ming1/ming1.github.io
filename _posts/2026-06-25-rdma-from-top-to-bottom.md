@@ -42,6 +42,8 @@ the stream into different messages/transactions.**
 [RDMA Tutorial](https://www.doc.ic.ac.uk/~jgiceva/teaching/ssc18-rdma.pdf)
 
 
+[RDMA / InfiniBand / RoCEv2 / NCCL (wechat)](https://mp.weixin.qq.com/s?__biz=MzYyMzQ4ODM3OQ==&mid=2247483901&idx=1&sn=6fa6a7e1c622b927c881443244fbde34&chksm=feb3be03ed5923133b6ef9c9df500b57140195e970865121d011429145837360196a9aa67f7d&mpshare=1&scene=1&srcid=0706AhXuzisqFYJyYM4U3bdT&sharer_shareinfo=9493f2469ed50e40cb6d5a2110967f0f&sharer_shareinfo_first=9493f2469ed50e40cb6d5a2110967f0f#rd)
+
 # Terms and abbreviations
 
 This post is dense with RDMA vocabulary. Skim this once and refer back as
