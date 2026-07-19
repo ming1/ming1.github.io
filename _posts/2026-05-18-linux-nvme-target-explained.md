@@ -285,6 +285,86 @@ Two things to notice:
 
 See: [`nvmet.h` ~ line 380](https://elixir.bootlin.com/linux/latest/source/drivers/nvme/target/nvmet.h#L380).
 
+### The object graph, serialized: the `nvmetcli` JSON
+
+The diagram above lives in kernel memory, but the same graph has a portable
+on-disk form. `nvmetcli save /etc/nvmet/config.json` walks the live configfs
+tree (section 7) and dumps it as JSON; `nvmetcli restore` replays it after a
+reboot. So the JSON is not a separate model — it is a *photograph of the
+object graph*, and every key maps back onto a struct from this section.
+
+It has exactly three top-level buckets — `hosts`, `ports`, `subsystems` — the
+same trichotomy as `/sys/kernel/config/nvmet/`. Using the identifiers from the
+section 7 recipe:
+
+```json
+{
+  "hosts": [
+    { "nqn": "nqn.2026-05.org.example:host1" }
+  ],
+  "ports": [
+    {
+      "portid": 1,
+      "addr": {
+        "trtype":  "tcp",
+        "adrfam":  "ipv4",
+        "traddr":  "192.168.1.10",
+        "trsvcid": "4420"
+      },
+      "referrals": [],
+      "subsystems": [ "nqn.2026-05.org.example:storage" ]
+    }
+  ],
+  "subsystems": [
+    {
+      "nqn": "nqn.2026-05.org.example:storage",
+      "attr": { "allow_any_host": "0" },
+      "allowed_hosts": [ "nqn.2026-05.org.example:host1" ],
+      "namespaces": [
+        {
+          "nsid": 1,
+          "enable": 1,
+          "device": {
+            "path": "/dev/sdb",
+            "uuid": "b2f8e1a0-1c3d-4e5f-8a9b-0c1d2e3f4a5b",
+            "nguid": "00000000-0000-0000-0000-000000000000"
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+The dump above is trimmed for clarity: a real `save` also emits the other
+`attr` fields (`serial`, `model`, `firmware`, …), and a host with
+authentication configured carries a `dhchap` group (`dhchap_key`,
+`dhchap_ctrl_key`, …) rather than the bare `{ "nqn": … }` shown here — those
+are the same files section 9 wires up.
+
+Wiring each JSON element back to the objects above:
+
+| JSON location | Section 3 object | What the field carries |
+|---|---|---|
+| `ports[]` | **`nvmet_port`** | one listening endpoint |
+| `ports[].portid` / `addr.*` | `nvmet_port` fields | the `trtype`/`adrfam`/`traddr`/`trsvcid` tuple that pins the socket |
+| `ports[].subsystems[]` | port → subsys **link** | list of NQN *strings* — the configfs symlinks. A reference, not ownership: one port lists many subsystems |
+| `subsystems[]` | **`nvmet_subsys`** | one logical "device" |
+| `subsystems[].nqn` | `subsys->subsysnqn` | the NQN that names it |
+| `subsystems[].attr.allow_any_host` + `allowed_hosts[]` | the access gate | decides whether a connecting host is permitted to spin up a `nvmet_ctrl` |
+| `subsystems[].namespaces[]` | **`nvmet_ns`** | one namespace, *owned* by the subsystem (nested, not linked) |
+| `namespaces[].device.path` | `ns->bdev` **or** `ns->file` | the per-namespace bdev-or-file choice |
+| `namespaces[].nsid` / `uuid` / `nguid` | `ns` identifiers | NSID and the reported namespace IDs |
+| `hosts[]` | host NQN records | referenced by `allowed_hosts`; also carry the DH-HMAC-CHAP keys used in section 9 |
+
+The revealing part is **what the JSON does *not* contain.** There is no
+`nvmet_ctrl`, no `nvmet_sq`/`nvmet_cq`, no `nvmet_req`. Those are the
+right-hand, runtime half of the diagram: a controller is born only when a host
+issues the fabrics `Connect` command, its queues are allocated with it, and
+each `nvmet_req` lives for the duration of a single command. The JSON freezes
+the *persistent* spine — port, subsystem, namespace, host — and everything
+downstream of `nvmet_ctrl` grows on top of it dynamically at connect time.
+
 ---
 
 ## 4. The Command Lifecycle (Top to Bottom)
