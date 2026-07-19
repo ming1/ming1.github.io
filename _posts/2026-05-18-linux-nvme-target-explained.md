@@ -197,7 +197,8 @@ the fly, hooks it to that **subsystem**, and exposes the underlying
 ## 3. Top View: The Object Graph
 
 Everything in `nvmet` revolves around six core objects, defined in
-[`nvmet.h`](https://elixir.bootlin.com/linux/latest/source/drivers/nvme/target/nvmet.h):
+[`nvmet.h`](https://elixir.bootlin.com/linux/v7.0/source/drivers/nvme/target/nvmet.h)
+(struct line numbers below are pinned to Linux v7.0):
 
 ```
                      ┌──────────────────────┐
@@ -237,19 +238,25 @@ Everything in `nvmet` revolves around six core objects, defined in
 
 A quick guide to who owns whom:
 
-- **`nvmet_port`** — a network listener. It does *not* own subsystems; it
+- **[`nvmet_port`](https://elixir.bootlin.com/linux/v7.0/source/drivers/nvme/target/nvmet.h#L200)**
+  — a network listener. It does *not* own subsystems; it
   references them via configfs symlinks (one port can expose many
   subsystems; one subsystem can be reachable through many ports).
-- **`nvmet_subsys`** — the logical "device" identified by its NQN. Holds an
+- **[`nvmet_subsys`](https://elixir.bootlin.com/linux/v7.0/source/drivers/nvme/target/nvmet.h#L315)**
+  — the logical "device" identified by its NQN. Holds an
   `xarray` of namespaces and a list of currently connected controllers.
-- **`nvmet_ns`** — one namespace, backed by either a `struct block_device`
+- **[`nvmet_ns`](https://elixir.bootlin.com/linux/v7.0/source/drivers/nvme/target/nvmet.h#L100)**
+  — one namespace, backed by either a `struct block_device`
   *or* a `struct file`. The choice is per-namespace.
-- **`nvmet_ctrl`** — a per-host controller; created when a host sends the
+- **[`nvmet_ctrl`](https://elixir.bootlin.com/linux/v7.0/source/drivers/nvme/target/nvmet.h#L251)**
+  — a per-host controller; created when a host sends the
   fabrics `Connect` command. Holds the SQ/CQ arrays and async-event slots.
-- **`nvmet_sq` / `nvmet_cq`** — the queue pair. `qid==0` is the admin
+- **[`nvmet_sq`](https://elixir.bootlin.com/linux/v7.0/source/drivers/nvme/target/nvmet.h#L150) / [`nvmet_cq`](https://elixir.bootlin.com/linux/v7.0/source/drivers/nvme/target/nvmet.h#L143)**
+  — the queue pair. `qid==0` is the admin
   queue; `qid>0` are I/O queues. A `percpu_ref` protects in-flight commands
   from racing with queue teardown.
-- **`nvmet_req`** — one command in flight. This is the unit that travels
+- **[`nvmet_req`](https://elixir.bootlin.com/linux/v7.0/source/drivers/nvme/target/nvmet.h#L446)**
+  — one command in flight. This is the unit that travels
   from the transport through parsing to the backend executor.
 
 ### The `nvmet_req` is the workhorse
@@ -283,7 +290,7 @@ Two things to notice:
    avoid heap allocation entirely: the bio is built inside the request
    object using inline `bio_vec`s.
 
-See: [`nvmet.h` ~ line 380](https://elixir.bootlin.com/linux/latest/source/drivers/nvme/target/nvmet.h#L380).
+See: [`nvmet_req` in `nvmet.h`, v7.0 line 446](https://elixir.bootlin.com/linux/v7.0/source/drivers/nvme/target/nvmet.h#L446).
 
 ### The object graph, serialized: the `nvmetcli` JSON
 
