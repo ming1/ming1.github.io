@@ -39,17 +39,36 @@ RUSTFLAGS="-Z print-type-sizes"
 
 ### core idea
 
-It follows that the owners and their owned values form trees: your owner
-is your parent, and the values you own are your children. And at the ultimate
-root of each tree is a variable; when that variable goes out of scope, the
-entire tree goes with it.
+In Rust, however, the concept of ownership is built into the language 
+itself and enforced by compile-time checks. Every value has a single 
+owner that determines its lifetime. When the owner is freed—dropped, 
+in Rust terminology—the owned value is dropped too.
+
+Rust’s Box type serves as another example of ownership. A Box<T> is 
+a pointer to a value of type T stored on the heap. Since a Box owns the 
+space it points to, when the Box is dropped, it frees the space too. 
+
+It follows that the owners and their owned values form trees: your owner 
+is your parent, and the values you own are your children. And at the 
+ultimate root of each tree is a variable; when that variable goes out of 
+scope, the entire tree goes with it.
+
+- You can move values from one owner to another. This allows you to build, rearrange, and tear down the tree
+
+- Very simple types like integers, ﬂoating-point numbers, and characters are excused from the ownership rules.
+These are called Copy types.
+
+- The standard library provides the reference-counted pointer types Rc and Arc, which allow values to have multiple owners, under some restrictions. 
+
+- You can “borrow a reference” to a value; references are non-owning pointers, with limited lifetimes.
+
 
 <any variable can only have one single owner, but one can owns many variables>
 
 #### how to make it useful
 
-It is still much too rigid to be useful. Rust extends this simple idea in
-several ways:
+It is still much too rigid to be useful. Rust extends this simple idea in 
+several ways: 
 
 - You can move values from one owner to another. This allows you to build,
 rearrange, and tear down the tree.
@@ -122,26 +141,38 @@ fixed-size array of Copy types is itself a Copy type.
 be Copy: a Vec needs to free its elements, a File needs to close its
 file handle, a MutexGuard needs to unlock its mutex, and so on.
 
+#### Rc and Arc: Shared Ownership
+
+Rust’s memory and thread-safety guarantees depend on ensuring that no value is 
+ever simultaneously shared and mutable. Rust assumes the referent of an Rc 
+pointer might in general be shared, so it must not be mutable.
+
+
 ### references
 
 #### reference can't outlive value
 
-#### References are non-owning pointers
+#### References are **non-owning pointers**
+
+A **shared reference** lets you read but not modify its referent. **Shared references are Copy**
+
+If you have a **mutable reference** to a value, you may both read and modify the value. 
+However, you may not have any other references of any sort to that value active at 
+the same time. **Mutable references are not Copy.**
 
 #### multiple shared(ro) reference vs single mutable reference
 
-You can think of the distinction between shared and mutable references as
-a way to enforce a multiple readers or single writer rule at compile time.
-In fact, this rule doesn’t apply only to references; it covers the
-borrowed value’s owner as well. As long as there are shared references to
-a value, not even its owner can modify it; the value is locked down. Nobody
-can modify table while show is working with it. Similarly, if there is a
-mutable reference to a value, it has exclusive access to the value; you can’t
+You can think of the distinction between shared and mutable references as 
+a way to enforce a multiple readers or single writer rule at compile time. 
+In fact, this rule doesn’t apply only to references; it covers the 
+borrowed value’s owner as well. **As long as there are shared references to 
+a value, not even its owner can modify it; the value is locked down.** Nobody 
+can modify table while show is working with it. Similarly, if there is a 
+mutable reference to a value, it has exclusive access to the value; you can’t 
 use the owner at all, until the mutable reference goes away.
 
-Keeping sharing and mutation fully separate turns out to be
-essential to memory safety, for reasons we’ll go into later in
-the chapter.
+Keeping sharing and mutation fully separate turns out to be essential to memory 
+safety, for reasons we’ll go into later in the chapter.
 
 #### by value vs. by reference
 
@@ -179,21 +210,21 @@ its left operand, if needed:
 
 #### References Are Never Null
 
-In Rust, if you need a value that is either a reference to something or not,
-use the type Option<&T>. At the machine level, Rust represents None as a null
-pointer and Some(r), where r is a &T value, as the nonzero address, so
-Option<&T> is just as eﬀicient as a nullable pointer in C or C++, even though
-it’s safer: its type requires you to check whether it’s None before you can
+In Rust, if you need a value that is either a reference to something or not, 
+use the type Option<&T>. At the machine level, Rust represents None as a null 
+pointer and Some(r), where r is a &T value, as the nonzero address, so 
+Option<&T> is just as eﬀicient as a nullable pointer in C or C++, even though 
+it’s safer: its type requires you to check whether it’s None before you can 
 use it.
 
-#### References to Slices and Trait Objects(fat pointer)
+#### References to Slices and Trait Objects(**fat pointer**)
 
-- A reference to a slice is a fat pointer, carrying the starting address of
-the slice and its length.
+A reference to a slice is a fat pointer, carrying the **starting address of 
+the slice and its length.**
 
-- Rust’s other kind of fat pointer is a trait object, a reference to a value
-that implements a certain trait. A trait object carries a value’s address and
-a pointer to the trait’s implementation appropriate to that value, for
+Rust’s other kind of fat pointer is a trait object, a reference to a value 
+that implements a certain trait. A trait object carries a **value’s address and 
+a pointer to the trait’s implementation appropriate to that value**, for 
 invoking the trait’s methods.
 
 #### can we append the vector to itself?
@@ -204,8 +235,48 @@ invoking the trait’s methods.
 Suppose wave starts with space for four elements and so must allocate a
 larger buﬀer via realloc() when extend tries to add a ﬁfth.
 
-- Shared access is read-only access.
-- Mutable access is exclusive access.
+- Shared access is read-only access. 
+
+- Mutable access is exclusive access. 
+
+
+#### Reference safety
+
+##### **Structs Containing References
+
+```
+The lifetime of any reference you store in r had better enclose
+'a, and 'a must outlast the lifetime of wherever you store the S.
+
+    struct S<'a> {
+        r: &'a i32
+    }
+
+Turning back to the preceding code, the expression S { r: &x } creates 
+a fresh S value with some lifetime 'a. When you store &x in the r ﬁeld, 
+you constrain 'a to lie entirely within x’s lifetime.
+```
+
+How does a type with a lifetime parameter behave when placed inside some 
+other type?
+
+```
+struct D {
+    s: S // not adequate
+}
+```
+
+Here, we give D its own lifetime parameter and pass that to S:
+
+```
+struct D<'a> {
+    s: S<'a>
+}
+```
+
+By taking a lifetime parameter 'a and using it in s’s type, we’ve 
+allowed Rust to relate D value’s lifetime to that of the reference 
+its S holds.
 
 
 ## Result
