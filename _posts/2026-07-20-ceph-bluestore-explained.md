@@ -359,23 +359,49 @@ Design notes a storage developer will care about:
 ## The RocksDB schema
 
 All metadata shares one ordered keyspace, distinguished by one-letter
-prefixes (`BlueStore.cc:134`):
+prefixes (`BlueStore.cc:134`). Key layouts and values per prefix
+(integers are encoded big-endian so bytewise sort equals numeric sort):
 
-| Prefix | Content |
-|--------|---------|
-| `S` | superblock: nid_max, blobid_max, freelist type, ondisk format |
-| `T` | statfs counters (allocated / stored / compressed bytes) |
-| `C` | collections (PGs): `cnode_t` with the PG's hash-bit count |
-| `O` | **onodes + extent-map shards** — the heart of the store |
-| `M` / `P` / `m` / `p` | omap key/value data (legacy / pgmeta / per-pool / per-PG encodings) |
-| `L` | deferred-write journal records (replayed after crash) |
-| `B` / `b` | freelist (extent form / bitmap blocks) |
-| `X` | shared blobs (clone refcount maps) |
+| Prefix | Key (after the prefix byte) | Value |
+|--------|------------------------------|-------|
+| `S` | field name: `nid_max`, `blobid_max`, `min_alloc_size`, `freelist_type`, `ondisk_format`, `per_pool_omap`, ... | one encoded scalar/string each — the store's superblock, read once in `_open_super_meta` |
+| `T` | `bluestore_statfs` (global) or pool id | int64 array: allocated / stored / compressed bytes... updated via a *merge operator* (deltas, no read-modify-write) |
+| `C` | collection name, e.g. `2.1f_head` | `bluestore_cnode_t` — essentially the PG's hash-bit count |
+| `O` | shard + pool + **bit-reversed hash** + namespace + name + snap + gen | encoded `bluestore_onode_t` (+ inline extent map while small) |
+| `O` (shard) | the same onode key + u32 shard offset + suffix byte `'x'` (`BlueStore.cc:201`) | one encoded extent-map shard — big objects split their map across adjacent keys |
+| `M` / `P` | u64 **nid** + omap key (`P`: same, for the pgmeta collection) | the user's omap value, verbatim |
+| `m` | s64 pool + u64 nid + omap key | ditto (per-pool accounting era) |
+| `p` | u64 pool + u32 hash + u64 nid + omap key | ditto (current; sorts omap in PG order for scrub) |
+| `L` | u64 sequence number | encoded `deferred_transaction_t`: target device extents **plus the payload bytes**; deleted after replay |
+| `B` | meta field names: `bytes_per_block`, `blocks_per_key`, `blocks`, `size` | bitmap-freelist geometry (`BitmapFreelistManager.cc:97`) |
+| `b` | u64 device offset (one key per `blocks_per_key` chunk) | allocation bitmap chunk, flipped via an XOR merge operator |
+| `X` | u64 shared-blob id (sbid) | `bluestore_shared_blob_t` — the extent refcount map for clones |
 
-The `O` key encoding (`get_object_key`, `BlueStore.cc:496`) packs
-shard + pool + *bit-reversed* object hash + name + snapshot, so objects of
-the same PG sort together in RocksDB exactly as CRUSH hashes them — PG
-enumeration and deletion become range scans.
+Three encoding tricks are worth pausing on:
+
+- **The `O` key sorts like CRUSH places.** `get_object_key`
+  (`BlueStore.cc:496`) packs shard + pool + *bit-reversed* object hash +
+  name + snapshot. PG membership is decided by the *low* bits of the
+  hash, so reversing the bits makes all objects of one PG a contiguous
+  key range — PG enumeration, split, and deletion become range scans.
+  Extent-map shards extend the same key with their offset, so an onode
+  and all its shards are physically adjacent in the SST files.
+- **omap keys use the nid, not the object name.** Every onode gets a
+  monotonic numeric id (`nid`, allocated from `nid_max` in `S`); omap
+  keys embed that instead of the (long, mutable) object name. Renames
+  and clones never rewrite omap data — only the onode's pointer to its
+  nid — and omap keys stay short regardless of object-name length.
+- **Hot counters are merges, not writes.** statfs (`T`) and the
+  allocation bitmap (`b`) are updated through RocksDB merge operators —
+  an append-only "+delta" / "XOR these bits" record that compaction
+  folds in later. That keeps the commit path write-only (no
+  read-modify-write of the old value), the same principle as the data
+  path bypassing RocksDB reads.
+
+A worked example — `rados put` of a fresh 4 MiB object touches, in one
+atomic batch: one `O` put (new onode + extent map), one `b` merge
+(bitmap bits for the allocated extents), one `T` merge (statfs deltas) —
+and nothing else; the 4 MiB payload went straight to disk.
 
 ## Interface 1: transactions — the write path
 
