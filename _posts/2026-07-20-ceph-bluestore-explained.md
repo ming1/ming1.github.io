@@ -67,7 +67,6 @@ first, then BlueStore's own objects, then persistence and devices.
 | Term | Meaning |
 |------|---------|
 | RocksDB | embedded LSM key/value store holding ALL BlueStore metadata |
-| O key | an onode's RocksDB key: `O` + shard + pool + bit-reversed hash + name + snap — sorts objects in PG order; extent-map shards append u32 offset + `'x'` |
 | WAL | write-ahead log — RocksDB's journal; its fsync is the commit point |
 | BlueFS | mini-filesystem BlueStore implements just to host RocksDB's files |
 | block / block.db / block.wal | the OSD's data / RocksDB / WAL devices |
