@@ -711,6 +711,61 @@ The moving parts, top-down:
   after a device resize — the operator-facing corners of everything
   above.
 
+### How the two RocksDB write streams hit BlueFS: SST vs WAL
+
+RocksDB produces exactly two kinds of write traffic, and BlueFS treats
+them very differently. Placement first: RocksDB opens files under
+`db/`, `db.wal/`, or `db.slow/`, and
+[`open_for_write`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.h#L874)
+uses the directory name as the volume-selector hint that maps the file
+to a device tier (with spillover when the preferred tier is full).
+
+```
+ SST file (memtable flush /            WAL file (every BlueStore
+ compaction output)                    kv commit batch)
+ ──────────────────────────            ──────────────────────────
+ open db/000123.sst                    open db.wal/000042.log
+   hint "db"     → BDEV_DB               hint "db.wal" → BDEV_WAL
+ Append × thousands                    Append (a few-KiB batch)
+   FileWriter buffers, flushes           write batch at write pos
+   at ≥ bluefs_min_flush_size          Sync (EVERY commit):
+   extents preallocated in               legacy: data fdatasync + fnode
+   bluefs_alloc_size chunks                dirty → journal append +
+ Sync once when file completes             journal fdatasync = 2 syncs
+   data flush + ONE journal              envelope mode (default): length
+   append (fnode + dir link)               header written in-band → no
+ throughput-bound, latency-              fnode update needed → 1 sync
+ insensitive                           latency-bound: this IS the
+                                       client-visible commit path
+```
+
+- **SST writes are the easy case**: large, sequential, and nobody waits
+  on them. The `FileWriter` buffers appends and flushes at
+  [`bluefs_min_flush_size`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L4278)
+  (512 KiB); space is grabbed in
+  [`bluefs_alloc_size`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L4224)
+  (1 MiB) chunks so the fnode's extent list changes rarely; one `Sync`
+  at file completion flushes data and appends a single
+  `OP_FILE_UPDATE_INC` (+ dir link) to the BlueFS journal.
+- **WAL writes are the hard case**, because they sit on the
+  client-visible commit path (`kv_sync_thread`'s
+  `submit_transaction_sync` lands here). The classic cost:
+  [`fsync`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.cc#L4428)
+  must flush the data *and* — since every append grows the file, marking
+  the fnode dirty
+  ([`BlueFS.cc:4094`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.cc#L4094))
+  — run
+  [`_flush_and_sync_log_LD`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.cc#L3878)
+  to journal the new size: **two device syncs per commit**.
+- **Envelope mode kills the second sync.**
+  [`bluefs_wal_envelope_mode`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L4311)
+  (default `true`) frames each WAL append with an in-band length
+  header, so the durable file size no longer matters — recovery finds
+  the log tail by walking envelopes, the fnode needs no per-append
+  journal update, and per the option's own description WAL fdatasync
+  count drops ~50%. (Downgrading needs `ceph-bluestore-tool
+  downgrade-wal-to-v1`.)
+
 The design trade is explicit: mount-time replay cost and a periodic
 compaction stall risk, in exchange for a metadata write path that is a
 single sequential append — on the same device RocksDB is already
