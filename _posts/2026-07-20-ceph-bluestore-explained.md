@@ -351,10 +351,10 @@ Design notes a storage developer will care about:
   large extent map; storing it as one RocksDB value would make every
   metadata update rewrite the whole map. `ExtentMap` therefore splits into
   shards (`bluestore_onode_t::shard_info`), each a separate `O` key,
-  loaded and dirtied independently (`BlueStore.h:965`).
+  loaded and dirtied independently ([`BlueStore.h:965`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L965)).
 - **Lifetime.** Onodes/Blobs are refcounted (`nref`) and live in
   per-collection caches (a *collection* == one placement group,
-  `BlueStore.h:1716`); nothing is ever freed on disk except through a
+  [`BlueStore.h:1716`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1716)); nothing is ever freed on disk except through a
   transaction that updates the freelist atomically with the metadata.
 
 ## The RocksDB schema
@@ -362,7 +362,7 @@ Design notes a storage developer will care about:
 RocksDB stores **metadata only** — object data bytes never live there,
 with one deliberate, temporary exception (the deferred-write journal,
 below). All of it shares one ordered keyspace, split into namespaces by
-a one-letter prefix (`BlueStore.cc:134`); integers inside keys are
+a one-letter prefix ([`BlueStore.cc:134`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L134)); integers inside keys are
 encoded big-endian so bytewise sort equals numeric sort. Each kind of
 metadata gets its own subsection here: key/value format, why it exists,
 and when it's touched.
@@ -405,9 +405,9 @@ and when it's touched.
 ### `O` — onodes and extent maps (the heart of the store)
 
 - **Key**: shard + pool + **bit-reversed** object hash + namespace +
-  name + snapshot + generation (`get_object_key`, `BlueStore.cc:496`).
+  name + snapshot + generation (`get_object_key`, [`BlueStore.cc:496`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L496)).
   Big objects add sibling keys: same key + u32 shard offset + suffix
-  `'x'` (`BlueStore.cc:201`), one per extent-map shard.
+  `'x'` ([`BlueStore.cc:201`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L201)), one per extent-map shard.
 - **Value**: the encoded `bluestore_onode_t` (size, attrs, flags — with
   the extent map inlined while small); shard keys hold one encoded
   extent-map shard each.
@@ -452,7 +452,7 @@ and when it's touched.
 ### `B` / `b` — persistent freelist
 
 - **Key**: `B` holds named geometry fields (`bytes_per_block`,
-  `blocks_per_key`, `blocks`, `size`; `BitmapFreelistManager.cc:97`);
+  `blocks_per_key`, `blocks`, `size`; [`BitmapFreelistManager.cc:97`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BitmapFreelistManager.cc#L97));
   `b` holds one key per chunk of `blocks_per_key` device blocks, keyed
   by u64 offset.
 - **Value**: `B`: encoded geometry scalars; `b`: that chunk's
@@ -495,8 +495,8 @@ The OSD hands BlueStore a `ceph::os::Transaction`
 POSIX and BlueStore gets natively from a RocksDB write batch.
 
 `queue_transactions()` wraps the batch in a `TransContext`, which walks a
-state machine (`state_t`, `BlueStore.h:1909`; driver `_txc_state_proc`,
-`BlueStore.cc:14634`):
+state machine (`state_t`, [`BlueStore.h:1909`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1909); driver `_txc_state_proc`,
+[`BlueStore.cc:14634`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L14634)):
 
 ```
  queue_transactions()
@@ -531,7 +531,7 @@ state machine (`state_t`, `BlueStore.h:1909`; driver `_txc_state_proc`,
 ```
 
 The two write strategies (chosen in `_do_write_small` /
-`_do_write_big`, `BlueStore.cc:16566` / `:17077`):
+`_do_write_big`, [`BlueStore.cc:16566`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L16566) / [`:17077`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L17077)):
 
 - **Big or new writes** never overwrite live data: allocate new blocks,
   `aio_write` them, and only then flip the metadata in RocksDB. Crash at
@@ -552,24 +552,24 @@ one `submit_transaction_sync`, so queue depth amortizes the fsync.
 
 ## Interface 2: the read path
 
-`read()` → `_do_read()` (`BlueStore.cc:13138`): look up the Onode (cache
+`read()` → `_do_read()` ([`BlueStore.cc:13138`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L13138)): look up the Onode (cache
 first, else RocksDB `O` key), load the extent-map shards covering the
 range, then per blob: serve from the buffer cache if resident, else
 `aio_read` the physical extents, **verify the checksum**
-(`_verify_csum`, `BlueStore.cc:13299`), and decompress if the blob is
+(`_verify_csum`, [`BlueStore.cc:13299`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L13299)), and decompress if the blob is
 compressed. A checksum mismatch returns EIO to the PG layer — which then
 repairs the replica from another OSD; this is how BlueStore turns silent
 media corruption into self-healing.
 
 Default checksum is crc32c per blob chunk (`bluestore_csum_type`,
-`global.yaml.in:4643`); compression (`bluestore_compression_mode`,
+[`global.yaml.in:4643`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L4643)); compression (`bluestore_compression_mode`,
 default `none`) is decided per write hint and marked in the blob flags.
 
 ## BlueFS and BlueRocksEnv: RocksDB without a filesystem
 
 RocksDB expects a POSIX-ish filesystem for its `.sst`, `MANIFEST` and WAL
 files. Instead of keeping XFS around just for that, BlueStore implements
-`BlueRocksEnv` (`BlueRocksEnv.h:19`, a `rocksdb::EnvWrapper`) backed by
+`BlueRocksEnv` ([`BlueRocksEnv.h:19`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueRocksEnv.h#L19), a `rocksdb::EnvWrapper`) backed by
 **BlueFS** — a minimal, journaled, extent-based userspace filesystem
 whose entire feature set is "what RocksDB needs": create/append/read
 files, rename, fsync, three directories.
@@ -620,13 +620,13 @@ anything *except* the log itself.
 
 The moving parts, top-down:
 
-- **A file is just an fnode.** `bluefs_fnode_t` (`bluefs_types.h:140`):
+- **A file is just an fnode.** `bluefs_fnode_t` ([`bluefs_types.h:140`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluefs_types.h#L140)):
   ino, size, mtime, and a vector of raw extents — each tagged with which
   device tier it lives on. Directories are flat (`db/`, `db.wal/`,
   `db.slow/`); no nesting, because RocksDB never asks for it.
 - **The journal is the metadata.** Every namespace or fnode mutation is
   an op appended to the journal (`op_dir_link`, `op_file_update`, ...;
-  the op set at `bluefs_types.h:349-362` is the complete metadata
+  the op set at [`bluefs_types.h:349-362`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluefs_types.h#L349-L362) is the complete metadata
   "schema"). `fsync` of a RocksDB file = flush its data extents, then
   append the file's new fnode as `OP_FILE_UPDATE_INC` and flush the
   journal. There is deliberately no other durable structure to update.
@@ -639,11 +639,11 @@ The moving parts, top-down:
   which is why BlueFS needs no persistent freelist at all.
 - **Compaction bounds the journal.** An append-forever journal would
   replay ever slower, so when it exceeds a threshold
-  (`_should_start_compact_log_L_N`, `BlueFS.h:732`) BlueFS writes a
+  (`_should_start_compact_log_L_N`, [`BlueFS.h:732`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.h#L732)) BlueFS writes a
   fresh journal containing just a snapshot of current metadata and jumps
   to it — either stop-the-world (`_compact_log_sync_LNF_LD`,
-  `BlueFS.h:745`) or the default async variant
-  (`_compact_log_async_LD_LNF_D`, `:746`) that builds the new log while
+  [`BlueFS.h:745`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.h#L745)) or the default async variant
+  (`_compact_log_async_LD_LNF_D`, [`:746`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.h#L746)) that builds the new log while
   writers continue, then atomically flips `log_fnode` via a superblock
   rewrite. The cryptic suffixes (`_LNF_LD`) encode the lock order —
   log/nodes/file locks — a hint that this path is the concurrency
@@ -688,19 +688,19 @@ the durable one:
              is durable (and after async discard completes)
 ```
 
-**The in-memory view** is the `Allocator` (`Allocator.cc:38`): a
+**The in-memory view** is the `Allocator` ([`Allocator.cc:38`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/Allocator.cc#L38)): a
 pluggable policy object per device answering "give me N contiguous-ish
-bytes" from RAM. Default is `hybrid` (`global.yaml.in:5327`) — an AVL
+bytes" from RAM. Default is `hybrid` ([`global.yaml.in:5327`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L5327)) — an AVL
 interval tree for the common case that degrades gracefully to per-region
 bitmaps when fragmentation makes the tree expensive; `avl`, `btree`,
 `bitmap`, `stupid`, and `hybrid_btree2` are selectable. The main-device
-allocator is *shared with BlueFS* (`shared_alloc`, `BlueStore.h:2426`),
+allocator is *shared with BlueFS* (`shared_alloc`, [`BlueStore.h:2426`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2426)),
 so RocksDB file growth and object data carve from the same pool — this
 is what lets a single-device OSD work at all. Fragmentation is a
-first-class metric (`get_fragmentation_score`, `Allocator.cc:96`;
+first-class metric (`get_fragmentation_score`, [`Allocator.cc:96`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/Allocator.cc#L96);
 `ceph tell osd.N bluestore allocator score block` to sample it).
 
-**The on-disk view** is the `FreelistManager` (`FreelistManager.cc:7`),
+**The on-disk view** is the `FreelistManager` ([`FreelistManager.cc:7`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/FreelistManager.cc#L7)),
 and its only job is surviving crashes. The bitmap variant keeps one `b`
 key per chunk of `blocks_per_key` blocks and *XOR-merges* bit flips into
 it — allocation and free are the same operation (flip), so the commit
@@ -717,7 +717,7 @@ metadata and free space disagree on disk.
   the commit, nothing was persisted; the space simply reappears as free
   at next mount. Optimistic, and safe by construction.
 - *Freeing* is lazy: released extents (`txc->released`) rejoin the RAM
-  allocator only in `_txc_release_alloc` (`BlueStore.cc:15140`), called
+  allocator only in `_txc_release_alloc` ([`BlueStore.cc:15140`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15140)), called
   from `_txc_finish` after the freeing transaction is durable — and if
   async discard is enabled, only after the device-level discard
   completes. Reusing a "freed" extent any earlier would let a crash
@@ -729,10 +729,10 @@ metadata and free space disagree on disk.
 exists: iterate the `b` bitmap keys (classic mode), or — on
 non-rotational devices, where per-commit bitmap merges cost real write
 amplification — **NCB / null-freelist mode** (`_open_fm`,
-`BlueStore.cc:7357`): persist *nothing* per commit, destage the entire
+[`BlueStore.cc:7357`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L7357)): persist *nothing* per commit, destage the entire
 allocator map to a file on clean shutdown, and after a crash rebuild it
 the hard way by walking every onode's extents
-(`read_allocation_from_drive_on_startup`, `BlueStore.cc:21041`). Zero
+(`read_allocation_from_drive_on_startup`, [`BlueStore.cc:21041`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L21041)). Zero
 steady-state overhead, paid for with a full metadata scan on unclean
 restart — the trade only makes sense because SSD scans are fast.
 
@@ -741,11 +741,11 @@ restart — the trade only makes sense because SSD scans are fast.
 `BlockDevice::create` picks `KernelDevice` by default (SPDK `NVMEDevice`
 and `PMEMDevice` exist for kernel-bypass setups). `KernelDevice`
 (`src/blk/kernel/KernelDevice.cc`) is comfortable territory for a kernel
-reader: the device is opened `O_RDWR|O_DIRECT` (`:185`), submission
-prefers **io_uring** with libaio fallback (`:48`, `:96`), durability is
+reader: the device is opened `O_RDWR|O_DIRECT` ([`:185`](https://github.com/ceph/ceph/blob/v21.3.0/src/blk/kernel/KernelDevice.cc#L185)), submission
+prefers **io_uring** with libaio fallback ([`:48`](https://github.com/ceph/ceph/blob/v21.3.0/src/blk/kernel/KernelDevice.cc#L48), [`:96`](https://github.com/ceph/ceph/blob/v21.3.0/src/blk/kernel/KernelDevice.cc#L96)), durability is
 `fdatasync` — skipped when no writes happened since the last flush
-(`io_since_flush`, `:517`) — and TRIM runs on dedicated discard threads
-(`KernelDevice.h:86`). BlueStore is effectively a userspace driver stack:
+(`io_since_flush`, [`:517`](https://github.com/ceph/ceph/blob/v21.3.0/src/blk/kernel/KernelDevice.cc#L517)) — and TRIM runs on dedicated discard threads
+([`KernelDevice.h:86`](https://github.com/ceph/ceph/blob/v21.3.0/src/blk/kernel/KernelDevice.h#L86)). BlueStore is effectively a userspace driver stack:
 its own page-cache substitute, its own scheduler decisions, its own
 barriers.
 
@@ -754,21 +754,21 @@ barriers.
 With no kernel page cache (O_DIRECT), BlueStore caches in-process,
 sharded to avoid lock contention:
 
-- **Onode cache** — `LruOnodeCacheShard` (`BlueStore.cc:1093`): decoded
+- **Onode cache** — `LruOnodeCacheShard` ([`BlueStore.cc:1093`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1093)): decoded
   metadata; an onode miss costs a RocksDB point-get plus decode.
-- **Buffer cache** — `TwoQBufferCacheShard` (2Q, `BlueStore.cc:1343`;
+- **Buffer cache** — `TwoQBufferCacheShard` (2Q, [`BlueStore.cc:1343`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1343);
   plain LRU selectable via `bluestore_cache_type`): object data buffers.
 - **RocksDB block cache** — SSTable blocks, inside RocksDB.
 
-A `MempoolThread` (`BlueStore.h:2595`) rebalances the three pools
+A `MempoolThread` ([`BlueStore.h:2595`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2595)) rebalances the three pools
 continuously against `osd_memory_target` (default 4 GiB per OSD) using
 `PriorityCache` — cache ratios are workload-adaptive, not static.
 
 ## mkfs and mount
 
-`BlueStore::mkfs()` (`BlueStore.cc:8662`) writes the bdev label, carves
+`BlueStore::mkfs()` ([`BlueStore.cc:8662`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L8662)) writes the bdev label, carves
 out BlueFS, creates RocksDB, initializes freelist + allocator, persists
-the superblock. `_mount()` (`:9556`) reverses it: open devices →
+the superblock. `_mount()` ([`:9556`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L9556)) reverses it: open devices →
 replay BlueFS journal → open RocksDB → read `S` superblock keys →
 initialize the allocator (from freelist or NCB file) → **replay any
 pending `L` deferred writes** — the crash-recovery half of the deferred
@@ -779,11 +779,11 @@ path.
 | You want to... | Look at |
 |---|---|
 | change write/read behavior | `_do_write_small/_big`, `_do_read`, `WriteContext` in `BlueStore.cc` |
-| add on-disk metadata | `bluestore_types.h` (bump `encode/decode` versions!), new `PREFIX_*` in `BlueStore.cc:134` |
-| new allocation policy | subclass `Allocator`, register in `Allocator.cc:38` factory |
+| add on-disk metadata | `bluestore_types.h` (bump `encode/decode` versions!), new `PREFIX_*` in [`BlueStore.cc:134`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L134) |
+| new allocation policy | subclass `Allocator`, register in [`Allocator.cc:38`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/Allocator.cc#L38) factory |
 | new device backend | `src/blk/BlockDevice.cc` factory + new device class |
 | add a config knob | `src/common/options/global.yaml.in` (not a header) |
-| add observability | perf counters in `_init_logger` (`BlueStore.cc:6336`), `ceph tell osd.N bluestore ...` asok commands |
+| add observability | perf counters in `_init_logger` ([`BlueStore.cc:6336`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L6336)), `ceph tell osd.N bluestore ...` asok commands |
 | test it | `src/test/objectstore/store_test.cc` (gtest, runs against BlueStore), `ceph_test_objectstore` |
 
 One hard rule inherited from the encoding layer: every persisted struct
