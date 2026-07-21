@@ -115,19 +115,43 @@ fi
 # ---------------------------------------------------------------------------
 # 4. deploy BlueStore OSDs
 # ---------------------------------------------------------------------------
-HOST=$(hostname)
+# Use the hostname as registered in the orchestrator — with
+# --allow-fqdn-hostname it can differ from `hostname`, and
+# `orch daemon add osd` rejects unregistered names.
+HOST=$($CEPH orch host ls --format json | jq -r '.[0].hostname')
+[ -n "$HOST" ] && [ "$HOST" != "null" ] || die "no host registered in orchestrator"
+log "Orchestrator host: $HOST"
+
 for spec in "${OSD_SPECS[@]}"; do
     log "Adding BlueStore OSD on $spec"
-    $CEPH orch daemon add osd "$HOST:$spec" || \
-        echo "  (may already exist, continuing)"
+    if ! out=$($CEPH orch daemon add osd "$HOST:$spec" 2>&1); then
+        echo "$out"
+        case "$out" in
+        *"already created"*|*"already exists"*)
+            echo "  (already exists, continuing)" ;;
+        *)
+            $CEPH log last 50 cephadm || true
+            die "orch daemon add osd failed for $spec (see cephadm log above)" ;;
+        esac
+    else
+        echo "  $out"
+    fi
 done
 
 log "Waiting for OSDs to come up"
+up=0
 for _ in $(seq 1 60); do
     up=$($CEPH osd stat -f json | jq .num_up_osds)
     [ "$up" -ge "${#OSD_SPECS[@]}" ] && break
     sleep 5
 done
+if [ "$up" -lt "${#OSD_SPECS[@]}" ]; then
+    echo "--- diagnostics: orch host ls / device ls / cephadm log ---"
+    $CEPH orch host ls || true
+    $CEPH orch device ls --wide || true
+    $CEPH log last 100 cephadm || true
+    die "expected ${#OSD_SPECS[@]} OSDs up, have $up"
+fi
 $CEPH osd tree
 
 # ---------------------------------------------------------------------------
