@@ -766,6 +766,20 @@ to a device tier (with spillover when the preferred tier is full).
   count drops ~50%. (Downgrading needs `ceph-bluestore-tool
   downgrade-wal-to-v1`.)
 
+A caveat for anyone reasoning about sequential-write devices: both
+streams are append-only at the *file* level, but not physically. An
+unaligned flush zero-pads the final device block and then **rewrites
+that same block in place** on the next flush —
+[`get_flush_buffer`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.cc#L3945)
+duplicates the tail bytes and rewinds `buffer_pos` one block ("append
+(duplicate) tail for next flush") — which for the WAL means nearly
+every commit. Two more in-place writers: RocksDB WAL recycling maps to
+[`open_for_write(overwrite=true)`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.cc#L4785)
+("overwrite in place"; off by default — Ceph doesn't set
+`recycle_log_file_num`), and the BlueFS superblock is rewritten at its
+fixed slot on every journal compaction
+([`_write_super`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.cc#L1299)).
+
 The design trade is explicit: mount-time replay cost and a periodic
 compaction stall risk, in exchange for a metadata write path that is a
 single sequential append — on the same device RocksDB is already
