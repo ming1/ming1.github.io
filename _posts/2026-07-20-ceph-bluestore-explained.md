@@ -482,7 +482,8 @@ and when it's touched.
 
 A `rados put` of a fresh 4 MiB object touches, in one atomic batch: one
 `O` put (new onode + extent map), one `b` merge (bitmap bits for the
-allocated extents), one `T` merge (statfs deltas) — and nothing else;
+allocated extents; skipped in NCB/null mode), one `T` merge (statfs
+deltas) — and nothing else;
 the 4 MiB payload went straight to disk.
 
 ## Interface 1: transactions — the write path
@@ -624,7 +625,7 @@ handle:
  RocksDB writes an SST:
    WritableFile::Append(data)          rocksdb's view: "a file"
      → BlueRocksWritableFile
-       → BlueFS::append(FileWriter*)   buffer + extend fnode extents
+       → BlueFS::append_try_flush()    buffer + extend fnode extents
    WritableFile::Sync()
      → BlueFS::fsync()                 flush data extents to BlockDevice,
                                        append OP_FILE_UPDATE_INC to the
@@ -740,7 +741,7 @@ the durable one:
              persisted as bitmap-merge in the SAME kv batch as the onode
    free:     recorded in txc->released at PREPARE
              returned to the RAM allocator only in _txc_finish ->
-             _txc_release_alloc (BlueStore.cc:15140), AFTER the commit
+             _txc_release_alloc (BlueStore.cc:15071), AFTER the commit
              is durable (and after async discard completes)
 ```
 
@@ -773,7 +774,7 @@ metadata and free space disagree on disk.
   the commit, nothing was persisted; the space simply reappears as free
   at next mount. Optimistic, and safe by construction.
 - *Freeing* is lazy: released extents (`txc->released`) rejoin the RAM
-  allocator only in `_txc_release_alloc` ([`BlueStore.cc:15140`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15140)), called
+  allocator only in `_txc_release_alloc` ([`BlueStore.cc:15071`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15071)), called
   from `_txc_finish` after the freeing transaction is durable — and if
   async discard is enabled, only after the device-level discard
   completes. Reusing a "freed" extent any earlier would let a crash
@@ -798,7 +799,8 @@ restart — the trade only makes sense because SSD scans are fast.
 and `PMEMDevice` exist for kernel-bypass setups). `KernelDevice`
 (`src/blk/kernel/KernelDevice.cc`) is comfortable territory for a kernel
 reader: the device is opened `O_RDWR|O_DIRECT` ([`:185`](https://github.com/ceph/ceph/blob/v21.3.0/src/blk/kernel/KernelDevice.cc#L185)), submission
-prefers **io_uring** with libaio fallback ([`:48`](https://github.com/ceph/ceph/blob/v21.3.0/src/blk/kernel/KernelDevice.cc#L48), [`:96`](https://github.com/ceph/ceph/blob/v21.3.0/src/blk/kernel/KernelDevice.cc#L96)), durability is
+uses **libaio** by default — io_uring is opt-in via `bdev_ioring`, with
+libaio fallback when unsupported ([`:86`](https://github.com/ceph/ceph/blob/v21.3.0/src/blk/kernel/KernelDevice.cc#L86), [`:96`](https://github.com/ceph/ceph/blob/v21.3.0/src/blk/kernel/KernelDevice.cc#L96)) — durability is
 `fdatasync` — skipped when no writes happened since the last flush
 (`io_since_flush`, [`:517`](https://github.com/ceph/ceph/blob/v21.3.0/src/blk/kernel/KernelDevice.cc#L517)) — and TRIM runs on dedicated discard threads
 ([`KernelDevice.h:86`](https://github.com/ceph/ceph/blob/v21.3.0/src/blk/kernel/KernelDevice.h#L86)). BlueStore is effectively a userspace driver stack:
