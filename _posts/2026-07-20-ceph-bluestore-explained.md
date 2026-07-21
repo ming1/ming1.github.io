@@ -274,6 +274,17 @@ Two facts orient everything else:
   the free list) goes into RocksDB — and RocksDB's own files live on the
   same raw disk through BlueFS, a ~6k-line purpose-built filesystem.
 
+Why can data bypass RocksDB entirely? Because on a write, RocksDB is
+*written to, never read from*: the free-space decision comes from the
+in-memory allocator (loaded once at mount), the destination is fresh
+extents (big writes are copy-on-write, so no existing state needs
+reading), and the onode/freelist updates are constructed in memory and
+*put* into RocksDB after the data lands — an LSM put needs no read. The
+only KV read on the write path is an onode-cache miss (one point-get of
+the object's metadata), and the deliberate exception is small deferred
+writes, whose payload rides *inside* the RocksDB commit (details in the
+write-path section).
+
 ## On-disk layout
 
 A BlueStore OSD is one to three raw block devices, named by symlinks in
