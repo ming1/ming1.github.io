@@ -375,7 +375,7 @@ and when it's touched.
 - **Why**: BlueStore needs a handful of store-wide facts before it can
   interpret anything else (how big is an allocation unit? which
   freelist format?) — the equivalent of a filesystem superblock.
-- **Used**: read once at mount (`_open_super_meta`); written at mkfs, on
+- **Used**: read once at mount ([`_open_super_meta`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L14335)); written at mkfs, on
   format upgrades, and occasionally to bump the `nid_max`/`blobid_max`
   id-allocation watermarks.
 
@@ -394,7 +394,7 @@ and when it's touched.
 ### `C` — collections (placement groups)
 
 - **Key**: the collection name, e.g. `2.1f_head` (pool 2, PG 0x1f).
-- **Value**: `bluestore_cnode_t` — essentially the number of hash bits
+- **Value**: [`bluestore_cnode_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h#L72) — essentially the number of hash bits
   this PG spans.
 - **Why**: the OSD's unit of replication and recovery is the PG;
   BlueStore mirrors each PG as a *collection* so PG creation, split,
@@ -408,7 +408,7 @@ and when it's touched.
   name + snapshot + generation (`get_object_key`, [`BlueStore.cc:496`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L496)).
   Big objects add sibling keys: same key + u32 shard offset + suffix
   `'x'` ([`BlueStore.cc:201`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L201)), one per extent-map shard.
-- **Value**: the encoded `bluestore_onode_t` (size, attrs, flags — with
+- **Value**: the encoded [`bluestore_onode_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h#L1160) (size, attrs, flags — with
   the extent map inlined while small); shard keys hold one encoded
   extent-map shard each.
 - **Why the odd key**: PG membership is decided by the *low* bits of the
@@ -433,12 +433,12 @@ and when it's touched.
   scrub and PG deletion can walk omap with range scans, like `O`.
 - **Used**: RGW bucket indexes, CephFS directory fragments, RBD image
   metadata — the workloads where omap *is* the workload; read/written
-  via the `OP_OMAP_*` transaction ops and iterated by `omap_iterate`.
+  via the `OP_OMAP_*` transaction ops and iterated by [`omap_iterate`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/ObjectStore.h#L778).
 
 ### `L` — deferred-write journal
 
 - **Key**: a u64 sequence number.
-- **Value**: an encoded `deferred_transaction_t`: the target device
+- **Value**: an encoded [`deferred_transaction_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h#L1363): the target device
   extents **plus the payload bytes** — the one place data transits
   RocksDB.
 - **Why**: small overwrites would otherwise pay a read-modify-write of
@@ -447,7 +447,7 @@ and when it's touched.
   append; the payload is written to its real location lazily.
 - **Used**: written by sub-`prefer_deferred_size` overwrites; deleted
   after the background replay lands the payload; scanned at mount
-  (`_deferred_replay`) to recover writes a crash interrupted.
+  ([`_deferred_replay`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15847)) to recover writes a crash interrupted.
 
 ### `B` / `b` — persistent freelist
 
@@ -469,7 +469,7 @@ and when it's touched.
 ### `X` — shared blobs
 
 - **Key**: a u64 shared-blob id (sbid).
-- **Value**: `bluestore_shared_blob_t` — a refcount map over the blob's
+- **Value**: [`bluestore_shared_blob_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h#L1130) — a refcount map over the blob's
   physical extents.
 - **Why**: RBD snapshots and clones share physical extents between
   onodes (copy-on-write). Something must count references so space is
