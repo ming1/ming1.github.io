@@ -359,50 +359,132 @@ Design notes a storage developer will care about:
 
 ## The RocksDB schema
 
-All metadata shares one ordered keyspace, distinguished by one-letter
-prefixes (`BlueStore.cc:134`). Key layouts and values per prefix
-(integers are encoded big-endian so bytewise sort equals numeric sort):
+RocksDB stores **metadata only** — object data bytes never live there,
+with one deliberate, temporary exception (the deferred-write journal,
+below). All of it shares one ordered keyspace, split into namespaces by
+a one-letter prefix (`BlueStore.cc:134`); integers inside keys are
+encoded big-endian so bytewise sort equals numeric sort. Each kind of
+metadata gets its own subsection here: key/value format, why it exists,
+and when it's touched.
 
-| Prefix | Key (after the prefix byte) | Value |
-|--------|------------------------------|-------|
-| `S` | field name: `nid_max`, `blobid_max`, `min_alloc_size`, `freelist_type`, `ondisk_format`, `per_pool_omap`, ... | one encoded scalar/string each — the store's superblock, read once in `_open_super_meta` |
-| `T` | `bluestore_statfs` (global) or pool id | int64 array: allocated / stored / compressed bytes... updated via a *merge operator* (deltas, no read-modify-write) |
-| `C` | collection name, e.g. `2.1f_head` | `bluestore_cnode_t` — essentially the PG's hash-bit count |
-| `O` | shard + pool + **bit-reversed hash** + namespace + name + snap + gen | encoded `bluestore_onode_t` (+ inline extent map while small) |
-| `O` (shard) | the same onode key + u32 shard offset + suffix byte `'x'` (`BlueStore.cc:201`) | one encoded extent-map shard — big objects split their map across adjacent keys |
-| `M` / `P` | u64 **nid** + omap key (`P`: same, for the pgmeta collection) | the user's omap value, verbatim |
-| `m` | s64 pool + u64 nid + omap key | ditto (per-pool accounting era) |
-| `p` | u64 pool + u32 hash + u64 nid + omap key | ditto (current; sorts omap in PG order for scrub) |
-| `L` | u64 sequence number | encoded `deferred_transaction_t`: target device extents **plus the payload bytes**; deleted after replay |
-| `B` | meta field names: `bytes_per_block`, `blocks_per_key`, `blocks`, `size` | bitmap-freelist geometry (`BitmapFreelistManager.cc:97`) |
-| `b` | u64 device offset (one key per `blocks_per_key` chunk) | allocation bitmap chunk, flipped via an XOR merge operator |
-| `X` | u64 shared-blob id (sbid) | `bluestore_shared_blob_t` — the extent refcount map for clones |
+### `S` — store superblock
 
-Three encoding tricks are worth pausing on:
+- **Key**: a field name: `nid_max`, `blobid_max`, `min_alloc_size`,
+  `freelist_type`, `ondisk_format`, `per_pool_omap`, ...
+- **Value**: one small encoded scalar or string per field.
+- **Why**: BlueStore needs a handful of store-wide facts before it can
+  interpret anything else (how big is an allocation unit? which
+  freelist format?) — the equivalent of a filesystem superblock.
+- **Used**: read once at mount (`_open_super_meta`); written at mkfs, on
+  format upgrades, and occasionally to bump the `nid_max`/`blobid_max`
+  id-allocation watermarks.
 
-- **The `O` key sorts like CRUSH places.** `get_object_key`
-  (`BlueStore.cc:496`) packs shard + pool + *bit-reversed* object hash +
-  name + snapshot. PG membership is decided by the *low* bits of the
-  hash, so reversing the bits makes all objects of one PG a contiguous
-  key range — PG enumeration, split, and deletion become range scans.
-  Extent-map shards extend the same key with their offset, so an onode
-  and all its shards are physically adjacent in the SST files.
-- **omap keys use the nid, not the object name.** Every onode gets a
-  monotonic numeric id (`nid`, allocated from `nid_max` in `S`); omap
-  keys embed that instead of the (long, mutable) object name. Renames
-  and clones never rewrite omap data — only the onode's pointer to its
-  nid — and omap keys stay short regardless of object-name length.
-- **Hot counters are merges, not writes.** statfs (`T`) and the
-  allocation bitmap (`b`) are updated through RocksDB merge operators —
-  an append-only "+delta" / "XOR these bits" record that compaction
-  folds in later. That keeps the commit path write-only (no
-  read-modify-write of the old value), the same principle as the data
-  path bypassing RocksDB reads.
+### `T` — space-usage statistics
 
-A worked example — `rados put` of a fresh 4 MiB object touches, in one
-atomic batch: one `O` put (new onode + extent map), one `b` merge
-(bitmap bits for the allocated extents), one `T` merge (statfs deltas) —
-and nothing else; the 4 MiB payload went straight to disk.
+- **Key**: `bluestore_statfs` (store-wide) or a pool id.
+- **Value**: an array of int64 counters — bytes allocated, stored,
+  compressed, ...
+- **Why**: `ceph df` needs instant answers; recounting by scanning
+  onodes would be absurd. Counters are updated through a RocksDB *merge
+  operator* — each commit appends a "+delta" record and compaction folds
+  them later — so the hot path never reads the old value.
+- **Used**: merged on every transaction that changes space usage; read
+  by `statfs()` for `ceph df` and pool accounting.
+
+### `C` — collections (placement groups)
+
+- **Key**: the collection name, e.g. `2.1f_head` (pool 2, PG 0x1f).
+- **Value**: `bluestore_cnode_t` — essentially the number of hash bits
+  this PG spans.
+- **Why**: the OSD's unit of replication and recovery is the PG;
+  BlueStore mirrors each PG as a *collection* so PG creation, split,
+  and merge are first-class, durable operations.
+- **Used**: read at mount to populate the collection map; written on PG
+  create/split/merge — rare, but correctness-critical.
+
+### `O` — onodes and extent maps (the heart of the store)
+
+- **Key**: shard + pool + **bit-reversed** object hash + namespace +
+  name + snapshot + generation (`get_object_key`, `BlueStore.cc:496`).
+  Big objects add sibling keys: same key + u32 shard offset + suffix
+  `'x'` (`BlueStore.cc:201`), one per extent-map shard.
+- **Value**: the encoded `bluestore_onode_t` (size, attrs, flags — with
+  the extent map inlined while small); shard keys hold one encoded
+  extent-map shard each.
+- **Why the odd key**: PG membership is decided by the *low* bits of the
+  object hash; bit-reversing moves them to the front, so every object
+  of a PG — and its extent-map shards right beside it — forms one
+  contiguous key range. PG enumeration, split, and deletion become
+  range scans, and sharding means a 4 KiB overwrite dirties one shard,
+  not a megabyte of extent map.
+- **Used**: point-get on every onode cache miss; put on every object
+  mutation; range-scanned by PG listing, backfill, and scrub.
+
+### `M` / `P` / `m` / `p` — object omap
+
+- **Key**: the onode's **nid** (a monotonic numeric id from `nid_max`)
+  plus the user's omap key. The generations differ in what they prepend:
+  `M` nothing more (legacy), `P` the same for the pgmeta collection,
+  `m` a pool id, `p` pool + PG hash (current — omap sorts in PG order).
+- **Value**: the user's omap value, verbatim.
+- **Why the nid**: keying omap by numeric id instead of object name
+  means renames and clones never rewrite omap rows, and keys stay short
+  no matter how long object names get. The per-PG `p` layout exists so
+  scrub and PG deletion can walk omap with range scans, like `O`.
+- **Used**: RGW bucket indexes, CephFS directory fragments, RBD image
+  metadata — the workloads where omap *is* the workload; read/written
+  via the `OP_OMAP_*` transaction ops and iterated by `omap_iterate`.
+
+### `L` — deferred-write journal
+
+- **Key**: a u64 sequence number.
+- **Value**: an encoded `deferred_transaction_t`: the target device
+  extents **plus the payload bytes** — the one place data transits
+  RocksDB.
+- **Why**: small overwrites would otherwise pay a read-modify-write of
+  a live blob before the client sees an ack. Embedding the payload in
+  the already-fsyncing commit batch makes the ack one sequential WAL
+  append; the payload is written to its real location lazily.
+- **Used**: written by sub-`prefer_deferred_size` overwrites; deleted
+  after the background replay lands the payload; scanned at mount
+  (`_deferred_replay`) to recover writes a crash interrupted.
+
+### `B` / `b` — persistent freelist
+
+- **Key**: `B` holds named geometry fields (`bytes_per_block`,
+  `blocks_per_key`, `blocks`, `size`; `BitmapFreelistManager.cc:97`);
+  `b` holds one key per chunk of `blocks_per_key` device blocks, keyed
+  by u64 offset.
+- **Value**: `B`: encoded geometry scalars; `b`: that chunk's
+  allocation bitmap.
+- **Why**: the in-memory allocator dies with the process; this is its
+  durable shadow. Bits are flipped via an XOR merge operator — allocate
+  and free are the same operation, so commits never read the old
+  bitmap — and the flip rides the same batch as the onode that consumed
+  the space, keeping metadata and free space atomically consistent.
+- **Used**: merged on every allocating/freeing commit; iterated once at
+  mount to rebuild the allocator — unless NCB/null mode is active, in
+  which case this prefix stays empty (see the free-space section).
+
+### `X` — shared blobs
+
+- **Key**: a u64 shared-blob id (sbid).
+- **Value**: `bluestore_shared_blob_t` — a refcount map over the blob's
+  physical extents.
+- **Why**: RBD snapshots and clones share physical extents between
+  onodes (copy-on-write). Something must count references so space is
+  freed exactly when the last user goes — per-extent, since clones
+  diverge piecewise as they're overwritten.
+- **Used**: created when a blob is first cloned; decremented as
+  overwrites un-share extents; consulted on delete to decide what is
+  actually freeable.
+
+### Putting it together
+
+A `rados put` of a fresh 4 MiB object touches, in one atomic batch: one
+`O` put (new onode + extent map), one `b` merge (bitmap bits for the
+allocated extents), one `T` merge (statfs deltas) — and nothing else;
+the 4 MiB payload went straight to disk.
 
 ## Interface 1: transactions — the write path
 
