@@ -587,6 +587,63 @@ tier with space. The recursion (RocksDB's metadata needs a filesystem,
 BlueFS's own metadata is just a journal) bottoms out because BlueFS never
 needs random metadata lookups — it replays its log into memory at mount.
 
+### Not FUSE: an in-process filesystem
+
+A natural question for a kernel reader: is this a FUSE filesystem? No —
+BlueFS is never mounted, has no POSIX API, and involves no kernel
+filesystem machinery at all. It is a plain C++ class inside the OSD
+process, and its only client is the RocksDB instance in that same
+process, reached by direct function calls:
+
+```
+ FUSE filesystem                        BlueFS
+ ───────────────                        ──────
+ app ──syscall──► kernel VFS            RocksDB (same process)
+        │                                  │ C++ virtual calls
+        ▼                                  ▼ (rocksdb::Env plugin API)
+   fuse driver ──/dev/fuse──► userspace  BlueRocksEnv → BlueFS
+   daemon ──syscalls──► real storage       │ direct function calls
+        (2 kernel crossings + copies       ▼
+         per operation)                  BlockDevice: O_DIRECT aio
+                                         (io_uring/libaio) to raw disk
+```
+
+FUSE exists so *arbitrary* processes can reach a userspace filesystem
+through syscalls; BlueFS has exactly one consumer, already in-process,
+so that machinery would add two kernel crossings per op for nothing.
+The plug-in point is RocksDB's own portability layer instead: RocksDB
+does all file I/O through `rocksdb::Env`, and BlueRocksEnv implements
+the handful of interfaces it needs —
+[`BlueRocksSequentialFile`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueRocksEnv.cc#L51),
+[`BlueRocksRandomAccessFile`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueRocksEnv.cc#L98),
+[`BlueRocksWritableFile`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueRocksEnv.cc#L177),
+plus directory and file-lock stubs — each a thin shim over a BlueFS
+handle:
+
+```
+ RocksDB writes an SST:
+   WritableFile::Append(data)          rocksdb's view: "a file"
+     → BlueRocksWritableFile
+       → BlueFS::append(FileWriter*)   buffer + extend fnode extents
+   WritableFile::Sync()
+     → BlueFS::fsync()                 flush data extents to BlockDevice,
+                                       append OP_FILE_UPDATE_INC to the
+                                       BlueFS journal, flush journal
+```
+
+This is also why BlueFS can be so small: it is deliberately far *less*
+than POSIX — no nested directories, no rename-over, no permissions, no
+mmap, no concurrent writers to one file — because RocksDB needs none of
+that. Don't confuse it with Ceph's actual FUSE code: `FuseStore`
+(`src/os/FuseStore.h`) is a debugging bridge that exposes an
+ObjectStore's contents as a browsable mount, and `ceph-fuse` is the
+CephFS *client* — neither is in the OSD's I/O path. One deliberate
+exception to the all-O_DIRECT rule:
+[`bluefs_buffered_io`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L4289)
+lets BlueFS *reads* go through the kernel page cache (compaction
+re-reads benefit), while writes stay direct — a knob whose default has
+flipped over the years due to interactions with swap behavior.
+
 ## Inside BlueFS: superblock, journal, and compaction
 
 BlueFS has no allocation bitmap, no inode table, no directory blocks on
