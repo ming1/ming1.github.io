@@ -468,6 +468,77 @@ tier with space. The recursion (RocksDB's metadata needs a filesystem,
 BlueFS's own metadata is just a journal) bottoms out because BlueFS never
 needs random metadata lookups — it replays its log into memory at mount.
 
+## Inside BlueFS: superblock, journal, and compaction
+
+BlueFS has no allocation bitmap, no inode table, no directory blocks on
+disk. Its entire persistent metadata is **one superblock plus one
+journal file**; everything else is rebuilt in memory at mount. For a
+kernel reader: imagine a log-structured filesystem that never checkpoints
+anything *except* the log itself.
+
+```
+ DB device (BDEV_DB), 2nd 4 KiB block (_open_super, BlueFS.cc:1323)
+ ┌────────────────────────────────────────────────────────────┐
+ │ bluefs_super_t (bluefs_types.h:316)                        │
+ │   uuid, block sizes, ...                                   │
+ │   log_fnode ────────────┐  inode of THE journal file       │
+ └─────────────────────────┼──────────────────────────────────┘
+                           ▼
+ journal file = sequence of bluefs_transaction_t (types.h:347)
+ ┌──────────────────────────────────────────────────────────────┐
+ │ OP_INIT                                                      │
+ │ OP_DIR_CREATE "db"          OP_DIR_LINK "db/000123.sst" ino  │
+ │ OP_FILE_UPDATE {ino, size, extents[(bdev,off,len)...]}       │
+ │ OP_FILE_UPDATE_INC {fnode delta}    OP_FILE_REMOVE ino       │
+ │ OP_JUMP seq/offset          ... appended forever ...         │
+ └──────────────────────────────────────────────────────────────┘
+                           │ _replay() at mount (BlueFS.h:800)
+                           ▼
+ in-memory only: dir map {"db" -> {name -> File}}, ino -> File,
+                 per-bdev allocators rebuilt from every fnode's extents
+```
+
+The moving parts, top-down:
+
+- **A file is just an fnode.** `bluefs_fnode_t` (`bluefs_types.h:140`):
+  ino, size, mtime, and a vector of raw extents — each tagged with which
+  device tier it lives on. Directories are flat (`db/`, `db.wal/`,
+  `db.slow/`); no nesting, because RocksDB never asks for it.
+- **The journal is the metadata.** Every namespace or fnode mutation is
+  an op appended to the journal (`op_dir_link`, `op_file_update`, ...;
+  the op set at `bluefs_types.h:349-362` is the complete metadata
+  "schema"). `fsync` of a RocksDB file = flush its data extents, then
+  append the file's new fnode as `OP_FILE_UPDATE_INC` and flush the
+  journal. There is deliberately no other durable structure to update.
+- **Bootstrap chicken-and-egg.** The journal is itself a file described
+  by an fnode — stored inside the superblock (`log_fnode`), which lives
+  at a fixed 4 KiB slot on the DB device. Mount reads the superblock,
+  follows `log_fnode`'s extents, replays ops in sequence, and the whole
+  filesystem exists in RAM. Free-space allocators for each tier are
+  derived by subtracting every live fnode's extents from the device —
+  which is why BlueFS needs no persistent freelist at all.
+- **Compaction bounds the journal.** An append-forever journal would
+  replay ever slower, so when it exceeds a threshold
+  (`_should_start_compact_log_L_N`, `BlueFS.h:732`) BlueFS writes a
+  fresh journal containing just a snapshot of current metadata and jumps
+  to it — either stop-the-world (`_compact_log_sync_LNF_LD`,
+  `BlueFS.h:745`) or the default async variant
+  (`_compact_log_async_LD_LNF_D`, `:746`) that builds the new log while
+  writers continue, then atomically flips `log_fnode` via a superblock
+  rewrite. The cryptic suffixes (`_LNF_LD`) encode the lock order —
+  log/nodes/file locks — a hint that this path is the concurrency
+  hotspot of BlueFS.
+- **Observability.** `ceph tell osd.N bluefs stats` shows per-tier usage
+  and spillover; `ceph-bluestore-tool bluefs-export` dumps the whole
+  BlueFS namespace to a directory, and `bluefs-bdev-expand` grows it
+  after a device resize — the operator-facing corners of everything
+  above.
+
+The design trade is explicit: mount-time replay cost and a periodic
+compaction stall risk, in exchange for a metadata write path that is a
+single sequential append — on the same device RocksDB is already
+fsyncing anyway.
+
 ## Allocator and FreelistManager
 
 Free space is managed twice, deliberately:
