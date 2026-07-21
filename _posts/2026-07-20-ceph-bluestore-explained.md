@@ -28,6 +28,54 @@ VM), then from the inside (its components, data structures, and the read /
 write / transaction paths through the code). The target reader knows
 storage and kernel programming but is new to Ceph.
 
+# Terms and abbreviations
+
+Skim once, refer back as needed; groups run top-down — cluster level
+first, then BlueStore's own objects, then persistence and devices.
+
+### Ceph cluster level
+
+| Term | Meaning |
+|------|---------|
+| RADOS | Reliable Autonomic Distributed Object Store — Ceph's core object store |
+| OSD | Object Storage Daemon — one daemon per disk; BlueStore lives inside it |
+| MON / MGR | Monitor (cluster maps, quorum) / Manager (metrics, orchestration) |
+| PG | Placement Group — a shard of a pool; the unit of replication and recovery |
+| CRUSH | the hash-based placement algorithm — clients compute object locations |
+| RBD / CephFS / RGW | block / file / S3-object interfaces, all layered on RADOS |
+| object | RADOS's unit: name + byte data + xattrs + omap (typically 4 MiB for RBD) |
+| omap | per-object sorted key/value pairs (like a small per-object database) |
+| cephadm | the deployment tool — runs daemons as podman containers under systemd |
+
+### BlueStore objects
+
+| Term | Meaning |
+|------|---------|
+| ObjectStore | the backend API BlueStore implements (`src/os/ObjectStore.h`) |
+| Transaction | an op batch (write + attrs + omap + ...) that must commit atomically |
+| onode | per-object metadata record (size, attrs, extent map) — RocksDB `O` key |
+| extent | a *logical* byte range of an object, pointing into a blob |
+| blob | a unit of *physical* allocation: device extents + checksum + flags |
+| pextent | one physical device range (offset, length) inside a blob |
+| SharedBlob | refcounted blob state shared between clones/snapshots (COW) |
+| collection | BlueStore's container for one PG's objects |
+| TransContext | one in-flight transaction walking the write-path state machine |
+| deferred write | small overwrite whose payload commits via RocksDB (`L` key) first, reaches its final location later |
+
+### Persistence and devices
+
+| Term | Meaning |
+|------|---------|
+| RocksDB | embedded LSM key/value store holding ALL BlueStore metadata |
+| WAL | write-ahead log — RocksDB's journal; its fsync is the commit point |
+| BlueFS | mini-filesystem BlueStore implements just to host RocksDB's files |
+| block / block.db / block.wal | the OSD's data / RocksDB / WAL devices |
+| min_alloc_size | smallest allocation unit on the data device (4 KiB default) |
+| allocator | in-memory free-space policy (default `hybrid`) |
+| FreelistManager | persistent free-space record, stored in RocksDB |
+| NCB | source-code tag for null-freelist mode: skip per-commit freelist updates, rebuild the allocator map on unclean startup |
+| csum | per-blob-chunk checksum (crc32c default), verified on every read |
+
 # Part 1: the user view
 
 ## What Ceph is, and where BlueStore sits
