@@ -705,11 +705,8 @@ The moving parts, top-down:
   rewrite. The cryptic suffixes (`_LNF_LD`) encode the lock order —
   log/nodes/file locks — a hint that this path is the concurrency
   hotspot of BlueFS.
-- **Observability.** `ceph tell osd.N bluefs stats` shows per-tier usage
-  and spillover; `ceph-bluestore-tool bluefs-export` dumps the whole
-  BlueFS namespace to a directory, and `bluefs-bdev-expand` grows it
-  after a device resize — the operator-facing corners of everything
-  above.
+- **Observability.** Covered in its own subsection below — *Observing
+  BlueFS*.
 
 ### How the two RocksDB write streams hit BlueFS: SST vs WAL
 
@@ -784,6 +781,58 @@ The design trade is explicit: mount-time replay cost and a periodic
 compaction stall risk, in exchange for a metadata write path that is a
 single sequential append — on the same device RocksDB is already
 fsyncing anyway.
+
+### Observing BlueFS
+
+Four surfaces, from live to offline:
+
+**Admin socket** — BlueFS registers its own commands
+([`BlueFS::SocketHook`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.cc#L102)):
+
+```bash
+ceph tell osd.0 bluefs stats        # per-tier usage + file-type matrix
+ceph tell osd.0 bluefs files list   # every file: name, size, extents, device
+```
+
+The usage matrix in `bluefs stats` (which file types sit on which
+device tier) is how you spot **spillover** — RocksDB files landing on
+the slow device because `block.db` filled up (cluster-wide: the
+`BLUEFS_SPILLOVER` health warning). `bluefs files list` shows the live
+fnodes: `db.wal/000042.log`, `db/000123.sst`, and their extent lists.
+
+**Perf counters** — `ceph tell osd.0 perf dump bluefs | jq`, also
+exported as `ceph_bluefs_*` Prometheus metrics:
+
+| Counter | Question it answers |
+|---|---|
+| `db_used_bytes` / `wal_used_bytes` / `slow_used_bytes` | tier fill; `slow_used_bytes > 0` on a hybrid layout = spillover |
+| `bytes_written_wal` vs `bytes_written_sst` | WAL-vs-compaction mix — metadata write amplification at a glance |
+| `log_bytes`, `log_compactions` | BlueFS journal size, and how often the compaction stall risk fires |
+| `read_random_bytes` / `read_prefetch_bytes` | RocksDB read pattern through BlueFS |
+
+**Offline** — `ceph-bluestore-tool` with the OSD stopped (inside
+`cephadm shell --name osd.0` on cephadm clusters): `bluefs-stats`,
+`bluefs-bdev-sizes`, `bluefs-export --out-dir DIR` (extract all of
+RocksDB to ordinary files, ready for `ldb`/`sst_dump`), and the one to
+study this post's journal-is-the-metadata design in the wild:
+`bluefs-log-dump`, which decodes the entire BlueFS journal op by op
+(`OP_FILE_UPDATE_INC`, `OP_DIR_LINK`, ...). `bluefs-bdev-expand` grows
+BlueFS after a device resize.
+
+**Logging and kernel-side** — `ceph tell osd.0 config set debug_bluefs
+10` narrates flushes/fsyncs/compaction (20 adds mount-time replay).
+And since BlueFS does O_DIRECT to real devices, `iostat -x` on the
+`block.db`/`block.wal` partitions isolates metadata I/O, while a
+bpftrace one-liner catches the commit path in the act:
+
+```bash
+bpftrace -e 'tracepoint:syscalls:sys_enter_fdatasync
+             /comm == "bstore_kv_sync"/ { @[comm] = count(); }'
+```
+
+(`bstore_kv_sync` is the kv-sync thread from the write-path section —
+counting its fdatasyncs is how you verify the envelope-mode "~50%
+fewer syncs" claim on your own hardware.)
 
 ## Free-space management: the in-memory and on-disk views
 
