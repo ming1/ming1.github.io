@@ -577,25 +577,82 @@ compaction stall risk, in exchange for a metadata write path that is a
 single sequential append — on the same device RocksDB is already
 fsyncing anyway.
 
-## Allocator and FreelistManager
+## Free-space management: the in-memory and on-disk views
 
-Free space is managed twice, deliberately:
+Free space is managed twice, deliberately — one representation for
+*speed*, one for *crash consistency* — and the interesting engineering
+is in keeping them coherent without ever letting the fast one corrupt
+the durable one:
 
-- **Allocator** (`Allocator.cc:38`) — the *in-memory* policy deciding
-  where new writes land. Pluggable: `hybrid` (default,
-  `global.yaml.in:5327` — AVL interval tree for the common case, falling
-  back to bitmap under fragmentation), plus `avl`, `btree`, `bitmap`,
-  `stupid`, `hybrid_btree2`.
-- **FreelistManager** (`FreelistManager.cc:7`) — the *persistent* record
-  of free space, stored transactionally in RocksDB (`B`/`b` keys) so that
-  allocation state commits atomically with the metadata that consumed it.
+```
+             IN MEMORY (per device)              ON DISK (RocksDB)
+ ┌─────────────────────────────────┐   ┌──────────────────────────────┐
+ │ Allocator ("hybrid": AVL range  │   │ FreelistManager              │
+ │ tree + bitmap under             │   │  "b" keys: XOR-merged bitmap │
+ │ fragmentation)                  │   │  chunks; "B" keys: geometry  │
+ │  - answers "give me N bytes"    │   │  - answers nothing at        │
+ │    in O(log ranges), no I/O     │   │    runtime; exists to be     │
+ │  - shared with BlueFS           │   │    REPLAYED at next mount    │
+ │    (shared_alloc,BlueStore.h:2426)  │  - or "null" (NCB mode):     │
+ │  - authoritative between mounts?│   │    nothing per commit at all │
+ │    NO — it dies with the process│   └──────────────────────────────┘
+ └─────────────────────────────────┘
+ extent lifecycle:
+   allocate: removed from RAM allocator at txc PREPARE (instantly)
+             persisted as bitmap-merge in the SAME kv batch as the onode
+   free:     recorded in txc->released at PREPARE
+             returned to the RAM allocator only in _txc_finish ->
+             _txc_release_alloc (BlueStore.cc:15140), AFTER the commit
+             is durable (and after async discard completes)
+```
 
-On non-rotational devices, current code defaults to the **"null"
-freelist / NCB mode** (`_open_fm`, `BlueStore.cc:7357`): skip per-commit
-freelist updates entirely, destage the allocator's map to a file on clean
-shutdown, and after a crash rebuild it by scanning all onodes
-(`read_allocation_from_drive_on_startup`, `BlueStore.cc:21041`) — trading
-rare recovery cost for zero steady-state overhead.
+**The in-memory view** is the `Allocator` (`Allocator.cc:38`): a
+pluggable policy object per device answering "give me N contiguous-ish
+bytes" from RAM. Default is `hybrid` (`global.yaml.in:5327`) — an AVL
+interval tree for the common case that degrades gracefully to per-region
+bitmaps when fragmentation makes the tree expensive; `avl`, `btree`,
+`bitmap`, `stupid`, and `hybrid_btree2` are selectable. The main-device
+allocator is *shared with BlueFS* (`shared_alloc`, `BlueStore.h:2426`),
+so RocksDB file growth and object data carve from the same pool — this
+is what lets a single-device OSD work at all. Fragmentation is a
+first-class metric (`get_fragmentation_score`, `Allocator.cc:96`;
+`ceph tell osd.N bluestore allocator score block` to sample it).
+
+**The on-disk view** is the `FreelistManager` (`FreelistManager.cc:7`),
+and its only job is surviving crashes. The bitmap variant keeps one `b`
+key per chunk of `blocks_per_key` blocks and *XOR-merges* bit flips into
+it — allocation and free are the same operation (flip), so the commit
+path never reads the old bitmap. Crucially, the freelist mutation rides
+in the **same RocksDB batch** as the onode/extent-map update that
+consumed or released the space: one WAL fsync makes "object points at
+extent" and "extent is no longer free" atomic — there is no window where
+metadata and free space disagree on disk.
+
+**The coherence rules** are asymmetric, and the asymmetry is the point:
+
+- *Allocation* leaves the RAM allocator immediately at prepare time —
+  before the data write, before the commit. If the OSD crashes before
+  the commit, nothing was persisted; the space simply reappears as free
+  at next mount. Optimistic, and safe by construction.
+- *Freeing* is lazy: released extents (`txc->released`) rejoin the RAM
+  allocator only in `_txc_release_alloc` (`BlueStore.cc:15140`), called
+  from `_txc_finish` after the freeing transaction is durable — and if
+  async discard is enabled, only after the device-level discard
+  completes. Reusing a "freed" extent any earlier would let a crash
+  land new bytes where still-committed old metadata points — the
+  read-after-crash would return garbage that passes nothing. Pessimistic,
+  and *required* for correctness.
+
+**At mount**, the RAM allocator is rebuilt from whichever durable source
+exists: iterate the `b` bitmap keys (classic mode), or — on
+non-rotational devices, where per-commit bitmap merges cost real write
+amplification — **NCB / null-freelist mode** (`_open_fm`,
+`BlueStore.cc:7357`): persist *nothing* per commit, destage the entire
+allocator map to a file on clean shutdown, and after a crash rebuild it
+the hard way by walking every onode's extents
+(`read_allocation_from_drive_on_startup`, `BlueStore.cc:21041`). Zero
+steady-state overhead, paid for with a full metadata scan on unclean
+restart — the trade only makes sense because SSD scans are fast.
 
 ## The block device layer (src/blk/)
 
