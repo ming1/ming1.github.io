@@ -580,6 +580,29 @@ The OSD hands BlueStore a `ceph::os::Transaction`
 **atomically** — this is the contract FileStore struggled to fake on
 POSIX and BlueStore gets natively from a RocksDB write batch.
 
+How BlueStore actually delivers that atomicity — four ingredients:
+
+- **One batch for everything.** Every mutation the Transaction implies
+  — onode/extent map, omap rows, freelist bit-flips, statfs deltas,
+  deferred payloads — accumulates into a *single* RocksDB write batch
+  (the `TransContext`'s `txc->t`). RocksDB applies a batch
+  all-or-nothing through its WAL, so "the transaction" is literally
+  one atomic KV commit.
+- **Data first, metadata second.** New data goes to freshly allocated
+  extents (copy-on-write) and its aio must complete before the batch
+  is submitted — the batch never references bytes that aren't already
+  on disk. A crash therefore leaves either the old object (batch not
+  committed; the new extents are unreferenced and their space simply
+  reappears at mount) or the new one — never a torn mix. And because
+  nothing live is ever modified in place, **no undo log is needed**.
+- **One fsync makes it durable.** `kv_sync_thread` submits the batch
+  with `submit_transaction_sync` — the RocksDB WAL fdatasync *is* the
+  commit point, and the client ack follows it.
+- **Order preserved per PG.** Transactions on the same collection pass
+  through an `OpSequencer`, so their batches commit in submission
+  order even though `kv_sync_thread` aggregates transactions from many
+  PGs into one sync.
+
 `queue_transactions()` wraps the batch in a `TransContext`, which walks a
 state machine (`state_t`, [`BlueStore.h:1909`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1909); driver `_txc_state_proc`,
 [`BlueStore.cc:14634`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L14634)):
