@@ -365,7 +365,27 @@ below). All of it shares one ordered keyspace, split into namespaces by
 a one-letter prefix ([`BlueStore.cc:134`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L134)); integers inside keys are
 encoded big-endian so bytewise sort equals numeric sort. Each kind of
 metadata gets its own subsection here: key/value format, why it exists,
-and when it's touched.
+when it's touched — and one concrete example.
+
+The whole keyspace at a glance — prefixes are just intervals on one
+sorted line (bytewise order, so the uppercase prefixes all sort before
+the lowercase ones):
+
+```
+ B        C       L        M      O               P      S     T     X      b        m      p
+ ├────────┼───────┼────────┼──────┼───────────────┼──────┼─────┼─────┼──────┼────────┼──────┼────
+ freelist collec- deferred legacy onodes + extent pgmeta super stats shared freelist omap   omap
+ geometry tions   journal  omap   shards, sorted  omap               blobs  bitmap   (/pool)(/PG)
+                                  in PG order
+```
+
+A running example makes the formats concrete — one RBD image in pool 2
+(32 PGs, so 5 hash bits): its data object
+`rbd_data.ab12.0000000000000005` hashes to `0x0000001f` (low 5 bits
+`11111` → PG `2.1f`), was assigned nid 4711, and holds one 4 MiB extent
+at disk offset `0x2fc00000`; the image's header object
+`rbd_header.ab12` (nid 4710) keeps its settings in omap. Keys below are
+raw bytes, shown spaced for readability.
 
 ### `S` — store superblock
 
@@ -378,6 +398,9 @@ and when it's touched.
 - **Used**: read once at mount ([`_open_super_meta`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L14335)); written at mkfs, on
   format upgrades, and occasionally to bump the `nid_max`/`blobid_max`
   id-allocation watermarks.
+- **Example**: `S` `nid_max` → `8192` — nids up to 8192 are
+  pre-reserved, so assigning nid 4711 to our object needed no extra
+  commit.
 
 ### `T` — space-usage statistics
 
@@ -390,6 +413,9 @@ and when it's touched.
   them later — so the hot path never reads the old value.
 - **Used**: merged on every transaction that changes space usage; read
   by `statfs()` for `ceph df` and pool accounting.
+- **Example**: our 4 MiB write appends the merge record `T`
+  `bluestore_statfs` → `{allocated: +4 MiB, stored: +4 MiB}`;
+  compaction later folds it into the absolute totals.
 
 ### `C` — collections (placement groups)
 
@@ -401,6 +427,8 @@ and when it's touched.
   and merge are first-class, durable operations.
 - **Used**: read at mount to populate the collection map; written on PG
   create/split/merge — rare, but correctness-critical.
+- **Example**: `C` `2.1f_head` → `cnode{bits: 5}` — "PG 2.1f owns every
+  object whose hash ends in the five bits `11111`".
 
 ### `O` — onodes and extent maps (the heart of the store)
 
@@ -419,6 +447,17 @@ and when it's touched.
   not a megabyte of extent map.
 - **Used**: point-get on every onode cache miss; put on every object
   mutation; range-scanned by PG listing, backfill, and scrub.
+- **Example**: our object's key, and the shard key beside it —
+
+  ```
+  O <shard> 0x8000000000000002 f8000000 "" "rbd_data.ab12.…0005" <head>
+            └ pool 2 (+2^63) ┘ └rev(hash 0x0000001f)┘
+    → bluestore_onode_t{nid: 4711, size: 4 MiB, extents → 0x2fc00000 + 4 MiB}
+  O <same key…> 00000000 x        ← extent-map shard covering offset 0
+  ```
+
+  Every PG 2.1f object's hash ends `…11111`, so every reversed hash
+  *starts* `11111…` — first byte `f8`–`ff`, one contiguous key range.
 
 ### `M` / `P` / `m` / `p` — object omap
 
@@ -434,6 +473,10 @@ and when it's touched.
 - **Used**: RGW bucket indexes, CephFS directory fragments, RBD image
   metadata — the workloads where omap *is* the workload; read/written
   via the `OP_OMAP_*` transaction ops and iterated by [`omap_iterate`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/ObjectStore.h#L778).
+- **Example**: the image's settings live under its *header* object:
+  `p` `<pool 2> <hash(rbd_header.ab12)> <nid 4710>` `"features"` →
+  `61`. Renaming the image never rewrites these rows — they hang off
+  nid 4710, not the name.
 
 ### `L` — deferred-write journal
 
@@ -448,6 +491,10 @@ and when it's touched.
 - **Used**: written by sub-`prefer_deferred_size` overwrites; deleted
   after the background replay lands the payload; scanned at mount
   ([`_deferred_replay`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15847)) to recover writes a crash interrupted.
+- **Example**: a 4 KiB overwrite inside our image's object: `L`
+  `0x000000000000002a` → `deferred_txn{disk 0x12340000 + 0x1000, plus
+  the 4 KiB payload}` — deleted again once the background replay lands
+  the bytes.
 
 ### `B` / `b` — persistent freelist
 
@@ -465,6 +512,10 @@ and when it's touched.
 - **Used**: merged on every allocating/freeing commit; iterated once at
   mount to rebuild the allocator — unless NCB/null mode is active, in
   which case this prefix stays empty (see the free-space section).
+- **Example**: our 4 MiB allocation is 1024 four-KiB blocks: the commit
+  merges XOR masks into the `b` chunk keys starting at `0x2fc00000`
+  (eight keys at the default 128 blocks per key). Freeing the extent
+  later merges the *same* masks — XOR flips the bits back.
 
 ### `X` — shared blobs
 
@@ -478,14 +529,19 @@ and when it's touched.
 - **Used**: created when a blob is first cloned; decremented as
   overwrites un-share extents; consulted on delete to decide what is
   actually freeable.
+- **Example**: after `rbd snap create`, snapshot and head share our
+  extent: `X` `0x000000000000007b` → `shared_blob{0x2fc00000 + 4 MiB:
+  2 refs}`. Deleting either side just drops a ref; the space frees
+  when the count hits zero.
 
 ### Putting it together
 
-A `rados put` of a fresh 4 MiB object touches, in one atomic batch: one
-`O` put (new onode + extent map), one `b` merge (bitmap bits for the
-allocated extents; skipped in NCB/null mode), one `T` merge (statfs
-deltas) — and nothing else;
-the 4 MiB payload went straight to disk.
+The `rados put` that created our example object touched, in one atomic
+batch: one `O` put (onode 4711 + the extent map pointing at
+`0x2fc00000`), the `b` XOR merges for its 1024 block-bits (skipped in
+NCB/null mode), one `T` merge (the statfs deltas) — and nothing else;
+the 4 MiB payload went straight to disk, exactly as the
+component-boundary section promised.
 
 ## Interface 1: transactions — the write path
 
