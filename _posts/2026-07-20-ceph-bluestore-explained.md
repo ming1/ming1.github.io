@@ -1321,6 +1321,83 @@ The implementation pieces:
 - **Metadata**: RocksDB + BlueFS were required to live on a separate
   conventional device — the zoned mode never attempted metadata on SMR.
 
+### The removed zoned mode, top to bottom
+
+How the pieces actually fit together — the full stack, then each
+component in the order a write meets it (all line refs against the
+removal commit's parent,
+[`169bd8553ed^`](https://github.com/ceph/ceph/commit/169bd8553ed)):
+
+```
+ mkfs/mount: bdev->is_smr()?  ──► freelist_type = "zoned"
+                                  prefer_deferred_size = 0 (no RMW)
+                                       │
+ write path (_do_write*)               ▼
+   │ "where do these bytes go?"   ┌──────────────────┐   RocksDB (on a
+   ▼                              │ ZonedAllocator   │   CONVENTIONAL
+ append at zone wp ◄──────────────│ (RAM, per zone:  │   device!)
+   │                              │  wp, dead bytes) │  ┌─────────────┐
+   │ txc commit batch:            └──────────────────┘  │ Z/z zone    │
+   ├─ onode + zone_offset_refs ─────────────────────────│   state     │
+   ├─ z merge: wp advance / dead bytes ─────────────────│ G cleaner   │
+   └─ G key: (zone, offset) → object ───────────────────│   index     │
+                                       ▲                └─────────────┘
+ cleaner thread "bstore_zcleaner"      │ reads G to find live objects
+   pick worst zone → move live         │
+   data out → reset zone ──────────────┘
+                                       ▼
+ HMSMRDevice (libzbd): zone report / append writes / zone reset
+```
+
+Component by component:
+
+- **Mode selection** — no separate build of BlueStore: opening the
+  device detects zones (`bdev->is_smr()` after `_open_bdev`) and flips
+  two switches everywhere: `freelist_type` is forced to `"zoned"` and
+  `prefer_deferred_size` to 0, killing the deferred-write RMW path.
+  Every other zoned behavior hangs off `is_smr()` checks in the
+  regular code paths — an integration style worth copying.
+- **Write path** — `_do_write` asks the allocator for space and gets
+  back "the write pointer of the currently open zone"; the data write
+  is an append by construction. The transaction then carries two
+  extra pieces of bookkeeping alongside the onode: the allocator's
+  wp-advance, and the object's `zone_offset_refs` (each onode records
+  which (zone, offset) holds its data).
+- **`ZonedAllocator`** (RAM) — a vector of per-zone
+  `{write_pointer, num_dead_bytes}`. Allocate = hand out wp, bump it.
+  Free = *nothing moves*: just `num_dead_bytes += n`. It also answers
+  the cleaner's question — `pick_zone_to_clean(min_score, min_saved)`
+  scores zones by bytes-saved / bytes-moved — and excludes the zone
+  currently being cleaned (`cleaning_zone`) from allocation.
+- **`ZonedFreelistManager`** (RocksDB `Z`/`z` keys) — the durable
+  shadow of the allocator: one `zone_state_t` record per zone, updated
+  by merge operator (`Int64ArrayMergeOperator`), so a commit appends
+  "wp += 64K" or "dead += 4K" without reading the old state — the
+  same write-only-commit trick as the bitmap freelist's XOR.
+- **The cleaner index** (RocksDB `G` keys) — the reverse map the GC
+  needs: key = (zone, offset, object-id) (`get_zone_offset_object_key`,
+  old `BlueStore.cc:573`), written and deleted in the *same commit
+  batch* as the onode's `zone_offset_refs` — so "which live objects
+  are in zone 12" is one range scan, and it can never disagree with
+  object metadata.
+- **The cleaner thread** (`bstore_zcleaner`, old `BlueStore.cc:14776`)
+  — the policy loop: pick the worst zone (thresholds hardcoded and
+  marked `FIXME`: score ≥ 0.05, savings ≥ zone_size/32), mark it
+  `cleaning_zone`, range-scan its `G` keys, rewrite each live object
+  through the ordinary write path (so the moved data lands in the
+  open zone with full transactional metadata), then reset the zone.
+  Simple, synchronous, one zone at a time — correct, but with no
+  throttling against client I/O.
+- **`HMSMRDevice`** (`libzbd`) — the thin bottom: report zones at
+  open (geometry for the allocator), pass writes through (already
+  append-shaped by the layers above), reset on the cleaner's order.
+- **What it never solved** — one open zone at a time (no hot/cold
+  stream separation, the biggest WA lever); synchronous unthrottled
+  cleaning; small-write latency (deferred writes off, nothing in
+  their place); and metadata categorically off-drive. These gaps are
+  exactly the "v2 deltas" in the native plan below — the skeleton was
+  right, the policies were placeholders.
+
 Why it died ([`169bd8553ed`](https://github.com/ceph/ceph/commit/169bd8553ed)):
 not because the design was wrong, but because nobody reviewed or
 maintained it while the rest of BlueStore kept moving. Any revival plan
