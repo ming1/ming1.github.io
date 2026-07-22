@@ -1253,8 +1253,52 @@ for next flush"):
 ```
 
 WAL commits are a few KiB and never block-aligned, so this fires on
-nearly **every commit**. Envelope mode doesn't help — it removes the
-fnode-journal sync, not the tail rewrite.
+nearly **every commit** — and today it hits SSTs too: every
+buffer-pressure flush, `Sync`, and `Close` takes the pad+rewind path
+(only RocksDB's `RangeSync` avoids it, by rounding the range down —
+[`BlueRocksEnv.cc:283`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueRocksEnv.cc#L283)).
+Envelope mode doesn't help either: it removes the fnode-journal sync,
+but the rewind in `get_flush_buffer` runs unconditionally, so even
+envelope WAL rewrites its last block on every fsync.
+
+*The fix: pad-and-advance, split by read pattern.* The zone-legal rule
+is "pad the block, advance, never return":
+
+```
+ today (rewind-and-rewrite):        pad-and-advance (zone-legal):
+ #1: N   |AAA0|   wp -> N+1        #1: N   |AAA0|    wp -> N+1
+ #2: N   |AAAB|   REWRITE ✗        #2: N+1 |B000|    wp -> N+2  ✓
+     N+1 |B000|                         every write lands exactly at wp
+```
+
+BlueFS already contains the working precedent: its **own journal**
+zero-pads every transaction to block alignment before appending
+([`_pad_bl`, `BlueFS.cc:3800`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.cc#L3800))
+and never rewinds — replay walks the in-band op framing. Extending
+that discipline to RocksDB's files splits by how each file is read:
+
+- **Sequentially-replayed logs (WAL, MANIFEST)**: fsync must persist
+  the unaligned tail, so pad-and-advance with in-band framing is the
+  only option. Envelope mode provides the hooks — length-framed
+  records and a physical-size/`content_size` split — but not the
+  behavior: the writer needs a no-rewind branch, and the envelope
+  scanner assumes gapless records
+  ([`_envmode_seek_to`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.cc#L2798)
+  and the replay indexer), so both need block-boundary skip logic.
+  MANIFEST matters here too — it is fsync'd on every version edit and
+  rewrites its tail today; classifying by read pattern (not by `.log`
+  extension, as the current envelope gating does) covers it.
+- **Offset-addressed files (SSTs)**: random reads go straight through
+  the linear fnode mapping, so in-band framing would corrupt offset
+  addressing. But these files don't fsync mid-stream — so the fix is
+  **hold back the tail**: flush only block-aligned prefixes (what
+  `RangeSync` already does), keep the unaligned remainder in RAM, and
+  pad exactly once at file completion — safely past `fnode.size`, so
+  reads clip and addressing is untouched.
+
+Neither piece exists at v21.3.0 (BlueFS has zero zoned-awareness
+today), but both are bounded, and the journal's own append discipline
+proves the pattern inside this codebase.
 
 **Violation 2 — WAL file recycling (whole-file overwrite, off by
 default).** With `recycle_log_file_num > 0`, RocksDB reuses a finished
@@ -1291,7 +1335,7 @@ The fix list maps one-to-one:
 
 | Violation | Fires | Zone-aware fix |
 |---|---|---|
-| tail-block rewrite | ~every WAL commit | accumulate full blocks (zone-append granularity), or keep the active tail in a conventional zone |
+| tail-block rewrite | ~every WAL commit + SST flushes | pad-and-advance, split by read pattern: envelope-framed no-rewind for logs (WAL, MANIFEST), hold-back-tail + pad-at-completion for offset-addressed files (SSTs) — see above |
 | WAL recycling | only if enabled | return NotSupported from `ReuseWritableFile` on zoned devices; assert `recycle_log_file_num=0` |
 | superblock slot | every compaction | superblock in a conventional zone, or a log-structured slot-pair |
 
