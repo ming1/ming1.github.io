@@ -387,6 +387,32 @@ at disk offset `0x2fc00000`; the image's header object
 `rbd_header.ab12` (nid 4710) keeps its settings in omap. Keys below are
 raw bytes, shown spaced for readability.
 
+The two example object names, decoded — they are librbd's chunking and
+metadata scheme:
+
+```
+ rbd_data.ab12.0000000000000005          rbd_header.ab12
+ └───┬───┘└─┬─┘└───────┬──────┘          └────┬─────┘└┬─┘
+     │      │          └ chunk index,         │       └ same image id
+     │      │            16 hex digits:       └ the image's ONE metadata
+     │      │            image bytes            object: ~empty data,
+     │      │            [5·4 MiB, 6·4 MiB)     all state in omap
+     │      └ internal image id (rbd info:      (size, features,
+     │        block_name_prefix)                snapshots), updated via
+     └ fixed prefix, format-2 data objects      cls_rbd methods in the
+                                                OSD; clients watch + lock
+                                                this object to coordinate
+```
+
+Three built-in consequences: each chunk is an independent RADOS object
+(consecutive chunks hash to unrelated PGs, so one big image write fans
+out across OSDs in parallel — RBD striping *is* this naming plus
+CRUSH); chunks exist only where data was written (thin provisioning
+for free — reading an absent chunk returns zeros, `fstrim` deletes
+chunk objects); and both names use the internal id `ab12`, not the
+image name — a tiny `rbd_id.<name>` object maps name → id, which makes
+`rbd rename` O(1) — the same indirection trick as the omap nid below.
+
 ### `S` — store superblock
 
 - **Key**: a field name: `nid_max`, `blobid_max`, `min_alloc_size`,
