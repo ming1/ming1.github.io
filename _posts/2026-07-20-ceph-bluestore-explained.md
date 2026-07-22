@@ -846,6 +846,41 @@ buffers are natural *registered buffers*, and the same mechanism
 extends to `FSRandomAccessFile::ReadAsync`/`Poll` — which would let
 RocksDB's coroutine MultiGet overlap reads end-to-end.
 
+Which thread context submits? **The calling thread itself — there is
+no dedicated submitter.** `MultiRead` is a synchronous *batched* call:
+the caller builds SQEs on its own thread-local ring,
+`io_uring_submit_and_wait`s, and blocks until all CQEs arrive —
+parallelism comes from batch depth inside one call, not from another
+thread (this is RocksDB's own POSIX model, `thread_local_io_urings_`).
+Inside an OSD, the threads that would own rings:
+
+```
+ thread (comm)                      why it reads through RocksDB
+ ─────────────────────────────      ────────────────────────────────
+ tp_osd_tp shard workers            foreground ops: onode cache
+                                    misses, omap reads, PG listings
+ rocksdb:low* / rocksdb:high*       compaction / flush reads — the
+   (bg pool; plain pthreads via     heaviest MultiRead users
+    Env::Schedule → POSIX)
+ scrub / fsck / mount contexts      deep-scrub omap walks, fsck,
+                                    mount-time replay
+```
+
+Three properties of this model: it preserves the Env contract exactly
+(a worker blocks in `MultiRead` as it blocks in `pread` today — but
+for max of the fragment latencies instead of their sum); it is the
+*opposite* of KernelDevice's write-side pattern, which needs a
+dedicated reaper thread (`bstore_aio`) because write completions
+drive state-machine transitions — read completions drive nothing, so
+per-caller rings stay simple; and the async upgrade
+(`ReadAsync`/`Poll`) changes who *waits*, not who submits — the same
+thread polls its own ring between other work, still zero extra
+threads (only `IORING_SETUP_SQPOLL`, an optional latency play, would
+add a kernel-side submitter). One observability footnote: BlueFS
+reads currently trace as `pread` from these threads; with user rings
+they become `io_uring_enter` from `tp_osd_tp` and `rocksdb:low*` —
+adjust your bpftrace one-liners accordingly.
+
 ## Inside BlueFS: superblock, journal, and compaction
 
 BlueFS has no allocation bitmap, no inode table, no directory blocks on
