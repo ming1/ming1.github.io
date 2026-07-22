@@ -758,7 +758,8 @@ splits into two groups:
    (SST reads: Read(offset), Prefetch)        GetFileSize, GetFileModificationTime
  NewWritableFile → BlueRocksWritableFile      LinkFile, AreFilesSame, LockFile
    (SST/WAL writes — the contract below)      NewLogger (→ dout), GetTestDirectory
- NewDirectory → BlueRocksDirectory (Fsync=noop: BlueFS journals dir ops)
+ NewDirectory → BlueRocksDirectory (Fsync → flush BlueFS log;
+                                    dir ops are already journaled)
 ```
 
 The `WritableFile` contract is where the raw-disk semantics live —
@@ -780,7 +781,7 @@ about devices — BlueFS here, ZenFS for zoned devices, plus RocksDB's
 own `MemEnv`/`EncryptedEnv`. The engine keeps placement, tiering, and
 durability decisions; RocksDB keeps thinking in files. (Newer RocksDB
 splits file ops into a `FileSystem` API — ZenFS plugs in there; Ceph's
-bundled 7.10 still uses the Env path.)
+bundled 7.9 still uses the Env path.)
 
 And **io_uring**: the Env interface is deliberately synchronous-looking,
 so asynchrony lives *below* it. In Ceph's stack that's KernelDevice —
@@ -788,7 +789,7 @@ BlueFS submits through the BlockDevice aio queue (io_uring when
 `bdev_ioring` is set, libaio otherwise) and a completion thread wakes
 the waiters; nothing in BlueRocksEnv knows. RocksDB itself, though,
 grew io_uring-aware hooks — `RandomAccessFile::MultiRead`
-([`env.h:812`](https://github.com/ceph/ceph/blob/v21.3.0/src/rocksdb/include/rocksdb/env.h#L812))
+([`env.h:812`](https://github.com/ceph/rocksdb/blob/24ea35870fe9b3ba15285ec8746ba97ed5d67ff3/include/rocksdb/env.h#L812))
 and async reads, which its own POSIX backend implements with per-thread
 io_uring queues (`ROCKSDB_IOURING_PRESENT`, `fs_posix.cc`). BlueRocksEnv
 implements none of them — MultiGet and iterator prefetch fall back to
@@ -1132,7 +1133,7 @@ zone handling, zero random overwrites, managed GC, crash consistency,
 metadata isolation, observability, and upstream acceptance.
 (Background: [zonedstorage.io](https://zonedstorage.io/), the kernel
 [ublk driver](https://docs.kernel.org/block/ublk.html), and
-[ZenFS](https://github.com/westerndigitalcorp/zenfs).)
+[ZenFS](https://github.com/westerndigitalcorporation/zenfs).)
 
 ## The problem: what HM-SMR demands, and where BlueStore violates it
 
@@ -1216,7 +1217,7 @@ The implementation pieces:
 - **`HMSMRDevice`** (`src/blk/zoned/`, built with `WITH_ZBD` against
   `libzbd`): zone report/reset plumbed into the `BlockDevice` API. The
   virtuals survive at `BlockDevice.h:217-233` (`is_smr()`,
-  `get_zone_size()`, `reset_zones()`, ...), currently returning stubs.
+  `get_zone_size()`, `reset_all_zones()`, ...), currently returning stubs.
 - **`ZonedAllocator`** (240 lines): pure append — track a write pointer
   per zone, hand out space from the currently open zone, roll to the next
   when full. A `cleaning_zone` marker excluded the zone under GC.
@@ -1422,7 +1423,7 @@ is "pad the block, advance, never return":
 
 BlueFS already contains the working precedent: its **own journal**
 zero-pads every transaction to block alignment before appending
-([`_pad_bl`, `BlueFS.cc:3800`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.cc#L3800))
+(the [`_pad_bl` call in `_flush_and_sync_log_core`, `BlueFS.cc:3800`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.cc#L3800))
 and never rewinds — replay walks the in-band op framing. Extending
 that discipline to RocksDB's files splits by how each file is read:
 
@@ -1432,7 +1433,7 @@ that discipline to RocksDB's files splits by how each file is read:
   records and a physical-size/`content_size` split — but not the
   behavior: the writer needs a no-rewind branch, and the envelope
   scanner assumes gapless records
-  ([`_envmode_seek_to`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.cc#L2798)
+  ([`_envmode_seek_to`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.cc#L2702)
   and the replay indexer), so both need block-boundary skip logic.
   MANIFEST matters here too — it is fsync'd on every version edit and
   rewrites its tail today; classifying by read pattern (not by `.log`
@@ -1500,8 +1501,8 @@ superblock), no reuse-in-place — plus lifetime-based file→zone
 placement so files that die together share zones, making it GC-less.
 And the swap is mechanically small: BlueStore hands RocksDB its
 filesystem at exactly one point
-([`new BlueRocksEnv(bluefs)`, `BlueStore.cc:8202`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L8202)),
-Ceph's bundled RocksDB (7.10) lists ZenFS in its own `PLUGINS.md`
+([`new BlueRocksEnv(bluefs)`, `BlueStore.cc:8180`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L8180)),
+Ceph's bundled RocksDB (7.9) lists ZenFS in its own `PLUGINS.md`
 (`ROCKSDB_PLUGINS=zenfs`, device via `fs_uri=zenfs://dev:...`), and
 ZenFS's `aux_path` maps to the OSD data dir. A prototype is a small
 patch plus build plumbing.
