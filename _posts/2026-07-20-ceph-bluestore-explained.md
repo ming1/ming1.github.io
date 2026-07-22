@@ -728,6 +728,73 @@ lets BlueFS *reads* go through the kernel page cache (compaction
 re-reads benefit), while writes stay direct — a knob whose default has
 flipped over the years due to interactions with swap behavior.
 
+### The rocksdb::EnvWrapper contract in detail
+
+`rocksdb::Env` is RocksDB's entire OS abstraction — not just file I/O
+but also background threads, the clock, and host queries. That breadth
+is exactly why `EnvWrapper` exists: it's a forwarding decorator that
+delegates every virtual to a wrapped target Env, so a custom backend
+overrides only what it cares about. BlueRocksEnv says so in its own
+constructor
+([`BlueRocksEnv.cc:334`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueRocksEnv.cc#L334)):
+
+```cpp
+BlueRocksEnv::BlueRocksEnv(BlueFS *f)
+  : EnvWrapper(Env::Default()),  // forward most of it to POSIX
+```
+
+Thread scheduling (`Schedule`, `StartThread` — compaction workers),
+timing, and logging remain ordinary POSIX; only the ~20 file-shaped
+virtuals are intercepted. The overridden surface
+([`BlueRocksEnv.h:35-183`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueRocksEnv.h#L35-L183))
+splits into two groups:
+
+```
+ factories → per-file handle objects        namespace ops → BlueFS maps
+ ─────────────────────────────────          ──────────────────────────────
+ NewSequentialFile → BlueRocksSequentialFile  FileExists, GetChildren
+   (WAL/MANIFEST replay: Read, Skip)          DeleteFile, RenameFile
+ NewRandomAccessFile → BlueRocksRandomAccessFile CreateDir(IfMissing), DeleteDir
+   (SST reads: Read(offset), Prefetch)        GetFileSize, GetFileModificationTime
+ NewWritableFile → BlueRocksWritableFile      LinkFile, AreFilesSame, LockFile
+   (SST/WAL writes — the contract below)      NewLogger (→ dout), GetTestDirectory
+ NewDirectory → BlueRocksDirectory (Fsync=noop: BlueFS journals dir ops)
+```
+
+The `WritableFile` contract is where the raw-disk semantics live —
+each method maps onto a specific BlueFS behavior:
+
+| RocksDB calls | BlueRocks maps it to |
+|---|---|
+| `Append(data)` | `BlueFS::append_try_flush` — buffer, flush at 512 KiB |
+| `Flush()` | nothing durable — just pushes buffered bytes toward BlueFS |
+| `Sync()` | `BlueFS::fsync` — data extents + fnode journal append |
+| `RangeSync(off, n)` | flush a *rounded-down* aligned prefix (the one zone-friendly path) |
+| `Allocate(off, len)` | preallocation hint → BlueFS extent reservation |
+| `Truncate(size)` | fnode size cut, journaled |
+| `PositionedAppend` | not supported — append-only by contract |
+
+Why this pattern for **writing to raw disk**: any engine that owns its
+devices implements this same interface rather than teaching RocksDB
+about devices — BlueFS here, ZenFS for zoned devices, plus RocksDB's
+own `MemEnv`/`EncryptedEnv`. The engine keeps placement, tiering, and
+durability decisions; RocksDB keeps thinking in files. (Newer RocksDB
+splits file ops into a `FileSystem` API — ZenFS plugs in there; Ceph's
+bundled 7.10 still uses the Env path.)
+
+And **io_uring**: the Env interface is deliberately synchronous-looking,
+so asynchrony lives *below* it. In Ceph's stack that's KernelDevice —
+BlueFS submits through the BlockDevice aio queue (io_uring when
+`bdev_ioring` is set, libaio otherwise) and a completion thread wakes
+the waiters; nothing in BlueRocksEnv knows. RocksDB itself, though,
+grew io_uring-aware hooks — `RandomAccessFile::MultiRead`
+([`env.h:812`](https://github.com/ceph/ceph/blob/v21.3.0/src/rocksdb/include/rocksdb/env.h#L812))
+and async reads, which its own POSIX backend implements with per-thread
+io_uring queues (`ROCKSDB_IOURING_PRESENT`, `fs_posix.cc`). BlueRocksEnv
+implements none of them — MultiGet and iterator prefetch fall back to
+serial reads through BlueFS — so wiring `MultiRead` to KernelDevice's
+existing io_uring queue is real, unclaimed performance on the table.
+
 ## Inside BlueFS: superblock, journal, and compaction
 
 BlueFS has no allocation bitmap, no inode table, no directory blocks on
