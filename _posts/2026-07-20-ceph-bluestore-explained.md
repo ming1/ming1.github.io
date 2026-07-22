@@ -25,9 +25,11 @@ device** — no filesystem in between — with metadata kept in an embedded
 RocksDB. This post explains BlueStore three ways: from the outside (what
 Ceph is for, where BlueStore sits, how to deploy and verify it on a Fedora
 VM), from the inside (its components, data structures, and the read /
-write / transaction paths through the code), and forward-looking (a design
-exploration of supporting SMR / zoned disks, ublk-based vs native). The
-target reader knows storage and kernel programming but is new to Ceph.
+write / transaction paths through the code), forward-looking (a design
+exploration of supporting SMR / zoned disks, ublk-based vs native), and
+hands-on (testing and inspecting BlueStore in isolation, no cluster
+needed). The target reader knows storage and kernel programming but is
+new to Ceph.
 
 # Terms and abbreviations
 
@@ -1945,6 +1947,133 @@ answers "who keeps this green" — the question that actually killed v1.
 - SMR HDDs only pay off for capacity-tier workloads (RGW/EC, backups);
   hot RBD pools on SMR will disappoint regardless of how good the
   implementation is — deployment guidance must say so plainly.
+
+# Part 4: hands-on — testing and inspecting BlueStore in isolation
+
+Everything in this part runs **without a Ceph cluster** — no mon, no
+PGs, no networking. BlueStore is a library; these tools link it
+directly and run it against a scratch directory or a disk, which makes
+it the fastest way to learn the component on its own.
+
+## Unit and stress tests, per component
+
+All from `build/` after a normal build; each binary maps to a layer
+from Part 2:
+
+| Binary (`./bin/...`) | What it exercises |
+|---|---|
+| `ceph_test_objectstore` | the full ObjectStore API against BlueStore (`store_test.cc`) |
+| `unittest_bluefs`, `ceph_test_bluefs` | BlueFS alone — files, journal, replay |
+| `unittest_alloc`, `unittest_hybrid_allocator`, `unittest_fastbmap_allocator` | the allocators alone |
+| `unittest_bluestore_types` | encode/decode of the `bluestore_*_t` structs |
+| `unittest_bdev` | the KernelDevice layer |
+| `ceph_perf_objectstore` | a quick ObjectStore micro-benchmark |
+
+The store test is parameterized by backend — `"memstore"` is variant
+`/0` and `"bluestore"` is `/1` (`store_test.cc:7563`), so to run only
+BlueStore:
+
+```bash
+cd build && ninja ceph_test_objectstore   # builds just this target
+./bin/ceph_test_objectstore --gtest_filter='ObjectStore/StoreTest.*/1'
+./bin/ceph_test_objectstore --gtest_list_tests | less   # see what exists
+ctest -R "bluefs|alloc|bluestore"                       # the ctest route
+```
+
+The `StoreTestSpecificAUSize` and `Synthetic*` suites are
+BlueStore-only stress mills (random op soup over configurable
+min_alloc_size) — good for watching behavior under the debug logs
+described below.
+
+## Driving BlueStore with fio — no OSD at all
+
+The gem for performance learning: an fio engine that calls
+`queue_transactions` directly
+([`src/test/fio/`](https://github.com/ceph/ceph/tree/v21.3.0/src/test/fio),
+with a ready-made job file):
+
+```bash
+cd build && ninja fio_ceph_objectstore
+LD_LIBRARY_PATH=lib fio ../src/test/fio/ceph-bluestore.fio
+```
+
+The job file points at `ceph-bluestore.conf` (any `bluestore_*` option
+from this post can be set there) and a `directory=` for the store.
+It can even couple writes with PG-log-style omap traffic
+(`pglog_simulation=1`) — OSD-shaped load, still no OSD. This is also
+the easiest way to **create a scratch BlueStore to dissect** with the
+tools below.
+
+## Reading the metadata: every schema prefix, live
+
+`ceph-kvstore-tool` opens a stopped BlueStore's RocksDB through BlueFS
+— every key from the schema section, inspectable:
+
+```bash
+ceph-kvstore-tool bluestore-kv <store-path> stats           # totals per prefix
+ceph-kvstore-tool bluestore-kv <store-path> list O | head   # onode keys —
+                                                # find the bit-reversed hash!
+ceph-kvstore-tool bluestore-kv <store-path> list S          # superblock fields
+ceph-kvstore-tool bluestore-kv <store-path> get S min_alloc_size
+```
+
+`list b`, `list T`, `list X` work the same — after writing a few
+objects with fio, walking these prefixes and matching them against the
+running example in the schema section is the single best exercise for
+internalizing BlueStore's metadata model.
+
+## Reading objects: ceph-objectstore-tool
+
+One level up — the ObjectStore view of the same store:
+
+```bash
+ceph-objectstore-tool --data-path <store-path> --op list        # all objects
+ceph-objectstore-tool --data-path <store-path> --op meta-list   # meta objects
+ceph-objectstore-tool --data-path <store-path> <object> dump    # attrs, omap,
+                                                                # sizes
+ceph-objectstore-tool --data-path <store-path> --op fuse \
+                      --mountpoint /mnt/store    # browse it as a filesystem —
+                                                 # this is FuseStore from the
+                                                 # not-FUSE subsection
+```
+
+## Reading BlueFS and its journal
+
+The BlueFS-specific commands are covered in *Observing BlueFS*
+(Part 2); the two to highlight for learning, both offline:
+
+```bash
+ceph-bluestore-tool --path <store-path> bluefs-log-dump   # decode the journal
+                                                # op by op — every OP_DIR_LINK /
+                                                # OP_FILE_UPDATE_INC from the
+                                                # journal subsection, in the wild
+ceph-bluestore-tool --path <store-path> bluefs-export --out-dir /tmp/bfs
+ceph-bluestore-tool --path <store-path> show-label        # the bdev label
+ceph-bluestore-tool --path <store-path> fsck --deep on    # full consistency walk
+ceph-bluestore-tool --path <store-path> free-dump         # freelist contents
+```
+
+And for watching any of the above at work, the debug logs narrate the
+exact code paths from Part 2 — set them via env on the standalone
+tools:
+
+```bash
+CEPH_ARGS="--debug_bluestore 20 --debug_bluefs 20 --log-to-stderr" \
+  ./bin/ceph_test_objectstore --gtest_filter='ObjectStore/StoreTest.Simple*/1'
+```
+
+## A suggested learning loop
+
+1. Build: `ninja ceph_test_objectstore fio_ceph_objectstore ceph-bluestore-tool ceph-kvstore-tool ceph-objectstore-tool`.
+2. Create a small store with the fio job; write a few MiB.
+3. `ceph-kvstore-tool ... list O` / `list b` / `stats` — match what you
+   see against the schema section's running example.
+4. `ceph-bluestore-tool ... bluefs-log-dump` — match against the
+   journal subsection's op table.
+5. Re-run fio with `--debug_bluestore 20` in the conf and follow one
+   write through the state machine from the write-path section.
+6. `fsck --deep on` — see the checker traverse everything you just
+   learned.
 
 # Summary
 
