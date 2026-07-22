@@ -917,12 +917,9 @@ The moving parts, top-down:
   ino, size, mtime, and a vector of raw extents — each tagged with which
   device tier it lives on. Directories are flat (`db/`, `db.wal/`,
   `db.slow/`); no nesting, because RocksDB never asks for it.
-- **The journal is the metadata.** Every namespace or fnode mutation is
-  an op appended to the journal (`op_dir_link`, `op_file_update`, ...;
-  the op set at [`bluefs_types.h:349-362`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluefs_types.h#L349-L362) is the complete metadata
-  "schema"). `fsync` of a RocksDB file = flush its data extents, then
-  append the file's new fnode as `OP_FILE_UPDATE_INC` and flush the
-  journal. There is deliberately no other durable structure to update.
+- **The journal is the metadata.** Every namespace or fnode mutation
+  is an op appended to the journal, and there is deliberately no other
+  durable structure to update. It earns its own subsection just below.
 - **Bootstrap chicken-and-egg.** The journal is itself a file described
   by an fnode — stored inside the superblock (`log_fnode`), which lives
   at a fixed 4 KiB slot on the DB device. Mount reads the superblock,
@@ -930,19 +927,83 @@ The moving parts, top-down:
   filesystem exists in RAM. Free-space allocators for each tier are
   derived by subtracting every live fnode's extents from the device —
   which is why BlueFS needs no persistent freelist at all.
-- **Compaction bounds the journal.** An append-forever journal would
-  replay ever slower, so when it exceeds a threshold
-  (`_should_start_compact_log_L_N`, [`BlueFS.h:732`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.h#L732)) BlueFS writes a
-  fresh journal containing just a snapshot of current metadata and jumps
-  to it — either stop-the-world (`_compact_log_sync_LNF_LD`,
-  [`BlueFS.h:745`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.h#L745)) or the default async variant
-  (`_compact_log_async_LD_LNF_D`, [`:746`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.h#L746)) that builds the new log while
-  writers continue, then atomically flips `log_fnode` via a superblock
-  rewrite. The cryptic suffixes (`_LNF_LD`) encode the lock order —
-  log/nodes/file locks — a hint that this path is the concurrency
-  hotspot of BlueFS.
+- **Compaction bounds the journal** — an append-forever log would
+  replay ever slower; details in the journal subsection.
 - **Observability.** Covered in its own subsection below — *Observing
   BlueFS*.
+
+The design trade is explicit: mount-time replay cost and a periodic
+compaction stall risk, in exchange for a metadata write path that is a
+single sequential append — on the same device RocksDB is already
+fsyncing anyway.
+
+### The BlueFS journal in detail
+
+**What it is.** A regular BlueFS file with the reserved ino 1 — but
+listed in no directory: its fnode lives in the superblock
+(`log_fnode`), which is what makes it findable before any metadata
+exists. Append-only, always.
+
+**What one journal entry looks like.** The unit is a
+[`bluefs_transaction_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluefs_types.h#L347), framed and padded to
+block alignment:
+
+```
+ ┌──────────────────────────────────────────────────────┐
+ │ preamble: encoded length + checksum                  │
+ │ uuid  — this filesystem's uuid  (guards stale data)  │
+ │ seq   — e.g. 17                 (must be last + 1)   │
+ │ op_bl — the ops, e.g.:                               │
+ │   OP_FILE_UPDATE_INC {ino 42: size 64M, +1 extent}   │
+ │   OP_DIR_LINK "db" "000123.sst" 42                   │
+ │ zero padding to the 4 KiB block boundary             │
+ └──────────────────────────────────────────────────────┘
+```
+
+**The op vocabulary** is the complete metadata schema
+([`bluefs_types.h:349-362`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluefs_types.h#L349-L362)) — small
+enough to list in full:
+
+| Op | Meaning |
+|---|---|
+| `OP_INIT` | "an empty filesystem starts here" |
+| `OP_DIR_CREATE` / `OP_DIR_REMOVE` | add / drop a directory |
+| `OP_DIR_LINK` / `OP_DIR_UNLINK` | bind / unbind a name → ino |
+| `OP_FILE_UPDATE` / `_INC` | full fnode / incremental delta (new size, new extents) |
+| `OP_FILE_REMOVE` | drop an ino |
+| `OP_JUMP` / `OP_JUMP_SEQ` | "continue at seq/offset X" — compaction's splice |
+
+**When entries are written.** Not on every write — on every
+*metadata-dirtying sync*: an `fsync` of a file whose fnode changed, a
+create/rename/unlink. All files dirty at that moment are flushed into
+one transaction, which is why a burst of RocksDB activity costs one
+journal append, not one per file.
+
+**Runway.** The journal must never stall on allocation in the middle of
+a commit, so space is reserved ahead of need
+(`bluefs_min_log_runway` 1 MiB / `bluefs_max_log_runway` 4 MiB;
+`_extend_log` tops it up outside the hot path).
+
+**Replay** ([`_replay`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.h#L800), run at every mount) walks
+the log start to end applying ops to the in-memory maps, and stops at
+the first record that fails any of three checks: uuid ≠ the
+superblock's uuid, seq ≠ previous + 1, or a failed length/checksum
+decode — which is exactly what the zero padding past the true tail
+produces. Same walk, `noop` mode, is `bluefs-log-dump`.
+
+**Compaction.** An append-forever journal would replay ever slower, so
+when the log outgrows its live metadata
+(`_should_start_compact_log_L_N`, [`BlueFS.h:732`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.h#L732);
+ratio ≥ `bluefs_log_compact_min_ratio` (5) and size ≥
+`bluefs_log_compact_min_size` (16 MiB)), BlueFS writes a *fresh* log
+containing just a snapshot of current metadata plus an `OP_JUMP` splice
+— either stop-the-world (`_compact_log_sync_LNF_LD`,
+[`BlueFS.h:745`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.h#L745)) or the default async variant
+(`_compact_log_async_LD_LNF_D`, [`:746`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.h#L746)) that builds
+the new log while writers continue — then atomically flips `log_fnode`
+via a superblock rewrite. The cryptic suffixes (`_LNF_LD`) encode the
+lock order — log/nodes/file — a hint that this is the concurrency
+hotspot of BlueFS.
 
 ### How the two RocksDB write streams hit BlueFS: SST vs WAL
 
@@ -1012,11 +1073,6 @@ every commit. Two more in-place writers: RocksDB WAL recycling maps to
 `recycle_log_file_num`), and the BlueFS superblock is rewritten at its
 fixed slot on every journal compaction
 ([`_write_super`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.cc#L1299)).
-
-The design trade is explicit: mount-time replay cost and a periodic
-compaction stall risk, in exchange for a metadata write path that is a
-single sequential append — on the same device RocksDB is already
-fsyncing anyway.
 
 ### Observing BlueFS
 
