@@ -796,6 +796,56 @@ implements none of them — MultiGet and iterator prefetch fall back to
 serial reads through BlueFS — so wiring `MultiRead` to KernelDevice's
 existing io_uring queue is real, unclaimed performance on the table.
 
+A natural follow-up: **whose io_uring instance could do that work?**
+Two-part answer:
+
+- **RocksDB's own rings: structurally unreachable.** Its io_uring
+  support lives inside the POSIX backend —
+  `PosixRandomAccessFile::MultiRead` pulls a thread-local
+  `struct io_uring`
+  ([`io_posix.cc:619`](https://github.com/ceph/rocksdb/blob/24ea35870fe9b3ba15285ec8746ba97ed5d67ff3/env/io_posix.cc#L619))
+  and builds SQEs naming the file's *POSIX fd*. Over BlueRocksEnv that
+  backend is never instantiated, and a BlueFS file has **no fd** —
+  there is nothing those SQEs could name. The rings aren't merely
+  unused; the types they operate on don't exist on this path.
+- **A user-owned ring against KernelDevice's device fd: yes.**
+  KernelDevice opens the device `O_RDWR|O_DIRECT|O_EXCL`
+  ([`KernelDevice.cc:185`](https://github.com/ceph/ceph/blob/v21.3.0/src/blk/kernel/KernelDevice.cc#L185)),
+  but `O_EXCL` guards the *open*, not submission — any ring in the
+  process may issue preads against the already-open fd; io_uring
+  instances are independent, and multiple rings per fd are fine. Reads
+  carry no coupling to the write path (no flush-ordering to respect,
+  and the extents under a read are stable: SSTs are immutable and
+  BlueFS never relocates live extents), so a read-only external ring
+  bypassing KernelDevice's queue is safe. Writes must stay on
+  KernelDevice's own queue — they are entangled with flush ordering
+  and deferred completions.
+
+The implementation sketch:
+
+```
+ BlueRocksRandomAccessFile::MultiRead(reqs[])       (new override)
+   → BlueFS::multi_read(FileReader*, reqs[])        (new)
+       per req: fnode.seek(offset) → (bdev, dev_off)  extent-crossing
+                                                      reqs split into
+       → thread-local io_uring: one SQE per           multiple SQEs
+         fragment, against KernelDevice's direct fd
+       → io_uring_submit_and_wait; unaligned edges
+         via bounce buffers (as read_random already
+         does synchronously, KernelDevice.cc:1581)
+```
+
+The care points: O_DIRECT alignment (4 KiB offset/length/buffer;
+bounce-buffer the edges), scattering extent-split fragments back into
+the caller's buffers, and `bluefs_buffered_io` mode (submit against
+the buffered fd instead — io_uring punts page-cache misses to async
+context, still correct). And because the target is a single
+long-lived device fd with aligned buffers, io_uring's power features
+apply cleanly: the fd is the ideal *registered file*, RocksDB's read
+buffers are natural *registered buffers*, and the same mechanism
+extends to `FSRandomAccessFile::ReadAsync`/`Poll` — which would let
+RocksDB's coroutine MultiGet overlap reads end-to-end.
+
 ## Inside BlueFS: superblock, journal, and compaction
 
 BlueFS has no allocation bitmap, no inode table, no directory blocks on
