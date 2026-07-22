@@ -1349,9 +1349,10 @@ per-zone state is just `{write pointer, dead bytes}` persisted in
 RocksDB; freeing never rewrites anything — it only increments a
 zone's dead-byte count — and space comes back via a cleaner that
 migrates the remaining live data out of mostly-dead zones and resets
-them. All metadata (RocksDB + BlueFS) was required to live on a
-separate conventional device, so the zoned device saw only sequential
-data writes. A write flowed: pick open zone → append at wp → commit
+them. All metadata (RocksDB + BlueFS) was confined to
+conventional space — the SMR drive's own conventional zones in the
+single-drive case (their presence is asserted), or a separate device —
+so the sequential zones saw only data writes. A write flowed: pick open zone → append at wp → commit
 onode + wp-advance merge (+ a `zone_offset_refs` back-reference for the
 cleaner) in one RocksDB batch; crash recovery replayed the freelist and
 trusted the device-reported write pointers.
@@ -1377,8 +1378,16 @@ The implementation pieces:
   — the reverse map the cleaner walks to move live data out of a
   near-dead zone before resetting it. That field *still exists* at
   `bluestore_types.h:1185`, kept for encoding compatibility.
-- **Metadata**: RocksDB + BlueFS were required to live on a separate
-  conventional device — the zoned mode never attempted metadata on SMR.
+- **Metadata**: RocksDB + BlueFS were confined to conventional space —
+  the drive's own conventional zones (BlueFS's `shared_alloc` drew from
+  the conventional region, whose existence was asserted) or a separate
+  device — never on *sequential* zones. Upstream BlueFS had zero zone
+  awareness (the removal touched `BlueFS.cc` by one line). The
+  [CMU-PDL-19-102 paper](https://www.pdl.cmu.edu/PDL-FTP/FS/CMU-PDL-19-102.pdf)'s prototype went further — BlueFS journal
+  and a specially-formatted sequentially-writable WAL on sequential
+  zones — but that part was never merged; today's
+  `bluefs_wal_envelope_mode` reinvented the same WAL framing idea for a
+  different reason (fewer fdatasyncs).
 
 ### The removed zoned mode, top to bottom
 
@@ -1392,9 +1401,9 @@ removal commit's parent,
                                   prefer_deferred_size = 0 (no RMW)
                                        │
  write path (_do_write*)               ▼
-   │ "where do these bytes go?"   ┌──────────────────┐   RocksDB (on a
+   │ "where do these bytes go?"   ┌──────────────────┐   RocksDB (in
    ▼                              │ ZonedAllocator   │   CONVENTIONAL
- append at zone wp ◄──────────────│ (RAM, per zone:  │   device!)
+ append at zone wp ◄──────────────│ (RAM, per zone:  │   zones/device!)
    │                              │  wp, dead bytes) │  ┌─────────────┐
    │ txc commit batch:            └──────────────────┘  │ Z/z zone    │
    ├─ onode + zone_offset_refs ─────────────────────────│   state     │
