@@ -1262,6 +1262,46 @@ conventional zone or a log-structured slot-pair. Bounded and
 enumerable — but each touches the commit path, which is why it stays
 phase 2+.
 
+#### Can we just use ZenFS instead of BlueFS?
+
+Tempting shortcut: ZenFS already solves all three violations by
+construction — zone-append discipline with in-band framing (no
+tail-block rewrite), a zoned metadata journal (no fixed-slot
+superblock), no reuse-in-place — plus lifetime-based file→zone
+placement so files that die together share zones, making it GC-less.
+And the swap is mechanically small: BlueStore hands RocksDB its
+filesystem at exactly one point
+([`new BlueRocksEnv(bluefs)`, `BlueStore.cc:8202`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L8202)),
+Ceph's bundled RocksDB (7.10) lists ZenFS in its own `PLUGINS.md`
+(`ROCKSDB_PLUGINS=zenfs`, device via `fs_uri=zenfs://dev:...`), and
+ZenFS's `aux_path` maps to the OSD data dir. A prototype is a small
+patch plus build plumbing.
+
+The showstopper is device sharing: ZenFS formats and **owns an entire
+zoned device** — no subset-of-zones mode, no sharing with a foreign
+allocator. The flagship SMR deployment is a *single-drive OSD*, which
+BlueFS serves through the shared allocator
+([`shared_alloc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2426));
+every workaround is bad (zone-aligned `dm-linear` carving, forking
+ZenFS to accept a zone range, or falling back to conventional zones —
+which is just Option A). The swap also drops BlueFS's operational
+surface — spillover, `bluefs stats`, `bluefs-export`/`bluefs-log-dump`
+salvage tooling — and adds a version-pinned external dependency Ceph
+has never carried (zero ZenFS integration in tree or history; even the
+old zoned mode's
+[own doc](https://github.com/ceph/ceph/blob/16ffaaf819c/doc/dev/zoned-storage.rst)
+kept RocksDB on conventional media).
+
+Verdict: for single-drive SMR OSDs, ZenFS is a **reference
+implementation to steal from**, not a component to adopt — the
+three-change zone-aware BlueFS above stays the path. The one niche
+where adopting it outright makes sense: SMR data plus a **ZNS SSD** for
+DB/WAL, where ZenFS would make the whole OSD zone-native with almost
+no BlueFS work — cheap enough to be a phase-2 experiment. (One
+favorable SMR fact from the old doc's own 14 TB test drive: "Maximum
+number of open zones: no limit" — SMR HDDs typically lack the tight
+zone caps that constrain ZenFS on ZNS.)
+
 ### 2.5 Crash recovery and fsck
 
 The write pointer reported by the drive is ground truth. On mount:
