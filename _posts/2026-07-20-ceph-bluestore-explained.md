@@ -1970,7 +1970,7 @@ from Part 2:
 | `ceph_perf_objectstore` | a quick ObjectStore micro-benchmark |
 
 The store test is parameterized by backend — `"memstore"` is variant
-`/0` and `"bluestore"` is `/1` (`store_test.cc:7563`), so to run only
+`/0` and `"bluestore"` is `/1` (`store_test.cc:7562`), so to run only
 BlueStore:
 
 ```bash
@@ -1980,10 +1980,10 @@ cd build && ninja ceph_test_objectstore   # builds just this target
 ctest -R "bluefs|alloc|bluestore"                       # the ctest route
 ```
 
-The `StoreTestSpecificAUSize` and `Synthetic*` suites are
-BlueStore-only stress mills (random op soup over configurable
-min_alloc_size) — good for watching behavior under the debug logs
-described below.
+The `SyntheticMatrix*` suites are BlueStore-only stress mills (random
+op soup over configurable min_alloc_size); `StoreTestSpecificAUSize`
+and `Synthetic` run on both backends, so use their `/1` variants —
+good fodder for the debug logs described below.
 
 ## Driving BlueStore with fio — no OSD at all
 
@@ -1994,8 +1994,13 @@ with a ready-made job file):
 
 ```bash
 cd build && ninja fio_ceph_objectstore
-LD_LIBRARY_PATH=lib fio ../src/test/fio/ceph-bluestore.fio
+cd ../src/test/fio    # run from here so the job's relative conf= resolves
+LD_LIBRARY_PATH=$OLDPWD/lib $OLDPWD/src/fio/fio ceph-bluestore.fio
 ```
+
+(That last `fio` is the one Ceph builds itself, `build/src/fio/fio` —
+a system fio usually rejects the engine over a `FIO_IOOPS_VERSION`
+mismatch.)
 
 The job file points at `ceph-bluestore.conf` (any `bluestore_*` option
 from this post can be set there) and a `directory=` for the store.
@@ -2027,15 +2032,20 @@ internalizing BlueStore's metadata model.
 One level up — the ObjectStore view of the same store:
 
 ```bash
-ceph-objectstore-tool --data-path <store-path> --op list        # all objects
-ceph-objectstore-tool --data-path <store-path> --op meta-list   # meta objects
-ceph-objectstore-tool --data-path <store-path> <object> dump    # attrs, omap,
-                                                                # sizes
+ceph-objectstore-tool --data-path <store-path> --no-superblock --op list
+ceph-objectstore-tool --data-path <store-path> --no-superblock --op meta-list
+ceph-objectstore-tool --data-path <store-path> --no-superblock <object> dump
 ceph-objectstore-tool --data-path <store-path> --op fuse \
                       --mountpoint /mnt/store    # browse it as a filesystem —
                                                  # this is FuseStore from the
                                                  # not-FUSE subsection
 ```
+
+`--no-superblock` matters on a fio-created store: only a real OSD ever
+writes the *OSD* superblock object, and the object ops abort without
+it. `--op fuse` doesn't check, and `ceph-kvstore-tool` /
+`ceph-bluestore-tool` sit below the OSD layer entirely, so those work
+on fio stores unflagged.
 
 ## Reading BlueFS and its journal
 
@@ -2070,7 +2080,7 @@ CEPH_ARGS="--debug_bluestore 20 --debug_bluefs 20 --log-to-stderr" \
    see against the schema section's running example.
 4. `ceph-bluestore-tool ... bluefs-log-dump` — match against the
    journal subsection's op table.
-5. Re-run fio with `--debug_bluestore 20` in the conf and follow one
+5. Re-run fio with `debug bluestore = 20` in the conf and follow one
    write through the state machine from the write-path section.
 6. `fsck --deep on` — see the checker traverse everything you just
    learned.
