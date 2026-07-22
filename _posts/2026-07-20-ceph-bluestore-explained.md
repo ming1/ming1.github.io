@@ -1228,39 +1228,75 @@ synchronized with metadata is the hard requirement.
 
 #### Why Option B is genuinely hard: BlueFS is not physically append-only
 
-RocksDB's two write streams are append-only at the file level (SSTs are
-write-once-immutable; the WAL and MANIFEST are pure appends) — the
-property ZenFS builds on. But BlueFS's implementation breaks it in three
-places (details and code links in Part 2's SST-vs-WAL subsection):
+At the *file* level, RocksDB's write streams are perfectly append-only:
+an SST is written once and deleted whole; the WAL and MANIFEST only
+grow. That's the property ZenFS builds on. The problem is one layer
+down — three places where BlueFS's *implementation* writes a device
+block that was already written. On a normal disk nobody notices; on an
+SMR zone, any write below the write pointer (wp) is rejected by the
+drive. Each violation, with a small example:
 
-1. **The partial tail-block rewrite** — the big one, hitting both
-   streams. An unaligned flush zero-pads the final device block, and
-   [`get_flush_buffer`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.cc#L3945)
-   duplicates the tail bytes and rewinds one block ("append (duplicate)
-   tail for next flush"), so the next flush **rewrites the same device
-   block in place**. WAL commits are a few KiB and never aligned — this
-   fires on nearly every commit, and envelope mode does not help (it
-   removes the fnode-journal sync, not the tail rewrite).
-2. **WAL file recycling** —
-   [`BlueRocksEnv::ReuseWritableFile`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueRocksEnv.cc#L385)
-   maps to `open_for_write(overwrite=true)`
-   (["already exists, overwrite in place"](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.cc#L4785)),
-   a whole-file in-place overwrite. Off by default (Ceph doesn't set
-   `recycle_log_file_num`), but one config string away.
-3. **The superblock** — rewritten at its fixed 4 KiB slot on every
-   journal compaction
-   ([`_write_super`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.cc#L1299)).
-   The journal itself is clean: compaction writes the replacement log
-   to fresh extents; only the flip is an overwrite.
+**Violation 1 — the tail-block rewrite (every unaligned flush).**
+BlueFS writes whole 4 KiB blocks. When a flush ends mid-block, it pads
+with zeros; when the next bytes arrive, it rewrites that same block —
+[`get_flush_buffer`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.cc#L3945)
+keeps the tail in RAM and rewinds one block ("append (duplicate) tail
+for next flush"):
 
-A zone-aware BlueFS therefore needs exactly three changes: (a) tail
-handling — accumulate full blocks (zone-append granularity) before
-touching the device, or keep the active tail in a conventional zone;
-(b) return NotSupported from `ReuseWritableFile` on zoned devices and
-assert `recycle_log_file_num=0`; (c) move the superblock to a
-conventional zone or a log-structured slot-pair. Bounded and
-enumerable — but each touches the commit path, which is why it stays
-phase 2+.
+```
+ WAL commit #1 appends 3 KiB (A):
+   block N: |AAA0|          write N, zero-padded     wp -> N+1
+
+ WAL commit #2 appends 2 KiB (B):
+   block N: |AAAB|          REWRITE N in place   ◄ N is behind wp:
+   block N+1: |B000|        write N+1              rejected on SMR
+```
+
+WAL commits are a few KiB and never block-aligned, so this fires on
+nearly **every commit**. Envelope mode doesn't help — it removes the
+fnode-journal sync, not the tail rewrite.
+
+**Violation 2 — WAL file recycling (whole-file overwrite, off by
+default).** With `recycle_log_file_num > 0`, RocksDB reuses a finished
+WAL file instead of deleting it:
+[`ReuseWritableFile`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueRocksEnv.cc#L385)
+→ `open_for_write(overwrite=true)`
+(["already exists, overwrite in place"](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.cc#L4785)):
+
+```
+ 000042.log, fully written:      zone 12: |██████████|  wp at end
+       │ rename -> 000057.log, write again from offset 0
+       ▼
+ same extents, offset 0:         zone 12: |new....   |  ◄ every byte
+                                                          is behind wp
+```
+
+Ceph doesn't set `recycle_log_file_num`, so this is dormant — but it's
+one config string away and must be explicitly forbidden.
+
+**Violation 3 — the superblock's fixed slot (every compaction).** The
+BlueFS journal itself is clean — compaction writes the replacement log
+to *fresh* extents. But the pointer flip lands in the same 4 KiB slot
+forever
+([`_write_super`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.cc#L1299)):
+
+```
+ DB device: | label | SUPER | ... zones ... |
+                       ▲
+   every journal compaction rewrites this   ◄ same LBA, forever —
+   one block to flip log_fnode                illegal in a seq. zone
+```
+
+The fix list maps one-to-one:
+
+| Violation | Fires | Zone-aware fix |
+|---|---|---|
+| tail-block rewrite | ~every WAL commit | accumulate full blocks (zone-append granularity), or keep the active tail in a conventional zone |
+| WAL recycling | only if enabled | return NotSupported from `ReuseWritableFile` on zoned devices; assert `recycle_log_file_num=0` |
+| superblock slot | every compaction | superblock in a conventional zone, or a log-structured slot-pair |
+
+Bounded and enumerable — but the first and third touch the commit
+path, which is why metadata-on-SMR stays phase 2+.
 
 #### Can we just use ZenFS instead of BlueFS?
 
