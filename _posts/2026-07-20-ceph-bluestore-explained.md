@@ -1778,9 +1778,11 @@ prototype, with exactly this recipe:
   BlueFS journal): deleting an SST becomes a zone reset — GC-free
   metadata, the same insight ZenFS later productized.
 
-Measured result: RocksDB on the prototype BlueFS over an HM-SMR drive
-ran 48% faster than RocksDB over XFS on a conventional drive with the
-WAL format alone, and 3× faster with recycling added — evidence that
+Measured result (§5.7, synchronous inserts): with the WAL format
+alone, RocksDB on the prototype BlueFS over an HM-SMR drive ran 48%
+faster than RocksDB over XFS on a conventional drive, and 3× faster
+with recycling added. Part of that edge is the SMR drive's ~32% higher
+sequential bandwidth — but the direction is clear:
 metadata-on-sequential-zones is not merely feasible but *profitable*.
 Only the recycling piece was ever merged; the zone-format pieces are
 the Option B work.
