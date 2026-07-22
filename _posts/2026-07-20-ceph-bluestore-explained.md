@@ -144,7 +144,7 @@ an XFS filesystem. That design paid a double tax:
   never designed for.
 
 BlueStore's answer (2016, default since the Luminous release; the design is
-written up in the SOSP '19 paper): **own the raw block device**. Data
+written up in the [SOSP '19 paper](https://www.pdl.cmu.edu/PDL-FTP/Storage/ceph-exp-sosp19.pdf)): **own the raw block device**. Data
 extents are allocated by BlueStore itself directly on the disk; all
 metadata goes into RocksDB, whose write-ahead log provides the transaction
 semantics; the filesystem disappears from the picture entirely.
@@ -1260,8 +1260,8 @@ below.
 ## What Ceph already tried: the removed zoned mode
 
 Before designing anything, read the code Ceph deleted — it is a working
-sketch of the native answer, by the same author as the BlueStore SOSP '19
-paper (Aghayev), and its skeleton still shapes the tree today.
+sketch of the native answer, by the same author as the BlueStore
+[SOSP '19 paper](https://www.pdl.cmu.edu/PDL-FTP/Storage/ceph-exp-sosp19.pdf) (Aghayev), and its skeleton still shapes the tree today.
 
 **Status and history.** HM-SMR support landed around 2020–21:
 [`ab865ca002c`](https://github.com/ceph/ceph/commit/ab865ca002c)
