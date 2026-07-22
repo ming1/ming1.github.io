@@ -1398,6 +1398,80 @@ Component by component:
   exactly the "v2 deltas" in the native plan below — the skeleton was
   right, the policies were placeholders.
 
+#### The metadata added for zones
+
+Zone support added exactly one onode field and three RocksDB
+namespaces — nothing else:
+
+```
+ in the onode:
+   zone_offset_refs: {zone → first offset}   "this object has data in
+                                              zone 12, starting at X"
+ in RocksDB:
+   z <zone#>              → {write_pointer, dead_bytes}   per-zone state
+   Z <field>              → freelist geometry             (like B for bitmap)
+   G <zone><offset><oid>  → (empty)                       reverse index:
+                                                          "who lives in zone 12?"
+```
+
+The `z` records are updated by merge operator — a commit appends
+"wp += 64 KiB" or "dead += 64 KiB" without reading the old value, the
+same write-only trick as the bitmap freelist's XOR. The `G` index
+exists purely for the cleaner: "list every object in zone 12" becomes
+one range scan. The invariant that makes it all safe: **all three are
+written in the same commit batch as the onode itself** — zone
+accounting can never disagree with object metadata, crash or no crash.
+(`zone_offset_refs` is the field that still survives in today's tree.)
+
+#### The write path, step by step
+
+One 64 KiB write to an object, on a zoned device:
+
+```
+ 1. _do_write asks the allocator for 64 KiB
+      → answer is always "zone 12's write pointer" (say 0x300000)
+ 2. data is aio-appended at 0x300000 — never anywhere else
+ 3. one commit batch:
+      onode: extent map now points at zone12+0x300000
+      first data in zone 12?  → add zone_offset_refs[12]
+                              → insert G(12, 0x300000, oid)
+      z merge: zone 12 wp += 64 KiB
+ 4. if this overwrote data that lived in zone 7:
+      z merge: zone 7 dead += 64 KiB          (nothing moves!)
+      object now has nothing left in zone 7?  → drop ref + G key
+```
+
+That's the whole trick: an overwrite *writes forward* into the open
+zone and just counts the old bytes as dead. Deferred writes are
+disabled (`prefer_deferred_size = 0`), so no path ever does
+read-modify-write — the device only ever sees appends at the write
+pointer and, eventually, zone resets.
+
+#### The cleaner thread, in plain terms
+
+`bstore_zcleaner` is a simple loop:
+
+```
+ forever:
+   zone = pick_zone_to_clean()     worth it when: dead/moved ≥ 0.05
+                                   and dead ≥ zone_size/32  (FIXME'd)
+   if none: sleep(bluestore_cleaner_sleep_interval); retry
+   mark zone "cleaning"            allocator stops using it
+   for each G(zone, off, oid):     every object still alive in it
+       rewrite that object's data  through the ORDINARY write path →
+                                   lands in the open zone, metadata
+                                   moves in ordinary transactions
+   reset the zone                  device zone reset + z record zeroed
+```
+
+Two things make this design trustworthy: the cleaner never touches raw
+blocks — it re-writes *objects* through the normal write path, so every
+safety property of ordinary writes (atomic commit batch, crash
+recovery) applies to GC for free; and the zone being cleaned is
+excluded from allocation, so cleaner and clients never chase the same
+write pointer. What it lacked was purely policy: hardcoded thresholds,
+no throttling against client I/O, one zone at a time.
+
 Why it died ([`169bd8553ed`](https://github.com/ceph/ceph/commit/169bd8553ed)):
 not because the design was wrong, but because nobody reviewed or
 maintained it while the rest of BlueStore kept moving. Any revival plan
