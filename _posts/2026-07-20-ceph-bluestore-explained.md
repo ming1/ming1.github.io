@@ -1757,6 +1757,34 @@ Neither piece exists at v21.3.0 (BlueFS has zero zoned-awareness
 today), but both are bounded, and the journal's own append discipline
 proves the pattern inside this codebase.
 
+It also has *published* precedent — the 2019 BlueFS paper (Aghayev,
+Weil, Ganger, Amvrosiadis,
+["Reconciling LSM-Trees with Modern Hard Drives using BlueFS"](https://www.pdl.cmu.edu/PDL-FTP/FS/CMU-PDL-19-102.pdf),
+CMU-PDL-19-102) put the RocksDB WAL on a *sequential* zone in its
+prototype, with exactly this recipe:
+
+- **Wrap every WAL write in a record that carries its length inline,
+  padded to a 4 KiB boundary.** Reads stop being a direct
+  offset-to-extent mapping — record lengths must be walked — which is
+  acceptable because the WAL is only ever read sequentially, during
+  crash recovery. (This is pad-and-advance, a decade early — and the
+  same framing envelope mode later reinvented for fdatasync
+  reduction.)
+- **Preallocate and recycle a pool of WAL files**, so file sizes never
+  change and a synchronous insert costs *one* device write instead of
+  two (data + metadata) — tripling sync-insert throughput; this half
+  did reach mainline RocksDB.
+- **Give whole sequential zones to sequential files** (SSTs, WALs, the
+  BlueFS journal): deleting an SST becomes a zone reset — GC-free
+  metadata, the same insight ZenFS later productized.
+
+Measured result: RocksDB on the prototype BlueFS over an HM-SMR drive
+ran 48% faster than RocksDB over XFS on a conventional drive with the
+WAL format alone, and 3× faster with recycling added — evidence that
+metadata-on-sequential-zones is not merely feasible but *profitable*.
+Only the recycling piece was ever merged; the zone-format pieces are
+the Option B work.
+
 **Violation 2 — WAL file recycling (whole-file overwrite, off by
 default).** With `recycle_log_file_num > 0`, RocksDB reuses a finished
 WAL file instead of deleting it:
