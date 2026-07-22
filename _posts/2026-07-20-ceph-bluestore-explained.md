@@ -1383,9 +1383,10 @@ Component by component:
 - **The cleaner thread** (`bstore_zcleaner`, old `BlueStore.cc:14776`)
   — the policy loop: pick the worst zone (thresholds hardcoded and
   marked `FIXME`: score ≥ 0.05, savings ≥ zone_size/32), mark it
-  `cleaning_zone`, range-scan its `G` keys, rewrite each live object
-  through the ordinary write path (so the moved data lands in the
-  open zone with full transactional metadata), then reset the zone.
+  `cleaning_zone`, range-scan its `G` keys, rewrite each live object's
+  in-zone extents through the ordinary write path (so the moved data
+  lands in the open zone with full transactional metadata), then reset
+  the zone.
   Simple, synchronous, one zone at a time — correct, but with no
   throttling against client I/O.
 - **`HMSMRDevice`** (`libzbd`) — the thin bottom: report zones at
@@ -1418,7 +1419,8 @@ The `z` records are updated by merge operator — a commit appends
 "wp += 64 KiB" or "dead += 64 KiB" without reading the old value, the
 same write-only trick as the bitmap freelist's XOR. The `G` index
 exists purely for the cleaner: "list every object in zone 12" becomes
-one range scan. The invariant that makes it all safe: **all three are
+one range scan. (The stored offset is just a stable key tag — never
+updated as extents come and go; the cleaner reads only the object id.) The invariant that makes it all safe: **all three are
 written in the same commit batch as the onode itself** — zone
 accounting can never disagree with object metadata, crash or no crash.
 (`zone_offset_refs` is the field that still survives in today's tree.)
@@ -1465,7 +1467,8 @@ pointer and, eventually, zone resets.
 ```
 
 Two things make this design trustworthy: the cleaner never touches raw
-blocks — it re-writes *objects* through the normal write path, so every
+blocks — it re-writes each object's *extents in that zone* through the
+normal write path, so every
 safety property of ordinary writes (atomic commit batch, crash
 recovery) applies to GC for free; and the zone being cleaned is
 excluded from allocation, so cleaner and clients never chase the same
