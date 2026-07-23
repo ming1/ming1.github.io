@@ -822,6 +822,211 @@ from the laptop. (`/commit` is not a built-in slash command; either
 ask Claude to commit in plain prose or define a custom
 `.claude/commands/commit.md`.)
 
+# Useful blogs
+
+## The Map Is Not the Territory: Finding Your Unknowns with Claude Fable 5
+
+[The Map Is Not the Territory: Finding Your Unknowns with Claude Fable 5](https://explainx.ai/blog/map-is-not-territory-fable-5-thariq-unknowns-2026) 
+
+### Help Claude help you
+
+The most important part of this process is to give Claude context about  
+your starting point. For example, tell it where you are in your thought  
+process; disclose your experience with the problem and codebase; and let  
+it work with you like a thought partner.
+
+
+### Pre-implementation
+
+#### Blind Spot Pass
+
+When starting work, one of the most useful things you can do is understand  
+your blindspots. For example, if you’re writing a feature in a new part of   
+the codebase or using Claude to help you with unfamiliar work like iterating   
+on a design, you’re likely to have a lot of unknown unknowns.
+
+You may not know what questions to ask, what good looks like, what historical  
+work has been done or what potholes to avoid.
+
+To do this, you can ask Claude to help you find your unknown unknowns and   
+explain them to you. I like to use the literal words “blindspot pass” and   
+“unknown unknowns”. Giving it context on who you are and what you know is   
+usually important for
+
+Example Prompts:
+
+“I'm working on adding a new auth provider but I know nothing about the auth   
+modules in this codebase. Can you do a blindspot pass to help me figure out   
+my relevant unknown unknowns and help me prompt you better.”
+
+“I don’t know what color grading is but I need to grade this video. Can you   
+teach me to understand my unknown unknowns about color grading, so that I can   
+prompt better?”
+
+#### Brainstorms and prototypes
+
+When I’m working in an area with a lot of unknown knowns, involving criteria  
+I only know to define when I see it, I like to ask Claude to brainstorm and   
+prototype with me.
+
+It’s extremely valuable to identify and verbalize unknown knowns early during   
+prototyping, because finding them out during implementation can be (relatively)   
+expensive. Small changes in a feature or spec can cause drastically different   
+implementations in code and it can be more difficult for your agent to revert   
+previous changes.
+
+I also start almost every coding session with an exploration or brainstorming   
+phase. This helps me start with intent to define the project’s scope. Claude   
+often finds high-value approaches I would have missed and sometimes misses   
+the forest through the trees. Brainstorming prevents me from setting too   
+narrow or too wide a scope.
+
+Example prompts:
+
+"I want a dashboard for this data but I have no visual taste and don't know  
+what's possible. Make me an HTML page with 4 wildly different design directions  
+so I can react to them.”
+
+“Before wiring anything up, make a single HTML file mocking the new editor toolbar   
+with fake data. I want to react to the layout before you touch the treal app."  
+
+"Here's my rough problem: users churn after onboarding. Search the codebase and   
+brainstorm 10 places we could intervene, from cheapest to most ambitious. I'll   
+tell you which ones resonate."
+
+#### Interviews
+
+Once I’ve done sufficient brainstorming, I likely still have unknowns.
+
+In this case, I ask Claude to interview me about any unknowns or ambiguities. When   
+asking Claude to interview you, try and give it context about your problem to guide   
+its questions. Here are some examples.
+
+Example prompts:
+
+"Interview me one question at a time about anything ambiguous, prioritize questions   
+where my answer would change the architecture."
+
+#### References
+
+Sometimes you can’t describe what you want in detail. For example, you might not   
+have the language or it might be so complicated that it would take you quite a while.  
+
+In this case, the best answer is a reference. While you can include diagrams,   
+documentation or pictures, the absolute best reference is source code.
+
+If you have a library that implements something in a certain way or a design   
+component you really like, just point Fable at the folder and tell it what to look   
+for, even if it’s in a different language.
+
+This is also the way Claude Design works. You don't have to hand it a file (  
+although you can do that too). You can point it at a module on a website you   
+like, and it reads the underlying code, not just the screenshot. This   
+provides much richer detail around the markup, structure, and how the   
+component is actually built.
+
+Example prompts:
+
+This Rust crate in vendor/rate-limiter implements the exact backoff behavior I  
+want. Read it and reimplement the same semantics in our TypeScript API client.
+
+### Implementation Plans
+
+When I think I’m ready to implement, I tend to ask Claude to put together  
+an implementation plan for me to review that focuses on the parts that might   
+be most likely to change, for example to review data models, type interfaces   
+or UX flows. This allows Claude to surface things I might actually need to alter.  
+
+Example Prompts:
+
+"Write an implementation plan in HTML, but lead with the decisions I'm most   
+likely to tweak with: data model changes, new type interfaces, and anything   
+user-facing. Bury the mechanical refactoring at the bottom, I trust you on   
+that part."
+
+### During implementation
+
+#### Implementation notes
+
+Once I am satisfied with my plan, I make a new session and pass any artifacts   
+to the prompt. For example, I might pass in a spec file and a prototype and   
+ask an agent to implement it.
+
+But the truth is that no matter how much planning you do, there are always   
+unknown unknowns lurking. The agent may find during its work that it needs   
+to take a different tack due to an edge case it found in the code.
+
+I ask Claude Code to keep a temporary ‘implementation-notes.md’ (or .html)   
+file where it keeps track of decisions it makes so we can learn from our   
+next attempt.
+
+Example prompts:
+
+"Keep an implementation-notes.md file. If you hit an edge case that forces   
+you to deviate from the plan, pick the conservative option, log it under   
+'Deviations', and keep going."
+
+### Post implementation
+
+#### Pitches and explainers
+
+One of the most important parts of shipping something is getting buy-in and   
+approvals.Building pitch and explainer artifacts in the final document helps:  
+
+- Accelerate understanding when reviewers start with the same unknowns you did  
+
+- Accelerate approvals when experts want to see you accounted for the unknowns   
+and common failure points they would have anticipated
+
+Example prompts:
+
+"Package the prototype, the spec, and the implementation notes into a single doc   
+I can drop in Slack to get buy-in. Lead with the demo GIF."
+
+### Quizzes
+
+After a long working session, Claude might have accomplished a lot more than I   
+realized. Reading the code diffs can only give me a light understanding of what   
+happened, since much of the behavior will depend on existing code paths.
+
+Asking Claude to quiz me about the change after giving me a bunch of context  
+helps me understand what happens. I only merge after I pass the quiz perfectly.  
+
+Example prompts:
+
+“I want to make sure I understand everything that's happened in this change. Give  
+me a HTML report on the changes for me to read and understand with context,   
+intuition, what was done, etc. and a quiz at the bottom on the changes that I must pass.”
+
+### How this comes together: launching Fable
+
+
+### discipline
+
+The most durable part of the field guide isn't a specific tactic — it's a  
+**discipline**. A few practices worth adopting directly:
+
+- Have the agent restate the plan before executing.  
+If Claude's paraphrase of your prompt surprises you, that's the map/territory  
+gap surfacing early and cheaply, before any code changes.
+
+- Treat every surprising first-pass output as a signal, not just a bug.  
+When the agent does something reasonable-but-wrong, don't just fix the output —   
+ask what assumption in your map was missing, and update CLAUDE.md or the relevant   
+skill so the same gap doesn't reappear next session.
+
+- Reserve high reasoning effort for genuinely ambiguous work.   
+Effort level is itself a map decision — spending more of it on a well-specified,  
+repeatable task wastes budget you'd rather spend on the parts of the codebase   
+your map doesn't cover well.
+
+- Don't mistake a complaint about the model for a complaint about the map.  
+A chunk of the public frustration with new model releases traces back to prompts,   
+skills, and context tuned for the previous model's blind spots — not an actual   
+regression. Re-verify your map against the new model before assuming the territory changed.
+
+
+
 # Summary
 
 **Main advantages**
