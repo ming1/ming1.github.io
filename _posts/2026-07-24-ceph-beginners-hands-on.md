@@ -507,6 +507,19 @@ keyring holding *only its own* key, so a compromised OSD leaks "the
 ability to be `osd.0`", never "the ability to be admin". Ours were
 minted by `ceph osd new` with the canned OSD profile:
 
+
+**The client.admin.keyring is the absolute master key to your cluster.  
+Because it grants unrestricted access to destroy, reconfigure, or read  
+any data in the entire system, it should be treated like a root SSH key.**
+
+Where the Admin Keyring SHOULD be Stored:
+
+- Monitor Nodes (MONs):
+
+- Dedicated Admin / Bastion Nodes:
+
+- Orchestration / Deployment Nodes:
+
 ```
 # cat /tmp/ceph/osd0/keyring
 [osd.0]
@@ -543,6 +556,14 @@ the Paxos transaction log that makes multi-MON quorum work. Why a
 transactional KV store: a map update must be committed atomically
 or not at all — the same reasoning that gives BlueStore its
 embedded RocksDB.
+
+The Ceph Monitor cluster maintains a centralized authentication  
+database (often referred to as the auth subsystem). This database  
+contains the names, secret keys, and capabilities (caps) of every  
+single entity in the cluster—every OSD, every MDS, and every  
+client (including client.admin). This entire auth database is stored
+persistently inside the Monitor's underlying RocksDB key-value store.
+
 
 **`osdN/` — a pointer, not a store.** The most instructive listing,
 because of what is *missing*:
@@ -591,25 +612,12 @@ by the default cluster name (`ceph`) and `$cluster-$id`:
 | `run/*.asok`, `*.pid` | `/var/run/ceph/` (tmpfs, from systemd) |
 | `log/*.log` | `/var/log/ceph/` (+ `ceph.log` on the MON) |
 
-Same shapes, different directories — plus a few pieces the lab
-bypassed. Clients locate `/etc/ceph/ceph.client.admin.keyring` via
-a built-in search order, which is why a bare `ceph -s` works on a
-package host with no `keyring =` line in the conf. OSDs created by
-`ceph-volume` take "a pointer, not a store" one step further: the
-data directory is a *tmpfs*, regenerated on every activation from
-LVM tags and the BlueStore label, with `block` aimed at an LVM
-volume. Daemons run as the `ceph` user under systemd
-(`ceph-osd@0.service`, ..., grouped by `ceph.target`). And per-type
-`/var/lib/ceph/bootstrap-osd/ceph.keyring` keys — caps limited to
-"may enroll a new OSD" — let hosts add daemons without holding the
-admin key, where the lab just used `client.admin` for everything.
-cephadm shifts this whole layer once more, to
-`/var/lib/ceph/<fsid>/<name>/`.
-
 The punchline of the tour: apart from three raw devices, a Ceph
 cluster is a handful of INI files, tiny text markers, and two kinds
 of RocksDB. Your *data* appears in none of these paths — it exists
 only inside the OSDs' block devices.
+
+
 
 # 4. Hands-on: the three interfaces
 
