@@ -45,6 +45,8 @@ The vocabulary you need before anything else:
 | RADOS | Reliable Autonomic Distributed Object Store — the core cluster |
 | object | RADOS's unit: name + bytes + xattrs + omap (key/value pairs) |
 | OSD | Object Storage Daemon — one per disk; stores objects (BlueStore) |
+| BlueStore | the OSD's storage engine: raw device, no filesystem below |
+| BlueFS | BlueStore's tiny internal FS, only to host its own RocksDB |
 | MON | Monitor — keeps the authoritative cluster maps, forms quorum |
 | monmap | the map of the MONs themselves: who they are, where they listen |
 | osdmap | the map of OSDs (which exist, up/in state) — versioned by epoch |
