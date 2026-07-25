@@ -466,8 +466,13 @@ file really does (Section 3.1) — plain INI text, `[global]`/
 is learned from the MON after connecting, which is why the file is
 small and rarely changes.
 
-**`keyring` — identity as a file.** Also INI text: one section per
-principal, a base64 secret, optionally the caps. Ours has collected
+**`keyring` — identity as a file.** A keyring is Ceph's equivalent
+of an SSH private key file: a principal's name plus the secret that
+proves you *are* that name — whoever can read the file can **be**
+that principal. In the cephx handshake the owner proves possession
+of the secret (never sending it), the MON compares against its own
+database, and the caller then speaks *as* that principal. The
+format is INI text, one section per identity; ours has collected
 every key appended during bootstrap:
 
 ```
@@ -489,10 +494,17 @@ every key appended during bootstrap:
         key = AQDnHWRqsaAIFxAAcIsg40Hmvoo6f/nHtwH7Yg==
 ```
 
-(One shared file is lab convenience; the caps lines are a cached
-copy — the authoritative caps live in the MON's database.) Each OSD
-gets a private keyring holding *only its own* key, minted by
-`ceph osd new` with the canned OSD profile — least privilege:
+Just as important is what a keyring is **not**. It is not
+authorization: the `caps` lines are a cached, human-readable note,
+and the MON's database alone decides what each principal may do.
+It is not data or state: lose a daemon's keyring and its store is
+intact — the daemon just cannot log in until an admin re-exports
+the key (`ceph auth get osd.0`; the MON's copy is authoritative).
+And it is deliberately not cluster-wide: one shared file is lab
+convenience, while real deployments give each daemon a private
+keyring holding *only its own* key, so a compromised OSD leaks "the
+ability to be `osd.0`", never "the ability to be admin". Ours were
+minted by `ceph osd new` with the canned OSD profile:
 
 ```
 # cat /tmp/ceph/osd0/keyring
@@ -1114,8 +1126,13 @@ Ceph-specific adaptations worth knowing:
   the MON exactly like clients, with keys minted at enrollment time
   (`ceph osd new`, `ceph auth get-or-create`).
 - **Rotating service secrets** — all OSDs share one rotating secret
-  (likewise MDS, MGR), refreshed from the MON on a TTL. Revocation
-  is passive: a deleted principal simply fails its next renewal.
+  (likewise MDS, MGR), refreshed from the MON on a TTL. Note this is
+  *not* the key in a daemon's keyring file: that one is its
+  permanent login credential (how `osd.0` authenticates to the MON,
+  like any client); the rotating secret is fetched *after* that
+  login and lives only in memory — it is how any OSD can unseal any
+  client's ticket. Revocation is passive: a deleted principal simply
+  fails its next renewal.
 - **Caps ride in the ticket** — authorization is enforced by each
   daemon from the unsealed ticket, no directory consulted per op.
 - **Integrity, not secrecy** — cephx authenticates the parties; it
