@@ -13,8 +13,12 @@ tags: [ceph, storage, distributed storage, rbd, cephfs, rgw, rados]
 >   [`src/os/bluestore/`][src-bluestore], [`src/librbd/`][src-librbd],
 >   [`src/mds/`][src-mds], [`src/rgw/`][src-rgw],
 >   [`src/crush/`][src-crush], [`src/vstart.sh`][vstart].
-> - Ceph docs: [cephadm install][doc-cephadm], [RBD][doc-rbd],
+> - Ceph docs: [`doc/architecture.rst`][doc-arch] — upstream's own
+>   architecture overview, the prose counterpart to what this post does
+>   by hand; also [cephadm install][doc-cephadm], [RBD][doc-rbd],
 >   [CephFS][doc-cephfs], [RGW][doc-rgw], [developer guide][doc-dev].
+> - Background for Section 6: [Kerberos (protocol)][kerberos] — the
+>   ticket/session-key design cephx is modelled on.
 > - Linux kernel clients: [`drivers/block/rbd.c`][krbd],
 >   [`fs/ceph/`][kcephfs], [`net/ceph/`][libceph].
 > - A companion deep dive on the OSD's storage engine:
@@ -1111,9 +1115,9 @@ trusted authority, hostile network. MIT solved it in the 1980s.
 
 ## 6.2 The Kerberos idea in one diagram
 
-Kerberos assumes a Key Distribution Center (KDC) that shares a
-secret with every principal. Nobody ever sends a secret over the
-wire — not even hashed. Instead, the KDC answers a *plaintext*
+[Kerberos][kerberos] assumes a Key Distribution Center (KDC) that
+shares a secret with every principal. Nobody ever sends a secret over
+the wire — not even hashed. Instead, the KDC answers a *plaintext*
 request with **two sealed boxes carrying the same freshly-minted
 session key**, one openable by the client, one by the service:
 
@@ -1251,6 +1255,11 @@ podman containers under systemd.)
 
 ## 7.2 Where to start reading code
 
+Read upstream's [`doc/architecture.rst`][doc-arch] alongside the tree —
+it is this same territory in prose, and it covers the RADOS behaviour a
+one-node lab cannot show: erasure coding, scrubbing, acting vs up sets,
+striping parameters, watch/notify, and RADOS classes.
+
 Guided by the trace in Section 5, each hop has a home in the tree
 (refs against [`v20.2.2`][ceph-tag]):
 
@@ -1288,6 +1297,7 @@ started from.
 [src-crush]: https://github.com/ceph/ceph/tree/v20.2.2/src/crush
 [src-auth]: https://github.com/ceph/ceph/tree/v20.2.2/src/auth
 [vstart]: https://github.com/ceph/ceph/blob/v20.2.2/src/vstart.sh
+[doc-arch]: https://github.com/ceph/ceph/blob/main/doc/architecture.rst
 [doc-cephadm]: https://docs.ceph.com/en/latest/cephadm/install/
 [doc-rbd]: https://docs.ceph.com/en/latest/rbd/
 [doc-cephfs]: https://docs.ceph.com/en/latest/cephfs/
@@ -1296,6 +1306,7 @@ started from.
 [krbd]: https://github.com/torvalds/linux/blob/master/drivers/block/rbd.c
 [kcephfs]: https://github.com/torvalds/linux/tree/master/fs/ceph
 [libceph]: https://github.com/torvalds/linux/tree/master/net/ceph
+[kerberos]: https://en.wikipedia.org/wiki/Kerberos_%28protocol%29
 [vng]: https://github.com/arighi/virtme-ng
 [vmtest]: https://github.com/ublk-org/vmtest
 [lab-script]: https://github.com/ming1/ming1.github.io/blob/master/code/ceph-single-vm-lab.sh
