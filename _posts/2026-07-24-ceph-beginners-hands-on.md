@@ -51,6 +51,10 @@ The vocabulary you need before anything else:
 | MGR | Manager — metrics, orchestration modules, balancer, dashboard |
 | Pool | a namespace of objects with a replication/EC policy |
 | PG | Placement Group — a shard of a pool; unit of replication/recovery |
+| active+clean | PG state: serving I/O, every replica current — the goal |
+| peering | PG state: replicas reconciling history before serving I/O |
+| degraded | PG state: serving I/O with fewer copies than `size` |
+| remapped | PG state: temporarily on other OSDs than CRUSH's answer |
 | CRUSH | the placement function: PG → list of OSDs, computed, not looked up |
 | cephx | shared-secret auth: the MON stores all keys and issues tickets |
 | principal | a named identity in cephx: `mon.`, `client.admin`, `osd.0` |
