@@ -554,12 +554,41 @@ invaluable when a daemon is up but unreachable through the cluster.
 noise" from Section 3.5's mkfs actually went; `-d` on any daemon
 streams the same to the foreground instead.
 
+**Where these live in a real deployment.** Our lab pinned every
+path to `/tmp/ceph`; a normal install from Fedora packages sets
+none of them — these locations are the compiled-in defaults, shaped
+by the default cluster name (`ceph`) and `$cluster-$id`:
+
+| This lab | Fedora packages |
+|----------|-----------------|
+| `ceph.conf` | `/etc/ceph/ceph.conf` |
+| `keyring` (admin part) | `/etc/ceph/ceph.client.admin.keyring` |
+| `monmap` | transient; discarded after `ceph-mon --mkfs` |
+| `mon/` | `/var/lib/ceph/mon/ceph-a/` |
+| `osd0/` | `/var/lib/ceph/osd/ceph-0/` |
+| (mds, mgr, rgw dirs) | `/var/lib/ceph/{mds,mgr,radosgw}/ceph-*/` |
+| `run/*.asok`, `*.pid` | `/var/run/ceph/` (tmpfs, from systemd) |
+| `log/*.log` | `/var/log/ceph/` (+ `ceph.log` on the MON) |
+
+Same shapes, different directories — plus a few pieces the lab
+bypassed. Clients locate `/etc/ceph/ceph.client.admin.keyring` via
+a built-in search order, which is why a bare `ceph -s` works on a
+package host with no `keyring =` line in the conf. OSDs created by
+`ceph-volume` take "a pointer, not a store" one step further: the
+data directory is a *tmpfs*, regenerated on every activation from
+LVM tags and the BlueStore label, with `block` aimed at an LVM
+volume. Daemons run as the `ceph` user under systemd
+(`ceph-osd@0.service`, ..., grouped by `ceph.target`). And per-type
+`/var/lib/ceph/bootstrap-osd/ceph.keyring` keys — caps limited to
+"may enroll a new OSD" — let hosts add daemons without holding the
+admin key, where the lab just used `client.admin` for everything.
+cephadm shifts this whole layer once more, to
+`/var/lib/ceph/<fsid>/<name>/`.
+
 The punchline of the tour: apart from three raw devices, a Ceph
 cluster is a handful of INI files, tiny text markers, and two kinds
 of RocksDB. Your *data* appears in none of these paths — it exists
-only inside the OSDs' block devices. (cephadm arranges the same
-pieces under `/var/lib/ceph/<fsid>/` and `/etc/ceph/`; the shapes
-are identical.)
+only inside the OSDs' block devices.
 
 # 4. Hands-on: the three interfaces
 
