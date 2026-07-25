@@ -1042,29 +1042,42 @@ trusted authority, hostile network. MIT solved it in the 1980s.
 ## 6.2 The Kerberos idea in one diagram
 
 Kerberos assumes a Key Distribution Center (KDC) that shares a
-secret with every principal. Nobody ever sends a secret; you prove
-you *hold* one by decrypting what the KDC seals with it. The trick
-that keeps the KDC off the data path is the **ticket**:
+secret with every principal. Nobody ever sends a secret over the
+wire — not even hashed. Instead, the KDC answers a *plaintext*
+request with **two sealed boxes carrying the same freshly-minted
+session key**, one openable by the client, one by the service:
 
 ```
- +--------+ (1) prove possession of key  +----------+
- |        | ---------------------------> |   KDC    |
- | client | (2) ticket for service S     | all keys |
- |        | <--------------------------- +----------+
- |        |     ticket = {client id, session key, expiry}
- |        |     sealed with SERVICE S's secret key
+ +--------+ (1) "alice here: a ticket    +----------+
+ |        |      for service S, please"  |   KDC    |
+ |        | ---------------------------> | all keys |
+ | client | (2) reply: two sealed boxes  +----------+
+ |        | <---------------------------
+ |        |  [session key]                sealed with ALICE's key
+ |        |      -> only she can open it: that IS the login
+ |        |  [alice, session key, expiry] sealed with S's key
+ |        |      -> the TICKET: opaque to her, forwarded as-is
  |        |
- |        | (3) present ticket           +----------+
- |        | ---------------------------> | service  |
- |        | (4) S unseals it locally --  |    S     |
- |        | <==========================> +----------+
- +--------+     talk, keyed by the session key
+ |        | (3) ticket + authenticator   +----------+
+ |        |     (encrypted w/ session k) | service  |
+ |        | ---------------------------> |    S     |
+ |        | (4) S unseals ticket locally +----------+
+ |        | <==========================>
+ +--------+   both now hold the same session key
 ```
 
-The client cannot read or forge the ticket (it is sealed with a key
-the client does not have); the service validates it **without asking
-the KDC** — authenticate once, then talk to many services directly
-until the expiry forces a background renewal.
+This is how the client gets the session key: box one is sealed with
+the *client's own* secret, so decrypting it is simultaneously the
+delivery of the key and the proof of identity — an impostor without
+alice's secret holds two boxes it cannot open. Box two, the
+**ticket**, carries the same session key to the service by a route
+the client cannot read or tamper with. In step (3) the client adds
+a small *authenticator* (e.g. a timestamp) encrypted with the
+session key, proving it really opened box one; the service unseals
+the ticket with its own key, finds the same session key inside, and
+checks the authenticator and expiry — all **without asking the
+KDC**. Authenticate once, then talk to many services directly until
+expiry forces a background renewal.
 
 ## 6.3 cephx: Kerberos re-cast for a storage cluster
 
