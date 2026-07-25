@@ -40,7 +40,11 @@ placement and onto the raw disk, verifying every hop with checksums.
 The target reader is an engineer who wants to *use* Ceph now and *hack
 on* Ceph later.
 
-The vocabulary you need before anything else:
+The vocabulary you need before anything else, in five small groups.
+Skim them now, and come back as the terms start appearing in
+commands — every one of them shows up later in real output.
+
+**The cluster and its unit of storage** — what Ceph fundamentally is:
 
 | Term | Meaning |
 |------|---------|
@@ -48,6 +52,13 @@ The vocabulary you need before anything else:
 | fsid | the cluster's UUID — stamped into maps, stores, device labels |
 | RADOS | Reliable Autonomic Distributed Object Store — the core cluster |
 | object | RADOS's unit: name + bytes + xattrs + omap (key/value pairs) |
+
+**Daemons, and the maps that describe them** — the processes
+Section 3 starts one by one (the maps are what the MON exists to
+keep):
+
+| Term | Meaning |
+|------|---------|
 | OSD | Object Storage Daemon — one per disk; stores objects (BlueStore) |
 | BlueStore | the OSD's storage engine: raw device, no filesystem below |
 | BlueFS | BlueStore's tiny internal FS, only to host its own RocksDB |
@@ -56,13 +67,25 @@ The vocabulary you need before anything else:
 | osdmap | the map of OSDs (which exist, up/in state) — versioned by epoch |
 | epoch | a map's version number, bumped on every change (`osdmap e39`) |
 | MGR | Manager — metrics, orchestration modules, balancer, dashboard |
+
+**Placement** — how an object finds its disks (Section 5 traces
+this live), and the PG states you will see in `ceph -s`:
+
+| Term | Meaning |
+|------|---------|
 | Pool | a namespace of objects with a replication/EC policy |
 | PG | Placement Group — a shard of a pool; unit of replication/recovery |
+| CRUSH | the placement function: PG → list of OSDs, computed, not looked up |
 | active+clean | PG state: serving I/O, every replica current — the goal |
 | peering | PG state: replicas reconciling history before serving I/O |
 | degraded | PG state: serving I/O with fewer copies than `size` |
 | remapped | PG state: temporarily on other OSDs than CRUSH's answer |
-| CRUSH | the placement function: PG → list of OSDs, computed, not looked up |
+
+**Authentication** — the cephx cast, used from the first key in
+Section 3.2 and unpacked fully in Section 6:
+
+| Term | Meaning |
+|------|---------|
 | cephx | shared-secret auth: the MON stores all keys and issues tickets |
 | principal | a named identity in cephx: `mon.`, `client.admin`, `osd.0` |
 | key | a principal's secret — in a keyring file and the MON's database |
@@ -70,6 +93,12 @@ The vocabulary you need before anything else:
 | ticket | Kerberos-style token: identity + caps + session key (Sec 6) |
 | session key | fresh per-login secret both sides share to key the talk |
 | authenticator | timestamp sealed with the session key, proving key receipt |
+
+**Interfaces and deployment** — what users actually touch
+(Section 4 uses all three):
+
+| Term | Meaning |
+|------|---------|
 | RBD | RADOS Block Device — virtual disks striped over RADOS objects |
 | CephFS | POSIX filesystem on RADOS; an MDS daemon serves the metadata |
 | RGW | RADOS Gateway — S3/Swift-compatible HTTP object storage |
@@ -512,19 +541,6 @@ keyring holding *only its own* key, so a compromised OSD leaks "the
 ability to be `osd.0`", never "the ability to be admin". Ours were
 minted by `ceph osd new` with the canned OSD profile:
 
-
-**The client.admin.keyring is the absolute master key to your cluster.  
-Because it grants unrestricted access to destroy, reconfigure, or read  
-any data in the entire system, it should be treated like a root SSH key.**
-
-Where the Admin Keyring SHOULD be Stored:
-
-- Monitor Nodes (MONs):
-
-- Dedicated Admin / Bastion Nodes:
-
-- Orchestration / Deployment Nodes:
-
 ```
 # cat /tmp/ceph/osd0/keyring
 [osd.0]
@@ -533,6 +549,16 @@ Where the Admin Keyring SHOULD be Stored:
         caps mon = "allow profile osd"
         caps osd = "allow *"
 ```
+
+**The `client.admin` keyring is the absolute master key to your
+cluster. Because it grants unrestricted access to destroy,
+reconfigure, or read any data in the entire system, it should be
+treated like a root SSH key.** Where the admin keyring SHOULD be
+stored:
+
+- Monitor nodes (MONs)
+- Dedicated admin / bastion nodes
+- Orchestration / deployment nodes
 
 **`monmap` — a one-shot bootstrap blob.** A small binary file
 (epoch, fsid, monitor addresses — `monmaptool` printed those fields
@@ -562,13 +588,13 @@ transactional KV store: a map update must be committed atomically
 or not at all — the same reasoning that gives BlueStore its
 embedded RocksDB.
 
-The Ceph Monitor cluster maintains a centralized authentication  
-database (often referred to as the auth subsystem). This database  
-contains the names, secret keys, and capabilities (caps) of every  
-single entity in the cluster—every OSD, every MDS, and every  
-client (including client.admin). This entire auth database is stored
-persistently inside the Monitor's underlying RocksDB key-value store.
-
+The Ceph Monitor cluster maintains a centralized authentication
+database (often referred to as the auth subsystem). This database
+contains the names, secret keys, and capabilities (caps) of every
+single entity in the cluster — every OSD, every MDS, and every
+client (including `client.admin`). This entire auth database is
+stored persistently inside the Monitor's underlying RocksDB
+key-value store.
 
 **`osdN/` — a pointer, not a store.** The most instructive listing,
 because of what is *missing*:
@@ -624,52 +650,54 @@ only inside the OSDs' block devices.
 
 ## 3.7 How does client get Monitor Map (The Bootstrap)
 
-Before a client can do anything, it needs to find the Key Distribution Center  
-(the Monitors). But if it doesn't have a map yet, how does it know where they are?
+Before a client can do anything, it needs to find the Key
+Distribution Center (the Monitors). But if it doesn't have a map
+yet, how does it know where they are?
 
-- The Seed (ceph.conf):
+**The seed (`ceph.conf`).** When a client application (like a kernel
+rbd mount or a librbd container) starts, it reads its local
+`/etc/ceph/ceph.conf` file. This file contains a `mon_host`
+directive listing the IP addresses of one or more Monitors (e.g.,
+`mon_host = 192.168.1.10,192.168.1.11`). Modern Ceph can also use
+DNS SRV records so you don't even need a `ceph.conf` file, but IPs
+are most common.
 
-When a client application (like a kernel rbd mount or a librbd container) starts, it  
-reads its local /etc/ceph/ceph.conf file. This file contains a mon_host directive   
-listing the IP addresses of one or more Monitors (e.g., mon_host = 192.168.1.10,  
-192.168.1.11). (Note: Modern Ceph can also use DNS SRV records so you don't even  
-need a ceph.conf file, but IPs are most common).
+**The handshake.** The client reaches out to one of those IPs,
+completes the cephx authentication handshake (using its keyring),
+and establishes a session.
 
-- The Handshake:
-
-The client reaches out to one of those IPs, completes the cephx authentication  
-handshake (using its keyring), and establishes a session.
-
-- Downloading the monmap:
-
-Once authenticated, the Monitor immediately sends the client the latest Monitor  
-Map (monmap). This map contains the current IP addresses, ports (v1/v2), and  
-epochs of all active Monitors in the quorum. The client now knows exactly who   
-the cluster brain is, even if the IPs in its local ceph.conf were outdated.
+**Downloading the monmap.** Once authenticated, the Monitor
+immediately sends the client the latest Monitor Map (monmap). This
+map contains the current IP addresses, ports (v1/v2), and epochs of
+all active Monitors in the quorum. The client now knows exactly who
+the cluster brain is, even if the IPs in its local `ceph.conf` were
+outdated.
 
 ## 3.8 OSD Map and how to find OSD
 
-When the client connects to the Monitor, it downloads the OSD Map, which contains  
-the cluster topology and the CRUSH map (a mathematical algorithm).
+When the client connects to the Monitor, it downloads the OSD Map,
+which contains the cluster topology and the CRUSH map (a
+mathematical algorithm).
 
-When a client needs to read or write an object, it executes the following steps  
-entirely in its local CPU without network lookups:
+When a client needs to read or write an object, it executes the
+following steps entirely in its local CPU, without network lookups:
 
-1. **Hash the Object:** The client hashes the object name.
+1. **Hash the object:** the client hashes the object name.
    `Hash("my_vm_disk_block_0") = 0x5A8B`
-
-2. **Calculate the PG:** The hash is divided (modulo) by the target pool's total  
-PG count to determine the Placement Group ID.
+2. **Calculate the PG:** the hash is divided (modulo) by the target
+   pool's total PG count to determine the Placement Group ID.
    `0x5A8B % Pool_PG_Count = PG 34`
-
-3. **Execute CRUSH:** The client feeds "PG 34" and the current OSD Map into  
-the CRUSH algorithm. The algorithm outputs a deterministic list of physical OSDs.
+3. **Execute CRUSH:** the client feeds "PG 34" and the current OSD
+   Map into the CRUSH algorithm. The algorithm outputs a
+   deterministic list of physical OSDs.
    `CRUSH(PG 34, OSD Map) = [OSD.12, OSD.45, OSD.88]`
 
-The client then establishes a direct, encrypted connection (v2 protocol on  
-port 6800+) to the primary OSD (`OSD.12`) to perform the I/O.
+The client then establishes a direct, encrypted connection (v2
+protocol on port 6800+) to the primary OSD (`OSD.12`) to perform
+the I/O.
 
-object name has to be unique in one Pool.
+Note that an object name has to be unique in one pool — the name is
+the only input to placement.
 
 # 4. Hands-on: the three interfaces
 
@@ -1188,24 +1216,27 @@ Ceph-specific adaptations worth knowing:
   (`ceph osd new`, `ceph auth get-or-create`).
 - **Rotating service secrets** — cephx's counterpart of the
   Kerberos service key, but minted *per daemon class*: one secret
-  for the OSDs, one for the MDSes, one for the MGRs. Class-wide is
-  forced by RADOS itself — a client cannot know which OSDs it will
-  end up talking to as maps change, so the ticket it carries must
-  be unsealable by **any** OSD. And precisely because the key is so
-  widely shared, it rotates on the ticket TTL
-  (`auth_service_ticket_ttl`, default one hour), daemons holding a
-  small overlapping set (previous / current / next) so a rotation
-  or mild clock skew never invalidates a fresh ticket. Note this is
-  *not* the key in a daemon's keyring file — that one is its
-  permanent login credential (how `osd.0` authenticates to the MON,
-  like any client). The rotating secrets live in exactly two
-  places: authoritatively in the MON's auth database (inside the
-  `store.db` of Section 3.6, Paxos-committed like every map), and
-  as an in-memory ring on each daemon, fetched after login,
-  refreshed before expiry, never written to the daemon's disk — so
-  a stolen OSD keyring leaks one login, not a durable
-  ticket-unsealing key. Revocation is passive: a deleted principal
-  simply fails its next renewal, and no OSD ever needs to be told.
+  for the OSDs, one for the MDSes, one for the MGRs.
+  - *Class-wide* is forced by RADOS itself — a client cannot know
+    which OSDs it will end up talking to as maps change, so the
+    ticket it carries must be unsealable by **any** OSD.
+  - *Rotating*, precisely because the key is so widely shared: it
+    turns over on the ticket TTL (`auth_service_ticket_ttl`,
+    default one hour), daemons holding a small overlapping set
+    (previous / current / next) so a rotation or mild clock skew
+    never invalidates a fresh ticket.
+  - This is *not* the key in a daemon's keyring file — that one is
+    its permanent login credential (how `osd.0` authenticates to
+    the MON, like any client).
+  - The rotating secrets live in exactly two places:
+    authoritatively in the MON's auth database (inside the
+    `store.db` of Section 3.6, Paxos-committed like every map), and
+    as an in-memory ring on each daemon, fetched after login,
+    refreshed before expiry, never written to the daemon's disk —
+    so a stolen OSD keyring leaks one login, not a durable
+    ticket-unsealing key.
+  - Revocation is passive: a deleted principal simply fails its
+    next renewal, and no OSD ever needs to be told.
 - **Caps ride in the ticket** — authorization is enforced by each
   daemon from the unsealed ticket, no directory consulted per op.
 - **Integrity, not secrecy** — cephx authenticates the parties; it
