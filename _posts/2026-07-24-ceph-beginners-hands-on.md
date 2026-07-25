@@ -55,6 +55,7 @@ The vocabulary you need before anything else:
 | cephx | shared-secret auth: the MON stores all keys and issues tickets |
 | principal | a named identity in cephx: `mon.`, `client.admin`, `osd.0` |
 | key | a principal's secret — in a keyring file and the MON's database |
+| caps | a principal's rights, per daemon type: `osd 'allow rwx'`, ... |
 | ticket | Kerberos-style token: identity + caps + session key (Sec 6) |
 | RBD | RADOS Block Device — virtual disks striped over RADOS objects |
 | CephFS | POSIX filesystem on RADOS; an MDS daemon serves the metadata |
