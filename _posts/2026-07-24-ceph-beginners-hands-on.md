@@ -1126,14 +1126,26 @@ Ceph-specific adaptations worth knowing:
   (Section 3.2's `ceph-authtool` output); daemons authenticate to
   the MON exactly like clients, with keys minted at enrollment time
   (`ceph osd new`, `ceph auth get-or-create`).
-- **Rotating service secrets** — all OSDs share one rotating secret
-  (likewise MDS, MGR), refreshed from the MON on a TTL. Note this is
-  *not* the key in a daemon's keyring file: that one is its
+- **Rotating service secrets** — cephx's counterpart of the
+  Kerberos service key, but minted *per daemon class*: one secret
+  for the OSDs, one for the MDSes, one for the MGRs. Class-wide is
+  forced by RADOS itself — a client cannot know which OSDs it will
+  end up talking to as maps change, so the ticket it carries must
+  be unsealable by **any** OSD. And precisely because the key is so
+  widely shared, it rotates on the ticket TTL
+  (`auth_service_ticket_ttl`, default one hour), daemons holding a
+  small overlapping set (previous / current / next) so a rotation
+  or mild clock skew never invalidates a fresh ticket. Note this is
+  *not* the key in a daemon's keyring file — that one is its
   permanent login credential (how `osd.0` authenticates to the MON,
-  like any client); the rotating secret is fetched *after* that
-  login and lives only in memory — it is how any OSD can unseal any
-  client's ticket. Revocation is passive: a deleted principal simply
-  fails its next renewal.
+  like any client). The rotating secrets live in exactly two
+  places: authoritatively in the MON's auth database (inside the
+  `store.db` of Section 3.6, Paxos-committed like every map), and
+  as an in-memory ring on each daemon, fetched after login,
+  refreshed before expiry, never written to the daemon's disk — so
+  a stolen OSD keyring leaks one login, not a durable
+  ticket-unsealing key. Revocation is passive: a deleted principal
+  simply fails its next renewal, and no OSD ever needs to be told.
 - **Caps ride in the ticket** — authorization is enforced by each
   daemon from the unsealed ticket, no directory consulted per op.
 - **Integrity, not secrecy** — cephx authenticates the parties; it
@@ -1199,8 +1211,9 @@ Guided by the trace in Section 5, each hop has a home in the tree
 - [`src/mds/`][src-mds] — the CephFS metadata server; kernel client in
   [`fs/ceph/`][kcephfs].
 - [`src/rgw/`][src-rgw] — the S3/Swift gateway.
-- [`src/auth/`][src-auth] — the cephx protocol from Section 6:
-  tickets, rotating secrets, the handshake.
+- [`src/auth/`][src-auth] — the cephx protocol from Section 6: the
+  MON-side `KeyServer` (mints principals and rotating secrets), the
+  daemon-side `RotatingKeyRing`, tickets and the handshake.
 
 And if kernel storage is your angle, the client side is a first-class
 entry point: `net/ceph/` (the messenger), `drivers/block/rbd.c` and
