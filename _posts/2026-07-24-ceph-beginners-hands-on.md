@@ -50,6 +50,7 @@ The vocabulary you need before anything else:
 | MON | Monitor — keeps the authoritative cluster maps, forms quorum |
 | monmap | the map of the MONs themselves: who they are, where they listen |
 | osdmap | the map of OSDs (which exist, up/in state) — versioned by epoch |
+| epoch | a map's version number, bumped on every change (`osdmap e39`) |
 | MGR | Manager — metrics, orchestration modules, balancer, dashboard |
 | Pool | a namespace of objects with a replication/EC policy |
 | PG | Placement Group — a shard of a pool; unit of replication/recovery |
