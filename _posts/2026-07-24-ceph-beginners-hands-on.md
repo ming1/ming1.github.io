@@ -618,7 +618,54 @@ cluster is a handful of INI files, tiny text markers, and two kinds
 of RocksDB. Your *data* appears in none of these paths — it exists
 only inside the OSDs' block devices.
 
+## 3.7 How does client get Monitor Map (The Bootstrap)
 
+Before a client can do anything, it needs to find the Key Distribution Center  
+(the Monitors). But if it doesn't have a map yet, how does it know where they are?
+
+- The Seed (ceph.conf):
+
+When a client application (like a kernel rbd mount or a librbd container) starts, it  
+reads its local /etc/ceph/ceph.conf file. This file contains a mon_host directive   
+listing the IP addresses of one or more Monitors (e.g., mon_host = 192.168.1.10,  
+192.168.1.11). (Note: Modern Ceph can also use DNS SRV records so you don't even  
+need a ceph.conf file, but IPs are most common).
+
+- The Handshake:
+
+The client reaches out to one of those IPs, completes the cephx authentication  
+handshake (using its keyring), and establishes a session.
+
+- Downloading the monmap:
+
+Once authenticated, the Monitor immediately sends the client the latest Monitor  
+Map (monmap). This map contains the current IP addresses, ports (v1/v2), and  
+epochs of all active Monitors in the quorum. The client now knows exactly who   
+the cluster brain is, even if the IPs in its local ceph.conf were outdated.
+
+## 3.8 OSD Map and how to find OSD
+
+When the client connects to the Monitor, it downloads the OSD Map, which contains  
+the cluster topology and the CRUSH map (a mathematical algorithm).
+
+When a client needs to read or write an object, it executes the following steps  
+entirely in its local CPU without network lookups:
+
+1. **Hash the Object:** The client hashes the object name.
+   `Hash("my_vm_disk_block_0") = 0x5A8B`
+
+2. **Calculate the PG:** The hash is divided (modulo) by the target pool's total  
+PG count to determine the Placement Group ID.
+   `0x5A8B % Pool_PG_Count = PG 34`
+
+3. **Execute CRUSH:** The client feeds "PG 34" and the current OSD Map into  
+the CRUSH algorithm. The algorithm outputs a deterministic list of physical OSDs.
+   `CRUSH(PG 34, OSD Map) = [OSD.12, OSD.45, OSD.88]`
+
+The client then establishes a direct, encrypted connection (v2 protocol on  
+port 6800+) to the primary OSD (`OSD.12`) to perform the I/O.
+
+object name has to be unique in one Pool.
 
 # 4. Hands-on: the three interfaces
 
