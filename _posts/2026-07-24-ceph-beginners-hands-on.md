@@ -63,6 +63,7 @@ The vocabulary you need before anything else:
 | key | a principal's secret — in a keyring file and the MON's database |
 | caps | a principal's rights, per daemon type: `osd 'allow rwx'`, ... |
 | ticket | Kerberos-style token: identity + caps + session key (Sec 6) |
+| authenticator | timestamp sealed with the session key, proving key receipt |
 | RBD | RADOS Block Device — virtual disks striped over RADOS objects |
 | CephFS | POSIX filesystem on RADOS; an MDS daemon serves the metadata |
 | RGW | RADOS Gateway — S3/Swift-compatible HTTP object storage |
