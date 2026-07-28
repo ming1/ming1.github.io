@@ -607,8 +607,9 @@ osd memory target = 1073741824
 The other manual step is credential distribution, and it is worth being
 deliberate about: the admin keyring goes only to hosts that are meant
 to administer the cluster. `c21` and `c22` have it; `c23`, `c24` and
-`c25` run OSDs holding replicas of everything and have no admin
-credential at all. Section 4.3 shows the difference on disk.
+`c25` store and serve real user data — each of them is the primary for
+a share of the cluster's PGs — and hold no admin credential at all.
+Section 4.3 shows the difference on disk.
 
 Two habits this kind of by-hand deployment teaches, both of which cost
 real time to learn: `systemctl enable --now` returns when systemd has
@@ -863,9 +864,32 @@ show. Compare the admin node with a pure storage node:
 -rw-r--r-- 1 root root  92 Jun 23 00:00 rbdmap
 ```
 
-`c23` runs four OSDs holding real replicas of everything, and has **no
-admin keyring at all**. Its daemons authenticate with their own
-per-OSD keys, kept beside their data:
+What does `c23` actually hold? Ask the PG map rather than guessing:
+
+```
+[c21]# ceph pg dump pgs_brief --format=json | python3 -c '
+import json,sys
+pgs = json.load(sys.stdin)["pg_stats"]
+c23 = {4,5,6,7}
+print("total PGs           :", len(pgs))
+print("with a copy on c23  :", sum(1 for p in pgs if c23 & set(p["acting"])))
+print("where c23 is primary:", sum(1 for p in pgs if p["acting"][0] in c23))'
+total PGs           : 87
+with a copy on c23  : 72                                                (1)
+where c23 is primary: 24                                                (2)
+```
+
+1. Not all 87. With `size 3` and a failure domain of `host`, CRUSH
+   picks **three of the four** storage hosts for each PG — so every
+   host sits out roughly a quarter of them. No single machine in this
+   cluster holds a copy of everything, which is rather the point.
+2. And for 24 PGs `c23` is not a passive copy but the **primary**:
+   clients send their reads and writes for those straight to it, and it
+   is the OSD that orders the write and replicates onward. "Storage
+   node" does not mean "backup node".
+
+That machine nonetheless has **no admin keyring at all**. Its daemons
+authenticate with their own per-OSD keys, kept beside their data:
 
 ```
 [c23]# cat /var/lib/ceph/osd/ceph-4/keyring
@@ -1318,6 +1342,47 @@ osdmap e186 pool 'rbd' (14)
    for this PG goes to osd.9, which replicates to 13 and 2 and acks
    only after all three have the write persisted. `up` equal to
    `acting` means nothing is recovering.
+
+**There is no such thing as a "replica OSD".** This trips up almost
+everyone coming from RAID or from primary/secondary databases, so it is
+worth killing early: primary is a property of the *pair* (PG, OSD), not
+of the OSD. It is simply position 0 in that PG's acting set — and every
+OSD is position 0 for some PGs and position 1 or 2 for others:
+
+```
+[c21]# ceph pg dump pgs_brief --format=json | python3 -c '
+import json,sys,collections
+pgs = json.load(sys.stdin)["pg_stats"]
+prim, rep = collections.Counter(), collections.Counter()
+for p in pgs:
+    prim[p["acting"][0]] += 1
+    for o in p["acting"][1:]: rep[o] += 1
+for o in sorted(prim | rep):
+    print(f"osd.{o:<3} primary for {prim[o]:3}   replica for {rep[o]:3}")'
+osd.0   primary for   7   replica for  11
+osd.1   primary for   9   replica for  13
+osd.2   primary for   6   replica for  13                               (1)
+...
+osd.9   primary for   8   replica for  14                               (2)
+...
+osd.13  primary for   7   replica for  11                               (3)
+```
+
+1. `osd.2` was a plain replica for PG 14.c above — and is primary for
+   six other PGs.
+2. `osd.9` leads 8 PGs and follows in 14.
+3. Likewise `osd.13`, which Section 6.3 will watch *become* primary for
+   14.c the instant osd.9 goes down — no reconfiguration, just the
+   acting set losing its head and the next entry inheriting the role.
+
+Not one of the sixteen OSDs is exclusively primary or exclusively
+replica. That is deliberate: the primary serves every read and orders
+every write for its PG, so if primaries clustered on a few OSDs those
+disks would carry the whole cluster's load. Spreading PGs spreads the
+primary role with them, which is what makes a Ceph cluster scale by
+adding disks. (`ceph osd primary-affinity` can bias this, and the
+`read_balance_score` in `ceph osd pool ls detail` reports how evenly it
+worked out.)
 
 The payoff of a multi-node cluster is in asking *where those OSDs are*:
 
