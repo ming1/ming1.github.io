@@ -333,8 +333,13 @@ creating /tmp/ceph.mon.keyring
 3. **`client.bootstrap-osd` — a deliberately weak key.** Its single cap
    lets it register new OSDs and do nothing else. This is what a
    storage host is given so it can create its own OSD identities
-   (Section 3.6) without ever holding an admin key. Ceph ships the same
-   pattern for `bootstrap-mds`, `-mgr`, `-rgw` and `-rbd`.
+   (Section 3.6) without ever holding an admin key. Generating it by
+   hand is in fact belt and braces: the monitor mints the whole family
+   itself the first time the cluster comes up
+   (`AuthMonitor::_generate_bootstrap_keys` in [`src/mon/`][src-mon],
+   reached from `create_initial()`), so `bootstrap-osd`, `-mds`,
+   `-mgr`, `-rgw`, `-rbd` and `-rbd-mirror` all appear in Section 4.3's
+   listing even though only this one was ever used here.
 4. `--import-keyring` merges the other two into the mon keyring,
    because `ceph-mon --mkfs` seeds its auth database from exactly one
    file. After mkfs, the MON's own store is the source of truth and
@@ -838,10 +843,10 @@ client.rgw.c21                                                           (4)
    key**: it can destroy, reconfigure or read anything in the cluster.
    It belongs on monitor nodes, dedicated admin/bastion hosts, and
    orchestration hosts, and nowhere else.
-3. The `bootstrap-*` principals from Section 3.2 — deliberately weak.
-   Ceph pre-creates the full set at mkfs time, so `bootstrap-mds`,
-   `-mgr`, `-rgw` and `-rbd` exist even though this deployment only
-   used `bootstrap-osd`.
+3. The `bootstrap-*` principals from Section 3.2 — deliberately weak,
+   and all six minted by the monitor itself at cluster creation, so
+   `-mds`, `-mgr`, `-rgw`, `-rbd` and `-rbd-mirror` exist here despite
+   only `bootstrap-osd` ever being used.
 4. RGW is just another client from RADOS's point of view: `rw` on the
    monitor, `rwx` on OSDs, no admin rights.
 
@@ -1201,7 +1206,9 @@ port to listen on, and start it:
 [c21]# install -d -o ceph -g ceph /var/lib/ceph/radosgw/ceph-rgw.c21
 [c21]# ceph auth get-or-create client.rgw.c21 mon 'allow rw' osd 'allow rwx' \
            -o /var/lib/ceph/radosgw/ceph-rgw.c21/keyring                (1)
-[c21]# ceph config set client.rgw.c21 rgw_frontends "beast port=8000"   (2)
+[c21]# chown ceph:ceph /var/lib/ceph/radosgw/ceph-rgw.c21/keyring       (2)
+[c21]# chmod 600 /var/lib/ceph/radosgw/ceph-rgw.c21/keyring
+[c21]# ceph config set client.rgw.c21 rgw_frontends "beast port=8000"   (3)
 [c21]# systemctl enable --now ceph-radosgw@rgw.c21
 [c21]# radosgw-admin user create --uid=ming --display-name="Ming Lei"
 {
@@ -1211,7 +1218,7 @@ port to listen on, and start it:
     "keys": [
         {
             "user": "ming",
-            "access_key": "9EL99MAN3C9O9W7DURQ2",                       (3)
+            "access_key": "9EL99MAN3C9O9W7DURQ2",                       (4)
             "secret_key": "F4EnhCrOH13Rj1n6CTS2U6bq8lS3dcVAXAqx6GJ8",
             "active": true
         }
@@ -1220,13 +1227,17 @@ port to listen on, and start it:
 }
 ```
 
-1. The same pattern as Sections 3.4 and 3.7 — `-o` writes the keyring
-   directly, with the right mode, instead of a shell redirection.
-2. Configuration through the monitor's config store rather than a local
+1. The same pattern as Sections 3.4 and 3.7, except that `-o` writes the
+   keyring itself instead of a shell redirection.
+2. `-o` still writes as the invoking user — root, mode 0644. The gateway
+   runs as `ceph`, so without these two lines it starts and then fails
+   to authenticate, complaining about a key it can see perfectly well.
+   Same fix as Section 3.4's `chmod 600`, same reason.
+3. Configuration through the monitor's config store rather than a local
    file — the `client.rgw.c21` row visible in Section 4.2's
    `ceph config dump`. On first start the gateway auto-creates its own
    pools (`.rgw.root`, `default.rgw.*`).
-3. A standard S3 credential pair. RGW stores users, buckets and ACLs as
+4. A standard S3 credential pair. RGW stores users, buckets and ACLs as
    RADOS objects and omap entries in its metadata pools — it is a
    protocol translator with no private database.
 
@@ -1829,18 +1840,20 @@ cd build && ninja                  # long; -j to taste
 
 Then [`vstart.sh`][vstart] launches a throwaway cluster **from the
 build tree** — conceptually exactly what Section 3 did by hand (it
-generates a conf, mints the keys, starts mon/mgr/osd/mds/rgw as plain
+generates a conf, mints the keys, starts the daemons as plain
 processes), just automated onto one machine:
 
 ```
 cd build
-MON=1 OSD=3 MDS=1 ../src/vstart.sh -d -n -x
+MON=1 OSD=3 MDS=1 RGW=1 ../src/vstart.sh -d -n -x
 ./bin/ceph -s        # note: ./bin/ceph, the freshly built CLI
 ```
 
-`-n` creates a new cluster, `-d` enables debug output, and env vars
-pick the daemon counts. Edit code, `ninja`, restart — a minutes-long
-iteration loop. Its sibling `cstart.sh` does the same with containers,
+`-n` creates a new cluster, `-d` enables debug output, and the env vars
+pick the daemon counts — all of which default to sensible numbers
+except `RGW`, which defaults to **0**, so a gateway only appears if you
+ask for one. Edit code, `ninja`, restart — a minutes-long iteration
+loop. Its sibling `cstart.sh` does the same with containers,
 and `mstart.sh` runs several clusters side by side. The
 [developer guide][doc-dev] documents the workflow. (For production the
 tool is [cephadm][doc-cephadm] — same daemons, run as podman containers
@@ -1900,6 +1913,7 @@ cluster you can reach, including a one-node `vstart.sh`.
 [src-rgw]: https://github.com/ceph/ceph/tree/v20.2.2/src/rgw
 [src-crush]: https://github.com/ceph/ceph/tree/v20.2.2/src/crush
 [src-auth]: https://github.com/ceph/ceph/tree/v20.2.2/src/auth
+[src-mon]: https://github.com/ceph/ceph/tree/v20.2.2/src/mon
 [vstart]: https://github.com/ceph/ceph/blob/v20.2.2/src/vstart.sh
 [doc-arch]: https://github.com/ceph/ceph/blob/main/doc/architecture.rst
 [doc-manual]: https://docs.ceph.com/en/latest/install/manual-deployment/
