@@ -1013,9 +1013,10 @@ Because the name is the only input to placement, an object name must be
 unique within its pool; two objects with the same name in different
 pools are unrelated.
 
-The list is ordered, and the first entry is the **primary**: barring
-the replica-read options of Section 4.6, that is the one the client
-talks to. So this object's I/O is destined for `osd.9`.
+The list is ordered, and the first entry is the **primary** — the OSD
+the client talks to. (Reads can be pointed at a replica instead; writes
+never are, since the primary is what orders them.) So this object's I/O
+is destined for `osd.9`.
 
 But `9` is an **integer**, and you cannot open a TCP connection to an
 integer. So there is a fourth step, and it is the osdmap's other job:
@@ -1053,34 +1054,25 @@ and placement into a single cached object.
 ## 4.6 How a client talks to an OSD
 
 Nothing in Section 4.5 needs a kernel. The ordinary Ceph client is a
-**userspace library**, `librados` — it is what RGW is built on, what
-QEMU links against to give a VM a virtual disk, and what the `rados`
-CLI is. krbd and the CephFS kernel client are a *second*, independent
+**userspace library**, `librados` — what RGW is built on, what QEMU
+links against to give a VM a virtual disk, and what the `rados` CLI is.
+krbd and the CephFS kernel client are a *second*, independent
 implementation of the same protocol that happens to live in the kernel.
-So the clearest way to watch a client work is with no kernel Ceph code
-in the picture at all: fetch the object this post traces with
-`rados get`, and raise the messenger's log level.
+
+So watch a client work with no kernel Ceph code in the picture at all:
+fetch the object this post traces, with the messenger's log level
+raised. `--debug-ms=1` is a **log level, not an interface** — it prints
+the messages the client would have sent anyway and alters none of them,
+so what follows describes the mechanism, not the diagnostic.
 
 ```
 [c21]# rados -p rbd --debug-ms=1 get \
            rbd_data.626e2b7e024e.0000000000000000 /tmp/x.bin
 ```
 
-**A word on what `--debug-ms=1` is, because the distinction matters for
-everything below.** It is a *log level*, not an interface. It makes the
-messenger print each message it sends and receives; it does not add,
-remove or alter a single one of them. The message *set* is identical
-with logging off — only the timings pick up the cost of writing each
-line down. (The knobs that genuinely do perturb the wire are separate
-options nobody sets by accident: `ms_inject_socket_failures`,
-`ms_inject_delay_type`, `ms_dump_on_send`.) Nothing in this section
-describes a debug facility; the debug facility is only how the
-mechanism is made visible. The mechanism is the messages.
-
-The trace below is that one command, reduced to one bootstrap round and
-one read: message lines only, pointer values trimmed, and the manager
-subscription and a second read round-trip omitted. It is the whole of
-Sections 4.5 and 4.6:
+Reduced to the message lines, with pointer values trimmed and a manager
+subscription and second read round-trip omitted, that one command is
+the whole of Sections 4.5 and 4.6:
 
 ```
  1 --2- >> [v2:10.0.0.21:3300/0,v1:10.0.0.21:6789/0] conn(...).connect      (1)
@@ -1091,225 +1083,73 @@ Sections 4.5 and 4.6:
  1 -- 10.0.0.21:0/2081066956 <== mon.0 v2:10.0.0.21:3300/0 1
         ==== mon_map magic: 0 ==== 321+0+0 (secure 0 0 0)                   (3)
  1 -- ... <== mon.0 ... ==== config(0 keys) ==== 4+0+0 (secure 0 0 0)
- 1 -- ... --> [v2:10.0.0.21:3300/0,...] -- mon_subscribe({osdmap=0})        (4)
+ 1 -- ... --> [v2:10.0.0.21:3300/0,...] -- mon_subscribe({osdmap=0})
  1 -- ... <== mon.0 ... ==== osd_map(198..198 src has 1..198) ====
-        13113+0+0 (secure 0 0 0)                                            (5)
+        13113+0+0 (secure 0 0 0)                                            (4)
  1 --2- 10.0.0.21:0/2081066956
         >> [v2:10.0.0.24:6815/1589244358,v1:10.0.0.24:6818/...]
-        conn(...).connect                                                   (6)
+        conn(...).connect                                                   (5)
  1 -- ... --> [v2:10.0.0.24:6815/1589244358,...] -- osd_op(unknown.0.0:1
         14.c 14:35e6b9b9:::rbd_data.626e2b7e024e.0000000000000000:head
         [read 0~4194304] snapc 0=[]
-        ondisk+read+known_if_redirected+supports_pool_eio e198)             (7)
+        ondisk+read+known_if_redirected+supports_pool_eio e198)             (6)
  1 -- ... <== osd.9 v2:10.0.0.24:6815/1589244358 1 ==== osd_op_reply(1
         rbd_data.626e2b7e024e.0000000000000000
         [read 0~4194304 out=4194304b] v0'0 uv71 ondisk = 0)
-        ==== 182+0+4194304 (crc 0 0 0)                                      (8)
+        ==== 182+0+4194304 (crc 0 0 0)
 ```
 
 1. It dials **both** monitors from `mon host` at once and races them —
-   `--2-` is msgr2. Nothing has been looked up yet; these two addresses
-   are the only thing the client knew when it started.
-2. `10.0.0.21:0/2081066956` is now the client's `entity_addr_t`: its
-   address, port 0 because it is not listening, and a random **nonce**
-   so two clients on one host are never confused. Then it *subscribes*
-   rather than polls — the monitor will push updates for the life of
-   the session.
-3. `(secure 0 0 0)` — this connection is **encrypted**. See below.
-4. A second subscription, this time for the osdmap.
-5. And there it is: 13 KB carrying the OSD list, their addresses and
-   the CRUSH map. `198..198 src has 1..198` — the client asked for the
-   latest and got epoch 198; the monitor advertises that it can supply
-   the full history back to epoch 1 for anyone who needs incrementals.
-6. **The whole point.** Having received the map, the client computed
-   `14.c → [9,13,2]`, resolved `osd.9` to `10.0.0.24:6815`, and
-   connected *directly*. It never asked anybody where the object was.
+   `--2-` is msgr2. These two addresses are the only thing the client
+   knew when it started.
+2. `10.0.0.21:0/2081066956` is the client's `entity_addr_t`: address,
+   port 0 because it is not listening, and a random **nonce** so two
+   clients on one host are never confused. It then *subscribes* rather
+   than polls — the monitor pushes updates for the life of the session.
+3. `(secure 0 0 0)` is the connection mode: this one is **encrypted**,
+   while the OSD reply at the bottom is `(crc 0 0 0)`, checksummed
+   only. That split is the default — Ceph secures traffic to monitors
+   and CRC-protects the rest (Section 7.3).
+4. 13 KB carrying the OSD list, their addresses and the CRUSH map.
+   `198..198 src has 1..198` — the client asked for the latest and got
+   epoch 198; the monitor advertises that it can supply the history
+   back to epoch 1 for anyone needing incrementals.
+5. **The whole point.** Having received the map, the client computed
+   `14.c → [9,13,2]`, resolved `osd.9` to `10.0.0.24:6815` and
+   connected *directly* — over ordinary TCP, to one of the ports OSDs
+   bind upward from 6800. It never asked anybody where the object was.
    No lookup message appears in this trace because none exists.
-7. The read request. Dissected below.
-8. The answer, straight from osd.9 — `182+0+4194304` is front, middle
-   and 4 MiB of data — and `(crc 0 0 0)`, **not** encrypted, unlike the
-   monitor traffic. Also below.
-
-Contrast that with `ss`, and the userspace/kernel split becomes visible:
-
-```
-[c21]# ss -tnp state established | awk 'NR==1 || $4 ~ /10.0.0.2[2-5]:68[0-9][0-9]/'
-Recv-Q Send-Q  Local Address:Port   Peer Address:Port  Process
-0      0        10.0.0.21:42718      10.0.0.24:6800                            (1)
-0      0        10.0.0.21:55634      10.0.0.25:6802
-0      0        10.0.0.21:34910      10.0.0.23:6800    users:(("ceph-mgr",...)) (2)
-0      0        10.0.0.21:51000      10.0.0.22:6801    users:(("radosgw",...))
-```
-
-1. Sockets with **no owning process**: these belong to the kernel
-   client, opened by `net/ceph/messenger.c`, which no task owns.
-2. Sockets with a process: `librados` inside the manager and the
-   gateway. Two implementations, one protocol. OSDs bind upward from
-   `ms_bind_port_min` (6800; ceiling `ms_bind_port_max`, 7568), and
-   each OSD takes **eight** ports — public, cluster, and two heartbeat
-   endpoints, each in a msgr2 and a msgr1 flavour. So the four OSDs on
-   one host cover 6800–6831, and every host repeats the same range
-   rather than sharing one well-known port.
-
-Sessions are lazy and per-OSD in both implementations: a client
-connects to an OSD the first time it has an op for one of its PGs, so a
-client touching a few objects holds a few connections, not one per OSD
-in the cluster.
+6. The read request itself, dissected next.
 
 **The request.** That `osd_op(...)` line is the entire client/OSD
-interface. Its exact shape is `MOSDOp::print` in
-[`src/messages/`][src-messages], and it is worth taking apart field by
-field:
+interface — not a byte range on a device, but a small structured
+message against a named object:
 
 | Field | Meaning |
 |-------|---------|
-| `unknown.0.0:1` | the request id: entity name, client incarnation, transaction id — see below |
+| `unknown.0.0:1` | entity name, client incarnation, transaction id. `unknown` only because msgr2 leaves the sender's name off the wire; the receiver stamps it, which is why the OSD side prints `client.25226` below |
 | `14.c` | the target PG, exactly as the client computed it in 4.5 |
-| `14:35e6b9b9:::...:head` | the full object identity — see below |
-| `[read 0~4194304]` | the **op vector**: one read, offset 0, length 4 MiB |
-| `snapc 0=[]` | snapshot context: which snapshots a write must be preserved against |
-| `ondisk+read+known_if_redirected+supports_pool_eio` | flags: durability, this is a read, the client believes its map is current, and it understands the pool-EIO flag |
-| `e198` | the osdmap epoch the client used. **This is the safety interlock** |
+| `14:35e6b9b9:::...:head` | the object's full identity: pool, hash, namespace, key, name, snapshot. The hash is 4.5's `0x9d9d67ac` with its bits reversed, which is the order objects are stored in |
+| `[read 0~4194304]` | the **op vector** — offset and length here, but a vector because one request can carry several operations applied atomically to the object |
+| `ondisk+read+known_if_redirected+supports_pool_eio` | flags |
+| `e198` | the osdmap epoch the client used |
 
-Five of those deserve more than a table row.
+That last field is the safety interlock, and it is what makes
+client-side placement workable at all. If the sender is behind,
+`OSDService::maybe_share_map` pushes the incremental maps it is missing
+down the same connection — nobody polls for map updates; they ride
+along with ordinary traffic. And if the op is *misdirected*, because
+this OSD is not the primary for that PG under the current map,
+`PrimaryLogPG::do_op` simply returns: no error reply, no redirect, the
+op is dropped. The client resends, having just been handed the newer
+map. A stale client therefore corrupts nothing and needs no error path
+— it computes, is corrected, and computes again.
 
-**The request id** `unknown.0.0:1` reads as *entity name*, *client
-incarnation*, *transaction id* — and the `unknown` is not what it
-looks like. The client is fully authenticated and holds a global id;
-run the same command with `--debug-monc=10` and
-`monclient: authenticate success, global_id 25806` is logged well
-before this line, as it must be, since the osdmap arrived over that
-authenticated session. The name is blank because **msgr2 does not put
-the sender's name on the wire**: `MOSDOp`'s sending constructor never
-fills it in, and `get_reqid()` falls back to a default-constructed
-`entity_name_t`, whose type 0 prints as `unknown`. The *receiver*
-stamps the real name from the authenticated connection — which is
-exactly why the same operation shows up as `client.25226.0:3089` when
-we look at it from the OSD's side later in this section. Only the last
-field moves between requests: the next op in the same run is
-`unknown.0.0:2`.
-
-**The object identity** `14:35e6b9b9:::rbd_data...:head` is a
-`hobject_t`, printed by `operator<<` in [`src/common/`][src-common] as
-`pool : hash : namespace : key : name : snapshot`. The two empty fields
-— hence `:::` — are the namespace and the locator key, both unused
-here. And `35e6b9b9` is not a different hash from Section 4.5's
-`0x9d9d67ac`; it is the same number with its **bits reversed**:
-
-```
-0x9d9d67ac = 1001 1101 1001 1101 0110 0111 1010 1100
-reversed   = 0011 0101 1110 0110 1011 1001 1011 1001 = 0x35e6b9b9
-```
-
-The printer calls `get_bitwise_key_u32()`, which returns
-`_reverse_bits(hash)` — and, more importantly, so does the comparison
-operator. Objects are *sorted* by the reversed hash, which scatters
-consecutive names across the keyspace while keeping each PG's objects
-contiguous. That ordering is what BlueStore's RocksDB and every PG scan
-rely on.
-
-**The op vector** is a vector because one request can carry several
-operations applied atomically to a single object — a write, an xattr
-update and an omap key, all committed or none. It is also the extension
-point RADOS classes hook into, letting a client invoke server-side code
-on the object rather than dragging it across the network.
-
-**The epoch** is what keeps a stale client from doing damage, and it is
-the interlock that makes client-side placement safe at all. Every op
-carries the map version its sender used. On the receiving side:
-
-- If the sender is behind, `OSDService::maybe_share_map` pushes the
-  **incremental** maps it is missing — just the range
-  `(projected_epoch, osdmap]` — back down the same connection. Nobody
-  polls for map updates; they ride along with ordinary traffic.
-- If the op is *misdirected* — this OSD is not the primary for that PG
-  under the current map — `PrimaryLogPG::do_op` simply **returns**. No
-  error reply, no redirect; the op is dropped. (It calls
-  `handle_misdirected_op` on the way out, but that is a debug hook: it
-  returns immediately unless `osd_debug_misdirected_ops` is set, which
-  by default it is not. The dropping is the bare `return`.) The client
-  resends, having just been handed the newer map by the bullet above.
-
-So a client whose map has gone stale corrupts nothing, and this
-particular mistake needs no error path at all: it sends to the OSD it
-computed, receives a map update and silence, recomputes, and sends
-again. Other stale-client conditions *are* answered explicitly —
-`do_op` replies `-EPERM`, `-EBLOCKLISTED`, or `-EAGAIN` for a laggy PG
-— so the silence is specific to "right cluster, wrong OSD", the one
-case the client can fix by itself.
-
-**Encrypted or not** is the difference between `(secure 0 0 0)` on the
-monitor messages and `(crc 0 0 0)` on the OSD reply, and it is not an
-accident of this lab. The defaults in `src/common/options/`:
-
-| Option | Default | Governs |
-|--------|---------|---------|
-| `ms_mon_client_mode` | `secure crc` | client → monitor |
-| `ms_client_mode` | `crc secure` | client → OSD/MDS |
-| `ms_cluster_mode` | `crc secure` | OSD ↔ OSD |
-
-The rule is narrower than "control plane versus data plane", and it is
-worth stating exactly: **traffic to a monitor is encrypted by default;
-everything else is not**. Keys and auth tickets go over AES-GCM because
-they are fetched from a monitor. But plenty of control traffic never
-touches one — OSD-to-OSD peering, PG state, and, most pointedly, the
-incremental osdmaps that `maybe_share_map` pushes down the *client/OSD*
-connection two paragraphs ago. Those ride a `crc` connection like your
-data does: integrity-checked, not confidential.
-
-The lists are preference-ordered, so flipping `ms_client_mode` to
-`secure crc` — or mounting with `ms_mode=secure` — encrypts the rest,
-at a real CPU cost.
-
-**The knobs.** Most of a client's behaviour is settable, whether it is
-librados reading `ceph.conf` or a kernel client taking mount options.
-The ones worth knowing early:
-
-| Option | Effect |
-|--------|--------|
-| `ms_mode=legacy\|crc\|secure\|prefer-crc\|prefer-secure` | kernel-client wire protocol: msgr1, or msgr2 checksummed / AES-GCM, or a preference. librados has no direct equivalent — `ms_client_mode` is an ordered preference list over `crc` and `secure` only, and cannot ask for `legacy` |
-| `read_from_replica=no\|balance\|localize` | serve reads from a non-primary member of the acting set (`no` is the default) |
-| `crush_location=rack:myrack\|datacenter:mydc` | tells the client where *it* sits, so `localize` can pick a near replica |
-| `osd_request_timeout=`, `mount_timeout=`, `osdkeepalive=` | how long to wait on an unresponsive OSD, and session keepalive |
-| `queue_depth=`, `alloc_size=` | krbd request concurrency and allocation granularity |
-| `rxbounce` | receive into a bounce buffer, for servers that modify pages under I/O |
-| `abort_on_full` | fail writes instead of blocking when the cluster is full |
-
-`read_from_replica` is the interesting one, because it is the only
-escape hatch from "all I/O goes to the primary". `balance` picks a
-random member of the acting set; `localize` picks the nearest by
-`crush_location`, where the lowest-valued matching bucket type wins —
-so a matching rack beats a matching data center. Mind the location
-syntax: `type:name` pairs joined by `|`, matched *independently*. It is
-a set of nodes, not a path down the hierarchy.
-
-The enforcement is in `PrimaryLogPG::do_op`, and it is stricter than
-"reads may go anywhere". A non-primary accepts the op only if all
-three hold: the message actually **carries** the balance or localize
-flag, so a plain read sent to a replica is still misdirected; the op is
-a read and neither `may_write()` nor `may_cache()`; and this OSD is in
-the acting set at all, primary or not, so a stray shard is refused too.
-Everything else falls into the branch the source labels "normal case;
-must be primary". Writes always go to the primary, because the primary
-is what *orders* them.
-
-**The server side of the same op.** Every OSD retains a small ring of
-recently completed operations with a timestamp per processing stage,
-readable through its admin socket. Like
-`--debug-ms`, this is **introspection, not interface** — but the line
-wants drawing precisely, because op tracking is neither free nor off.
-`osd_enable_op_tracker` defaults to `true`, every client op is born as
-a `TrackedOp`, and each stage below costs a lock and a timestamp. What
-makes it introspection is that nothing *reads* the record to make a
-decision: no client consults it, no peering or replication logic
-depends on it, and turning the option off leaves the cluster serving
-I/O exactly as before. It is write-only bookkeeping — which is also
-where the OSD's `slow request` warnings and the `SLOW_OPS` health check
-come from, those being the one thing that does read it.
-
-What it records is the real request osd.9 served, and the real times it
-reached each stage. The output is JSON; this is one op from the `ops`
-array, with the client-info block dropped and the event list kept whole:
+**The server side.** Every OSD keeps a ring of recently completed
+operations, stamped per stage. This is introspection rather than
+interface — nothing reads it back to make a decision — though not free:
+op tracking is on by default. Here is the same object being written,
+caught mid-`dd`, with the event list abridged:
 
 ```
 [c24]# ceph daemon osd.9 dump_historic_ops
@@ -1318,72 +1158,40 @@ array, with the client-info block dropped and the event list kept whole:
                     14:35e6b9b9:::rbd_data.626e2b7e024e.0000000000000000:head
                     [write 131072~1048576] snapc 0=[]
                     ondisk+write+known_if_redirected e198)",
-    "initiated_at": "2026-07-28T23:41:33.065201+0000",
     "duration": 0.034185965,
     "type_data": {
-        "flag_point": "commit sent; apply or cleanup",
         "events": [
    { "event": "initiated",                    "duration": 0        },
-   { "event": "header_read",                  "duration": 0        },
-   { "event": "throttled",                    "duration": 0.000005 },   (1)
-   { "event": "all_read",                     "duration": 0.004022 },
-   { "event": "dispatched",                   "duration": 0.000010 },
-   { "event": "queued_for_pg",                "duration": 0.000024 },
-   { "event": "reached_pg",                   "duration": 0.000194 },
    { "event": "started",                      "duration": 0.000092 },
-   { "event": "waiting for subops from 2,13", "duration": 0.000127 },   (2)
-   { "event": "op_commit",                    "duration": 0.020310 },   (3)
-   { "event": "sub_op_commit_rec",            "duration": 0.005190 },   (4)
+   { "event": "waiting for subops from 2,13", "duration": 0.000127 },   (1)
+   { "event": "op_commit",                    "duration": 0.020310 },   (2)
+   { "event": "sub_op_commit_rec",            "duration": 0.005190 },   (3)
    { "event": "sub_op_commit_rec",            "duration": 0.004174 },
-   { "event": "commit_sent",                  "duration": 0.000017 },   (5)
+   { "event": "commit_sent",                  "duration": 0.000017 },   (4)
    { "event": "done",                         "duration": 0.000020 }
         ]
     }
 }
 ```
 
-The trace earlier was a read; this is a **write**, caught mid-`dd`
-against the mapped image of Section 5.1. Same message shape, same
-fields — only the op vector and flags differ. Each `duration` is the
-gap from the *previous* event, which makes the shape of the operation
-readable at a glance.
+Each `duration` is the gap from the previous event.
 
-1. Read off the wire and admitted by the throttler, which bounds how
-   much unprocessed client data the messenger will buffer.
-2. **Here is the replication.** osd.9 does not answer the client yet;
-   it forwards the operation to osd.2 and osd.13 and waits.
-3. Its own BlueStore transaction commits — 20.3 ms, and by far the
-   largest single interval in the op.
-4. The two replicas report their commits, 5.2 ms and 4.2 ms later;
-   34.1 ms into the op, every copy is durable.
-5. **17 microseconds after that**, the client is answered. There is no
-   dead time between the last replica and the reply: the primary is
-   waiting on exactly one thing, and it responds the moment that thing
-   arrives. Total 34.2 ms, essentially all of it disk.
+1. **The replication.** osd.9 does not answer the client yet; it
+   forwards the operation to osd.2 and osd.13 and waits.
+2. Its own BlueStore transaction commits — 20 ms, by far the largest
+   interval in the op.
+3. The two replicas report their commits, 5.2 ms and 4.2 ms later.
+4. **17 microseconds after the last of them**, the client is answered.
 
-That sequence is the proof of a claim Section 6.1 only asserts: a write
-is acknowledged once **every** copy is durable, not once the primary
-is. Worth being exact about "every", because the answer is not "the
-acting set" and it is definitely not `min_size`:
-
-```
-  op.waiting_for_commit.insert(
-    parent->get_acting_recovery_backfill_shards().begin(),
-    parent->get_acting_recovery_backfill_shards().end());
-```
-
-`ReplicatedBackend::submit_transaction` builds the wait list from the
-**acting-recovery-backfill** set — the acting set *plus* any OSD
-currently being recovered or backfilled onto. A shard that is midway
-through receiving an old copy of this PG must also receive new writes
-to it, or it would finish backfill already stale. And `min_size` never
-enters this calculation at all: it decides whether the PG serves I/O
-in the first place (Section 6.3), not how many commits an ack waits
-for.
-
-So the slowest copy sets the latency — which is why a single sick disk
-can drag a whole pool down, why `ceph osd perf` is worth watching, and
-why a cluster feels slower while it is backfilling.
+So a write is acknowledged once *every* copy is durable, not once the
+primary is — the proof of a claim Section 6.1 only asserts. Be exact
+about "every", though: `ReplicatedBackend::submit_transaction` waits on
+the acting set *plus* any OSD currently being backfilled onto, so that
+a shard midway through receiving this PG does not finish already stale.
+`min_size` never enters it — that decides whether the PG serves I/O at
+all (Section 6.3), not how many commits an ack waits for. The slowest
+copy sets the latency, which is why one sick disk drags a whole pool
+down and why a cluster feels slower while backfilling.
 
 # 5. Hands-on: the three interfaces
 
@@ -2348,8 +2156,6 @@ cluster you can reach, including a one-node `vstart.sh`.
 [src-crush]: https://github.com/ceph/ceph/tree/v20.2.2/src/crush
 [src-auth]: https://github.com/ceph/ceph/tree/v20.2.2/src/auth
 [src-mon]: https://github.com/ceph/ceph/tree/v20.2.2/src/mon
-[src-messages]: https://github.com/ceph/ceph/blob/v20.2.2/src/messages/MOSDOp.h
-[src-common]: https://github.com/ceph/ceph/blob/v20.2.2/src/common/hobject.cc
 [vstart]: https://github.com/ceph/ceph/blob/v20.2.2/src/vstart.sh
 [doc-arch]: https://github.com/ceph/ceph/blob/main/doc/architecture.rst
 [doc-manual]: https://docs.ceph.com/en/latest/install/manual-deployment/
