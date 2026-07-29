@@ -46,3 +46,19 @@ There are no tests or linters configured.
 - `.gitignore` excludes `*~`, but the working tree is full of stray backup files (`*.md~`, `:w`, single-letter files like `2`/`3`, dumps like `ll`, `test.log`) and binary artifacts (`fast26-pan.pdf`, `favicon.ico` duplicated at root). **Do not `git add -A`** — stage explicitly. Most of these are untracked clutter, not in-progress work.
 - `_site/`, `.sass-cache/`, and `.jekyll-cache/` are build output; never commit changes inside them.
 - Two remotes: `github` (public, `git@github.com:ming1/ming1.github.io.git`) and `origin` (a private bare mirror at `/kvm/git/ming1.github.io.git/`). Publishing requires pushing to both, which is what `./update` does.
+
+## writing style
+
+- Make it concise and information-dense.
+- Remove repetition and unnecessary explanations.
+- Replace long sentences with clear, direct statements.
+- Keep all important technical details and reasoning.
+- Avoid marketing language and generic phrases.
+- Preserve the author's technical voice.
+
+### kernel or storage blogs
+
+Rewrite this as a concise, information-dense technical article for senior engineers.
+Preserve technical depth, remove verbosity, avoid generic explanations, and focus on
+architecture, implementation details, and trade-offs.
+
