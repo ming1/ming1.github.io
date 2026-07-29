@@ -226,54 +226,29 @@ ceph daemon osd.0 dump_mempools                   # onode cache memory
 
 # Part 2: developing and debugging Ceph
 
-Before any BlueStore code can be changed, there has to be somewhere to
-run it. Ceph's answer is unusual enough to state up front: **the
-binaries run straight out of the build tree**. `build/bin/ceph-osd`
-needs no `ninja install`, no packages, no `/etc/ceph` — only a
-generated `ceph.conf` pointing at directories under `build/`. Every
-environment below rests on that one property, and it is why *"how do I
-install Ceph on my nodes"* is a question you answer at the **end** of a
-change, not at the beginning.
+Ceph binaries run out of the build tree. `build/bin/ceph-osd` needs no
+`ninja install`, no packages, no `/etc/ceph` — only a generated
+`ceph.conf` pointing under `build/`. Everything below follows from
+that, and it is why installing Ceph on real nodes is the last step of a
+change rather than the first.
 
-> Every command and output in this part was captured on a Fedora 42
-> box (12 cores, 15 GB RAM) running a build of
-> `v21.3.0-1212-gec92d36e6eb`. Source links stay pinned to `v21.3.0`
-> like the rest of the post.
+> Commands and outputs captured on Fedora 42 (12 cores, 15 GB RAM)
+> running `v21.3.0-1212-gec92d36e6eb`. Source links stay pinned to
+> `v21.3.0` like the rest of the post.
 
-## Four environments, and when each is worth it
+## Four environments
 
-| Tier | What actually runs | Install needed | Iterate | Use it for |
+| Tier | What runs | Install | Iterate | Use for |
 |---|---|---|---|---|
-| **0** | BlueStore as a *library* — gtest binaries, an fio engine, offline tools | none | seconds | data structures, allocators, write path, micro-benchmarks |
-| **1** | `vstart.sh` — mon/mgr/osd forked from `build/bin` on one host | none | ~1 min | anything needing PGs, replication, RADOS clients |
-| **2** | `cstart.sh` — a genuine cephadm cluster of containers, one host | image build | ~1 min | cephadm/orchestrator behaviour, "looks like production" |
-| **3** | Real nodes: packages or containers, N hosts; teuthology | yes | minutes–hours | performance numbers, multi-node failure, release validation |
+| **0** | BlueStore as a library — gtest, fio engine, offline tools | none | seconds | data structures, allocators, write path, micro-benchmarks |
+| **1** | `vstart.sh` — mon/mgr/osd forked from `build/bin`, one host | none | ~1 min | PGs, replication, RADOS clients |
+| **2** | `cstart.sh` — real cephadm cluster of containers, one host | image build | ~1 min | orchestrator behaviour |
+| **3** | Real nodes, N hosts; teuthology | yes | minutes–hours | performance numbers, multi-node failure, release validation |
 
-Tier 0 and Tier 1 cover the overwhelming majority of BlueStore work.
-Tier 3 exists because **no number produced below it is publishable** —
-more on that in the vstart section.
+Tiers 0 and 1 carry most BlueStore work. Tier 3 exists because nothing
+below it produces a publishable number.
 
-A change is normally promoted up this ladder, and most never leave the
-bottom two rungs:
-
-```
-  Tier 0   BlueStore linked as a library        seconds     ─┐ where BlueStore
-           gtest + fio ObjectStore engine                    │ work actually
-              │ correct?                                     │ happens
-              ▼                                             ─┘
-  Tier 1   vstart.sh: processes from build/bin  ~1 min
-           real PGs, real RADOS clients
-              │ behaves under a real OSD?
-              ▼
-  Tier 2   cstart.sh / cpatch: containers       ~1 min        only needed for
-           a genuine cephadm cluster                          orchestrator work
-              │
-              ▼
-  Tier 3   real nodes, real devices             minutes-hours the only place a
-           packages or images; teuthology                     perf number counts
-```
-
-## Building for development
+## Building
 
 ```bash
 git submodule update --init --recursive   # required before the first build
@@ -282,8 +257,8 @@ git submodule update --init --recursive   # required before the first build
 cd build && ninja -j3                     # ~2.5 GB RAM per job
 ```
 
-The single most important flag for this post's subject is the build
-type, and `do_cmake.sh` itself warns about it
+`do_cmake.sh` defaults to Debug — `-O0`, lockdep, assertions, roughly a
+fifth of release speed — and says so
 ([`do_cmake.sh:119-124`](https://github.com/ceph/ceph/blob/v21.3.0/do_cmake.sh#L119)):
 
 ```
@@ -291,43 +266,31 @@ WARNING: do_cmake.sh now creates debug builds by default if .git exists.
 Performance may be severely affected. Please use -DCMAKE_BUILD_TYPE=RelWithDebInfo
 ```
 
-A Debug build is `-O0` with lockdep and assertions on — perhaps a fifth
-of release speed. For any performance work:
-
-```bash
-ARGS="-DCMAKE_BUILD_TYPE=RelWithDebInfo" ./do_cmake.sh
-```
-
-This is not a detail you can forget and detect later by eye: the build
-type is stamped into every OSD you create, and shows up in the device
-label (`ceph-bluestore-tool ... show-label`):
+The choice is recorded in every OSD created, so a forgotten Debug build
+stays visible after the fact via `ceph-bluestore-tool ... show-label`:
 
 ```
 "ceph_version_when_created": "ceph version 21.3.0-1212-gec92d36e6eb (...) umbrella (dev - Debug)"
 ```
 
-Other build-time options worth knowing:
-
 | Option | Effect |
 |---|---|
-| `-DCMAKE_BUILD_TYPE=RelWithDebInfo` | optimised **and** debuggable — the perf-work default |
-| `-DWITH_ASAN=ON` | AddressSanitizer ([`CMakeLists.txt:720`](https://github.com/ceph/ceph/blob/v21.3.0/CMakeLists.txt#L720)); the fastest way to find BlueStore's raw-buffer bugs |
-| `-DWITH_SYSTEM_LIBURING=ON` | link the system liburing instead of the bundled one |
-| ccache / sccache | auto-detected by `do_cmake.sh`, no flag needed |
+| `-DCMAKE_BUILD_TYPE=RelWithDebInfo` | optimised and debuggable — the perf-work default |
+| `-DWITH_ASAN=ON` | AddressSanitizer ([`CMakeLists.txt:720`](https://github.com/ceph/ceph/blob/v21.3.0/CMakeLists.txt#L720)); finds BlueStore's raw-buffer bugs fastest |
+| `-DWITH_SYSTEM_LIBURING=ON` | link system liburing instead of the bundled one |
+| ccache / sccache | auto-detected, no flag needed |
 
-Build only what you need — the full tree is 40–60 GB and hours; a
-single target is minutes:
+Build single targets; the full tree is 40–60 GB and hours:
 
 ```bash
-ninja ceph-osd                # just the OSD
-ninja vstart                  # just enough for a dev cluster
+ninja ceph-osd
+ninja vstart                                       # enough for a dev cluster
 ninja ceph_test_objectstore fio_ceph_objectstore   # the Tier 0 tools
 ```
 
-**Building for another distro without touching your host:**
-[`src/script/build-with-container.py`](https://github.com/ceph/ceph/blob/v21.3.0/src/script/build-with-container.py)
-runs the whole build inside podman/docker, which also makes it the
-easiest way to produce packages (steps from its `Steps` enum):
+[`build-with-container.py`](https://github.com/ceph/ceph/blob/v21.3.0/src/script/build-with-container.py)
+builds inside podman/docker — other distros without touching the host,
+and the shortest path to packages:
 
 ```bash
 src/script/build-with-container.py -d centos9  -e build      # default
@@ -337,18 +300,17 @@ src/script/build-with-container.py -d centos9  -e tests -b build.el9
 src/script/build-with-container.py -d centos9  -e interactive  # shell in the env
 ```
 
-## Tier 0: BlueStore with no cluster at all
+## Tier 0: no cluster
 
-BlueStore is a library, so the fastest loop links it directly and skips
-mon, PGs and networking entirely. Two entry points:
+BlueStore is a library; linking it directly skips mon, PGs and
+networking.
 
 ```bash
 ./bin/ceph_test_objectstore --gtest_list_tests        # 369 cases
 ./bin/ceph_test_objectstore --gtest_filter='ObjectStore/StoreTest.Trivial*/1'
 ```
 
-Every `StoreTest` case is instantiated twice — `/0` is memstore, `/1`
-is bluestore — so the `/1` suffix is what selects the backend:
+Each case is instantiated per backend — `/0` memstore, `/1` bluestore:
 
 ```
 ObjectStore/StoreTest.
@@ -356,15 +318,13 @@ ObjectStore/StoreTest.
   Trivial/1  # GetParam() = "bluestore"
 ```
 
-The other entry point is the fio ObjectStore engine
+The second entry point is the fio ObjectStore engine
 ([`src/test/fio/`](https://github.com/ceph/ceph/tree/v21.3.0/src/test/fio)),
-which drives `queue_transactions` directly with fio's workload
-generator and latency statistics — OSD-shaped load with no OSD in the
-profile. That, plus the offline tools (`ceph-bluestore-tool`,
-`ceph-kvstore-tool`, `ceph-objectstore-tool`), is the subject of
-Part 5; treat this section as the pointer to it.
+which drives `queue_transactions` directly: OSD-shaped load, no OSD in
+the profile. Part 5 covers it and the offline tools
+(`ceph-bluestore-tool`, `ceph-kvstore-tool`, `ceph-objectstore-tool`).
 
-## Tier 1: vstart.sh — a real cluster out of the build tree
+## Tier 1: vstart.sh
 
 ```bash
 cd build
@@ -373,58 +333,52 @@ MON=1 OSD=3 MDS=0 MGR=1 ../src/vstart.sh -d -n -x --localhost --bluestore
 ../src/stop.sh
 ```
 
-`-n` creates (and wipes) the cluster; omit it to restart and reuse.
-What it lays down, all inside `build/`:
+`-n` creates and wipes; omit it to restart and reuse. Everything lands
+inside `build/`:
 
 | Path | Contents |
 |---|---|
 | `build/ceph.conf` | generated conf — the one clients must use |
-| `build/dev/osd0/` | the OSD's data: `block`, `block.db`, `block.wal`, `bluefs` |
-| `build/out/osd.0.log` | the daemon log |
-| `build/out/osd.0.pid` | the pid — what you attach gdb to |
-| `build/asok/osd.0.asok` | the admin socket |
+| `build/dev/osd0/` | OSD data: `block`, `block.db`, `block.wal`, `bluefs` |
+| `build/out/osd.0.log` | daemon log |
+| `build/out/osd.0.pid` | pid — what gdb attaches to |
+| `build/asok/osd.0.asok` | admin socket |
 
-Two practical traps, both hit on a first run:
-
-- **Admin sockets are in `build/asok/`, not `build/out/`** — the conf
-  sets `admin socket = <build>/asok/$name.asok`.
-- **A stray `/etc/ceph/ceph.conf` will hijack your client.** vstart
-  warns about it, and the symptom is obscure — `ceph -s` hangs and
-  `ceph daemon osd.0 ...` fails with `unable to get conf option
-  admin_socket for osd`. Either delete it or export the conf vstart
-  prints:
+Two traps on a first run. Admin sockets are in `build/asok/`, not
+`build/out/`. And a stray `/etc/ceph/ceph.conf` hijacks the client:
+`ceph -s` hangs, `ceph daemon osd.0 ...` fails with `unable to get conf
+option admin_socket for osd`. Delete it, or export the conf vstart
+prints:
 
 ```bash
 export CEPH_CONF=$PWD/ceph.conf
 ```
 
-The BlueStore-relevant flags (full list in `vstart.sh`'s `usage`):
+BlueStore-relevant flags (full list in `vstart.sh`'s `usage`):
 
 | Flag | Effect |
 |---|---|
-| `--bluestore-devs a,b,c` | put OSD `block` on real block devices instead of files |
+| `--bluestore-devs a,b,c` | OSD `block` on real block devices instead of files |
 | `--bluestore-db-devs`, `--bluestore-wal-devs` | split DB / WAL onto separate devices — the tiering from Part 1 |
-| `--bluestore-io-uring` | select the io_uring backend in `src/blk/` |
+| `--bluestore-io-uring` | io_uring backend in `src/blk/` |
 | `--bluestore-spdk <PCI-IDs>` | userspace NVMe driver, kernel out of the path |
 | `--bluestore-pmem <file>` | PMEM-backed device |
-| `-d` | debug mode: high `debug_*` levels, daemons in the foreground |
+| `-d` | high `debug_*` levels, daemons in the foreground |
 | `--nodaemon` | run mon/osd/mds under `ceph-run` rather than daemonising |
-| `--crimson` | run `crimson-osd` (Seastar) instead of `ceph-osd` |
+| `--crimson` | `crimson-osd` (Seastar) instead of `ceph-osd` |
 
-### The startup warning that decides your device class
+### The startup warning that sets your device class
 
-Without `--bluestore-devs`, OSDs are backed by files under `build/dev/`,
-and startup logs three of these per OSD — one each for `block`,
-`block.db` and `block.wal`:
+File-backed OSDs log three of these at startup, one per device
+(`block`, `block.db`, `block.wal`):
 
 ```
 -1 bdev(0x55e94815a300 .../build/dev/osd2/block.wal) unable to get device
    name for .../build/dev/osd2/block.wal: (22) Invalid argument
 ```
 
-It is survivable — the cluster reaches `HEALTH_OK` regardless — but it
-is not cosmetic, and the line *after* it in the source is the one that
-matters
+The cluster reaches `HEALTH_OK` regardless, but the next line of source
+is the one that matters
 ([`KernelDevice.cc:285-296`](https://github.com/ceph/ceph/blob/v21.3.0/src/blk/kernel/KernelDevice.cc#L285)):
 
 ```cpp
@@ -439,21 +393,20 @@ if ((r = blkdev_buffered.partition(partition, PATH_MAX)) ||
 }
 ```
 
-Detection does not "see a file and assume rotational" — it fails to
-identify the device *at all* and defaults to rotational. For a
-non-block file
+Detection does not assume rotational for files; it fails to identify
+the device and defaults to rotational. For a non-block file
 [`BlkDev::get_devid()`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/blkdev.cc#L110)
-returns `st_dev`, the device of the filesystem *holding* the file, and
-passes it to `blkid_devno_to_devname()`. Whether that resolves depends
-on which filesystem your build dir sits on:
+returns `st_dev` — the filesystem's device, not the file's — and passes
+it to `blkid_devno_to_devname()`. Resolution therefore depends on the
+filesystem holding `build/`:
 
-| Build dir on | `st_dev` | Resolves? | Outcome |
+| Build dir on | `st_dev` | Resolves | Result |
 |---|---|---|---|
 | btrfs (Fedora's default) | `0:34` — anonymous major, no `/dev` node | no | warning, `rotational = true` |
-| ext4 / XFS | `253:2` — the real partition | yes | silent, inherits the backing disk's flags |
+| ext4 / XFS | `253:2` — the real partition | yes | silent, inherits the disk's flags |
 
-btrfs allocates an anonymous block device per subvolume, and major 0
-has no device node to find:
+btrfs gives each subvolume an anonymous block device, and major 0 has
+no node to find:
 
 ```console
 $ stat -c "%d" build/dev/osd2/block.wal     # build dir on btrfs
@@ -465,7 +418,7 @@ $ stat -c "%d" /boot/.                      # same box, ext4
 64770                                       # major 253, minor 2 = /dev/vda2
 ```
 
-So on Fedora the OSD ends up classified as an HDD, and says so:
+So the OSD is classified HDD:
 
 ```console
 $ ./bin/ceph osd metadata 0 | jq '{osd_objectstore, bluestore_bdev_type,
@@ -478,66 +431,58 @@ $ ./bin/ceph osd metadata 0 | jq '{osd_objectstore, bluestore_bdev_type,
 }
 ```
 
-That matters more than it looks. `min_alloc_size` happens to be 4 K
-either way at this version (`bluestore_min_alloc_size_hdd` and `_ssd`
-are both `4_K`), but the **deferred-write threshold is not**:
+`min_alloc_size` is 4 K either way at this version
+(`bluestore_min_alloc_size_hdd` and `_ssd` are both `4_K`), but
 `bluestore_prefer_deferred_size_hdd` is `64_K` against `0` for ssd. The
-OSD therefore sends every sub-64 KiB write down the deferred
-(double-write) path that an SSD-classified OSD would skip entirely — on
-your NVMe workstation, without saying so, and *decided by the
-filesystem you happened to clone the repo onto*. Pass
-`--bluestore-devs` with a real device, or set the class explicitly,
-before drawing any conclusion about the small-write path.
+OSD sends every sub-64 KiB write down the deferred double-write path an
+SSD-classified OSD skips — on your NVMe workstation, decided by the
+filesystem you cloned onto. Use `--bluestore-devs` with a real device
+before concluding anything about the small-write path.
 
-**Do not publish vstart numbers.** Debug builds, lockdep, all daemons
-sharing one page cache and one CPU, and file-backed devices each cost
-more than the effect most patches are trying to measure. vstart is for
-*correctness and code paths*; measurement belongs in Tier 0 (fio
-ObjectStore, isolated) or Tier 3 (real nodes). For repeatable cluster
-benchmarks there is
-[`src/script/run-cbt.sh`](https://github.com/ceph/ceph/blob/v21.3.0/src/script/run-cbt.sh),
-which wires up [CBT](https://github.com/ceph/cbt) against a vstart
-cluster (or an existing one with `--use-existing`) from YAML workload
-definitions.
+### vstart is not a benchmark
 
-## Tier 2: cephadm-shaped clusters, still on one host
+vstart numbers are not measurements: Debug builds, lockdep, all daemons
+sharing one host's page cache and CPUs, file-backed devices. Use it for
+correctness and code paths; measure in Tier 0 or Tier 3.
+[`run-cbt.sh`](https://github.com/ceph/ceph/blob/v21.3.0/src/script/run-cbt.sh)
+drives [CBT](https://github.com/ceph/cbt) against a vstart cluster (or
+an existing one, `--use-existing`) from YAML workload definitions.
 
-Production Ceph is deployed by **cephadm**: every daemon a container
-under systemd, managed by the mgr. Two ways to get that shape locally
-without owning a fleet.
+## Tier 2: cephadm-shaped, one host
 
+Production Ceph runs every daemon as a container under systemd, managed
+by the mgr.
 [`src/cstart.sh`](https://github.com/ceph/ceph/blob/v21.3.0/src/cstart.sh)
-launches a real cephadm cluster but drops the conf and keyring in your
-build dir, so `./bin/ceph` still works exactly as with vstart;
-`ckill.sh` tears it down. The container image is
-`quay.io/ceph-ci/ceph:$shortid`, built by cpatch on first run:
+reproduces that locally: a real cephadm cluster whose conf and keyring
+land in the build dir, so `./bin/ceph` works as with vstart. `ckill.sh`
+tears it down. The image is `quay.io/ceph-ci/ceph:$shortid`, built by
+cpatch on first run.
 
 ```bash
-sudo ../src/cstart.sh          # last line prints the cpatch command to update it
+sudo ../src/cstart.sh          # prints the cpatch command to update the image
 sudo ../src/ckill.sh
 ```
 
-[`src/script/cpatch.py`](https://github.com/ceph/ceph/blob/v21.3.0/src/script/cpatch.py)
-is the piece that makes this fast: it overlays artifacts from your
-local build dir onto an existing image rather than rebuilding one.
+[`cpatch.py`](https://github.com/ceph/ceph/blob/v21.3.0/src/script/cpatch.py)
+overlays your build dir onto an existing image instead of rebuilding
+one:
 
 ```bash
 src/script/cpatch.py --base quay.ceph.io/ceph-ci/ceph:main \
                      --target ceph/ceph:wip --core
 ```
 
-Component flags: `--core`, `--rgw`, `--dashboard`, `--cephadm`,
-`--python-mgr-modules`, `--python-bindings`, `--python-common`, `--py`
-(all Python), `--pure-py`. For BlueStore work `--core` is the one —
-rebuild `ceph-osd`, cpatch, redeploy, in about a minute instead of a
-package cycle.
+Components: `--core`, `--rgw`, `--dashboard`, `--cephadm`,
+`--python-mgr-modules`, `--python-bindings`, `--python-common`, `--py`,
+`--pure-py`. BlueStore work needs `--core`: rebuild `ceph-osd`, cpatch,
+redeploy — about a minute against a package cycle.
 
-### vstart --cephadm runs locally too — and why it wants an SSH key
+### vstart --cephadm is local, and still needs an SSH key
 
-`vstart.sh --cephadm` is a hybrid: mon/mgr/osd stay as vstart-forked
-host processes, but the cephadm orchestrator is enabled on top so you
-can deploy *additional* daemons as containers. It is still entirely
-local — the host it adds is `$(hostname)`
+`vstart.sh --cephadm` is a hybrid: mon/mgr/osd stay vstart-forked host
+processes, with the orchestrator enabled on top to deploy *additional*
+daemons as containers. It remains entirely local — the host it adds is
+`$(hostname)`
 ([`vstart.sh:1458-1473`](https://github.com/ceph/ceph/blob/v21.3.0/src/vstart.sh#L1458)):
 
 ```bash
@@ -549,8 +494,8 @@ ceph_adm orch host add "$(hostname)"        # exactly one host: this one
 ceph_adm config set mgr mgr/cephadm/allow_ptrace true
 ```
 
-The key is required because **SSH is cephadm's only transport, even to
-itself** — the module has no local-execution shortcut
+SSH is cephadm's only transport, even to itself — the module has no
+local-execution shortcut
 ([`src/pybind/mgr/cephadm/ssh.py:207`](https://github.com/ceph/ceph/blob/v21.3.0/src/pybind/mgr/cephadm/ssh.py#L207)):
 
 ```python
@@ -559,27 +504,25 @@ conn = await asyncssh.connect(addr, username=self.mgr.ssh_user,
 ```
 
 Every managed host, localhost included, is reached by opening an
-`asyncssh` connection (as `root` by default) and running the `cephadm`
-binary on the far end. So `~/.ssh/id_rsa` must be passphraseless and
-its public half must be in `root@$(hostname)`'s `authorized_keys`.
-Two consequences: daemons deployed *through* the orchestrator run as
-containers while vstart's own do not — which is why cephadm reports
-them as **stray daemons** — and `allow_ptrace` is set precisely so you
-can still attach gdb inside those containers.
+`asyncssh` connection (as `root` by default) and running `cephadm` on
+the far end. So `~/.ssh/id_rsa` must be passphraseless and its public
+half in `root@$(hostname)`'s `authorized_keys`. Two consequences:
+orchestrator-deployed daemons are containers while vstart's own are
+not, which is why cephadm reports the latter as **stray daemons**; and
+`allow_ptrace` is set so gdb still works inside those containers.
 
-## Tier 3: getting your build onto real nodes
+## Tier 3: onto real nodes
 
-This is the "install" question proper, and there are four answers.
+Four routes.
 
 | Route | How your code gets there | Turnaround | Best for |
 |---|---|---|---|
 | Stock release image | it doesn't — you run upstream Ceph | minutes | reproducing a user's cluster before changing anything |
 | `ceph-ci` image / packages | push branch → CI builds → pull by branch or sha1 | CI latency | sharing a build, teuthology, multi-node labs |
-| cpatch'd image | overlay your build dir onto a base image, push to a registry | ~1 min | your own lab, tight iteration |
+| cpatch'd image | overlay build dir onto a base image, push to a registry | ~1 min | your own lab, tight iteration |
 | Self-built packages | `make-dist` + rpmbuild, or `build-with-container.py -e rpm\|debs` | 30–60 min | distro-native install, no containers |
 
-The deployment command is the same in every case — only the image or
-repo differs:
+Deployment is identical in every case; only the image or repo differs:
 
 ```bash
 cephadm --image quay.io/ceph-ci/ceph:<sha1> bootstrap --mon-ip <ip>
@@ -587,11 +530,10 @@ ceph orch host add node2 <ip2>
 ceph orch apply osd --all-available-devices     # ceph-volume runs bluestore mkfs
 ```
 
-**The CI route is what upstream actually does**, and it is worth
-understanding because it is also how teuthology installs Ceph. Push a
-branch to the `ceph-ci` repo and Jenkins builds packages for every
-supported distro; **chacra** stores the resulting repos and **shaman**
-indexes them (`doc/dev/continuous-integration.rst`):
+The CI route is what upstream uses, and how teuthology installs Ceph.
+Push a branch to `ceph-ci`; Jenkins builds packages per distro,
+**chacra** stores the repos, **shaman** indexes them
+(`doc/dev/continuous-integration.rst`):
 
 ```
   your branch ──push──▶ github.com/ceph/ceph-ci
@@ -611,21 +553,18 @@ indexes them (`doc/dev/continuous-integration.rst`):
        or:     cephadm --image quay.io/ceph-ci/ceph:<sha1> bootstrap
 ```
 
-Two more routes worth knowing exist for specific worlds:
+Two adjacent tools:
 [`src/script/kubejacker/`](https://github.com/ceph/ceph/tree/v21.3.0/src/script/kubejacker)
-is cpatch's equivalent for Rook/Kubernetes — it injects your build dir
-into an image and pushes it to a local registry — and **teuthology**
-(`qa/suites/`) is the integration framework that provisions machines,
-installs from shaman, runs a suite and archives the logs. Teuthology
-needs a lab, so it is normally reached by scheduling a run rather than
-running it locally.
+is cpatch for Rook/Kubernetes — build dir into an image, pushed to a
+local registry; **teuthology** (`qa/suites/`) provisions machines,
+installs from shaman, runs a suite and archives logs. Teuthology needs
+a lab, so it is scheduled rather than run locally.
 
 ## The debugging toolbox
 
-### Log levels, three ways
+### Log levels
 
-Ceph's `dout(N)` levels are the primary instrument, and all three
-mechanisms below work on a running daemon:
+All three mechanisms work on a running daemon:
 
 ```bash
 ceph config set osd.0 debug_bluestore 20/20      # via mon; persistent
@@ -633,12 +572,11 @@ ceph daemon osd.0 config set debug_bluestore 10/10   # admin socket; local, wins
 ceph tell osd.0 injectargs '--debug-bluefs 5/5'      # via mon; this boot only
 ```
 
-The `X/Y` pair is **log-to-file / log-to-memory**. The memory half is a
-ring buffer that costs almost nothing and is dumped on crash — which is
-how you get level-20 detail without paying level-20 I/O. To read it out
-of a live process or a core,
-[`src/script/ceph_dump_log.py`](https://github.com/ceph/ceph/blob/v21.3.0/src/script/ceph_dump_log.py)
-is a **gdb extension**, not a standalone parser:
+`X/Y` is log-to-file / log-to-memory. The memory half is a near-free
+ring buffer dumped on crash — level-20 detail without level-20 I/O.
+Reading it out of a live process or a core needs
+[`src/script/ceph_dump_log.py`](https://github.com/ceph/ceph/blob/v21.3.0/src/script/ceph_dump_log.py),
+a gdb extension rather than a standalone parser:
 
 ```console
 $ gdb -q -batch -p $(cat out/osd.0.pid) \
@@ -648,19 +586,20 @@ $ gdb -q -batch -p $(cat out/osd.0.pid) \
 
 ### The admin socket
 
-Everything below is answered by the daemon itself, no mon involved:
+Answered by the daemon itself, no mon involved:
 
 | Command | What it tells you |
 |---|---|
 | `perf dump` | all counters; `jq .bluestore` for the BlueStore block |
 | `dump_mempools` | where memory went, per pool |
-| `dump_historic_ops` | the slowest recent ops, broken into stages |
+| `dump_historic_ops` | slowest recent ops, broken into stages |
 | `bluestore allocator score block` | free-space fragmentation, 0 → 1 |
-| `bluestore allocator dump block` / `fragmentation histogram` | the freelist itself |
+| `bluestore allocator dump block` | the freelist itself |
+| `bluestore allocator fragmentation histogram block` | fragmentation distribution |
 | `bluefs stats` | per-tier BlueFS usage and the volume selector's view |
 
-The counters that matter for write-path work are latencies per state,
-straight out of the state machine in Part 3:
+For write-path work the per-state latencies map onto the state machine
+in Part 3:
 
 ```console
 $ ceph daemon osd.0 perf dump | jq -r '.bluestore | to_entries[] | "\(.key)  \(.value)"'
@@ -676,15 +615,13 @@ state_kv_queued_lat     {"avgcount":3430,"sum":165.377528218,"avgtime":0.0482150
 state_kv_commiting_lat  {"avgcount":3430,"sum":328.420463784,"avgtime":0.095749406}
 ```
 
-(`max_inc` elided from each value for width.) Read top-down, that is
-the whole write path: time spent preparing the transaction, waiting on
-device aio, then queued for and committing to RocksDB — here the KV
-stages dominate by an order of magnitude, which is the signature of a
-Debug build on a file-backed device.
+(`max_inc` elided for width.) Top-down that is the write path:
+preparing the transaction, waiting on device aio, then queued for and
+committing to RocksDB. Here the KV stages dominate by an order of
+magnitude — the signature of a Debug build on a file-backed device.
 
-`dump_historic_ops` is the first stop for "why was this slow" — it
-timestamps each stage of an individual op, so the stall is visible
-rather than inferred:
+`dump_historic_ops` timestamps each stage of an individual op, so a
+stall is visible rather than inferred:
 
 ```console
 $ ceph daemon osd.0 dump_historic_ops \
@@ -698,7 +635,7 @@ reached_pg         2026-07-29T05:47:44.740328+0000   <-- 2.4 s stalled on peerin
 started            2026-07-29T05:47:44.740626+0000
 ```
 
-And the two BlueStore-specific views, on the same live OSD:
+Two BlueStore-specific views on the same OSD:
 
 ```console
 $ ceph daemon osd.0 bluestore allocator score block
@@ -720,29 +657,35 @@ db.slow     0 B         0 B         0 B         0 B         0 B         0 B     
 TOTAL       22 MiB      13 MiB      0 B         0 B         0 B         0 B         13
 ```
 
-Non-zero `db.slow` is the spillover condition from Part 3 — RocksDB
+Non-zero `db.slow` is the spillover condition from Part 3: RocksDB
 levels that no longer fit on the fast device.
 
 ### gdb
 
-The pid file makes attaching trivial, and the thread names are a map of
-the architecture:
-
 ```console
 $ gdb ./bin/ceph-osd -p $(cat out/osd.0.pid)
 (gdb) info threads
-  "tp_osd_tp"       the OSD op threadpool — where PrimaryLogPG runs
-  "bstore_kv_sync"  the KV sync thread — RocksDB commit, Part 3's write path
-  "bstore_kv_final" post-commit completion
-  "bstore_aio"      the KernelDevice aio completion thread
-  "bstore_mempool"  the cache trimmer
-  "rocksdb:high"    RocksDB flush pool ("rocksdb:low" is compaction)
+  Id   Target Id                                           Frame
+* 1    Thread 0x7f185a973dc0 (LWP 19216) "ceph-osd"        ...
+  3    Thread 0x7f183c8f66c0 (LWP 19716) "tp_osd_tp"       ...
+  ...
 ```
 
-Two caveats. Compile without optimisation (`-O0`) if you intend to
-inspect intermediates, and raise the suicide timeouts, or the daemon
-will kill itself while you sit on a breakpoint
-(`doc/dev/developer_guide/debugging-gdb.rst`):
+The thread names are a map of the architecture:
+
+| Thread | Role |
+|---|---|
+| `tp_osd_tp` | the OSD op threadpool — where `PrimaryLogPG` runs |
+| `bstore_kv_sync` | KV sync thread: RocksDB commit, Part 3's write path |
+| `bstore_kv_final` | post-commit completion |
+| `bstore_aio` | KernelDevice aio completion |
+| `bstore_mempool` | cache trimmer |
+| `rocksdb:high` / `rocksdb:low` | RocksDB flush / compaction pools |
+| `ms_dispatch`, `log` | messenger dispatch, the log ring-buffer writer |
+
+Two caveats. Build `-O0` if you need to inspect intermediates, and
+raise the suicide timeouts or the daemon kills itself while you sit on
+a breakpoint (`doc/dev/developer_guide/debugging-gdb.rst`):
 
 ```ini
 [osd]
@@ -750,9 +693,9 @@ osd_op_thread_timeout = 1500
 osd_op_thread_suicide_timeout = 1500
 ```
 
-For a core file from someone else's cluster — the common case in
-support work — [`src/script/ceph-debug-docker.sh`](https://github.com/ceph/ceph/blob/v21.3.0/src/script/ceph-debug-docker.sh)
-builds a container with the matching branch/sha1 debuginfo installed:
+For a core file from someone else's cluster,
+[`ceph-debug-docker.sh`](https://github.com/ceph/ceph/blob/v21.3.0/src/script/ceph-debug-docker.sh)
+builds a container with the matching branch/sha1 debuginfo:
 
 ```bash
 src/script/ceph-debug-docker.sh <branch>:<sha1> centos:9
@@ -760,12 +703,11 @@ src/script/ceph-debug-docker.sh <branch>:<sha1> centos:9
 
 ### Profiling
 
-For CPU work on a `RelWithDebInfo` build, plain `perf record -g` plus a
-flamegraph is the usual starting point; Ceph also ships a gperftools
-CPU profiler driven through the admin socket
-(`doc/dev/cpu-profiler.rst`) and heap profiling on the same channel.
-For memory, `dump_mempools` attributes allocations to BlueStore's own
-pools rather than to malloc:
+On a `RelWithDebInfo` build, `perf record -g` plus a flamegraph is the
+usual start; Ceph also exposes gperftools CPU and heap profiling
+through the admin socket (`doc/dev/cpu-profiler.rst`). For memory,
+`dump_mempools` attributes allocations to BlueStore's pools rather than
+to malloc:
 
 ```console
 $ ceph daemon osd.0 dump_mempools | jq -r '.mempool.by_pool | to_entries
@@ -780,25 +722,20 @@ bluestore_cache_data      61442 bytes   16 items
 
 ## A BlueStore performance-work loop
 
-Putting the tiers together, the loop that keeps iteration fast and
-conclusions honest:
-
-1. **Build once, correctly**:
+1. **Build once, correctly.**
    `ARGS="-DCMAKE_BUILD_TYPE=RelWithDebInfo" ./do_cmake.sh`, then
    `ninja ceph-osd ceph_test_objectstore fio_ceph_objectstore ceph-bluestore-tool`.
-2. **Measure in Tier 0.** Change BlueStore, rebuild one target, run the
-   fio ObjectStore job, compare latency percentiles. No OSD, no
-   messenger, no PG noise in the profile.
-3. **Check correctness in Tier 0 too**:
-   `ceph_test_objectstore --gtest_filter='...*/1'`, plus a
-   `-DWITH_ASAN=ON` build when touching buffers or extents.
+2. **Measure in Tier 0.** Rebuild one target, run the fio ObjectStore
+   job, compare latency percentiles — no OSD, messenger or PG noise in
+   the profile.
+3. **Check correctness in Tier 0.**
+   `ceph_test_objectstore --gtest_filter='...*/1'`, plus `-DWITH_ASAN=ON`
+   when touching buffers or extents.
 4. **Validate the code path in Tier 1.** vstart with
    `--bluestore-devs` on a real device, then `perf dump`,
-   `dump_historic_ops` and `bluestore allocator score` to confirm the
-   change does what you think under a real OSD.
-5. **Confirm on Tier 3 before believing any number.** Real nodes, real
-   devices, `RelWithDebInfo`, CBT — the only place a performance claim
-   survives review.
+   `dump_historic_ops`, `bluestore allocator score`.
+5. **Confirm on Tier 3 before believing a number.** Real nodes, real
+   devices, `RelWithDebInfo`, CBT.
 
 # Part 3: inside BlueStore
 
