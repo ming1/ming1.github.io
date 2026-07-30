@@ -367,6 +367,122 @@ Hop hostnames often encode useful information:
 | `221.183.x.x` | China Mobile (CMNET) backbone |
 | `be5298.agr21...` | `be` = bundle Ethernet (link aggregation), `agr` = aggregation router |
 
+## ip route get
+
+`ping` and `mtr` tell you whether a destination responds. Neither tells you
+**which path the kernel chose**. On a host running a VPN, tunnel, container
+bridge, or multiple interfaces, the route is often not the one you assume.
+
+```bash
+# Which interface and gateway will be used for this destination?
+ip route get IP_ADDR
+
+# The same lookup, but as if the packet carried a firewall mark
+ip route get IP_ADDR mark 0x80000
+
+# Policy rules, evaluated in ascending priority order
+ip rule show
+
+# Contents of a specific routing table
+ip route show table 52
+```
+
+Example — a host using a VPN as its default route:
+
+```
+$ ip route get IP_ADDR
+IP_ADDR dev tunnel0 table 52 src 100.64.0.1
+
+$ ip route get IP_ADDR mark 0x80000
+IP_ADDR via 192.168.0.1 dev wlan0 src 192.168.0.112 mark 0x80000
+```
+
+**Principle**: `ip route get` performs a real FIB (Forwarding Information
+Base) lookup and reports the decision the kernel *would* make — outgoing
+interface, next-hop gateway, and the **source address** it would select. No
+packet is sent. This separates "the route is wrong" from "the destination is
+unreachable" — a distinction `ping` cannot make. Worse, in the tunnel case
+above both routes *succeed*, so nothing fails; the traffic just silently
+takes a detour of thousands of kilometres.
+
+The two outputs differ only by a firewall mark, which changes which policy
+rule matches. See [How Linux Policy Routing Works](#how-linux-policy-routing-works).
+
+**What to look for**:
+
+- Is `dev` the interface you expected, or a tunnel?
+- Is `src` the address you expected? A wrong source address causes
+  asymmetric routing and silent drops when `rp_filter` is enabled.
+- Does the lookup resolve in `table <n>` rather than `main`? Something
+  installed policy rules — find them with `ip rule show`.
+
+## Detecting tunnels and encapsulation
+
+When traffic unexpectedly traverses a VPN, the symptom is generic slowness
+with nothing obviously broken. Three independent signals identify it, in
+increasing order of strength.
+
+**Signal 1 — implausible TTL.** Initial TTL is 64 on Linux, so a reply from
+a distant host should arrive with TTL noticeably below 64 (see the
+[ping field reference](#ping)). A far-away host answering with `ttl=64` has
+decremented nothing, meaning no router handled the packet — it arrived
+through a point-to-point tunnel:
+
+```
+64 bytes from IP_ADDR: icmp_seq=1 ttl=64 time=250 ms   ← 250ms but zero hops?
+```
+
+250 ms of latency with zero routers traversed is a contradiction. The tunnel
+endpoint counts as one hop regardless of how far the encapsulated packets
+actually travelled.
+
+**Signal 2 — collapsed hop count.** A tunnel hides the underlying path
+entirely, so `mtr` reports a single hop for an intercontinental destination:
+
+```
+HOST                       Loss%   Snt   Last   Avg
+1.|-- IP_ADDR              30.0%    20  246.7 244.6   ← the whole path, "one hop"
+```
+
+To see the real path, bypass the routing table with `SO_BINDTODEVICE`, which
+both `ping` and `mtr` expose via `-I`:
+
+```bash
+mtr -I wlan0 -r -c 10 -n IP_ADDR    # ignore the tunnel, use this interface
+ping -I wlan0 -c 20 IP_ADDR
+```
+
+This is also the cleanest way to A/B a tunnel: identical probes, one through
+it and one around it.
+
+**Signal 3 — the same bytes on two interfaces.** This is definitive, needs no
+privileges, and requires no reasoning about routing tables. Encapsulation
+means one payload appears at two layers, so read the kernel's per-interface
+byte counters before and after a transfer:
+
+```bash
+r(){ cat /sys/class/net/$1/statistics/$2_bytes; }
+t0=$(r tunnel0 rx); w0=$(r wlan0 rx)
+curl -s -o /dev/null -x http://127.0.0.1:8080 \
+     "https://speed.cloudflare.com/__down?bytes=5000000"
+echo "tunnel0: $(( ($(r tunnel0 rx) - t0) / 1048576 )) MB"
+echo "wlan0:   $(( ($(r wlan0 rx) - w0) / 1048576 )) MB"
+```
+
+Interpretation:
+
+| tunnel0 delta | wlan0 delta | Meaning |
+|---------------|-------------|---------|
+| ~5 MB | ~5.3 MB | Encapsulated. Ratio slightly >1 is the tunnel's own header overhead |
+| ~0 MB | ~5 MB | Not tunnelled — the payload only crossed the wire once |
+
+**Principle**: the counters in `/sys/class/net/*/statistics/` are incremented
+by the kernel at each interface, independently of routing configuration. A
+payload counted twice *is* the definition of encapsulation, which makes this
+immune to any misreading of `ip rule` or `ip route`. Compare with
+`ss -tn dst IP_ADDR`, which only reveals the egress path indirectly, through
+the source address the kernel selected.
+
 # Transport Layer: Port Connectivity
 
 ## nc (netcat / ncat)
@@ -814,6 +930,197 @@ mtr -T -r -c 10 -P 2053 proxy-server   # non-standard port
 If standard ports (80, 443) time out but non-standard ports show "connection
 refused" (meaning they are reachable), the issue is **port-level filtering**
 by a firewall or DPI system, not general connectivity.
+
+## Scenario 5: The Proxy Works, But Everything Is Slow
+
+Scenario 4 covers a proxy that *fails*. A proxy that *works but crawls* is
+harder, because nothing returns an error and every layer looks superficially
+healthy. This is a worked case study: a VPS reached from China through a
+Trojan proxy, "recently become slow", requests taking 2–9 s instead of 0.5 s.
+
+The controlling principle is **separate the server from the path before
+touching either**. They are independent suspects and each can be measured
+alone. Skipping this step is how hours get spent tuning a server that was
+never the problem.
+
+### Step 1: exonerate (or convict) the server
+
+Run these on the server. All are read-only:
+
+```bash
+uptime                     # load average; also reveals an unexpected reboot
+last -x reboot shutdown    # reboot history — was there an unplanned restart?
+free -m                    # memory pressure, swap usage
+vmstat 1 5                 # the 'st' column is the one that matters
+ip -s link                 # interface errors and drops
+```
+
+**Principle**: on a VPS the critical column is `st` (**steal time**) — CPU
+cycles the hypervisor gave to *other* tenants while your vCPU was runnable.
+Steal time is invisible to `top`'s load average and is the classic cause of
+"the server got slow and nothing changed", because literally nothing on your
+side did change; a neighbour got noisy.
+
+Then measure the server's own connectivity, independent of the client:
+
+```bash
+ping -c 20 1.1.1.1                              # is the server's network clean?
+curl -o /dev/null -w "%{speed_download}\n" \
+     https://speed.cloudflare.com/__down?bytes=10000000
+```
+
+In this case the server was demonstrably innocent: load 0.08, **`st` = 0**,
+no interface errors, **0% loss at 1.4 ms** to 1.1.1.1, and **46 MB/s**
+download. A server that pulls 368 Mbit/s is not the reason a proxy delivers
+35 KB/s. That single result redirects the entire investigation to the path.
+
+### Step 2: quantify the damage
+
+```bash
+nstat -az | grep -E "TcpRetransSegs|TcpOutSegs|TcpExtTCPLostRetransmit"
+```
+
+```
+TcpOutSegs                152937
+TcpRetransSegs             19518     ← 12.8% of all segments retransmitted
+TcpExtTCPLostRetransmit     4624     ← retransmissions that were themselves lost
+```
+
+**Principle**: the **retransmission rate**, `TcpRetransSegs / TcpOutSegs`, is
+the single most useful number for "slow but working". A healthy link sits
+below 0.5%. At 12.8%, TCP spends its time recovering rather than delivering.
+`TcpExtTCPLostRetransmit` being non-trivial is worse news still: the recovery
+packets are also being dropped, which forces RTO-based recovery and stalls
+measured in seconds. Counters reset at boot, so on a recently rebooted host
+they describe current conditions rather than ancient history.
+
+Note this is the system-wide analogue of the per-connection `retrans:` field
+from [`ss -i`](#flag-reference). Use `ss -i` for one connection, `nstat` for
+the host.
+
+### Step 3: localize the loss
+
+`mtr` gives a first sketch, but intermediate-hop loss in `mtr` is mostly ICMP
+rate-limiting, not real loss ([Pattern 3](#key-patterns-to-recognize)). Only
+loss that persists to the destination counts. So re-probe the interesting
+hops individually with a large sample:
+
+```bash
+for h in 183.233.67.169 221.183.166.218 223.120.16.241 IP_ADDR; do
+    printf "%-18s " $h
+    ping -c 40 -i 0.2 -W 2 $h 2>&1 | tail -2 | tr '\n' ' '; echo
+done
+```
+
+| Hop | Network | Loss | RTT |
+|-----|---------|------|-----|
+| 183.233.67.169 | China Mobile provincial access | **0%** | 13 ms |
+| 221.183.166.218 | China Mobile CMNET backbone | **0%** | 29 ms |
+| 223.120.16.241 | **China Mobile International egress** | **30%** | 211 ms |
+| IP_ADDR | the VPS | 20% | 250 ms |
+
+Loss is zero across the entire domestic network and appears at the hop where
+RTT jumps from 29 ms to 211 ms — the transpacific egress. This is
+[Pattern 4](#key-patterns-to-recognize) with the boundary precisely located.
+Note how the individual re-probe corrected `mtr`: a hop that reported 40%
+loss in the trace measured 0% over 40 dedicated packets.
+
+### Step 4: check both directions
+
+Loss is often asymmetric, and only the sender's direction is yours to
+influence. Trace back from the server toward the client:
+
+```bash
+mtr -r -c 10 -n CLIENT_PUBLIC_ADDR    # run on the server
+```
+
+Here the return path was clean at 44 ms across the US transit provider and
+degraded only on entering the same carrier's network — confirming congestion
+on that carrier's international capacity in **both** directions, not a
+one-way routing fault.
+
+A caveat: `ping` from the server to a home IP usually shows 100% loss because
+the residential router drops unsolicited ICMP. That is not evidence of
+anything. Trust the traceroute, which reaches the last upstream hop.
+
+### Step 5: rule out the local link
+
+Cheap, and prevents an expensive misdiagnosis:
+
+```bash
+ping -c 20 192.168.0.1     # your gateway: any loss here is your own LAN/WiFi
+```
+
+0% loss to the gateway means the problem is upstream. Skipping this step
+invites blaming an ISP for a failing WiFi radio.
+
+### The hypothesis that was wrong
+
+Worth recording, because it was compelling. The client used the VPS as a VPN
+exit node, and `tailscale status` reported the session as **relayed through a
+DERP relay in Chicago** while the client's nearest relay was Hong Kong at
+61 ms. China → Chicago → New York is an appalling path, and it neatly
+explained every symptom.
+
+It was also wrong. The test that killed it took one command — probe the same
+destination around the tunnel:
+
+```bash
+ping -I wlan0 -c 20 IP_ADDR    # bypass the tunnel entirely
+```
+
+Same 20% loss, same 250 ms. If removing the suspected cause does not change
+the symptom, the suspect is innocent, however good the story is. The relay
+report was stale; the server's own `tailscale status` showed the session as
+`direct`.
+
+**Principle**: prefer hypotheses that can be falsified with one command, and
+run that command before designing a fix. A plausible mechanism that explains
+all symptoms is not evidence — it is a hypothesis with good marketing.
+
+### Root cause and what could be done
+
+The root cause was congestion on one carrier's transpacific capacity, at the
+start of the local evening peak. Nothing about the VPS was at fault, and
+nothing on either endpoint could repair the link.
+
+What *could* be fixed was a self-inflicted amplifier discovered along the
+way. Because the VPN was configured as a full-tunnel exit node, its default
+route captured **the proxy's own upstream connection to the VPS**, so Trojan
+TLS was being wrapped in the VPN and hairpinned back to the same host — over
+the very link that was losing 20–30% of packets. The fix routes just that one
+socket around the tunnel with a firewall mark
+([How Linux Policy Routing Works](#how-linux-policy-routing-works)):
+
+```json
+"streamSettings": {
+    "network": "tcp",
+    "security": "tls",
+    "tlsSettings": { "serverName": "example.com" },
+    "sockopt": { "mark": 524288 }
+}
+```
+
+Measured over 20 samples per configuration, at peak hour:
+
+| Metric | Double-tunnelled | Direct | Change |
+|--------|------------------|--------|--------|
+| Latency, median | 3.22 s | 2.12 s | −34% |
+| Latency, p90 | 7.17 s | 3.37 s | −53% |
+| Throughput, median | 35 KB/s | 78 KB/s | +123% |
+| Failed requests | 1 / 20 | 0 / 20 | — |
+| Negotiated MSS | ~1240 | 1448 | +17% payload/packet |
+
+Two caveats. The p90/median spread here is ~4x, so a single `curl` can
+"demonstrate" any conclusion — hence 20 samples. And peak-hour congestion
+drifts minute to minute, so part of any delta is variance, not causation. What
+makes the result trustworthy is four metrics moving together plus an
+independently verified mechanism: MSS recovered, tunnel counters idle.
+
+The two lessons that generalize past this incident: **falsify before fixing**,
+and **separate what you can fix from what you cannot**. The carrier's
+congestion was immovable; the redundant encapsulation stacked on top of it was
+not, and only one of those was worth time.
 
 # Packet-level Diagnostics
 
@@ -1307,6 +1614,35 @@ Connection fails
     └── openssl s_client / tcpdump for packet-level analysis
 ```
 
+## Decision Tree: Slow But Working
+
+The tree above assumes something *fails*. Degraded-but-functional needs a
+different order of operations, because the goal is to assign blame between the
+server and the path before tuning either:
+
+```
+Connection works but is slow
+├── Is the server itself healthy?          (measure it in isolation first)
+│   ├── vmstat 1 5 → 'st' non-zero → CPU steal, noisy neighbour
+│   ├── ip -s link → interface errors or drops
+│   └── curl speed test FROM the server → is its own uplink fine?
+│       └── Server fast and clean → the server is exonerated; go to the path
+├── How bad is the path?
+│   ├── nstat | grep Retrans → >0.5% retransmits means loss-driven collapse
+│   ├── ping -c 40 <each suspect hop> → where does loss actually begin?
+│   │   └── Ignore mtr intermediate loss; re-probe hops individually
+│   └── mtr from the server back to the client → is loss symmetric?
+├── Is traffic even taking the path you assume?
+│   ├── ip route get <dst> → unexpected 'dev tunnel0'?
+│   ├── ping <dst> → ttl=64 from a distant host = tunnelled
+│   └── per-interface byte counters → same payload twice = encapsulated
+│       └── ping -I <phys-iface> to A/B around the tunnel
+└── Loss is real and upstream of you
+    ├── Stop manufacturing packets: remove redundant encapsulation, fix MSS
+    ├── Confirm BBR + fq are actually active (not merely configured)
+    └── Switch to rate-based UDP transport, or relay around the segment
+```
+
 ## Tool Summary
 
 | Tool | Layer | Protocol | Root? | Best for |
@@ -1322,6 +1658,239 @@ Connection fails
 | ssh -vvv | Application | SSH | No | SSH handshake debugging |
 | tcpdump | All | Raw packets | Yes | Packet-level analysis |
 | iptables/nft | Transport | — | Yes | Server firewall rule inspection |
+| ip route get | Network | — | No | Which interface/table/source the kernel will use |
+| ip rule | Network | — | No | Policy routing chain; finding what captured your traffic |
+| `/sys/class/net` counters | Network | — | No | Proving encapsulation (same payload on two interfaces) |
+| nstat | Transport | — | No | Host-wide TCP retransmission rate |
+| vmstat | — | — | No | CPU steal time on a VPS |
+
+# How Linux Policy Routing Works
+
+Classic routing picks a route by **destination address** alone. Linux also
+supports *policy* routing, where the decision depends on source address,
+inbound interface, or an arbitrary integer attached to the packet. This is the
+mechanism behind both a VPN capturing all traffic and the exemption that lets
+selected sockets escape it.
+
+## Multiple routing tables
+
+Linux has many routing tables, not one. Three exist by default:
+
+| Table | ID | Purpose |
+|-------|-----|---------|
+| `local` | 255 | Kernel-maintained: local and broadcast addresses |
+| `main` | 254 | The "normal" table — what `ip route` shows by default |
+| `default` | 253 | Empty by convention; a last-resort hook |
+
+VPNs commonly add their own, leaving `main` untouched — which is why
+`ip route` can look completely normal while every packet leaves through a
+tunnel.
+
+## The rule chain
+
+`ip rule show` lists the policy chain. Rules are evaluated in **ascending
+priority**, and the first match wins:
+
+```
+0:      from all lookup local
+5210:   from all fwmark 0x80000/0xff0000 lookup main
+5230:   from all fwmark 0x80000/0xff0000 lookup default
+5250:   from all fwmark 0x80000/0xff0000 unreachable
+5270:   from all lookup 52
+32766:  from all lookup main
+32767:  from all lookup default
+```
+
+Read it as a program. An **unmarked** packet skips 5210–5250 (no mark to
+match) and hits `5270: from all lookup 52`. If table 52 contains
+`default dev tunnel0`, every destination resolves into the tunnel — and rule
+32766, the normal `main` lookup, is never reached. That single rule is how a
+full-tunnel VPN captures a host.
+
+A packet **marked** `0x80000` matches at 5210 and looks up `main` instead,
+where the ordinary default route via the LAN gateway lives. Same destination,
+different table, completely different path.
+
+Table 52 typically also holds `throw` routes:
+
+```
+default dev tunnel0
+throw 127.0.0.0/8
+throw 192.168.0.0/24
+```
+
+A `throw` route aborts the lookup *in this table* and resumes the rule chain
+at the next rule, so loopback and LAN traffic fall through to `main` and stay
+local. This is why a full-tunnel VPN does not break access to your own
+printer.
+
+## Firewall marks (fwmark)
+
+A **mark** is a 32-bit integer carried in the kernel's `sk_buff` metadata
+alongside the packet. It is **never transmitted** — it does not exist on the
+wire, occupies no header, and the peer cannot observe or influence it. It is
+purely a local label that policy engines can match on: `ip rule ... fwmark`
+for routing, and `-m mark` in iptables/nftables for filtering.
+
+Marks can be applied in two places:
+
+```bash
+# Per-socket, by the application itself (SO_MARK)
+setsockopt(fd, SOL_SOCKET, SO_MARK, &mark, sizeof(mark));
+
+# Per-packet, by the firewall
+iptables -t mangle -A OUTPUT -p tcp --dport 443 -j MARK --set-mark 0x80000
+```
+
+Setting `SO_MARK` requires `CAP_NET_ADMIN`, so an unprivileged process cannot
+route itself around policy — the mechanism is privileged by design. Tools
+expose it directly (`ping -m`, `curl` has no equivalent), and many proxies
+expose it in configuration; Xray and V2Ray call it `streamSettings.sockopt.mark`.
+
+The `/0xff0000` in the rules above is a **mask**: only bits 16–23 are
+compared, leaving the other 24 bits free for unrelated subsystems to use
+without collision. `0x80000` is bit 19.
+
+## The tunnel recursion problem
+
+This is the structural reason marks exist, and it generalizes well beyond VPNs.
+
+A tunnel daemon encrypts packets and sends the result to the peer's **public**
+address. But if the tunnel is the default route, that public address also
+resolves *into the tunnel* — so the encrypted packet would be encrypted again,
+forever. The daemon must therefore exempt its own transport socket from the
+routing policy it installs. The bypass mark is that exemption, which is why
+tunnel software installs rules 5210–5250 for itself.
+
+The generalization: **any application whose destination is the tunnel endpoint
+has the same problem.** A proxy client connecting to a server that also happens
+to be the VPN exit node is exactly this case. Without the mark, its traffic is
+encrypted twice and hairpinned through the endpoint back to itself — and the
+symptom is not an error, merely unexplained slowness. Reusing the tunnel's own
+bypass mark solves it, since the rules are already installed and maintained:
+
+```bash
+# Verify the escape hatch exists and where it leads
+ip rule show | grep fwmark
+ip route get VPS_ADDR              # → dev tunnel0    (captured)
+ip route get VPS_ADDR mark 0x80000 # → via gateway    (exempt)
+```
+
+Scope the mark narrowly. It is a routing *override*, and its blast radius is
+exactly the set of sockets carrying it. On a proxy's upstream socket it is
+correct. On an outbound whose job is to reach the internet *from the tunnel*,
+the same mark silently converts "exit via the remote endpoint" into "exit via
+this machine's own address" — no error, opposite privacy properties.
+
+# Why TCP Collapses Under Packet Loss
+
+A recurring surprise in the case study above is the gap between a link's
+*capacity* and its *throughput*: a server with a 368 Mbit/s uplink delivering
+35 KB/s. Understanding the mechanism explains which remedies can possibly work.
+
+## Loss is a congestion signal
+
+Loss-based congestion control (Reno, CUBIC) interprets any lost segment as
+evidence of a full queue and halves its window in response. On a link whose
+loss is *not* congestion — a saturated international transit link dropping
+packets at random, or a lossy radio — this inference is simply wrong, and the
+sender throttles itself for no reason.
+
+The classic approximation (Mathis et al.) bounds a single Reno flow:
+
+```
+                MSS
+BW  ≈  ─────────────────────
+          RTT × sqrt(p)
+```
+
+where `p` is loss probability. The `sqrt(p)` term is brutal, and `RTT` in the
+denominator means long paths suffer disproportionately. For the case study —
+MSS 1448 B, RTT 250 ms, p = 0.25:
+
+```
+BW ≈ 1448 / (0.25 × 0.5) ≈ 11.6 KB/s per connection
+```
+
+(The formula carries a constant near 1.2 for Reno that is omitted here, so read
+this as ~11–14 KB/s.) Against a measured aggregate of 78 KB/s across roughly
+half a dozen concurrent proxy connections, that is order-of-magnitude
+agreement — and it demonstrates why **parallel connections** are the crude but
+effective workaround: aggregate throughput scales with flow count because each
+flow suffers the penalty independently.
+
+## Why MSS matters more than it looks
+
+Loss is charged **per packet**, not per byte. So reducing MSS increases the
+number of packets carrying a given payload, and each one is an independent
+chance to be dropped. A tunnel with MTU 1280 forces MSS ≈ 1240 instead of
+1448 — 17% more packets for the same data, and via the formula, a 17% lower
+per-flow ceiling:
+
+```
+MSS 1240:  1240 / 0.125 ≈  9.9 KB/s
+MSS 1448:  1448 / 0.125 ≈ 11.6 KB/s     (+17%)
+```
+
+This is why removing an unnecessary layer of encapsulation measurably helps
+even though it does nothing about the underlying loss: it stops manufacturing
+extra packets to lose. Check the negotiated value with:
+
+```bash
+ss -tni dst IP_ADDR | grep -oE 'mss:[0-9]+'
+```
+
+## What BBR does and does not fix
+
+BBR abandons loss as a signal entirely, modelling the path's bottleneck
+bandwidth and minimum RTT and pacing to that estimate. On a randomly lossy
+link it therefore vastly outperforms CUBIC, and it should be the default on
+any long-haul server:
+
+```bash
+sysctl net.ipv4.tcp_congestion_control    # want: bbr
+sysctl net.core.default_qdisc             # want: fq (BBR needs pacing)
+lsmod | grep bbr                          # confirm the module is loaded
+```
+
+Two caveats the case study illustrates. First, **verify rather than assume**:
+a kernel upgrade that leaves a stale `tcp_bbr` module, or a `sysctl.d` snippet
+that never applied, silently reverts to CUBIC — and a persisted setting in
+`/etc/sysctl.conf` is not proof of the running value.
+
+Second, BBR is not a repair. At 20–30% loss the retransmissions themselves
+consume the capacity: 12.8% of segments sent twice is 12.8% of goodput
+converted to overhead, and BBR cannot recover data that never arrived. It
+raises the ceiling; it does not remove it.
+
+## The implication for protocol choice
+
+Once loss is known to be irreparable and in the path, the productive question
+is no longer "how do I tune TCP" but "how do I stop using loss-based recovery":
+
+- **Rate-based congestion control over UDP** — QUIC-derived protocols
+  (Hysteria's Brutal, TUIC) send at a declared rate and simply do not
+  interpret loss as congestion. On a 20–30% loss link this is the difference
+  between kilobytes and megabytes per second.
+- **Forward error correction** — send redundancy so the receiver reconstructs
+  lost packets without a round trip. Trading bandwidth for latency is a good
+  deal when RTT is 250 ms.
+- **Avoid the segment entirely** — relay via a region with clean transit. Often
+  the cheapest fix, since it addresses the cause rather than the symptom.
+- **Multiplexing** — one connection carrying many streams suffers head-of-line
+  blocking on loss; several connections do not. This is why parallelism helps
+  TCP proxies and why QUIC's independent streams help more.
+
+Before pursuing any of these, confirm UDP survives the path at all — some
+networks throttle or block it, which would rule out the first two:
+
+```bash
+nc -zvu IP_ADDR 443              # UDP reachability (unreliable; no handshake)
+ping -c 10 IP_ADDR               # baseline RTT for comparison
+```
+
+An existing UDP-based tunnel reporting a `direct` (non-relayed) session to the
+host is stronger evidence, since it proves sustained bidirectional UDP.
 
 # How SSH Works
 
