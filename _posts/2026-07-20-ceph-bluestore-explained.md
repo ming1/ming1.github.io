@@ -2105,31 +2105,49 @@ $ ceph-kvstore-tool bluestore-kv /mnt/fio-bluestore histogram | head -8
     "Records for prefix: 'b'": 1079,
 ```
 
-### prefix record 
+### The record behind each prefix
 
-'C': Collections generally map 1-to-1 with Ceph Placement Groups (PGs).
+What a prefix's *value* actually decodes to. The prefix constants
+themselves, with their one-line contracts, are one block in
+[`BlueStore.cc:134`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L134):
 
-'P' (OSD PG State): Placement Group Logs (8,633 records)
-While BlueStore handles the objects, the Ceph OSD daemon stores its own operational state
-in the KV store. 'P' is used to store PG metadata, most notably the PG Log (the recent
-history of transactions and updates for peering and recovery).
+| Prefix | Key | Value record, and where it is defined |
+|---|---|---|
+| `S` | field name (`nid_max`, `min_alloc_size`, …) | bare scalar or string — no struct |
+| `T` | `u64` big-endian pool id, per pool ([`get_pool_stat_key`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L573)); legacy stores instead use one literal key, `bluestore_statfs` | [`volatile_statfs`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1800) — an int64 array folded by a RocksDB *merge* operator, so writers never read the old value |
+| `C` | collection name (`2.1f_head`) | [`bluestore_cnode_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h#L72) — one field, `bits` |
+| `O` | shard + pool + bit-reversed hash + namespace + name + snap + generation + `o` ([`_get_object_key`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L457)) | [`bluestore_onode_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h#L1160); sibling `…x` keys each hold one encoded extent-map shard |
+| `M` / `P` | `u64` id + `.` + user key | raw omap bytes — no BlueStore struct ([`calc_omap_key`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L4877)) |
+| `m` / `p` | pool (+ PG hash) + `u64` id + `.` + user key | same, re-keyed per pool / per PG so a PG's omap is one contiguous range |
+| `L` | deferred-op sequence id | [`bluestore_deferred_transaction_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h#L1363) — the small-write payload itself rides here |
+| `B` | `blocks`, `blocks_per_key`, `bytes_per_block`, `size` | bare `u64` geometry, written once at mkfs ([`BitmapFreelistManager`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BitmapFreelistManager.h#L16)) |
+| `b` | `u64` big-endian device offset, one key per `blocks_per_key` blocks | the free-space bitmap itself, updated through a `bitwise_xor` merge operator |
+| `X` | `u64` shared-blob id | [`bluestore_shared_blob_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h#L1130) — the clone/COW extent refcount map |
 
-'B' (PREFIX_ALLOC): Block Allocator (4 records)
-This tracks the "Freelist"—the metadata mapping which logical offsets and lengths of the
-raw disk are currently allocated versus free.
+Two of these mislead if read only through the source comments.
 
-'b' (PREFIX_ALLOC_BITMAP): Bitmap Allocator (1,079 records)
-Detailed tracking chunks used by BlueStore's space allocators (like BitmapAllocator or
-StupidAllocator) to manage free space on the block device.
+**`B` is not "offset → length".** The comment beside `PREFIX_ALLOC`
+still says `u64 offset -> u64 length (freelist)`, which describes the
+*extent-based* freelist manager. This store runs the bitmap one —
+`get S freelist_type` returns exactly `bitmap` — so `B` holds nothing
+but the four geometry constants and `b` carries the actual free-space
+bitmap. Four records, not a map of the device.
 
+**Neither `B` nor `b` is the allocator.** The allocator is the
+in-memory structure (`hybrid` by default) rebuilt at every mount; `b`
+is the *persistent* record it is rebuilt from. That split is the whole
+point of the free-space section in Part 2, and it is why the NCB mode
+described there can skip freelist writes on the commit path and pay
+for it with a metadata scan at startup instead.
 
-### further explaining on record
+### What the counts decompose into
 
 Every line lands in the schema section. `C`: 8 PG collections plus
 `meta`. `O`: 73 onodes — 64 data objects, 8 pgmeta, 1 osd_superblock —
 plus 551 extent-map shard keys. `P`: the simulated PG log. `b` / `B`:
-freelist bitmap and its geometry. `T`: statfs, one pool plus the
-store-wide row. Absent: `X` (nothing was cloned) and `L` (aligned
+freelist bitmap and its geometry. `T`: statfs, one row per pool — the
+data pool and the meta pool, whose id is `-1` and so sorts last as
+`0xFFFFFFFFFFFFFFFF`. Absent: `X` (nothing was cloned) and `L` (aligned
 64 KiB writes take the big-write path, and deferred keys are transient
 anyway).
 
