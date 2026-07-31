@@ -2162,6 +2162,111 @@ P  %00%00%00%00%00%00%00%02.dup_0000000011.00000000000000000001
 against the schema section's running example is the best exercise for
 internalizing the metadata model.
 
+### Output format: keys, values, and the read sub-commands
+
+Four read sub-commands print the same rows with progressively more of
+the value:
+
+| Sub-command | Row shape |
+|---|---|
+| `list [prefix]` | `<prefix>` TAB `<key>` |
+| `list-crc [prefix]` | adds a third column: crc32c over prefix + key + value, not the value alone — the same running checksum `store-crc` accumulates |
+| `dump [prefix]` | adds the value as a hexdump block under each row |
+| `get <prefix> <key>` | `(<prefix>, <key>)` then that one value's hexdump |
+
+**Keys** are raw binary, so they must be escaped to be printable, and
+the tool offers two renderings. The default is `url_escape`
+([`src/common/url_escape.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/url_escape.cc)):
+alphanumerics and `-._~/` pass through literally, every other byte
+becomes `%xx`. That is why an object name reads as text while the
+binary framing around it does not.
+
+`--pretty-binary-key` switches to `pretty_binary_string`, which
+alternates `0x…` hex runs with `'…'` string runs — the same notation
+BlueStore's own debug logs use, and the one that makes the key's
+structure visible. **This flag postdates `v21.3.0`** (added
+2026-04-16 in `e334498be3e`); at the tag itself `traverse` escapes
+unconditionally and the option is rejected. The build used here is
+1212 commits past the tag, so it has it:
+
+```console
+$ ceph-kvstore-tool bluestore-kv /mnt/fio-bluestore list O | grep -m1 bluestore.0.0
+O  %7f%80%01%00%00%00%00%00%01%00%00%00%00%21/mnt/…/bluestore.0.0%21%3d%ff…%fe%ff…%ffo
+
+$ ceph-kvstore-tool bluestore-kv /mnt/fio-bluestore list O --pretty-binary-key \
+      | grep -m1 bluestore.0.0
+O  0x7F800100000000000100000000'!/mnt/…/bluestore.0.0!='0xFFFFFFFFFFFFFFFEFFFFFFFFFFFFFFFF6F
+```
+
+Same key, same fields as the decode above — but segmented without
+counting `%xx` bytes, and showing one field that decode passed over:
+the `…FF` run immediately before the type byte is the *generation*
+(none). The form also round-trips, because the same commit added the
+reverse parser — a key copied straight out of a listing is valid
+input:
+
+```console
+$ K=$(ceph-kvstore-tool bluestore-kv /mnt/fio-bluestore list O --pretty-binary-key \
+        | grep -m1 bluestore.0.0 | cut -f2)
+$ ceph-kvstore-tool bluestore-kv /mnt/fio-bluestore get O "$K" --pretty-binary-key
+(O, 0x7F800100000000000100000000'!/mnt/…/bluestore.0.0!='0xFF…FF6F)
+00000000  02 01 49 00 00 00 0a 80  80 80 02 00 00 00 00 00  |..I.............|
+00000010  0a 00 00 00 00 c5 03 80  80 18 c7 03 80 80 30 c7  |..............0.|
+...                                            (3 rows elided)
+00000050  00                                                |.|
+00000051
+```
+
+That value is the onode: `02 01` version 2, compat 1; `49 00 00 00` =
+0x49 payload bytes. Then the fields, as varints: `0a` = `nid` 10, and
+`80 80 80 02` = `size` 4194304 — the 4 MiB the `dump` in the next
+section reports.
+
+**Values** print as `hexdump -C`-style rows (offset, bytes, ASCII
+gutter, end offset), and come in two shapes. Bare scalars — most of
+`S` and all of `B` — are just little-endian integers. Structs carry
+Ceph's encoding envelope first: `struct_v`, `compat_v`, a `u32`
+payload length, then the payload. Both are small enough to decode by
+eye:
+
+```console
+$ ceph-kvstore-tool bluestore-kv /mnt/fio-bluestore get C 281474976710657.0_head
+(C, 281474976710657.0_head)
+00000000  01 01 04 00 00 00 03 00  00 00                    |..........|
+0000000a
+```
+
+`01 01` = version 1, compat 1; `04 00 00 00` = 4 payload bytes;
+`03 00 00 00` = the `bluestore_cnode_t`'s only field, `bits` = 3. A
+collection *is* one PG, so `bits` says how many hash bits it matches —
+the pool has 2^3 = 8 PGs, which is both the eight `C` collections in
+the histogram and the `osd pool default pg num` the fio conf set.
+Note the endianness flip: little-endian in values, big-endian inside
+keys.
+
+The freelist prefixes show the same interlock across keys and values:
+
+```console
+$ ceph-kvstore-tool bluestore-kv /mnt/fio-bluestore list b --pretty-binary-key | head -3
+b  0x0000000000000000
+b  0x0000000000080000
+b  0x0000000000100000
+```
+
+Those are 8-byte big-endian device offsets, stepping by `0x80000` =
+512 KiB. `dump B` explains the stride — its four values decode as:
+
+| `B` key | Hexdump bytes | Value |
+|---|---|---|
+| `blocks` | `00 00 30 00 00 00 00 00` | `0x300000` = 3145728 |
+| `blocks_per_key` | `80 00 00 00 00 00 00 00` | 128 |
+| `bytes_per_block` | `00 10 00 00 00 00 00 00` | 4096 |
+| `size` | `00 00 00 00 03 00 00 00` | `0x300000000` = 12 GiB |
+
+`blocks_per_key` × `bytes_per_block` = 128 × 4 KiB = `0x80000`: one
+bitmap key per 128 blocks, which is exactly the `b` stride. `B` is the
+geometry, `b` the bitmap it describes.
+
 ## Reading objects: ceph-objectstore-tool
 
 One level up — the ObjectStore view of the same store:
@@ -2198,8 +2303,8 @@ for one object. Two quirks: use `--pgid` plus the plain name (feeding
 back a JSON row from `--op list` trips a pool-id comparison against
 the engine's 2^48-sized pool at this tag), and expect `Error getting
 attr … (61) No data available` — object-info and snapset attrs belong
-to the OSD layer, which never ran here; the dump is complete
-regardless:
+to the OSD layer, which never ran here; the BlueStore metadata below
+is unaffected:
 
 ```console
 $ ceph-objectstore-tool --data-path /mnt/fio-bluestore --no-mon-config \
@@ -2221,6 +2326,7 @@ $ ceph-objectstore-tool --data-path /mnt/fio-bluestore --no-mon-config \
               "blob": {
                   "extents": [ { "offset": 297807872, "length": 65536 } ],
                   "logical_length": 65536,
+                  "flags": 4,
                   "csum_type": 4,
                   "csum_chunk_order": 12,
                   "csum_data": [ 1608458274, ... 16 values ... ] } },
@@ -2230,10 +2336,95 @@ $ ceph-objectstore-tool --data-path /mnt/fio-bluestore --no-mon-config \
 Onode (nid 10, 4 MiB) → 10 extent-map shards — the `x` keys of the
 previous section, second shard at 393216 = `0x60000` — → 64 logical
 extents, one per 64 KiB write, each backed by a blob holding one
-physical extent on `block` plus its checksums: `csum_type` 4 is crc32c
-(`Checksummer.h`), `csum_chunk_order` 12 is 4 KiB chunks, hence 16
-`csum_data` values per 64 KiB blob. The Onode / ExtentMap / Extent /
-Blob / pextent chain, live.
+physical extent on `block` plus its checksums. The Onode / ExtentMap /
+Extent / Blob / pextent chain, live.
+
+### Output format: JSON lines and the dump tree
+
+**`--op list` / `--op meta-list` emit JSON *lines*** — one complete
+array per line, with no document wrapping the set. That is a quirk of
+the default format, not of the ops: the tool treats any `*-pretty`
+format as "human readable", strips the suffix, and then prints one
+row per line with no enclosing array. Since the default *is*
+`json-pretty`, passing `--format=json-pretty` changes nothing, and
+`jq -s` is the way to treat the stream as an array.
+
+Pass `--format=json` and you get the opposite shape — one wrapping
+array, and **three**-element rows, because the non-human-readable
+branch adds the raw collection name alongside the pgid:
+
+```console
+$ ceph-objectstore-tool … --op list --format=json
+[["281474976710657.7","281474976710657.7_head",{"oid":"", …}], …
+```
+
+In the default shape each row is a two-element array:
+
+```
+[ <collection> , { <ghobject> } ]
+      │                 └ the object's full identity
+      └ the PG id ("281474976710657.0") for a real PG, or the raw
+        collection name ("meta") for the non-PG metadata collection
+```
+
+The object half is `ghobject_t::dump`
+([`src/common/hobject.cc:490`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/hobject.cc#L490)),
+which emits the inner `hobject_t` and then its own fields:
+
+| Field | Meaning |
+|---|---|
+| `oid` | the object name — empty for a PG's pgmeta object |
+| `key` | locator key, overriding the name for placement when set |
+| `snapid` | `-2` = head, `-1` = snapdir, else the snapshot id |
+| `hash` | the name's hash — the PG-selecting value, *not* bit-reversed here |
+| `pool` | pool id (`281474976710657` = 2^48+1, the fio engine's) |
+| `namespace` | object namespace, empty for ordinary data |
+| `max` | listing sentinel — see below |
+| `generation`, `shard_id` | emitted **only** when not the default, so their absence here means "replicated object, no generation"; erasure-coded shards and rollback objects carry them |
+
+`max` appears **twice** in every row, and that is not a display
+artifact: `hobject_t::dump` writes one and `ghobject_t::dump` writes
+its own after it. Duplicate keys in one JSON object — `jq` and
+Python's `json` both silently keep the last.
+
+**`dump` is a single JSON document**, and a BlueStore-only one:
+`ObjectStore::dump_onode` is declared in the base class with a default
+body that just returns `-ENOTSUP`
+([`ObjectStore.h:577`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/ObjectStore.h#L577)),
+so this view exists precisely because the backend is BlueStore. The
+implementation calls `fault_range(db, 0, OBJECT_MAX_SIZE)` before
+printing, so every lazily-loaded extent-map shard is pulled in rather
+than showing whatever happened to be cached. Shards only: a `FIXME`
+directly above that call notes it is not enough to load shared blobs,
+so a cloned object's shared state will not be here.
+
+Its nesting follows the data-structures section, abridged below to the
+load-bearing fields:
+
+```
+onode                      bluestore_onode_t::dump
+├─ nid, size, flags, attrs (names + lengths only, never values)
+├─ extent_map_shards[]     {offset, bytes} per shard — the "x" keys
+└─ extents[]               ExtentMap::dump
+   └─ {logical_offset, length, blob_offset, blob}
+      └─ blob              bluestore_blob_t::dump
+         ├─ extents[]      the PHYSICAL ranges: {offset, length}
+         ├─ logical_length, compressed_length
+         ├─ flags, csum_type, csum_chunk_order
+         └─ csum_data[]    one value per csum chunk
+```
+
+Three blob fields print as bare integers and need a decoder:
+
+| Field | Value here | Meaning |
+|---|---|---|
+| `blob.flags` | `4` | bitmask ([`bluestore_types.h:515`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h#L515)): 1 = MUTABLE (legacy), 2 = COMPRESSED, 4 = CSUM, 8 = HAS_UNUSED, 16 = SHARED — so "has checksums", nothing else. Note `onode.flags` is a *different* enum (omap layout bits); don't cross-apply |
+| `csum_type` | `4` | `Checksummer::CSUM_CRC32C`. The enum starts at 1, deliberately: `CSUM_NONE = 1`, 2/3 = xxhash32/64, 5/6 = truncated crc32c |
+| `csum_chunk_order` | `12` | log2 of the chunk size: 2^12 = 4 KiB per checksum |
+
+`csum_data` length is derived, not free: blob length ÷ chunk size, so
+the 16 values on this 64 KiB blob are a consistency check you can do
+by eye.
 
 ## Reading BlueFS and its journal
 
@@ -2374,6 +2565,68 @@ on the standalone tools:
 CEPH_ARGS="--debug_bluestore 20 --debug_bluefs 20 --log-to-stderr" \
   ./bin/ceph_test_objectstore --gtest_filter='ObjectStore/StoreTest.Simple*/1'
 ```
+
+### Output format: the journal as a replay transcript
+
+`bluefs-log-dump` has no printer of its own. `BlueFS::log_dump()`
+opens the superblock and calls `_replay(noop=true, to_stdout=true)`
+([`BlueFS.cc:1976`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.cc#L1976)),
+and every op inside `_replay` prints twice — `dout(20)` and, under
+`to_stdout`, `std::cout`. The dump is therefore the *mount path*
+executed without applying anything, and its lines are what
+`debug_bluefs = 20` logs during a real mount, less the log header and
+the `__func__` prefix the `dout` side carries. Reading this output is
+reading replay.
+
+Two line kinds alternate, told apart by the spacing after the offset
+rather than by indentation. A transaction header:
+
+```
+ 0x1000: txn(seq 2 len 0xaa crc 0x6cfc8c72)
+ │               │     │        └ crc32c of the encoded op block
+ │               │     └ length of the encoded op block, in bytes
+ │               └ sequence number: +1 per transaction, the replay order
+ └ byte offset of this transaction within the log file
+```
+
+then its ops, one extra space in, each with its own offset *inside*
+the log:
+
+```
+ 0x1034:  op_dir_link  db/LOCK to 2
+```
+
+The op names are the on-disk enum tabulated in the journal subsection,
+lowercased by the printer. Two things that table cannot show:
+`op_file_update_inc` — a delta against the existing fnode — dominates
+once files are growing, which is why the full `op_file_update` records
+above all carry empty extent lists; and `op_init` sits at seq 1 here
+only because this log has never been compacted. Compaction builds its
+replacement log through `_make_initial_transaction`, which emits a
+fresh `op_init` at whatever sequence the new log starts from, so on a
+long-lived store `op_init` is not a one-time marker.
+
+File metadata prints as an fnode — here the log file's own, taken
+unelided from the dump's header line:
+
+```
+ log_fnode file(ino 1 size 0x1000 mtime 0.000000 allocated 400000 alloc_commit 400000 extents [0:0x100000~400000])
+```
+
+`size` is the bytes written, `allocated` the space handed to the file:
+4 KiB live inside a 4 MiB allocation, preallocation rather than a
+leak. Read those numbers carefully — `size` carries an `0x` prefix
+while `allocated` and `alloc_commit` are bare hex, so `400000` is
+4 MiB, not four hundred thousand. Only `ino`, the `mtime`, and the
+leading bdev id inside the extent are decimal; everything else on the
+line is hex, prefixed or not.
+
+The remaining outputs are plainer: `bluefs-export` lists each path as
+it writes it out; `show-label` is JSON keyed by device path;
+`free-dump` is JSON per allocator instance (`block`, `bluefs-db`,
+`bluefs-wal`), with `offset` and `length` as quoted hex *strings*
+rather than numbers — so `jq` arithmetic on them needs an explicit
+conversion.
 
 ## A suggested learning loop
 
