@@ -2037,7 +2037,9 @@ An fio engine that calls `queue_transactions` directly
 with a ready-made job file):
 
 ```bash
-cd build && ninja fio_ceph_objectstore
+cd build
+cmake -DWITH_FIO=ON .        # the engine is off in a default configure
+ninja fio_ceph_objectstore
 cd ../src/test/fio    # run from here so the job's relative conf= resolves
 LD_LIBRARY_PATH=$OLDPWD/lib $OLDPWD/src/fio/fio ceph-bluestore.fio
 ```
@@ -2053,42 +2055,185 @@ can couple writes with PG-log-style omap traffic
 easiest way to create a scratch BlueStore to dissect with the tools
 below.
 
+Everything below reads one store made exactly that way on tree
+`v21.3.0-1212-gec92d36e6eb`: the stock job — 64 files of 4 MiB
+(RBD-chunk-shaped) over 8 collections, 64 KiB random overwrites for
+20 s — with the `pglog_*` options uncommented, and the conf pointed at
+three raw disks instead of a directory-backed file:
+
+```ini
+bluestore block path = /dev/sda            # 12 GiB -> block
+bluestore block db path = /dev/vdb         #  8 GiB -> block.db
+bluestore block wal path = /dev/nvme0n1    #  8 GiB -> block.wal
+bluestore block create = false             # ditto db/wal: devices
+                                           # exist, create no files
+```
+
+One tag-specific wart: the engine dies in `_shutdown_cache()`
+([`BlueStore.cc:19575`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L19575))
+during fio's teardown, *after* the run completes. The store is not
+damaged — a creator killed mid-shutdown is exactly the crash BlueStore
+absorbs by design, and `fsck --deep` below agrees.
+
 ## Reading the metadata: every schema prefix, live
 
 `ceph-kvstore-tool` opens a stopped BlueStore's RocksDB through BlueFS
 — every key from the schema section, inspectable:
 
 ```bash
-ceph-kvstore-tool bluestore-kv <store-path> stats           # totals per prefix
-ceph-kvstore-tool bluestore-kv <store-path> list O | head   # onode keys —
+ceph-kvstore-tool bluestore-kv <store-path> histogram   # per-prefix census
+ceph-kvstore-tool bluestore-kv <store-path> list O      # onode keys —
                                                 # find the bit-reversed hash!
-ceph-kvstore-tool bluestore-kv <store-path> list S          # superblock fields
+ceph-kvstore-tool bluestore-kv <store-path> list S      # superblock fields
 ceph-kvstore-tool bluestore-kv <store-path> get S min_alloc_size
 ```
 
-`list b`, `list T`, `list X` work the same. Write a few objects with
-fio, then walk these prefixes against the running example in the schema
-section — the best exercise for internalizing the metadata model.
+(`stats` also exists but prints RocksDB's internal counters;
+`histogram` is the per-prefix view.) The census of the fio store:
+
+```console
+$ ceph-kvstore-tool bluestore-kv /mnt/fio-bluestore histogram | head -8
+{
+    "Records for prefix: 'B'": 4,
+    "Records for prefix: 'C'": 9,
+    "Records for prefix: 'O'": 624,
+    "Records for prefix: 'P'": 8633,
+    "Records for prefix: 'S'": 7,
+    "Records for prefix: 'T'": 2,
+    "Records for prefix: 'b'": 1079,
+```
+
+Every line lands in the schema section. `C`: 8 PG collections plus
+`meta`. `O`: 73 onodes — 64 data objects, 8 pgmeta, 1 osd_superblock —
+plus 551 extent-map shard keys. `P`: the simulated PG log. `b` / `B`:
+freelist bitmap and its geometry. `T`: statfs, one pool plus the
+store-wide row. Absent: `X` (nothing was cloned) and `L` (aligned
+64 KiB writes take the big-write path, and deferred keys are transient
+anyway).
+
+One object's `O` keys — fio names objects after its files:
+
+```console
+$ ceph-kvstore-tool bluestore-kv /mnt/fio-bluestore list O | grep 'bluestore.0.0%21'
+O  %7f%80%01%00%00%00%00%00%01%00%00%00%00%21/mnt/fio-bluestore/bluestore.0.0%21%3d%ff%ff%ff%ff%ff%ff%ff%fe%ff%ff%ff%ff%ff%ff%ff%ffo
+O  <same key>%00%00%00%00x
+O  <same key>%00%06%00%00x
+   ... 7 more shard keys (siblings elided for width) ...
+```
+
+`get_object_key`'s layout in the wild: shard `%7f` (no shard), pool
+`%80%01…%01` (the engine's pool 2^48+1, biased by 2^63, big-endian),
+bit-reversed hash `%00%00%00%00` (this name hashed to 0), the
+`!`-quoted name, snap `%ff…fe` (head), and the type byte `o` for
+onode. The `x` rows are its extent-map shards, keyed by big-endian
+byte offset — the second shard starts at `0x60000` = 393216, which
+`dump` in the next section confirms.
+
+The superblock, decodable by eye:
+
+```console
+$ ceph-kvstore-tool bluestore-kv /mnt/fio-bluestore list S
+S  blobid_max
+S  freelist_type
+S  min_alloc_size
+S  min_compat_ondisk_format
+S  nid_max
+S  ondisk_format
+S  per_pool_omap
+
+$ ceph-kvstore-tool bluestore-kv /mnt/fio-bluestore get S min_alloc_size
+(S, min_alloc_size)
+00000000  00 10 00 00 00 00 00 00                           |........|
+```
+
+Little-endian `0x1000` — the 4 KiB default. Last, the omap the
+`pglog_*` options generated, under each pgmeta object's omap id in
+`P`: 2 225 log entries keyed `<epoch>.<version>` and 6 400 `dup_`
+markers across the 8 PGs — the same keys a real OSD's PG log produces:
+
+```console
+$ ceph-kvstore-tool bluestore-kv /mnt/fio-bluestore list P | head -1
+P  %00%00%00%00%00%00%00%02.0000000011.00000000000000000801
+$ ceph-kvstore-tool bluestore-kv /mnt/fio-bluestore list P | grep -m1 dup_
+P  %00%00%00%00%00%00%00%02.dup_0000000011.00000000000000000001
+```
+
+`list b`, `list T`, `list X` work the same. Walking these prefixes
+against the schema section's running example is the best exercise for
+internalizing the metadata model.
 
 ## Reading objects: ceph-objectstore-tool
 
 One level up — the ObjectStore view of the same store:
 
 ```bash
-ceph-objectstore-tool --data-path <store-path> --no-superblock --op list
-ceph-objectstore-tool --data-path <store-path> --no-superblock --op meta-list
-ceph-objectstore-tool --data-path <store-path> --no-superblock <object> dump
+ceph-objectstore-tool --data-path <store-path> --no-mon-config --op list
+ceph-objectstore-tool --data-path <store-path> --no-mon-config --op meta-list
+ceph-objectstore-tool --data-path <store-path> --no-mon-config \
+                      --pgid <pgid> <object-name> dump
 ceph-objectstore-tool --data-path <store-path> --op fuse \
                       --mountpoint /mnt/store    # browse it as a filesystem —
                                                  # this is FuseStore from the
                                                  # not-FUSE subsection
 ```
 
-`--no-superblock` matters on a fio-created store: only a real OSD ever
-writes the *OSD* superblock object, and the object ops abort without
-it. `--op fuse` doesn't check, and `ceph-kvstore-tool` /
-`ceph-bluestore-tool` sit below the OSD layer entirely, so those work
-on fio stores unflagged.
+```console
+$ ceph-objectstore-tool --data-path /mnt/fio-bluestore --no-mon-config --op list
+["281474976710657.7",{"oid":"","key":"","snapid":-2,"hash":7,"max":0,"pool":281474976710657,"namespace":"","max":0}]
+["281474976710657.7",{"oid":"/mnt/fio-bluestore/bluestore.0.15","key":"","snapid":-2,"hash":7,"max":0,"pool":281474976710657,"namespace":"","max":0}]
+...                    # 72 rows: 64 data objects + 8 pgmeta (the empty oids)
+
+$ ceph-objectstore-tool --data-path /mnt/fio-bluestore --no-mon-config --op meta-list
+["meta",{"oid":"osd_superblock","key":"","snapid":0,"hash":599981278,"max":0,"pool":-1,"namespace":"","max":0}]
+```
+
+That `osd_superblock` is also why no `--no-superblock` flag appears
+above: the engine writes a real OSD superblock at mkfs
+([`fio_ceph_objectstore.cc:274`](https://github.com/ceph/ceph/blob/v21.3.0/src/test/fio/fio_ceph_objectstore.cc#L274))
+precisely so these ops work. Older engines did not — that is what the
+flag was for; here it only triggers a noisy per-object attr scan.
+
+`dump` walks the whole metadata chain of the data-structures section
+for one object. Two quirks: use `--pgid` plus the plain name (feeding
+back a JSON row from `--op list` trips a pool-id comparison against
+the engine's 2^48-sized pool at this tag), and expect `Error getting
+attr … (61) No data available` — object-info and snapset attrs belong
+to the OSD layer, which never ran here; the dump is complete
+regardless:
+
+```console
+$ ceph-objectstore-tool --data-path /mnt/fio-bluestore --no-mon-config \
+      --pgid 281474976710657.0 /mnt/fio-bluestore/bluestore.0.0 dump
+{
+    "id": { "oid": "/mnt/fio-bluestore/bluestore.0.0", "hash": 0,
+            "pool": 281474976710657, ... },
+    "stat": { "size": 4194304, "blksize": 4096, "blocks": 1024, ... },
+    "onode": {
+        "nid": 10,
+        "size": 4194304,
+        "extent_map_shards": [
+            { "offset": 0, "bytes": 453 },
+            { "offset": 393216, "bytes": 455 },
+            ...                                        10 shards total
+        ],
+        "extents": [
+            { "logical_offset": 0, "length": 65536, "blob_offset": 0,
+              "blob": {
+                  "extents": [ { "offset": 297807872, "length": 65536 } ],
+                  "logical_length": 65536,
+                  "csum_type": 4,
+                  "csum_chunk_order": 12,
+                  "csum_data": [ 1608458274, ... 16 values ... ] } },
+            ...                                        64 extents total
+```
+
+Onode (nid 10, 4 MiB) → 10 extent-map shards — the `x` keys of the
+previous section, second shard at 393216 = `0x60000` — → 64 logical
+extents, one per 64 KiB write, each backed by a blob holding one
+physical extent on `block` plus its checksums: `csum_type` 4 is crc32c
+(`Checksummer.h`), `csum_chunk_order` 12 is 4 KiB chunks, hence 16
+`csum_data` values per 64 KiB blob. The Onode / ExtentMap / Extent /
+Blob / pextent chain, live.
 
 ## Reading BlueFS and its journal
 
@@ -2106,6 +2251,122 @@ ceph-bluestore-tool --path <store-path> fsck --deep on    # full consistency wal
 ceph-bluestore-tool --path <store-path> free-dump         # freelist contents
 ```
 
+On the three-device store the journal dump names its devices first,
+and the log file's own extents sit on the WAL tier:
+
+```console
+$ ceph-bluestore-tool --path /mnt/fio-bluestore bluefs-log-dump
+ slot 2 /mnt/fio-bluestore/block -> /dev/sda
+ slot 1 /mnt/fio-bluestore/block.db -> /dev/vdb
+ slot 0 /mnt/fio-bluestore/block.wal -> /dev/nvme0n1
+ log_fnode file(ino 1 size 0x1000 ... extents [0:0x100000~400000])
+ 0x0: txn(seq 1 len 0x1 crc 0x5fe92fad)
+ 0x0:  op_init
+ 0x1000: txn(seq 2 len 0xaa crc 0x6cfc8c72)
+ 0x1000:  op_dir_create db
+ 0x1007:  op_dir_create db.slow
+ 0x1013:  op_dir_create db.wal
+ 0x101e:  op_file_update  file(ino 2 size 0x0 ... extents [])
+ 0x1034:  op_dir_link  db/LOCK to 2
+ 0x104b:  op_file_update  file(ino 3 size 0x0 ... extents [])
+ 0x1061:  op_dir_link  db/000000.dbtmp to 3
+ 0x1080:  op_file_update_inc  delta(ino 3 size 0x24 ... extents [1:0x100000~100000])
+ 0x2000: txn(seq 3 len 0x32 crc 0xc30d5861)
+ 0x2000:  op_dir_link  db/IDENTITY to 3
+ 0x201b:  op_dir_unlink  db/000000.dbtmp
+...
+```
+
+Replay from offset 0: mkfs creates the three tier directories, then
+RocksDB's write-temp-then-rename idiom lands as journal ops —
+`000000.dbtmp` written, hard-linked to `IDENTITY`, temp name unlinked.
+Extents read `device:offset~length`, and the device ids are the tiers:
+0 = WAL, 1 = DB, 2 = slow. The whole journal decodes to ~230 lines —
+42 `op_dir_link`, 41 `op_file_update_inc`, 33 `op_dir_unlink`, 25
+`op_file_update`, 16 `op_file_remove` — the store's entire filesystem
+history on one screen.
+
+`bluefs-export` materializes those directories as an ordinary RocksDB:
+
+```console
+$ ceph-bluestore-tool --path /mnt/fio-bluestore bluefs-export --out-dir /tmp/bfs
+db/
+db/000030.sst
+db/CURRENT
+db/IDENTITY
+db/MANIFEST-000032
+...
+db.slow/
+db.wal/
+db.wal/000031.log
+```
+
+The two RocksDB write streams as files: the SST under `db/` (extents
+on vdb), the live WAL segment under `db.wal/` (nvme0n1), and
+`db.slow/` empty — nothing spilled to sda.
+
+One store, three bdevs, one `osd_uuid` tying the labels together:
+
+```console
+$ ceph-bluestore-tool --path /mnt/fio-bluestore show-label
+{
+    "/mnt/fio-bluestore/block": {
+        "osd_uuid": "a4dec21d-b397-4a78-88a6-17279f87fcf4",
+        "size": 12884901888,
+        "btime": "2026-07-31T08:57:33.417277+0000",
+        "description": "main",
+        "bfm_blocks": "3145728",
+        "bfm_blocks_per_key": "128",
+        "bfm_bytes_per_block": "4096",
+        "bfm_size": "12884901888",
+        "bluefs": "1",
+        "elastic_shared_blobs": "1",
+        "epoch": "9",
+        "kv_backend": "rocksdb",
+        "multi": "yes",
+        "type": "bluestore",
+        "locations": [ "0x0", "0x40000000", "0x280000000" ]
+    },
+    "/mnt/fio-bluestore/block.wal": {
+        "osd_uuid": "a4dec21d-b397-4a78-88a6-17279f87fcf4",
+        "size": 8589934592,
+        "description": "bluefs wal",
+        "locations": [ "0x0" ]
+    },
+    "/mnt/fio-bluestore/block.db": { "description": "bluefs db", ... }
+}
+```
+
+The main label carries the store identity plus the `bfm_*` freelist
+geometry — the same fields the `B` prefix stores — and `multi` /
+`locations` is label redundancy: clones at 0, 1 GiB and 10 GiB. The
+db/wal labels hold just enough to be matched to their store.
+
+```console
+$ ceph-bluestore-tool --path /mnt/fio-bluestore fsck --deep on
+fsck success
+
+$ ceph-bluestore-tool --path /mnt/fio-bluestore free-dump | head -10
+block:
+{
+    "capacity": 12884901888,
+    "alloc_unit": 4096,
+    "alloc_type": "hybrid",
+    "alloc_name": "block",
+    "extents": [
+        {
+            "offset": "0x3000",
+            "length": "0x10000000"
+```
+
+`free-dump` continues with `bluefs-db:` and `bluefs-wal:` — one hybrid
+allocator per device. And `fsck success` deserves a beat: `--deep`
+re-reads every object and verifies every checksum, and it passes on a
+store whose creating process was killed by the teardown assert
+mid-unmount. Mount replayed the WAL; nothing was lost. That is the
+crash-consistency contract, checked offline. (Outputs above are
+trimmed of timestamped tool-log lines.)
+
 Debug logs narrate the exact code paths from Part 2; set them via env
 on the standalone tools:
 
@@ -2118,8 +2379,8 @@ CEPH_ARGS="--debug_bluestore 20 --debug_bluefs 20 --log-to-stderr" \
 
 1. Build: `ninja ceph_test_objectstore fio_ceph_objectstore ceph-bluestore-tool ceph-kvstore-tool ceph-objectstore-tool`.
 2. Create a small store with the fio job; write a few MiB.
-3. `ceph-kvstore-tool ... list O` / `list b` / `stats` — match what you
-   see against the schema section's running example.
+3. `ceph-kvstore-tool ... list O` / `list b` / `histogram` — match what
+   you see against the schema section's running example.
 4. `ceph-bluestore-tool ... bluefs-log-dump` — match against the
    journal subsection's op table.
 5. Re-run fio with `debug bluestore = 20` in the conf and follow one
