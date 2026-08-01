@@ -582,6 +582,22 @@ inner annotation reappears in the outer one with exactly one letter added —
 `W`. That is not a coincidence anyone could arrange accidentally: `W` is the
 `FileWriter` lock, and the suffix composes.
 
+The mapping is corroborated independently inside `_check_vselector_LNF`,
+which takes exactly the three locks its suffix names and then says so:
+
+```cpp
+  std::lock_guard ll(log.lock);
+  std::lock_guard nl(nodes.lock);
+  // Checking vselector is under log, nodes and file(s) locks,
+  // so any modification of vselector must be under at least one of those locks.
+  ...
+    f.second->lock.lock();
+```
+
+`L`, `N`, `F` — log, nodes, file — named in prose in the one place the code
+comes close to explaining itself. It is not a legend for the convention, but
+it pins three of the five letters beyond argument.
+
 Read that way the annotations become genuinely useful. `_flush_range_F` needs
 the file lock held. `_compact_log_sync_LNF_LD` will take the log lock twice in
 separate episodes, so it must not be called with it held. And the ordering
