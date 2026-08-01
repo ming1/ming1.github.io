@@ -656,27 +656,49 @@ The allocator is selected by `bluestore_allocator`, default **`hybrid`**, and
 "hybrid" is literally a composition rather than an algorithm:
 
 ```cpp
-// HybridAllocator.h:13
+// HybridAllocator.h:12
+template <typename PrimaryAllocator>
 class HybridAllocatorBase : public PrimaryAllocator {
   std::unique_ptr<BitmapAllocator> bmap_alloc;
 ```
 
-A primary extent-based allocator carries the free space, with a
-`BitmapAllocator` held in reserve for when the extent representation grows too
-expensive. The concrete types are `HybridAvlAllocator` over `AvlAllocator`
-and `HybridBtree2Allocator` over `Btree2Allocator` — so the tree in the name
-is a choice, and the bitmap fallback is common to both.
+The `template` line matters: `PrimaryAllocator` is a parameter, not a base
+class you can go read. A primary extent-based allocator carries the free
+space and *is* the base, with a `BitmapAllocator` held in reserve for when the
+extent representation grows too expensive. The two instantiations are
+`HybridAvlAllocator` over `AvlAllocator` and `HybridBtree2Allocator` over
+`Btree2Allocator`, whose `get_type()` returns `"hybrid"` and
+`"hybrid_btree2"`.
 
-The rest of the family is still in the tree and still selectable:
-`AvlAllocator`, `BtreeAllocator`, `Btree2Allocator`, `StupidAllocator`,
-`BitmapAllocator` with `fastbmap_allocator_impl` underneath. They implement
-one interface, `Allocator`/`AllocatorBase`, which is the file to read first —
-the algorithms differ only in how they answer "give me N bytes."
+`Allocator::create()` accepts exactly six names — `stupid`, `bitmap`, `avl`,
+`btree`, `hybrid`, `hybrid_btree2`. Note what is missing: there is no
+`"btree2"`. `Btree2Allocator` exists as a class but is reachable only as the
+primary inside `hybrid_btree2`, so of the family in the tree, one member
+cannot be selected on its own. All of them derive from `AllocatorBase`, which
+derives from `Allocator` — that pair is the file to read first, since the
+implementations differ only in how they answer "give me N bytes."
 
-On the persistent side, `FreelistManager.cc` is a factory; the implementation
-is `BitmapFreelistManager`. It writes its four geometry constants once at
-mkfs and thereafter updates a bitmap through a RocksDB **merge operator**, so
-the commit path never reads the old value before writing the new one.
+## The persistent side, and why it is usually idle
+
+`FreelistManager.cc` is a factory accepting two names, `bitmap` and `null` —
+and `null` is not a second class. It returns the same
+`BitmapFreelistManager` with `set_null_manager()` applied.
+
+When it is active, updates go through a RocksDB **merge operator**: an
+`XorMergeOperator` registered as `"bitwise_xor"`, with `allocate()` and
+`release()` issuing `txn->merge(...)` rather than a read-modify-write. The
+geometry — the four constants `bytes_per_block`, `blocks_per_key`, `blocks`,
+`size` — is written once at mkfs and never merged.
+
+The catch is that both paths are guarded by `if (!is_null_manager())`, and on
+a stock OSD the null manager is what you get. `bluestore_allocation_from_file`
+defaults to **true**, so `_open_fm()` sets `freelist_type` to `null` whenever
+the DB device is non-rotational and writable, and `_init_alloc()` restores the
+allocator by deserializing a flat allocation file out of BlueFS instead. The
+file is written at `_close_db()`; only an unclean shutdown falls back to
+`read_allocation_from_drive_on_startup()`, which rebuilds by scanning every
+onode. So on a healthy modern OSD the RocksDB freelist writes nothing at all,
+and the cost of that trade is paid at the next crash, not during operation.
 
 # Part 8: cache and memory
 
@@ -697,13 +719,25 @@ never trims directly — on its `bluestore_cache_trim_interval` timer
 that. As Part 4 showed, the same loop also submits deferred writes, so it is
 not purely a cache thread.
 
-The accounting hook is `MEMPOOL_CLASS_HELPERS()` on the cached types. It is
-what makes `dump_mempools` a real answer rather than an estimate: the
-`bluestore_cache_onode`, `bluestore_cache_meta` and `bluestore_cache_data`
-figures attribute allocation back to the classes in Part 3. When an OSD is
-over its `osd_memory_target`, that output is where you look first, and the
-priority cache manager is what acts on it — rebalancing the shards from the
-same mempool thread.
+What the mempool thread does instead is decide how big each shard is allowed
+to be. With `bluestore_cache_autotune` on by default it constructs a
+`PriorityCache::Manager`, and each iteration calls `balance()` then
+`tune_memory()`, pushing the results out through `set_max()` — which is where
+the incremental eviction actually originates. The knob that gates meta
+eviction in that path is `bluestore_cache_meta_evict_in_autotune`, also
+default true.
+
+The accounting hook is `MEMPOOL_CLASS_HELPERS()` on the cached types, and it
+is what makes `dump_mempools` a real answer rather than an estimate:
+allocation is attributed back to the classes in Part 3. One wrinkle worth
+knowing before you read that output — a `Buffer` is tagged to
+`bluestore_cache_buffer`, not `bluestore_cache_data`; the payload is
+*reassigned* into `bluestore_cache_data` once the write completes. So the two
+numbers move for different reasons, and a buffer in flight is counted in
+neither place you would first look.
+
+When an OSD is over its `osd_memory_target`, this output is where to start,
+and the priority cache manager is the thing acting on it.
 
 # Part 9: the persistence substrate
 
@@ -712,18 +746,41 @@ The companion post covers the schema, the journal format, compaction and
 spillover in depth — this part is only the code coordinates and the
 concurrency, which that post does not give.
 
-`BlueRocksEnv` is the shim: a `rocksdb::Env` implementation whose
-`WritableFile::Sync()`/`Fsync()`/`Close()` call `BlueFS::fsync()` and whose
-`Directory::Fsync()` calls `BlueFS::sync_metadata()`. Every BlueFS journal
-write is therefore driven by a RocksDB durability call — there is no
-background flusher.
+`BlueRocksEnv` is the shim, and it is narrower than "a `rocksdb::Env`
+implementation" suggests: it is a `rocksdb::EnvWrapper` around
+`Env::Default()`, whose own comment says it will *"forward most of it to
+POSIX."* Only file and directory operations reach BlueFS; threads, clocks and
+the rest fall through to the ordinary POSIX env.
+
+The mapping repays a close look. `Sync()` and `Close()` both call
+`BlueFS::fsync()` — and `Close()` does *only* that, since the real close
+happens later in `~BlueRocksWritableFile()` via `close_writer()`. `Flush()`
+calls `BlueFS::flush()`, not fsync, so it moves data without a journal write.
+And `WritableFile::Fsync()` is **not overridden at all**: it resolves to
+RocksDB's base-class default, `Status Fsync() { return Sync(); }`. The net
+effect matches, but nothing in BlueStore's source implements it.
+`Directory::Fsync()` is overridden, and calls `sync_metadata()`.
+
+So journal writes are driven by RocksDB durability calls, and there is no
+*periodic* flusher in the default configuration. Not quite "none": the
+`bluefs_splctr` thread of Part 2 writes the journal on its own when
+`bluefs_spillover_cleaner` is enabled, and it is off by default.
 
 The concurrency is the part worth studying, and Part 6's suffix decode is the
 way in. BlueFS accumulates metadata ops into one in-memory
-`bluefs_transaction_t` under `log.lock`, but a file's extent and size changes
-are *not* appended there when they happen: the file is pushed onto a dirty
-list, and the op is synthesized at flush time. That is why a dump shows one
-`op_file_update_inc` per dirty file per flush rather than one per write.
+`bluefs_transaction_t` under `log.lock` — but on the *write* path a file's
+extent and size changes are not appended there when they happen. `_flush_range_F`
+touches `log.t` not at all; it only sets `is_dirty`. The file goes onto a
+dirty list, and `_consume_dirty()` synthesizes exactly one
+`op_file_update_inc` per dirty file at flush time. That is why a dump shows
+one such op per file per flush rather than one per write.
+
+Only the write path defers, though. `preallocate()`, `truncate()` and every
+namespace operation append to `log.t` inline, and `truncate()` carries the
+comment that gives the whole scheme away — *"skipping
+log.t.op_file_update_inc, it will be done by flush()."* `_consume_dirty()`
+concedes the same from the other side: *"some bluefs ops may have already
+been stored in log.t."*
 
 `log_dump()` is `_replay(noop=true, to_stdout=true)` — the dump is the mount
 path executed without applying anything, which is why `bluefs-log-dump` output
@@ -744,18 +801,33 @@ kernel device. The resulting enum then selects one of three implementations:
     return new PMEMDevice(cct, cb, cbpriv);
 ```
 
+Three, and only three, at this tag — there is no zoned or HM-SMR backend in
+`v21.3.0`. Those `return new` lines are in `create_with_type()`; `create()`
+itself is the two-step resolver above it.
+
+The probes are worth knowing because one of them explains a natural mistake.
+SPDK's `support()` does a `readlink`, takes the basename of the *symlink
+target*, and prefix-matches it — so there really is a path-prefix test in
+here, just not the one that selects the backend. PMEM's `support()` is
+content-based, mapping the file to check its type. `KernelDevice` is never
+name-matched at all; it is what you get when nothing else claims the path.
+
 `KernelDevice` is the one every normal deployment uses: O_DIRECT, with libaio
 by default and io_uring behind `bdev_ioring` (default false). Its aio thread
 is the `bstore_aio` of Part 2, and its completion dispatch is the `ioc->priv`
-branch quoted there.
+branch quoted there. Note it opens the device more than once — a `fd_directs`
+array alongside `fd_buffereds`, so a caller that asks for buffered access gets
+a different descriptor rather than a different code path.
 
-Durability is `KernelDevice::flush()`, and two details matter. It short-circuits
-on an `io_since_flush` flag, so a redundant flush costs no syscall at all.
-And when it does act, it issues `::fdatasync` on the device fd — necessary
-precisely *because* the writes were O_DIRECT, which bypasses the page cache
-but does not guarantee the drive's volatile write cache has been emptied.
-That `fdatasync` is the instruction behind every "committed" callback in
-Part 1.
+Durability is `KernelDevice::flush()`, and two details matter. It
+short-circuits on an `io_since_flush` compare-and-exchange, so a redundant
+flush issues no syscall — though it still takes `flush_mutex` first, so
+"free" is not quite the word. And when it does act it issues `::fdatasync` on
+the direct fd, necessary precisely *because* the writes were O_DIRECT: that
+bypasses the page cache but says nothing about the drive's volatile write
+cache. That `fdatasync` is the instruction behind every "committed" callback
+in Part 1, and the reason the mutex exists at all is so a thread which saw an
+aio completion cannot return before the flush covering it has been observed.
 
 # Part 11: construction and teardown
 
