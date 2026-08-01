@@ -57,8 +57,9 @@ Where things live, and which part covers them:
 One orientation rule before starting: the `_`-prefixed methods are internal
 helpers; the public ones are those named in `ObjectStore.h`. Beyond that,
 resist the temptation to read the prefix as a locking convention. It is not
-one — across 168 `BlueStore::_*` definitions, exactly **3** assert that a
-lock is held.
+one — across 170 `BlueStore::_*` definitions, exactly **2** assert that a
+lock is held. The whole file contains only three such assertions; the third
+sits in `Collection::get_onode`, which is not a `_`-method at all.
 
 That absence is itself worth knowing, because the same codebase solves the
 problem the opposite way one directory over. BlueFS encodes its lock
@@ -96,10 +97,12 @@ solely inside `#ifdef WITH_BLKIN` — on a stock build it is a dead parameter.
 The return value is the part to internalize: **BlueStore always returns 0**
 (`BlueStore.cc:16088`). There is no error path. A transaction that cannot be
 applied does not fail — it aborts the process. `_txc_add_transaction` tolerates
-`-ENOENT` for most ops, treats it as a bug for clone and omap mutations
-(`"ENOENT on clone suggests osd bug"`), and deliberately crashes on `-ENOSPC`
-rather than partially applying. The interface is not "try this and tell me";
-it is "this must succeed."
+`-ENOENT` for most ops but treats it as a bug for the clone, attribute and
+omap mutations (`"ENOENT on clone suggests osd bug"`), and deliberately
+crashes on `-ENOSPC` rather than partially applying. The single escape is a
+debug build with `objectstore_debug_throw_on_failed_txc`, which unwinds the
+transaction and throws a raw `int` instead of aborting. The interface is not
+"try this and tell me"; it is "this must succeed."
 
 Two related sharp edges. An object op naming a collection that was never
 opened dereferences a null `CollectionRef` — a segfault, not an error. And a
@@ -108,7 +111,7 @@ single transaction may not span pools; that is asserted, not returned.
 ## What "applied" and "committed" actually mean
 
 `Transaction` carries three callback lists — `on_applied_sync`, `on_applied`,
-`on_commit` — and the header describes them in FileStore's terms. In BlueStore
+`on_commit` — and `Transaction.h` describes them in FileStore's terms. In BlueStore
 the first two fire from adjacent statements at the *end of the submitting
 call*, before any I/O has happened:
 
@@ -139,7 +142,7 @@ a FileStore-shaped hole that BlueStore fills trivially, which is why
 
 Only `on_commit` means durable. It fires from `_txc_committed_kv`
 (`BlueStore.cc:14952`) after `db->submit_transaction_sync()`, on the
-`bstore_kv_final` thread — Part 2's fourth thread. Note the header's claim
+`bstore_kv_final` thread — Part 2's fourth thread. Note `Transaction.h`'s claim
 that `on_applied` runs "from the separate Finisher thread" is wrong in a real
 OSD: when the OSD installs a `commit_queue`, both lists land on the OSD shard
 queue instead, and BlueStore's own `cfin` finisher sits idle.
@@ -234,6 +237,25 @@ caller blocked in `aio_wait()`. Only the device created in BlueStore has
 `aio_cb` wired, and only its thread reaches the state machine. "The aio
 thread advances the transaction" is true of exactly one of them.
 
+Be precise about the mechanism, because the branch does not test the device's
+callback at all — it tests the *IOContext*:
+
+```cpp
+// KernelDevice.cc:750
+if (ioc->priv) {
+  if (--ioc->num_running == 0) {
+    aio_callback(aio_callback_priv, ioc->priv);
+  }
+} else {
+  ioc->try_aio_wake();
+}
+```
+
+BlueFS builds its contexts with a null priv (`new IOContext(cct, NULL)`,
+`BlueFS.cc:569`) while a `TransContext` passes `this` (`ioc(cct, this)`). The
+null device callback and the null priv travel together, but `priv` is what the
+code reads.
+
 Note what is *absent*: no `bstore_discard`. It is gated twice — the pool size
 comes from `bdev_async_discard_threads` (default **0**) and is forced to zero
 unless `bdev_enable_discard` (default **false**) — so a stock OSD runs none.
@@ -320,7 +342,7 @@ enum is a menu, not an itinerary.
 | `STATE_KV_QUEUED` | *nothing* — parking state in `kv_queue` | — |
 | `STATE_KV_SUBMITTED` | `bstore_kv_final` | takes `osr->qlock` |
 | `STATE_KV_DONE` | `bstore_kv_final`; the mount thread during replay | none |
-| `STATE_DEFERRED_QUEUED` | *nothing* — parking state | `osr->deferred_lock` while parked |
+| `STATE_DEFERRED_QUEUED` | *nothing* — parking state | none held; `osr->deferred_lock` guards the batch |
 | `STATE_DEFERRED_CLEANUP` | `bstore_kv_final`; *set* by `bstore_aio` | none |
 | `STATE_DEFERRED_DONE` | never — dead code | — |
 | `STATE_FINISHING` | `bstore_kv_final` | takes `osr->qlock` |
@@ -410,7 +432,9 @@ The payload then rejoins on `bstore_aio` through `_deferred_aio_finish`, which
 sets `STATE_DEFERRED_CLEANUP` directly — again without going through
 `_txc_state_proc` — and queues the batch for `bstore_kv_sync` to promote from
 done to stable, after which `bstore_kv_final` retires it. So a deferred
-transaction crosses `bstore_aio` and `bstore_kv_sync` **twice**.
+transaction visits `bstore_kv_sync` and `bstore_kv_final` **twice** each. It
+touches `bstore_aio` only once, on the way back — there was no aio at prepare
+time to visit it the first time.
 
 ## Why completion order survives out-of-order I/O
 
