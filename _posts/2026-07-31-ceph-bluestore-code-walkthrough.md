@@ -836,9 +836,11 @@ Deliberately last: by now every component being assembled is familiar.
 
 `mkfs()` is idempotent — it checks the `mkfs_done` marker and returns early if
 the store already exists, which is why re-running it against a live store is
-safe rather than catastrophic. `mount()` forwards to `_mount()`, which opens
-the devices, mounts BlueFS, opens RocksDB, replays any deferred writes and
-starts the threads of Part 2.
+safe rather than catastrophic. `mount()` forwards to `_mount()`, which opens the
+devices, mounts BlueFS, opens RocksDB and the collections, then **starts the
+KV threads before replaying** — `_kv_start()` brings up the finisher,
+`bstore_kv_sync` and `bstore_kv_final`, and only then does `_deferred_replay()`
+run. The mempool thread starts last, after replay.
 
 Deferred replay is the interesting corner. `_deferred_replay` fabricates a
 `TransContext`, sets it to `STATE_KV_DONE` and calls `_txc_state_proc`
@@ -903,27 +905,40 @@ txc; and, if any op qualifies, a [`bluestore_deferred_transaction_t`](https://gi
 5. **Cost it.** [`_txc_calc_cost(txc)`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L14583) computes what this transaction will
    charge against the throttle.
 6. **Serialize the metadata.** [`_txc_write_nodes(txc, txc->t)`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L14789) encodes every
-   dirty onode and shard into the KV transaction. Until this point the changes
-   existed only as in-memory objects.
+   dirty onode, extent-map shard and shared-blob record into the KV
+   transaction. Until this point *those* changes existed only as in-memory
+   objects — omap and collection ops already wrote their own keys into
+   `txc->t` back in step 4.
 7. **Journal deferred payloads.** If `txc->deferred_txn` exists, stamp it with
    `++deferred_seq`, encode it, and put it under its `L` key — this is how a
    small write's data gets into the RocksDB transaction rather than onto the
    device.
-8. **Throttle.** `throttle.try_start_transaction(...)`, and if it cannot start,
-   raise `deferred_aggressive` and call [`deferred_try_submit()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15690) to drain
-   rather than block behind deferred work. Then
-   `throttle.finish_start_transaction()`.
-9. **Enter the state machine.** [`_txc_state_proc(txc)`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L14634) — `STATE_PREPARE` runs
-   right here, on the caller's thread, as Part 4 traced.
-10. **Fire the applied callbacks.** `on_applied_sync` inline, `on_applied`
-    queued to the collection's `commit_queue`. Then `return 0`, always.
+8. **Commit the space accounting.**
+   [`_txc_finalize_kv(txc, txc->t)`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L14853)
+   reconciles the allocated and released interval sets — so a region both
+   allocated and freed in one transaction cancels out — then calls
+   `fm->allocate()` / `fm->release()` into the same KV transaction and updates
+   the statfs counters. This is where the freelist changes of Part 7 join the
+   commit.
+9. **Throttle.** `throttle.try_start_transaction(...)`. The "try" concerns only
+   the *deferred* byte pool; the call blocks unconditionally in
+   `throttle_bytes.get(txc.cost)` regardless. If the deferred pool cannot be
+   had, raise `deferred_aggressive`, call
+   [`deferred_try_submit()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15690) to drain
+   rather than block behind deferred work, wake the kv_sync thread, and lower
+   `deferred_aggressive` again.
+10. **Enter the state machine.** [`_txc_state_proc(txc)`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L14634) — `STATE_PREPARE`
+    runs right here, on the caller's thread, as Part 4 traced.
+11. **Fire the applied callbacks.** `on_applied_sync` inline; `on_applied`
+    queued to the collection's `commit_queue`, or to BlueStore's own finisher
+    if the OSD never installed one. Then `return 0`, always.
 
-Steps 1–8 all run on the caller's thread, and no other thread *advances* the
-transaction until step 9 submits its I/O. Note the txc is nonetheless on
+Steps 1–9 all run on the caller's thread, and no other thread *advances* the
+transaction until step 10 enters the state machine. Note the txc is nonetheless on
 `osr->q` from step 3 onward, so it is structurally visible to anything walking
 that queue under `qlock` — `_txc_finish_io` can see it as a predecessor
 blocking a later transaction. Queued is not the same as running. If you are
-adding work to the write path, steps 1–8 are where it goes, and it is charged
+adding work to the write path, steps 1–9 are where it goes, and it is charged
 to an OSD op thread rather than to BlueStore.
 
 ## `read()`
