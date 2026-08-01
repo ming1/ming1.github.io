@@ -67,9 +67,10 @@ problem the opposite way one directory over. BlueFS encodes its lock
 expectations in the *function names* — `_flush_and_sync_log_LD`,
 `_compact_log_async_LD_LNF_D` — and backs them with 18 `ceph_mutex_is_locked`
 assertions. So the practical advice differs by subsystem: in BlueFS you can
-read the signature and know what is held; in BlueStore you must trace the
-callers. Part 6 decodes the BlueFS suffixes, which have no legend anywhere in
-the tree.
+read the signature and know what a function will *take*; in BlueStore you
+must trace the callers for even that. Part 6 decodes those suffixes: a legend
+for them does exist, but it is an easily-missed comment at the bottom of
+`BlueFS.h`, and it gives the letters without the grammar.
 
 # Part 1: the contract
 
@@ -549,13 +550,28 @@ convention rather than by mutual exclusion.
 ## BlueFS: decoding the function-name suffixes
 
 BlueFS annotates its functions with letter suffixes — `_LD`, `_LNF`,
-`_LNF_NF_LD_D`, `_WF_WD_WLD_WLNF_WNF`. **There is no legend anywhere in the
-tree**: not in the headers, not in the `.cc`, not in the commit history. The
-mapping has to be reverse-engineered, and it is worth doing, because these
-suffixes are the only place in either subsystem where lock discipline is
-stated in the signature.
+`_LNF_NF_LD_D`, `_WF_WD_WLD_WLNF_WNF`. They are the only place in either
+subsystem where lock discipline is stated in the signature.
 
-BlueFS has exactly five relevant mutexes, and the letters are their initials:
+There *is* a legend, and it is easy to miss — a comment at the very bottom of
+`BlueFS.h`, below the vselector classes, giving both the letters and the
+acquisition order as a graph:
+
+```
+ *     >        | W | L | N | D | F
+ * -------------|---|---|---|---|---
+ * FileWriter W |   | > | > | > | >
+ * log        L |       | > | > | >
+ * nodes      N |           | > | >
+ * dirty      D |           |   | >
+ * File       F |
+ *
+ * Claim: Deadlock is possible IFF graph contains cycles.
+```
+
+So the letters are settled, and the order is W < L < N < D < F — note that
+`dirty` nests *under* both log and nodes rather than being taken alongside
+them:
 
 | Letter | Lock | `BlueFS.h` |
 |---|---|---|
@@ -565,10 +581,20 @@ BlueFS has exactly five relevant mutexes, and the letters are their initials:
 | `F` | `BlueFS::File::lock` | 352 |
 | `W` | `BlueFS::FileWriter::lock` | 450 |
 
-Groups separated by `_` are **successive episodes**, and the letters within a
-group are the locks held *simultaneously* during that episode. So
-`_flush_and_sync_log_LD` holds log and dirty together; `_compact_log_async_LD_LNF_D`
-holds {log,dirty}, then {log,nodes,file}, then {dirty}, in that order.
+What the legend does *not* explain is the grammar of the groups, and that is
+the part worth working out. Letters within a group are held
+**simultaneously** — solid, and they always appear in the order above. But
+groups separated by `_` are **not** successive episodes, which is the reading
+the notation invites.
+
+A group is a **distinct maximal lock-set the function may acquire**, unioned
+across branches rather than sequenced. Three things force that reading.
+`_flush_and_sync_log_LD` performs three separate episodes — {log,dirty}, then
+log alone, then dirty alone — and gets one group. `sync_metadata` is
+annotated `_LNF_NF_LD_D` but its *first* act is an `LD` episode. And
+`compact_log` (`_LNF_LD_NF_D`) and `_maybe_compact_log_LNF_NF_LD_D` dispatch
+to the same two alternatives while carrying the same groups in different
+orders — which no sequential reading survives.
 
 The proof is a single pair of functions:
 
@@ -598,12 +624,17 @@ which takes exactly the three locks its suffix names and then says so:
 comes close to explaining itself. It is not a legend for the convention, but
 it pins three of the five letters beyond argument.
 
-Read that way the annotations become genuinely useful. `_flush_range_F` needs
-the file lock held. `_compact_log_sync_LNF_LD` will take the log lock twice in
-separate episodes, so it must not be called with it held. And the ordering
-across every annotation in the file is consistent — log before nodes before
-file, dirty acquired alongside log rather than nested under it — which is the
-deadlock-avoidance rule the suffixes exist to communicate.
+One more rule makes them usable: a suffix names the locks a function
+**acquires itself**, never those its caller must already hold.
+`_flush_range_F` carries only `F` despite opening with
+`ceph_assert(ceph_mutex_is_locked(h->lock))` — it *requires* `W` and *takes*
+`F`. That is precisely why the `fsync`/`_fsync` composition works: `_fsync`
+runs with the writer lock held and shows no `W`; `fsync` takes it and gains
+one in every group.
+
+So read a suffix as "the lock-sets this call may grab". A missing letter means
+either the caller already holds it, or the annotation has drifted — `truncate`
+(`_WF_L`) also takes `dirty.lock`, and no `D` appears.
 
 
 # Part 7: space — the allocator family and the freelist
@@ -612,10 +643,14 @@ This expands step 4 of the write trace: where the extents came from.
 
 Two separate mechanisms are easy to conflate, and the companion post draws the
 distinction; the code coordinates are these. The **allocator** is in-memory
-free-space policy, rebuilt at every mount. The **freelist manager** is the
-persistent record it is rebuilt *from*. Neither is the other, and a
-`free-dump` reports both — `alloc_type: hybrid` for the allocator,
-`freelist_type: bitmap` for the persistent side.
+free-space policy, reconstructed at every mount. The **freelist manager** is
+the persistent record — though on a stock OSD it is usually not the source:
+`bluestore_allocation_from_file` defaults on, so the allocator is deserialized
+from a BlueFS allocation file with `freelist_type` set to `null`, and the
+rebuild-from-onodes path runs only after an unclean shutdown. Neither is the other, and a
+`free-dump` reports the allocator as `alloc_type: hybrid`; the persistent side
+is not in that output at all — `freelist_type` is a superblock key, read with
+`ceph-kvstore-tool ... get S freelist_type`.
 
 The allocator is selected by `bluestore_allocator`, default **`hybrid`**, and
 "hybrid" is literally a composition rather than an algorithm:
@@ -654,10 +689,13 @@ before it is a performance one — each `Collection` is bound to a shard, which
 is why the header justifies per-collection onode caching as avoiding lock
 contention.
 
-Neither cache frees anything on the write path. Trimming is the
-`bstore_mempool` thread's job, on a `bluestore_cache_trim_interval` timer —
-and, as Part 4 showed, that same loop submits deferred writes, so it is not
-purely a cache thread.
+Eviction is inline, not deferred to a background thread: `BufferSpace::write()`,
+`discard()` and `did_read()` each call `cache->_trim()`, and
+`OnodeSpace::add_onode()` calls `_trim_some()`. The `bstore_mempool` thread
+never trims directly — on its `bluestore_cache_trim_interval` timer
+(default 0.05 s) it recomputes each shard's `max`, and eviction follows from
+that. As Part 4 showed, the same loop also submits deferred writes, so it is
+not purely a cache thread.
 
 The accounting hook is `MEMPOOL_CLASS_HELPERS()` on the cached types. It is
 what makes `dump_mempools` a real answer rather than an estimate: the
@@ -732,9 +770,9 @@ starts the threads of Part 2.
 Deferred replay is the interesting corner. `_deferred_replay` fabricates a
 `TransContext`, sets it to `STATE_KV_DONE` and calls `_txc_state_proc`
 **on the mounting thread** — the only time the state machine runs anywhere
-other than the four threads of Part 2. The source is candid about why the
-threads exist so early: *"we need finisher and kv_{sync,finalize}_thread
-\*just\* for replay."*
+other than the four threads of Part 2. `_fsck()` needs the same machinery and
+is candid about starting the threads solely to replay before it checks:
+*"we need finisher and kv_{sync,finalize}_thread \*just\* for replay."*
 
 `umount()` drains every sequencer, stops the KV threads, and can optionally
 run fsck on the way out, returning `-EIO` if it finds anything.
@@ -745,4 +783,4 @@ The companion post has a feature-work map organized by subsystem. The
 complement to it, from this post's angle: before changing anything in the
 write path, know which of the four threads your code will run on, and check
 whether the lock you need is already held by the caller — because in
-BlueStore, unlike BlueFS, the signature will not tell you.
+BlueStore the signature will not even tell you what the function takes.
