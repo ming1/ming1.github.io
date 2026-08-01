@@ -867,6 +867,8 @@ steps it actually performs.
 
 ## `queue_transactions()`
 
+Declared [`ObjectStore.h:241`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/ObjectStore.h#L241), implemented [`BlueStore.cc:15980`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15980).
+
 ```cpp
 int queue_transactions(CollectionHandle& ch, std::vector<Transaction>& tls,
                        TrackedOpRef op = TrackedOpRef(),
@@ -874,34 +876,33 @@ int queue_transactions(CollectionHandle& ch, std::vector<Transaction>& tls,
 ```
 
 **Who calls it.** Almost everything funnels through `PrimaryLogPG`, which
-issues `osd->store->queue_transaction(ch, std::move(t), op)` for the single
+issues [`queue_transaction(ch, std::move(t), op)`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.h#L382) for the single
 case and `queue_transactions(ch, tls, op, NULL)` for a batch — always with
-`ch` being that PG's own `PG::ch`, which is what makes the PG the unit of
+`ch` being that PG's own [`PG::ch`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PG.h#L196), which is what makes the PG the unit of
 ordering. The OSD itself calls it directly for non-PG work, on
 `service.meta_ch`.
 
-**Data structures involved.** `CollectionHandle` → `Collection` → its
-`OpSequencer`; a freshly allocated `TransContext`; the three `Context` lists
+**Data structures involved.** [`CollectionHandle`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/ObjectStore.h#L171) → [`Collection`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1716) → its [`OpSequencer`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2231); a freshly allocated [`TransContext`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1906); the three `Context` lists
 harvested off each `Transaction`; the `KeyValueDB::Transaction` inside the
-txc; and, if any op qualifies, a `bluestore_deferred_transaction_t`.
+txc; and, if any op qualifies, a [`bluestore_deferred_transaction_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h#L1363).
 
 **The steps it performs**, in order:
 
-1. **Harvest the callbacks.** `Transaction::collect_contexts` pulls
+1. **Harvest the callbacks.** [`Transaction::collect_contexts`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/Transaction.h#L338) pulls
    `on_applied`, `on_commit` and `on_applied_sync` out of every transaction in
    the batch into three flat lists.
 2. **Resolve the ordering stream.** Cast the handle to `Collection*`, take its
    `OpSequencer*`. This is the only thing that establishes order.
-3. **Create the transaction context.** `_txc_create(c, osr, &on_commit, op)`
+3. **Create the transaction context.** [`_txc_create(c, osr, &on_commit, op)`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L14558)
    allocates the `TransContext` and — importantly — queues it on `osr->q`
    *immediately*. Sequence position is fixed here, before any throttling, so
    throttling can never reorder.
 4. **Decode each transaction.** For every `Transaction` in `tls`, accumulate
-   `txc->bytes` and call `_txc_add_transaction`, which walks the op array and
+   `txc->bytes` and call [`_txc_add_transaction`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L16098), which walks the op array and
    dispatches per op code — taking `c->lock` in unique mode per object op.
-5. **Cost it.** `_txc_calc_cost(txc)` computes what this transaction will
+5. **Cost it.** [`_txc_calc_cost(txc)`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L14583) computes what this transaction will
    charge against the throttle.
-6. **Serialize the metadata.** `_txc_write_nodes(txc, txc->t)` encodes every
+6. **Serialize the metadata.** [`_txc_write_nodes(txc, txc->t)`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L14789) encodes every
    dirty onode and shard into the KV transaction. Until this point the changes
    existed only as in-memory objects.
 7. **Journal deferred payloads.** If `txc->deferred_txn` exists, stamp it with
@@ -909,10 +910,10 @@ txc; and, if any op qualifies, a `bluestore_deferred_transaction_t`.
    small write's data gets into the RocksDB transaction rather than onto the
    device.
 8. **Throttle.** `throttle.try_start_transaction(...)`, and if it cannot start,
-   raise `deferred_aggressive` and call `deferred_try_submit()` to drain
+   raise `deferred_aggressive` and call [`deferred_try_submit()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15690) to drain
    rather than block behind deferred work. Then
    `throttle.finish_start_transaction()`.
-9. **Enter the state machine.** `_txc_state_proc(txc)` — `STATE_PREPARE` runs
+9. **Enter the state machine.** [`_txc_state_proc(txc)`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L14634) — `STATE_PREPARE` runs
    right here, on the caller's thread, as Part 4 traced.
 10. **Fire the applied callbacks.** `on_applied_sync` inline, `on_applied`
     queued to the collection's `commit_queue`. Then `return 0`, always.
@@ -923,6 +924,8 @@ it goes — and it is charged to an OSD op thread, not to BlueStore.
 
 ## `read()`
 
+Declared [`ObjectStore.h:486`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/ObjectStore.h#L486), implemented [`BlueStore.cc:12759`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L12759).
+
 ```cpp
 int read(CollectionHandle &c, const ghobject_t& oid, uint64_t offset,
          size_t len, ceph::buffer::list& bl, uint32_t op_flags = 0) override;
@@ -932,7 +935,7 @@ int read(CollectionHandle &c, const ghobject_t& oid, uint64_t offset,
 
 **Steps.** Return `-ENOENT` if the collection does not exist; take `c->lock`
 **shared**; resolve the onode, `-ENOENT` if absent; apply the
-zero-offset-zero-length whole-object convention; then `_do_read`, which faults
+zero-offset-zero-length whole-object convention; then [`_do_read`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L13138), which faults
 in the covering extent-map shards, walks to the blobs, submits device reads
 and waits on them inline, verifying checksums before returning the byte count.
 
@@ -941,21 +944,21 @@ occupies an OSD op thread for its full duration.
 
 ## Collection lifecycle
 
-`open_collection(cid)` returns a handle or a **null** one — not an error code
-— so the caller must test it. `create_new_collection(cid)` builds the
+[`open_collection(cid)`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L12603) returns a handle or a **null** one — not an error code
+— so the caller must test it. [`create_new_collection(cid)`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L12608) builds the
 `Collection`, binds it to onode and buffer cache shards, attaches an
 `OpSequencer`, and files it under `new_coll_map`; it becomes visible to
 `open_collection` only when a transaction carrying `OP_MKCOLL` runs
-`_create_collection`, which moves it to `coll_map`.
-`set_collection_commit_queue` is what the OSD uses to redirect completion
+[`_create_collection`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L18919), which moves it to `coll_map`.
+[`set_collection_commit_queue`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L12622) is what the OSD uses to redirect completion
 callbacks onto its own shard queue, and it silently does nothing if the cid is
 unknown.
 
 ## `mount()` / `mkfs()` / `umount()`
 
-`mkfs()` is idempotent through the `mkfs_done` marker, though "returns early"
+[`mkfs()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L8662) is idempotent through the `mkfs_done` marker, though "returns early"
 is conditional — with `bluestore_fsck_on_mkfs` set it runs a full fsck first
-and may return its error. `mount()` is an inline forwarder to `_mount()`.
-`umount()` drains every sequencer, shuts down the mempool thread, stops the KV
+and may return its error. `mount()` is an inline forwarder to [`_mount()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L9556).
+[`umount()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L9665) drains every sequencer, shuts down the mempool thread, stops the KV
 threads, and optionally fscks on the way out — `bluestore_fsck_on_umount`,
 default false — returning `-EIO` when that finds a positive error count.
