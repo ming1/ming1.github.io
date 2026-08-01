@@ -677,8 +677,11 @@ is identical to what `debug_bluefs = 20` logs during a real mount.
 
 # Part 10: the device layer
 
-`src/blk/` is small and worth reading in full. `BlockDevice::create` picks the
-backend by path prefix, and there are three:
+`src/blk/` is small and worth reading in full. `BlockDevice::create` resolves
+the backend in two steps: if the `bdev_type` config option is set it is taken
+literally, otherwise `detect_device_type(path)` asks each compiled-in backend
+`support(path)` in turn — SPDK first, then PMEM, falling through to the
+kernel device. The resulting enum then selects one of three implementations:
 
 ```cpp
 // BlockDevice.cc:150-158
