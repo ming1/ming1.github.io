@@ -31,8 +31,9 @@ not work. What works is knowing the doorways, knowing who runs the code, and
 then following one operation all the way down. That is the shape of this post:
 the API contract (Part 1), the threads (Part 2), the objects and their
 lifetimes (Part 3), then one 64 KiB write traced from `queue_transactions()`
-to the device (Part 4) — after which every remaining part expands a step of
-that trace.
+to the device (Part 4). The read path (Part 5) is a short contrast, Part 6
+consolidates the locking, and Parts 7 onward each expand one step of the
+write trace.
 
 Two conventions throughout. Everything is pinned to `v21.3.0`; where the code
 disagrees with its own comments, the post says so. And where a mechanism is
@@ -369,6 +370,44 @@ The last gap explains the shape of the capture. Between `io_done` on
 state machine is driven by three threads, not four; kv_sync mutates state
 without dispatching on it.
 
+# Part 3: the nouns, and who owns them
+
+The companion post explains what these objects *mean*. Here they are C++
+objects with lifetimes you can get wrong.
+
+Almost everything in the metadata layer is intrusively refcounted with an
+`std::atomic_int nref` and tagged into a mempool:
+
+| Type | `BlueStore.h` | Refcounted | Lives in |
+|---|---|---|---|
+| `Onode` | 1379 | yes (1382) | its `Collection`'s `OnodeSpace` |
+| `Blob` | 658 | yes (661) | referenced by the onode's `ExtentMap` |
+| `SharedBlob` | 554 | yes (557) | a `SharedBlobSet`, only when cloned |
+| `Buffer` / `BufferSpace` | 320 / 427 | no — owned by the space | per-collection cache shard |
+| `Collection` | 1716 | via `CollectionImpl` | `coll_map` / `new_coll_map` |
+| `OpSequencer` | 2231 | yes | a `Collection`, or `zombie_osr_set` |
+| `TransContext` | 1906 | no — explicitly deleted | `osr->q` until `_txc_finish` |
+
+Two consequences worth internalizing before you touch any of it.
+
+**Caching is per-collection, and that is a locking decision.** Each
+`Collection` owns an `OnodeSpace`, and the header says why in one line: to
+*"cache onodes on a per-collection basis to avoid lock contention."* The
+collection's own lock is a `ceph::shared_mutex`, so readers share and writers
+exclude — which is why `_txc_add_transaction` takes it in unique mode while
+the read path takes it shared.
+
+**`TransContext` is the odd one out.** It is not refcounted. It is created in
+`_txc_create`, lives on `osr->q`, and is `delete`d in `_txc_finish` — by
+`bstore_kv_final`, on a different thread from the one that made it. That is
+why the deferred path's comment `// this may destroy txc` matters, and why
+the state machine never touches a transaction after handing it forward.
+
+The `MEMPOOL_CLASS_HELPERS()` on each type is the hook that makes
+`dump_mempools` meaningful: allocation is attributed per type, so the
+`bluestore_cache_onode` / `bluestore_cache_meta` / `bluestore_cache_data`
+numbers you can read from the admin socket map straight back to these classes.
+
 # Part 4: one write, end to end
 
 Two writes, actually. The same object size decides which of two quite
@@ -456,3 +495,235 @@ reached `io_done`, it returns and lets that one do the work later. Otherwise
 it walks forward, advancing the whole contiguous run of completed
 transactions. Ordering is a property of the queue, not of the completions —
 which is precisely why `OpSequencer` and not the aio thread owns the sequence.
+
+# Part 5: one read, end to end
+
+Reads are instructive by contrast: no state machine, no journal, no thread
+handoff. `BlueStore::read` runs entirely on the caller's thread.
+
+The shape is a lookup and a device read. Take `c->lock` **shared**, resolve
+the onode through the collection's `OnodeSpace`, then fault in whichever
+extent-map shards cover the requested range, walk the `ExtentMap` to find the
+`Blob`s, issue the device reads, and verify checksums before returning.
+
+Two details that catch people:
+
+**Reading past EOF returns 0, not an error** — stated in `ObjectStore.h` and
+honoured by BlueStore, which returns `-ENOENT` only for a missing collection
+or onode.
+
+**`read(c, oid, 0, 0, bl)` means "the whole object".** BlueStore special-cases
+zero offset with zero length into `length = o->onode.size`. Nothing in
+`ObjectStore.h` documents this; it is a convention you learn from the
+implementation.
+
+Because the whole path is synchronous on the caller's thread, a slow device
+read blocks an OSD op thread directly — there is no equivalent of the write
+path's handoff to `bstore_aio`. That asymmetry is the reason read latency and
+write latency have such different shapes under load.
+
+
+# Part 6: the locking reference
+
+Now that the threads and the objects are known, the locks can be tabulated.
+
+## BlueStore
+
+| Lock | Type | Protects |
+|---|---|---|
+| `Collection::lock` | `shared_mutex` | the collection's onodes; shared for reads, unique for mutations |
+| `OpSequencer::qlock` | mutex | `osr->q`, transaction states, `oncommits` |
+| `kv_lock` | mutex | `kv_queue`, `kv_queue_unsubmitted`, `deferred_done_queue` |
+| `kv_finalize_lock` | mutex | `kv_committing_to_finalize`, `deferred_stable_to_finalize` |
+| `OpSequencer::deferred_lock` | mutex | the sequencer's pending/running deferred batches |
+| `deferred_lock` | mutex | the store-wide queue of sequencers with deferred work |
+
+One caveat that matters if you are auditing: **not every queue is guarded
+where it is used.** `kv_committing` is documented under `kv_lock`, but
+`_kv_sync_thread` iterates and mutates it after unlocking. That is safe only
+because kv_sync is its sole accessor between the two swaps, and the invariant
+is enforced by an assertion — `ceph_assert(kv_committing.empty())` — which
+does run under the lock. It is correct, but it is correct by ownership
+convention rather than by mutual exclusion.
+
+## BlueFS: decoding the function-name suffixes
+
+BlueFS annotates its functions with letter suffixes — `_LD`, `_LNF`,
+`_LNF_NF_LD_D`, `_WF_WD_WLD_WLNF_WNF`. **There is no legend anywhere in the
+tree**: not in the headers, not in the `.cc`, not in the commit history. The
+mapping has to be reverse-engineered, and it is worth doing, because these
+suffixes are the only place in either subsystem where lock discipline is
+stated in the signature.
+
+BlueFS has exactly five relevant mutexes, and the letters are their initials:
+
+| Letter | Lock | `BlueFS.h` |
+|---|---|---|
+| `L` | `BlueFS::log.lock` | 610 |
+| `N` | `BlueFS::nodes.lock` | 600 |
+| `D` | `BlueFS::dirty.lock` | 618 |
+| `F` | `BlueFS::File::lock` | 352 |
+| `W` | `BlueFS::FileWriter::lock` | 450 |
+
+Groups separated by `_` are **successive episodes**, and the letters within a
+group are the locks held *simultaneously* during that episode. So
+`_flush_and_sync_log_LD` holds log and dirty together; `_compact_log_async_LD_LNF_D`
+holds {log,dirty}, then {log,nodes,file}, then {dirty}, in that order.
+
+The proof is a single pair of functions:
+
+```cpp
+int BlueFS::fsync(FileWriter *h)                    /*_WF_WD_WLD_WLNF_WNF*/
+int BlueFS::_fsync(FileWriter *h, bool force_dirty) /*_F_D_LD_LNF_NF*/
+```
+
+`fsync` does nothing but take `h->lock` and call `_fsync`. Every group in the
+inner annotation reappears in the outer one with exactly one letter added —
+`W`. That is not a coincidence anyone could arrange accidentally: `W` is the
+`FileWriter` lock, and the suffix composes.
+
+Read that way the annotations become genuinely useful. `_flush_range_F` needs
+the file lock held. `_compact_log_sync_LNF_LD` will take the log lock twice in
+separate episodes, so it must not be called with it held. And the ordering
+across every annotation in the file is consistent — log before nodes before
+file, dirty acquired alongside log rather than nested under it — which is the
+deadlock-avoidance rule the suffixes exist to communicate.
+
+
+# Part 7: space — the allocator family and the freelist
+
+This expands step 4 of the write trace: where the extents came from.
+
+Two separate mechanisms are easy to conflate, and the companion post draws the
+distinction; the code coordinates are these. The **allocator** is in-memory
+free-space policy, rebuilt at every mount. The **freelist manager** is the
+persistent record it is rebuilt *from*. Neither is the other, and a
+`free-dump` reports both — `alloc_type: hybrid` for the allocator,
+`freelist_type: bitmap` for the persistent side.
+
+The allocator is selected by `bluestore_allocator`, default **`hybrid`**, and
+"hybrid" is literally a composition rather than an algorithm:
+
+```cpp
+// HybridAllocator.h:13
+class HybridAllocatorBase : public PrimaryAllocator {
+  std::unique_ptr<BitmapAllocator> bmap_alloc;
+```
+
+A primary extent-based allocator carries the free space, with a
+`BitmapAllocator` held in reserve for when the extent representation grows too
+expensive. The concrete types are `HybridAvlAllocator` over `AvlAllocator`
+and `HybridBtree2Allocator` over `Btree2Allocator` — so the tree in the name
+is a choice, and the bitmap fallback is common to both.
+
+The rest of the family is still in the tree and still selectable:
+`AvlAllocator`, `BtreeAllocator`, `Btree2Allocator`, `StupidAllocator`,
+`BitmapAllocator` with `fastbmap_allocator_impl` underneath. They implement
+one interface, `Allocator`/`AllocatorBase`, which is the file to read first —
+the algorithms differ only in how they answer "give me N bytes."
+
+On the persistent side, `FreelistManager.cc` is a factory; the implementation
+is `BitmapFreelistManager`. It writes its four geometry constants once at
+mkfs and thereafter updates a bitmap through a RocksDB **merge operator**, so
+the commit path never reads the old value before writing the new one.
+
+# Part 8: cache and memory
+
+Where the OSD's memory behaviour is actually decided.
+
+BlueStore runs two distinct caches, both sharded: an **onode cache**
+(`OnodeCacheShard`, `BlueStore.h:1610`) and a **buffer cache**
+(`BufferCacheShard`, `BlueStore.h:1632`). Sharding is a locking decision
+before it is a performance one — each `Collection` is bound to a shard, which
+is why the header justifies per-collection onode caching as avoiding lock
+contention.
+
+Neither cache frees anything on the write path. Trimming is the
+`bstore_mempool` thread's job, on a `bluestore_cache_trim_interval` timer —
+and, as Part 4 showed, that same loop submits deferred writes, so it is not
+purely a cache thread.
+
+The accounting hook is `MEMPOOL_CLASS_HELPERS()` on the cached types. It is
+what makes `dump_mempools` a real answer rather than an estimate: the
+`bluestore_cache_onode`, `bluestore_cache_meta` and `bluestore_cache_data`
+figures attribute allocation back to the classes in Part 3. When an OSD is
+over its `osd_memory_target`, that output is where you look first, and the
+priority cache manager is what acts on it — rebalancing the shards from the
+same mempool thread.
+
+# Part 9: the persistence substrate
+
+RocksDB's files live on BlueFS; BlueFS's own metadata lives in its journal.
+The companion post covers the schema, the journal format, compaction and
+spillover in depth — this part is only the code coordinates and the
+concurrency, which that post does not give.
+
+`BlueRocksEnv` is the shim: a `rocksdb::Env` implementation whose
+`WritableFile::Sync()`/`Fsync()`/`Close()` call `BlueFS::fsync()` and whose
+`Directory::Fsync()` calls `BlueFS::sync_metadata()`. Every BlueFS journal
+write is therefore driven by a RocksDB durability call — there is no
+background flusher.
+
+The concurrency is the part worth studying, and Part 6's suffix decode is the
+way in. BlueFS accumulates metadata ops into one in-memory
+`bluefs_transaction_t` under `log.lock`, but a file's extent and size changes
+are *not* appended there when they happen: the file is pushed onto a dirty
+list, and the op is synthesized at flush time. That is why a dump shows one
+`op_file_update_inc` per dirty file per flush rather than one per write.
+
+`log_dump()` is `_replay(noop=true, to_stdout=true)` — the dump is the mount
+path executed without applying anything, which is why `bluefs-log-dump` output
+is identical to what `debug_bluefs = 20` logs during a real mount.
+
+# Part 10: the device layer
+
+`src/blk/` is small and worth reading in full. `BlockDevice::create` picks the
+backend by path prefix, and there are three:
+
+```cpp
+// BlockDevice.cc:150-158
+    return new KernelDevice(cct, cb, cbpriv, d_cb, d_cbpriv, dev_name);
+    return new NVMEDevice(cct, cb, cbpriv);          // SPDK
+    return new PMEMDevice(cct, cb, cbpriv);
+```
+
+`KernelDevice` is the one every normal deployment uses: O_DIRECT, with libaio
+by default and io_uring behind `bdev_ioring` (default false). Its aio thread
+is the `bstore_aio` of Part 2, and its completion dispatch is the `ioc->priv`
+branch quoted there.
+
+Durability is `KernelDevice::flush()`, and two details matter. It short-circuits
+on an `io_since_flush` flag, so a redundant flush costs no syscall at all.
+And when it does act, it issues `::fdatasync` on the device fd — necessary
+precisely *because* the writes were O_DIRECT, which bypasses the page cache
+but does not guarantee the drive's volatile write cache has been emptied.
+That `fdatasync` is the instruction behind every "committed" callback in
+Part 1.
+
+# Part 11: construction and teardown
+
+Deliberately last: by now every component being assembled is familiar.
+
+`mkfs()` is idempotent — it checks the `mkfs_done` marker and returns early if
+the store already exists, which is why re-running it against a live store is
+safe rather than catastrophic. `mount()` forwards to `_mount()`, which opens
+the devices, mounts BlueFS, opens RocksDB, replays any deferred writes and
+starts the threads of Part 2.
+
+Deferred replay is the interesting corner. `_deferred_replay` fabricates a
+`TransContext`, sets it to `STATE_KV_DONE` and calls `_txc_state_proc`
+**on the mounting thread** — the only time the state machine runs anywhere
+other than the four threads of Part 2. The source is candid about why the
+threads exist so early: *"we need finisher and kv_{sync,finalize}_thread
+\*just\* for replay."*
+
+`umount()` drains every sequencer, stops the KV threads, and can optionally
+run fsck on the way out, returning `-EIO` if it finds anything.
+
+## Where to hack
+
+The companion post has a feature-work map organized by subsystem. The
+complement to it, from this post's angle: before changing anything in the
+write path, know which of the four threads your code will run on, and check
+whether the lock you need is already held by the caller — because in
+BlueStore, unlike BlueFS, the signature will not tell you.
