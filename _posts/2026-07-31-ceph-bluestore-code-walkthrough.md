@@ -918,9 +918,13 @@ txc; and, if any op qualifies, a [`bluestore_deferred_transaction_t`](https://gi
 10. **Fire the applied callbacks.** `on_applied_sync` inline, `on_applied`
     queued to the collection's `commit_queue`. Then `return 0`, always.
 
-Steps 1–8 all run on the caller's thread before the transaction is visible to
-any BlueStore thread. If you are adding work to the write path, that is where
-it goes — and it is charged to an OSD op thread, not to BlueStore.
+Steps 1–8 all run on the caller's thread, and no other thread *advances* the
+transaction until step 9 submits its I/O. Note the txc is nonetheless on
+`osr->q` from step 3 onward, so it is structurally visible to anything walking
+that queue under `qlock` — `_txc_finish_io` can see it as a predecessor
+blocking a later transaction. Queued is not the same as running. If you are
+adding work to the write path, steps 1–8 are where it goes, and it is charged
+to an OSD op thread rather than to BlueStore.
 
 ## `read()`
 
