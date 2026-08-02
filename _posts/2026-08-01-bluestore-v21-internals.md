@@ -1745,60 +1745,33 @@ per shard, and 11 shards.
 
 #### The twelve keys, decoded
 
-Twelve RocksDB keys result, all under `O`. Here they are verbatim, exactly as
-`ceph-kvstore-tool bluestore-kv <path> list O` prints them, in the order the
-database holds them:
+Twelve RocksDB keys result, all under `O`, and all sharing a 36-byte prefix —
+verbatim from `ceph-kvstore-tool bluestore-kv <path> list O`, call it **P**:
 
 ```
-%7f%80%00%00%00%00%00%00%04%8d%d1o%86%21obj3%21%3d%ff…%fe%ff…%ffo
-%7f%80%00%00%00%00%00%00%04%8d%d1o%86%21obj3%21%3d%ff…%fe%ff…%ffo%00%00%00%00x
-%7f%80%00%00%00%00%00%00%04%8d%d1o%86%21obj3%21%3d%ff…%fe%ff…%ffo%00%06%00%00x
-%7f%80%00%00%00%00%00%00%04%8d%d1o%86%21obj3%21%3d%ff…%fe%ff…%ffo%00%0c%00%00x
-%7f%80%00%00%00%00%00%00%04%8d%d1o%86%21obj3%21%3d%ff…%fe%ff…%ffo%00%12%00%00x
-%7f%80%00%00%00%00%00%00%04%8d%d1o%86%21obj3%21%3d%ff…%fe%ff…%ffo%00%18%00%00x
-%7f%80%00%00%00%00%00%00%04%8d%d1o%86%21obj3%21%3d%ff…%fe%ff…%ffo%00%1e%00%00x
-%7f%80%00%00%00%00%00%00%04%8d%d1o%86%21obj3%21%3d%ff…%fe%ff…%ffo%00%24%00%00x
-%7f%80%00%00%00%00%00%00%04%8d%d1o%86%21obj3%21%3d%ff…%fe%ff…%ffo%00%2a%00%00x
-%7f%80%00%00%00%00%00%00%04%8d%d1o%86%21obj3%21%3d%ff…%fe%ff…%ffo%000%00%00x
-%7f%80%00%00%00%00%00%00%04%8d%d1o%86%21obj3%21%3d%ff…%fe%ff…%ffo%006%00%00x
-%7f%80%00%00%00%00%00%00%04%8d%d1o%86%21obj3%21%3d%ff…%fe%ff…%ffo%00%3c%00%00x
+P = %7f%80%00%00%00%00%00%00%04%8d%d1o%86%21obj3%21%3d%ff…%fe%ff…%ff
+     |   |                     |          |            |      |
+     |   pool 4 + 2^63         |          !obj3!=      snap   gen
+     shard_id −1, as id+0x80   hash 0x8dd16f86, bit-reversed
 ```
 
-(`%ff…%fe` and `%ff…%ff` stand for the two 8-byte runs written out in full
-below; nothing else is elided.)
-
-Every one is the same prefix, built by `_key_encode_prefix()`
-([BlueStore.cc:368](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L368)) and then `get_object_key()`. Field by field:
-
-```
-%7f  %80%00%00%00%00%00%00%04  %8d%d1o%86  %21obj3%21%3d  <snap>  <gen>  o
- 1B          8B                    4B          variable     8B      8B   1B
-```
-
-| Bytes | Field | Value here |
-|---|---|---|
-| `%7f` | shard id | `NO_SHARD` (−1), encoded `id + 0x80` |
-| `%80…%04` | pool | 4, biased by 2^63 |
-| `%8d%d1o%86` | hash | `0x8dd16f86`, bit-reversed |
-| `%21obj3%21%3d` | namespace + name | `!obj3!=` |
-| `%ff…%fe` / `%ff…%ff` | snap / generation | `CEPH_NOSNAP`, `NO_GEN` |
-| `o` | type | `ONODE_KEY_SUFFIX` |
-
-§5.2 covers why each field is shaped that way. The eleven shard keys append a
-4-byte big-endian logical offset and `EXTENT_SHARD_KEY_SUFFIX` `'x'` to that
-whole key — the strict-prefix property of §2.4.
+(`%ff…%fe` is `CEPH_NOSNAP`, `%ff…%ff` is `NO_GEN`, 8 bytes each; nothing else
+is elided.) `_key_encode_prefix()` ([BlueStore.cc:368](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L368)) builds it and
+`get_object_key()` appends the type byte `o`; §5.2 covers why each field is
+shaped that way. A shard key is the whole onode key plus a 4-byte big-endian
+logical offset and `EXTENT_SHARD_KEY_SUFFIX` `'x'` — the strict-prefix property
+of §2.4.
 
 So the **key** says which object and which logical offset; the **value** holds
-that range's extents, the blobs they point at, and the checksums. In key
-order:
+that range's extents, the blobs they point at, and the checksums. In key order:
 
-| Suffix | Value | Contents |
-|---|---|---|
-| *(none, ends at `o`)* | 410 B | onode: `nid 9330`, `size 0x400000`, attrs `_` 263 B + `snapset` 35 B, the 11-entry shard directory — 408 B, plus 2 B spanning-blob region (empty), 0 B inline extents |
-| `%00%00%00%00x` | 453 B | 6 extents, logical `0x0`–`0x60000` → device `0x19c9d000`–`0x19cfd000`; 384 B csum + 69 B framing |
-| `%00%06%00%00x` | 455 B | 6 extents, `0x60000`–`0xc0000` → `0x19cfd000`–`0x19d5d000` |
-| *… 8 more, 455 B each, 6 extents, 384 + 71 …* | | |
-| `%00%3c%00%00x` | 305 B | 4 extents, `0x3c0000`–`0x400000` → `0x1a05d000`–`0x1a09d000`; 256 + 49 |
+| Key | Value |
+|---|---|
+| `P` `o` | **410 B** — onode: `nid 9330`, `size 0x400000`, attrs `_` 263 B + `snapset` 35 B, the 11-entry shard directory. 408 B + 2 B spanning-blob region (empty) + 0 B inline extents |
+| `P` `o%00%00%00%00x` | **453 B** — 6 extents, logical `0x0`–`0x60000` → device `0x19c9d000`–`0x19cfd000`; 384 B csum + 69 B framing |
+| `P` `o%00%06%00%00x` | **455 B** — 6 extents, `0x60000`–`0xc0000` → `0x19cfd000`–`0x19d5d000` |
+| *… 8 more: `%00%0c`, `%00%12`, `%00%18`, `%00%1e`, `%00%24`, `%00%2a`, `%000`, `%006` …* | *455 B each — 6 extents, 384 + 71, device contiguous to `0x1a05d000`* |
+| `P` `o%00%3c%00%00x` | **305 B** — 4 extents, `0x3c0000`–`0x400000` → `0x1a05d000`–`0x1a09d000`; 256 + 49 |
 
 The device column runs `0x19c9d000` to `0x1a09d000` without a gap:
 `prealloc [0x19c9d000~400000]` sliced eleven ways. The shard boundary is a
