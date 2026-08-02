@@ -1873,39 +1873,27 @@ not causation.
 
 #### Why 64 blobs and not one
 
-`_set_blob_size()` ([BlueStore.cc:6106](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L6106)) takes `bluestore_max_blob_size` if set
-and otherwise the `_hdd` / `_ssd` variant, so the cap is 64 KiB and
-`_do_write_big` emits one blob per chunk. This partitions *metadata*, not
-space.
+`_set_blob_size()` ([BlueStore.cc:6106](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L6106)) caps blobs at
+`bluestore_max_blob_size_hdd` = 64 KiB and `_do_write_big` emits one per chunk.
+This partitions *metadata*, not space — all 64 share one contiguous extent.
 
-Splitting costs metadata rather than saving it: checksum volume is invariant
-under the split — the chunk is 4 KiB whatever the blob size — so what the split
-adds is 64 blob records and 64 extent records where one of each would do: most
-of the gap between the 4,853 bytes above and the ~4,100 a single blob needs.
+It costs metadata rather than saving it. Checksum volume is invariant, the
+chunk being 4 KiB whatever the blob size, so the split adds 64 blob and 64
+extent records where one of each would do — most of the gap between the 4,853
+bytes above and the ~4,100 a single blob needs. What it buys is granularity:
+the blob is the unit of four things, each of which degrades with its size.
 
-What it buys is granularity, the blob being the unit of four things that get
-expensive with size:
+| Blob is the unit of | So at 4 MiB per blob |
+|---|---|
+| **compression** — `get_release_size()` ([bluestore_types.h:1069](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h#L1069)) returns the whole logical length for a compressed blob (§2.5) | reading one byte decompresses 4 MiB — hence the separate `bluestore_compression_max_blob_size` |
+| **the `unused` bitmap** — 16 bits, whatever the blob length (§2.5) | "never written" is tracked at 256 KiB granularity instead of 4 KiB |
+| **shard containment** — a blob crossing shards is cut, or marked spanning (`blob_escapes_range()`, [BlueStore.cc:3857](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L3857)) | one blob spans all 11 shards, so it lands in the onode (§2.4) — and `can_split()` ([bluestore_types.h:610](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h#L610)) refuses for shared, compressed and `HAS_UNUSED` blobs, so cutting is not always available |
+| **clone sharing** — a `SharedBlob` is minted per blob | the whole object becomes one shared unit |
 
-- **Compression.** `get_release_size()` ([bluestore_types.h:1069](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h#L1069)) returns the
-  *whole* logical length for a compressed blob (§2.5) — hence the separate
-  `bluestore_compression_max_blob_size`.
-- **The `unused` bitmap is 16 bits** (§2.5). At 64 KiB each bit is 4 KiB —
-  exactly one AU; at 4 MiB it would be 256 KiB.
-- **Sharding.** A blob referenced from more than one shard trips
-  `blob_escapes_range()` ([BlueStore.cc:3857](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L3857)), and `reshard()` states the choice:
-  *"We have two options: (1) split the blob into pieces at the shard
-  boundaries … or (2) mark it spanning. We prefer to cut the blob if we can."*
-  §2.4 covers what spanning blobs cost, and `can_split()`
-  ([bluestore_types.h:610](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h#L610)) refuses for shared, compressed and
-  `HAS_UNUSED` blobs, so cutting is not always available.
-- **Sharing on clone**, which is per blob.
-
-64 KiB is 16 × `min_alloc_size`, the one size at which that 16-bit bitmap
-resolves to exactly one allocation unit — a fit worth noticing, though no
-comment states it as intent. The trade is a bet: an object written once and
-never touched would be cheaper as one blob, but BlueStore spends ~750 bytes up
-front because it cannot know that, and splitting later costs far more than
-splitting now.
+64 KiB is 16 × `min_alloc_size` — the one size at which that 16-bit bitmap
+resolves to exactly one AU, though no comment states it as intent. The trade is
+a bet: an object written once and never touched would be cheaper as one blob,
+but BlueStore spends ~750 bytes up front because it cannot know that.
 
 ### Case 2: 4 KiB overwrite inside that object
 
