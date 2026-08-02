@@ -1875,16 +1875,28 @@ covering `0x19c9d000~400000` and one statfs merge for pool 4 — nothing else of
 BlueStore's own; the OSD's PG-log omap writes ride in the same transaction and
 are excluded here.
 
-| What | Keys | Bytes |
-|---|---|---|
-| onode | 1 × `O …o` | 410 |
-| extent map | 11 × `O …o…x` | 4,853 |
-| freelist bits | 9 × `b`, each covering 512 KiB of device | merge ops |
-| statfs | 1 × `T` (this pool) | merge op |
+| What | Keys | Key bytes | Value bytes |
+|---|---|---|---|
+| onode | 1 × `O …o` | 37 | 410 |
+| extent map | 11 × `O …o…x` | 462 (42 each) | 4,853 |
+| freelist bits | 9 × `b`, each covering 512 KiB of device | 72 (8 each) | 9 × 16 B merge operands |
+| statfs | 1 × `T` (this pool) | 8 | one merge operand |
+| | | **579** | **5,263** + operands |
 
 The freelist row is derived, not measured: `list` cannot show it, because at
 128 blocks per key these are merges into keys that already existed. Nine
 follows from the 4 MiB extent and 512 KiB of device coverage per key.
+
+The key column is worth a moment, because nothing in BlueStore's own
+accounting includes it. `reshard_decision`'s `extent_avg` is computed from
+`inline_bl.length()` or the sum of `shard_info->bytes` — encoded *values*, in
+both branches — so `bluestore_extent_map_shard_target_size` is blind to the
+499 bytes of `O` key space this object occupies, about 9% of what RocksDB
+actually stores for it. Halving the target would roughly double the shard
+count and add another ~460 bytes of keys that the knob cannot see, which makes
+the real cost of small shards steeper than 500 bytes suggests. Object name
+length lands in the same place: it sits in the prefix every one of the twelve
+keys repeats.
 
 What is *not* in the table is `S nid_max`. It does change here, but not
 because this object consumed nid 9330 — `_assign_nid()` ([BlueStore.cc:14529](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L14529))

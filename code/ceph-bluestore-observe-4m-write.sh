@@ -127,8 +127,22 @@ PG=$(echo "$L" | sed 's/^\["\([^"]*\)".*/\1/'); OID=$(echo "$L" | cut -d$'\t' -f
 $COT --pgid "$PG" "$OID" dump 2>/dev/null > $EV/onode.json
 [ -s $EV/onode.json ] || die "empty onode dump for pgid $PG"
 ok "pgid $PG (read from --op list, never assumed)"
-start_osd
 diff $EV/crc-A.txt $EV/crc-B.txt | grep '^>' | sed 's/^> //' > $EV/chg.txt
+
+# pull the VALUE of every key this write touched, while the store is closed
+mkdir -p $EV/val; : > $EV/val/manifest.tsv
+awk -F'\t' -v o="$OBJ" '$1=="b" || $1=="T" || ($1=="O" && index($2,o))' $EV/chg.txt |
+  nl -ba -w1 -s$'\t' | while IFS=$'\t' read -r n p k _; do
+    f=$EV/val/$p$n.bin
+    $KVT get "$p" "$k" out "$f" >/dev/null 2>&1 &&
+      printf '%s\t%s\t%s\n' "$p" "$k" "$f" >> $EV/val/manifest.tsv
+  done
+ok "dumped $(wc -l < $EV/val/manifest.tsv) values"
+# the onode is the one value with a dencoder type of its own
+ONO=$(awk -F'\t' '$1=="O" && $2 !~ /x$/ {print $3; exit}' $EV/val/manifest.tsv)
+[ -n "$ONO" ] && ./bin/ceph-dencoder type bluestore_onode_t import "$ONO" \
+                   decode dump_json > $EV/val/onode-decoded.json 2>/dev/null
+start_osd
 
 echo "== 5. the keys THIS write produced"
 python3 - "$EV" "$OBJ" "$ALLOC" "$POOLID" "$SIZE" \
@@ -217,6 +231,42 @@ print(f"   extent map {tot} B for {size} B of data ({100*tot/size:.2f}%),"
 # every extent must land in exactly one shard, and csum must be 4 B per 4 KiB
 check(nex == len(ono["extents"]), f"all {nex} extents fall inside a shard")
 check(csum_tot == size // 4096 * 4, f"checksum total {csum_tot} B = 4 B per 4 KiB chunk")
+
+# --- the values themselves
+import os
+man = [l.rstrip('\n').split('\t') for l in open(f"{ev}/val/manifest.tsv")] \
+      if os.path.exists(f"{ev}/val/manifest.tsv") else []
+def hx(b, n=24):
+    return ' '.join(f'{c:02x}' for c in b[:n]) + (' …' if len(b) > n else '')
+klen = vlen = 0
+print("\n   values (key bytes / value bytes / first bytes):")
+for p, k, f in sorted(man, key=lambda r: (r[0], unesc(r[1]).encode('latin1'))):
+    raw, v = unesc(k).encode('latin1'), open(f, 'rb').read()
+    klen += len(raw) + 1; vlen += len(v)          # +1 for the prefix byte
+    if p == 'O':
+        lab = (f"shard @ 0x{int.from_bytes(raw[-5:-1],'big'):<7x}"
+               if raw[-1:] == b'x' else "onode")
+    elif p == 'b':
+        bits = sum(bin(c).count('1') for c in v)
+        lab = f"freelist 0x{int.from_bytes(raw[:8],'big'):<9x} {bits}/{len(v)*8} bits set"
+    else:
+        lab = f"statfs pool {int.from_bytes(raw[:8],'big',signed=True)}"
+    print(f"   {p}  {lab:<34} {len(raw)+1:>3}B key {len(v):>5}B val   {hx(v)}")
+print(f"   totals: {klen} B of keys, {vlen} B of values"
+      f"  ({100*klen/(klen+vlen):.0f}% keys)")
+# Optional: ceph-dencoder can decode the onode value, but the O value is the
+# onode struct PLUS the spanning-blob and inline-extent regions, so a strict
+# decode may reject the trailing bytes — and the plugin dir is not always
+# present. Never fail the run on it; objectstore-tool already gave us the map.
+try:
+    d = json.load(open(f"{ev}/val/onode-decoded.json"))
+    print(f"\n   onode value decodes: nid {d['nid']}, size {d['size']},"
+          f" {len(d['extent_map_shards'])} shards")
+    check(d["nid"] == ono["nid"], "raw onode value agrees with objectstore-tool")
+except Exception:
+    print("\n   (ceph-dencoder could not decode the onode value; skipped."
+          " The O value is onode + spanning blobs + inline extents, not a"
+          " bare bluestore_onode_t.)")
 print(f"\n   {'FAILED: ' + '; '.join(bad) if bad else 'all checks passed'}")
 sys.exit(1 if bad else 0)
 PY
