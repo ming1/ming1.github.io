@@ -12,8 +12,8 @@ tags: [ceph, bluestore, storage, concurrency, locking, rocksdb, allocator, c++]
 > in this post was checked with `git show v21.3.0:<path>`, not against a
 > working checkout:
 > - [`src/os/ObjectStore.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/ObjectStore.h) — the interface BlueStore implements.
-> - [`src/os/bluestore/`](https://github.com/ceph/ceph/tree/v21.3.0/src/os/bluestore) — `BlueStore.{cc,h}`, `BlueFS.{cc,h}`, the allocator family, `BitmapFreelistManager`, `BlueRocksEnv`.
-> - [`src/blk/`](https://github.com/ceph/ceph/tree/v21.3.0/src/blk) — `BlockDevice`, `KernelDevice`, aio and io_uring backends.
+> - [`src/os/bluestore/`](https://github.com/ceph/ceph/tree/v21.3.0/src/os/bluestore) — `BlueStore.{cc,h}`, `BlueFS.{cc,h}`, the allocator family, [`BitmapFreelistManager`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BitmapFreelistManager.h#L16), [`BlueRocksEnv`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueRocksEnv.h#L19).
+> - [`src/blk/`](https://github.com/ceph/ceph/tree/v21.3.0/src/blk) — [`BlockDevice`](https://github.com/ceph/ceph/blob/v21.3.0/src/blk/BlockDevice.h#L150), [`KernelDevice`](https://github.com/ceph/ceph/blob/v21.3.0/src/blk/kernel/KernelDevice.h#L40), aio and io_uring backends.
 > - Runtime evidence captured from a single-OSD `vstart.sh` cluster built at
 >   `v21.3.0` (0 commits past the tag), Fedora, kernel 6.19.
 > - Companion post: [Ceph BlueStore Explained]({{ site.baseurl }}/storage/ceph-bluestore-explained) — the
@@ -47,8 +47,8 @@ Where things live, and which part covers them:
 
 | Path | Contains | Part |
 |---|---|---|
-| `src/os/ObjectStore.h` | the backend-neutral interface, `Transaction` encoding | 1 |
-| `src/os/bluestore/BlueStore.h` | every in-memory type: `Onode`, `Collection`, `Blob`, `TransContext`, `OpSequencer`, the caches | 3 |
+| `src/os/ObjectStore.h` | the backend-neutral interface, [`Transaction`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/Transaction.h#L107) encoding | 1 |
+| `src/os/bluestore/BlueStore.h` | every in-memory type: [`Onode`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1379), `Collection`, [`Blob`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L658), `TransContext`, `OpSequencer`, the caches | 3 |
 | `src/os/bluestore/BlueStore.cc` | the implementation: write/read paths, the state machine, the KV threads | 2, 4, 5 |
 | `src/os/bluestore/bluestore_types.{cc,h}` | the persisted structs — `bluestore_onode_t`, `bluestore_blob_t`, … | 3 |
 | `src/os/bluestore/*Allocator*`, `fastbmap_allocator_impl.*` | in-memory free space | 7 |
@@ -65,7 +65,7 @@ sits in `Collection::get_onode`, which is not a `_`-method at all.
 
 That absence is itself worth knowing, because the same codebase solves the
 problem the opposite way one directory over. BlueFS encodes its lock
-expectations in the *function names* — `_flush_and_sync_log_LD`,
+expectations in the *function names* — [`_flush_and_sync_log_LD`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.cc#L3878),
 `_compact_log_async_LD_LNF_D` — and backs them with 18 `ceph_mutex_is_locked`
 assertions. So the practical advice differs by subsystem: in BlueFS you can
 read the signature and know what a function will *take*; in BlueStore you
@@ -99,7 +99,7 @@ solely inside `#ifdef WITH_BLKIN` — on a stock build it is a dead parameter.
 
 The return value is the part to internalize: **BlueStore always returns 0**
 (`BlueStore.cc:16088`). There is no error path. A transaction that cannot be
-applied does not fail — it aborts the process. `_txc_add_transaction` tolerates
+applied does not fail — it aborts the process. [`_txc_add_transaction`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L16098) tolerates
 `-ENOENT` for most ops but treats it as a bug for the clone, attribute and
 omap mutations (`"ENOENT on clone suggests osd bug"`), and deliberately
 crashes on `-ENOSPC` rather than partially applying. The single escape is a
@@ -178,7 +178,7 @@ iterator, then releases it before the visitor loop runs.
 
 ## CollectionHandle is the ordering token
 
-`CollectionHandle` is a refcounted pointer to a `CollectionImpl`, and it is
+`CollectionHandle` is a refcounted pointer to a [`CollectionImpl`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/ObjectStore.h#L142), and it is
 easy to mistake for a lookup cache — a way to avoid hashing a `coll_t` per
 call. It is more than that. The header is explicit that a collection *orders*
 transactions: same handle, sequential; different handles, parallel. There is
@@ -332,7 +332,7 @@ typedef enum {
 } state_t;
 ```
 
-The captured write logged five of them through `_txc_state_proc`: `prepare`,
+The captured write logged five of them through [`_txc_state_proc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L14634): `prepare`,
 `aio_wait`, `io_done`, `kv_submitted`, `finishing`. Eleven states, five
 observed — and each absence has a specific cause worth knowing, because an
 enum is a menu, not an itinerary.
@@ -341,7 +341,7 @@ enum is a menu, not an itinerary.
 |---|---|---|
 | `STATE_PREPARE` | `tp_osd_tp` | none |
 | `STATE_AIO_WAIT` | `bstore_aio` (data device) — but `tp_osd_tp` if the txc had no aios | none on entry |
-| `STATE_IO_DONE` | same thread, inside `_txc_finish_io` | `osr->qlock`, asserted; `kv_lock` nested |
+| `STATE_IO_DONE` | same thread, inside [`_txc_finish_io`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L14753) | `osr->qlock`, asserted; `kv_lock` nested |
 | `STATE_KV_QUEUED` | *nothing* — parking state in `kv_queue` | — |
 | `STATE_KV_SUBMITTED` | `bstore_kv_final` | takes `osr->qlock` |
 | `STATE_KV_DONE` | `bstore_kv_final`; the mount thread during replay | none |
@@ -349,7 +349,7 @@ enum is a menu, not an itinerary.
 | `STATE_DEFERRED_CLEANUP` | `bstore_kv_final`; *set* by `bstore_aio` | none |
 | `STATE_DEFERRED_DONE` | never — dead code | — |
 | `STATE_FINISHING` | `bstore_kv_final` | takes `osr->qlock` |
-| `STATE_DONE` | `bstore_kv_final`, set inside `_txc_finish` | `osr->qlock` for the pop, released before the free |
+| `STATE_DONE` | `bstore_kv_final`, set inside [`_txc_finish`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L14989) | `osr->qlock` for the pop, released before the free |
 
 Three classes of absence, then. The `deferred_*` states are missing because
 64 KiB is not a small write: deferred applies below
@@ -366,7 +366,7 @@ looks like a state.
 
 The last gap explains the shape of the capture. Between `io_done` on
 `bstore_aio` and `kv_submitted` on `bstore_kv_final`, the trace shows
-`bstore_kv_sync` doing `_txc_apply_kv` and no state transition — because
+`bstore_kv_sync` doing [`_txc_apply_kv`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L14905) and no state transition — because
 **the kv submit never re-enters the state machine**. `_txc_apply_kv` sets
 `STATE_KV_SUBMITTED` directly rather than calling `_txc_state_proc`. The
 state machine is driven by three threads, not four; kv_sync mutates state
@@ -382,10 +382,10 @@ Almost everything in the metadata layer is intrusively refcounted with an
 
 | Type | `BlueStore.h` | Refcounted | Lives in |
 |---|---|---|---|
-| `Onode` | 1379 | yes (1382) | its `Collection`'s `OnodeSpace` |
-| `Blob` | 658 | yes (661) | referenced by the onode's `ExtentMap` |
-| `SharedBlob` | 554 | yes (557) | a `SharedBlobSet`, only when cloned |
-| `Buffer` / `BufferSpace` | 320 / 427 | no — owned by the space | per-collection cache shard |
+| `Onode` | 1379 | yes (1382) | its `Collection`'s [`OnodeSpace`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1681) |
+| `Blob` | 658 | yes (661) | referenced by the onode's [`ExtentMap`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L965) |
+| [`SharedBlob`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L554) | 554 | yes (557) | a `SharedBlobSet`, only when cloned |
+| `Buffer` / [`BufferSpace`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L427) | 320 / 427 | no — owned by the space | per-collection cache shard |
 | `Collection` | 1716 | via `CollectionImpl` | `coll_map` / `new_coll_map` |
 | `OpSequencer` | 2231 | yes | a `Collection`, or `zombie_osr_set` |
 | `TransContext` | 1906 | no — explicitly deleted | `osr->q` until `_txc_finish` |
@@ -464,7 +464,7 @@ transaction, traces differently.
 name suggests it only trims caches is on the write path: its loop calls
 `deferred_try_submit()` once `bluestore_max_defer_interval` has elapsed. It is
 not the only possible submitter — `bstore_kv_final`, `tp_osd_tp` and the
-`cfin` finisher all call `_deferred_submit_unlock` under different conditions,
+`cfin` finisher all call [`_deferred_submit_unlock`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15726) under different conditions,
 and whichever arrives first does the work. There is no dedicated deferred
 thread. If you are looking for "the thread that performs deferred writes",
 there isn't one; there is a function that four threads race to call.
@@ -542,7 +542,7 @@ Now that the threads and the objects are known, the locks can be tabulated.
 
 One caveat that matters if you are auditing: **not every queue is guarded
 where it is used.** `kv_committing` is documented under `kv_lock`, but
-`_kv_sync_thread` iterates and mutates it after unlocking. That is safe only
+[`_kv_sync_thread`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15290) iterates and mutates it after unlocking. That is safe only
 because kv_sync is its sole accessor between the two swaps, and the invariant
 is enforced by an assertion — `ceph_assert(kv_committing.empty())` — which
 does run under the lock. It is correct, but it is correct by ownership
@@ -604,12 +604,12 @@ int BlueFS::fsync(FileWriter *h)                    /*_WF_WD_WLD_WLNF_WNF*/
 int BlueFS::_fsync(FileWriter *h, bool force_dirty) /*_F_D_LD_LNF_NF*/
 ```
 
-`fsync` does nothing but take `h->lock` and call `_fsync`. Every group in the
+`fsync` does nothing but take `h->lock` and call [`_fsync`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.cc#L4434). Every group in the
 inner annotation reappears in the outer one with exactly one letter added —
 `W`. That is not a coincidence anyone could arrange accidentally: `W` is the
 `FileWriter` lock, and the suffix composes.
 
-The mapping is corroborated independently inside `_check_vselector_LNF`,
+The mapping is corroborated independently inside [`_check_vselector_LNF`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.cc#L5397),
 which takes exactly the three locks its suffix names and then says so:
 
 ```cpp
@@ -627,7 +627,7 @@ it pins three of the five letters beyond argument.
 
 One more rule makes them usable: a suffix names the locks a function
 **acquires itself**, never those its caller must already hold.
-`_flush_range_F` carries only `F` despite opening with
+[`_flush_range_F`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.cc#L4053) carries only `F` despite opening with
 `ceph_assert(ceph_mutex_is_locked(h->lock))` — it *requires* `W` and *takes*
 `F`. That is precisely why the `fsync`/`_fsync` composition works: `_fsync`
 runs with the writer lock held and shows no `W`; `fsync` takes it and gains
@@ -667,8 +667,8 @@ The `template` line matters: `PrimaryAllocator` is a parameter, not a base
 class you can go read. A primary extent-based allocator carries the free
 space and *is* the base, with a `BitmapAllocator` held in reserve for when the
 extent representation grows too expensive. The two instantiations are
-`HybridAvlAllocator` over `AvlAllocator` and `HybridBtree2Allocator` over
-`Btree2Allocator`, whose `get_type()` returns `"hybrid"` and
+`HybridAvlAllocator` over [`AvlAllocator`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/AvlAllocator.h#L23) and `HybridBtree2Allocator` over
+[`Btree2Allocator`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/Btree2Allocator.h#L23), whose `get_type()` returns `"hybrid"` and
 `"hybrid_btree2"`.
 
 `Allocator::create()` accepts exactly six names — `stupid`, `bitmap`, `avl`,
@@ -676,7 +676,7 @@ extent representation grows too expensive. The two instantiations are
 `"btree2"`. `Btree2Allocator` exists as a class but is reachable only as the
 primary inside `hybrid_btree2`, so of the family in the tree, one member
 cannot be selected on its own. All of them derive from `AllocatorBase`, which
-derives from `Allocator` — that pair is the file to read first, since the
+derives from [`Allocator`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/Allocator.h#L25) — that pair is the file to read first, since the
 implementations differ only in how they answer "give me N bytes."
 
 ## The persistent side, and why it is usually idle
@@ -706,8 +706,8 @@ and the cost of that trade is paid at the next crash, not during operation.
 Where the OSD's memory behaviour is actually decided.
 
 BlueStore runs two distinct caches, both sharded: an **onode cache**
-(`OnodeCacheShard`, `BlueStore.h:1610`) and a **buffer cache**
-(`BufferCacheShard`, `BlueStore.h:1632`). Sharding is a locking decision
+([`OnodeCacheShard`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1610), `BlueStore.h:1610`) and a **buffer cache**
+([`BufferCacheShard`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1632), `BlueStore.h:1632`). Sharding is a locking decision
 before it is a performance one — each `Collection` is bound to a shard, which
 is why the header justifies per-collection onode caching as avoiding lock
 contention.
@@ -842,7 +842,7 @@ KV threads before replaying** — `_kv_start()` brings up the finisher,
 `bstore_kv_sync` and `bstore_kv_final`, and only then does `_deferred_replay()`
 run. The mempool thread starts last, after replay.
 
-Deferred replay is the interesting corner. `_deferred_replay` fabricates a
+Deferred replay is the interesting corner. [`_deferred_replay`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15847) fabricates a
 `TransContext`, sets it to `STATE_KV_DONE` and calls `_txc_state_proc`
 **on the mounting thread** — the only time the state machine runs anywhere
 other than the four threads of Part 2. `_fsck()` needs the same machinery and
