@@ -1684,6 +1684,22 @@ socket rather than `ceph tell` to raise the debug level — `tell` has to fetch
 an osdmap first and may not land before the write does. `bluestore_write_v2`
 is false at these defaults, so this is the v1 path of §3.3, not §3.4's.
 
+Case 1 is scripted end to end in
+[`code/ceph-bluestore-observe-4m-write.sh`]({{ site.baseurl }}/code/ceph-bluestore-observe-4m-write.sh),
+against a `vstart.sh` cluster. It validates before it reports — that the trace
+really covers this object, that the dumped onode *is* the object written, that
+the key count matches the shard directory, that every freelist key the traced
+extent implies is actually in the diff — and exits non-zero if any check
+fails. Three traps it encodes are worth knowing even if you never run it:
+
+- **Never run the stop step as an `ssh` one-liner.** `pkill -f 'ceph-osd -i 0'`
+  matches the argv of the shell running it and kills your own session.
+- **`--op list` matches on object name alone.** A same-named object in another
+  pool is returned first and silently dumped instead; filter by pool id.
+- **`_do_write` returns before the metadata is serialized.** `update shard`,
+  `_record_onode` and `_txc_finalize_kv` all appear *after* its exit line, so a
+  trace slice bounded by `_do_write` alone loses every metadata number.
+
 ### Case 1: 4 MiB to a new object
 
 ```bash
