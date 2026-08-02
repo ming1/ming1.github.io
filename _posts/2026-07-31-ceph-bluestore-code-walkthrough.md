@@ -33,8 +33,8 @@ the API contract (Part 1), the threads (Part 2), the objects and their
 lifetimes (Part 3, after the cast in Part 0), then one 64 KiB write traced
 from `queue_transactions()` to the device (Part 4). The read path (Part 5)
 is a short contrast, Part 6 consolidates the locking, and Parts 7 onward
-each expand one step of the write trace. Part 12 re-cuts the same material by entry point, for when you
-know which call you are changing.
+each expand one step of the write trace. Part 12 re-cuts the same material
+by entry point, for when you know which call you are changing.
 
 Two conventions throughout. Everything is pinned to `v21.3.0`; where the code
 disagrees with its own comments, the post says so. And where a mechanism is
