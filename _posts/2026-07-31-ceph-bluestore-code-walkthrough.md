@@ -84,9 +84,12 @@ The chain from an OSD write down to a disk extent is shorter than the file
 size suggests:
 
 ```
- Transaction            what the OSD hands over: a list of ops
-   └─ CollectionHandle  names the target, and IS the ordering stream
-        └─ Collection   one PG's container: onode cache + a lock
+ Transaction  +  CollectionHandle     passed side by side to
+ the ops         the target, and IS      queue_transactions() —
+ to apply        the ordering stream      neither contains the other
+                        │
+                        ▼  (downcast)
+             Collection   one PG's container: onode cache + a lock
              └─ Onode   one object's metadata
                   └─ ExtentMap    logical offset -> Extent
                        └─ Extent  a logical range, pointing into a...
@@ -101,11 +104,11 @@ in-flight transaction — and two more own free space and the device.
 |---|---|
 | [`Transaction`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/Transaction.h#L107) | the unit the OSD submits: an op array plus interned collection and object names, decoded by the backend |
 | [`CollectionImpl`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/ObjectStore.h#L142) / `CollectionHandle` | a refcounted handle: the ordering token, and the already-resolved collection — same handle means sequential |
-| [`Collection`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1716) | BlueStore's per-PG container: its own onode cache and `shared_mutex`, so PGs contend with each other as little as possible |
+| [`Collection`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1716) | BlueStore's per-PG container (plus one meta collection): its own onode cache and `shared_mutex`, so PGs contend as little as possible |
 | [`OpSequencer`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2231) | the queue that makes ordering real; outlives its collection so delete-then-recreate keeps the stream |
 | [`Onode`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1379) | one object's metadata — size, attrs, and the extent map |
 | [`ExtentMap`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L965) | logical offset → `Extent`; sharded so a small overwrite dirties one shard, not a megabyte |
-| [`Blob`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L658) | the unit of *physical* allocation: device extents, checksums, compression flags |
+| [`Blob`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L658) | device extents plus checksums and compression flags — the unit of checksumming and allocation *tracking*, though the allocator hands out `min_alloc_size` units |
 | [`SharedBlob`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L554) | refcounted extent ownership between clones — copy-on-write without copying |
 | [`BufferSpace`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L427) | the per-*onode* data cache, charged against the collection's buffer cache shard — object data, not the onode metadata cache |
 | [`TransContext`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1906) | one in-flight write: its state, its KV transaction, its aios |
