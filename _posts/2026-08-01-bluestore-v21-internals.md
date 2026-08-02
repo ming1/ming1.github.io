@@ -357,7 +357,56 @@ This is not a free lunch, and an honest reading of the design must name the cost
 
 # Part 2 — The Object Model
 
-## 2.1 The five-level mapping
+## 2.1 The names underneath: hobject_t and ghobject_t
+
+Before the object *model* there is the object *name*, and BlueStore does not
+define it — it inherits it from RADOS. Two structs matter, and the difference
+between them is a common source of confusion.
+
+[`hobject_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/hobject.h#L49) is the hashed object name: what RADOS means by "an
+object".
+
+| Field | Role |
+|---|---|
+| `oid` | the object name proper |
+| `key` | optional locator, overriding the name for placement when set |
+| `snap` | `-2` (`CEPH_NOSNAP`) for head, `-1` for snapdir, else the snapshot id |
+| `hash` | the name's hash — what selects the PG |
+| `pool` | pool id |
+| `nspace` | namespace, empty for ordinary data |
+
+[`ghobject_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/hobject.h#L476) wraps that and adds two fields BlueStore must carry
+but rarely uses:
+
+```cpp
+struct ghobject_t {
+  hobject_t hobj;
+  gen_t generation = NO_GEN;                   // rollback/temp objects
+  shard_id_t shard_id = shard_id_t::NO_SHARD;  // erasure-coded shard
+```
+
+Both default to "absent", which is why a replicated object's JSON dump shows
+neither. The **g** is what the ObjectStore API speaks: every method in
+`ObjectStore.h` takes a `ghobject_t`, never a bare `hobject_t`.
+
+Three things follow that matter later in this part.
+
+**The key is not the name.** BlueStore's `O` key is built from these fields in
+a deliberate order — shard, pool, *bit-reversed* hash, namespace, name, snap,
+generation — so that a PG's objects form one contiguous range. §2.4 covers why
+the reversal is load-bearing.
+
+**`hash` places the object; `nid` indexes it locally.** The hash is global and
+reproducible on any node; the nid is a private `u64` this store hands out for
+compact omap keys, and the same object on another OSD will have a different
+one. Never compare nids across stores.
+
+**Collections are named separately.** A `coll_t` names the PG-shaped container,
+and BlueStore mirrors each as a `Collection` — the `C` prefix in the schema.
+An object's placement is derivable from its `hobject_t` alone; the collection
+is how BlueStore groups them for locking and caching.
+
+## 2.2 The five-level mapping
 
 A RADOS object in BlueStore is represented by a chain of five structures. Four
 of them are in-memory C++ objects with on-disk encodings; the fifth is the raw
@@ -393,7 +442,7 @@ allocation, checksumming, compression, and sharing; an extent is the unit of
 same blob (common after partial overwrite), and the same blob can be pointed
 at by extents in *different objects* (this is how clones work).
 
-## 2.2 Onode
+## 2.3 Onode
 
 ```cpp
 struct Onode {
@@ -500,7 +549,7 @@ for (auto ls : { &txc->onodes, &txc->modified_objects }) {
 condvar broadcast are skipped entirely when nobody is waiting, which is the
 overwhelmingly common case.
 
-## 2.3 ExtentMap and sharding
+## 2.4 ExtentMap and sharding
 
 ```cpp
 struct ExtentMap {
@@ -697,7 +746,7 @@ reuses a single `Blob` for the whole scan. It serves
 `read_allocation_from_onodes()` during NCB recovery, where you want to visit
 tens of millions of onodes and only care about their pextents.
 
-## 2.4 Blob
+## 2.5 Blob
 
 ```cpp
 struct Blob {
@@ -799,7 +848,7 @@ The returned `PExtentVector` is what eventually reaches
 `txc->released` and then `alloc->release()` — but only after the transaction
 is fully done. See §4.5 for why that delay is mandatory.
 
-## 2.5 Extent
+## 2.6 Extent
 
 ```cpp
 struct Extent : public ExtentBase {
@@ -834,7 +883,7 @@ if (offset >= ep->blob_start() &&
   b_off = offset - ep->blob_start();
 ```
 
-## 2.6 A worked memory layout
+## 2.7 A worked memory layout
 
 Object `foo`, 32 KiB, `min_alloc_size` = 4 KiB, `max_blob_size` = 64 KiB.
 Written once sequentially, then 4 KiB overwritten at offset 0x4000.
@@ -1681,7 +1730,7 @@ Three refusal conditions (plus a debug-only fourth,
 invariant:
 
 1. **`last_nid >= nid_max`** — the nid ceiling update must be durable first
-   (§2.2).
+   (§2.3).
 2. **`kv_committing_serially`** — once one txc in this OSR went through the kv
    thread, later ones must too, or RocksDB would see them out of order. The
    source comment flags this as starvation-prone and unresolved.
@@ -2885,7 +2934,7 @@ The trade-off, stated plainly:
 
 This is a deliberate trade of *rare, slow recovery* for *constant, cheap
 steady state*. [`OnodeScan.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/OnodeScan.cc) and the non-Blob-instantiating `ExtentDecoder`
-(§2.3) exist to make the recovery scan as fast as possible.
+(§2.4) exist to make the recovery scan as fast as possible.
 
 There is a validation escape hatch: `compare_allocators()` [`:21091`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L21091),
 `verify_rocksdb_allocations()` [`:21462`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L21462), and `push_allocation_to_rocksdb()`
@@ -3872,7 +3921,7 @@ checksumming plus (optionally) compression on tens of MB/s.
 
 **2. Encoding and decoding onodes.** Every write re-encodes the onode and at
 least one extent map shard. The `denc` framework is efficient, but the extent
-map delta encoding (§2.3) requires a linear walk with per-extent branching.
+map delta encoding (§2.4) requires a linear walk with per-extent branching.
 Objects with thousands of extents are expensive to touch at all — this is the
 concrete cost of fragmentation, and it is CPU, not I/O.
 
@@ -3952,7 +4001,7 @@ goes through the WAL. Two benefits, and the second is the bigger one:
    (§4.7), and the RocksDB WAL write is sequential.
 2. **The extent map does not grow.** A deferred write goes *in place* into an
    existing blob. A non-deferred small write allocates new space and splits
-   extents (§2.6). On a device where reading a fragmented object costs a seek
+   extents (§2.7). On a device where reading a fragmented object costs a seek
    per extent, keeping the extent map short is worth more than the write
    savings.
 
