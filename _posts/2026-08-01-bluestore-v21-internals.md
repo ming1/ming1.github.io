@@ -678,6 +678,35 @@ void maybe_reshard(uint32_t begin, uint32_t end) {
 resharding, so the common case (small write to a large object) costs one
 shard re-encode.
 
+**Where the boundaries land.** `reshard_decision()` ([BlueStore.cc:3562](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L3562)) does
+not assume how many bytes an extent encodes to — it measures:
+
+```cpp
+unsigned target = cct->_conf->bluestore_extent_map_shard_target_size;
+unsigned slop = target *
+  cct->_conf->bluestore_extent_map_shard_target_size_slop;
+unsigned extent_avg = bytes / std::max(1u, extents);
+```
+
+`bytes` and `extents` are the current totals over the range being resharded,
+or the inline encoding if the onode is not sharded yet. It then walks the
+extents accumulating an estimate and cuts when that reaches `target`, so a
+shard holds roughly `target / extent_avg` extents.
+`bluestore_extent_map_shard_target_size_slop` (0.2, so 100 bytes) is the
+latitude it has to land a boundary on an existing extent rather than exactly
+at 500.
+
+So the *logical* span of a shard is derived, never configured. §3.6 traces the
+arithmetic on a live object: `extent_avg 75, target 500, slop 100` gives 6
+extents per shard, which at 64 KiB blobs is 384 KiB of object per shard, and
+the shards measure 453–455 bytes.
+
+Two consequences. Because most of a shard is checksum — 384 of 455 bytes in
+that measurement — `target_size` acts as a cap on *blobs per shard*, and the
+span moves when `max_blob_size` does. And nothing holds a shard at 500 bytes
+between reshards: it drifts as extents are added and removed, and only
+`min_size` or `max_size` triggers a rebuild.
+
 ### Spanning blobs, and the v21 answer to them
 
 A blob whose extents fall in more than one shard cannot be encoded in either
