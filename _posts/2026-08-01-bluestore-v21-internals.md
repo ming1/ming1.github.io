@@ -1793,43 +1793,70 @@ view — the shard directory it must keep to know where each shard ends:
                        … {"offset": 3932160, "bytes": 305} ]
 ```
 
-Twelve RocksDB keys result, all under `O`, and — per §2.4 — contiguous. The
-prefix is built by `_key_encode_prefix()` ([BlueStore.cc:368](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L368)), and decoding
-one is the fastest way to internalise the layout:
+Twelve RocksDB keys result, all under `O`. Here they are verbatim, exactly as
+`ceph-kvstore-tool bluestore-kv <path> list O` prints them, in the order the
+database holds them:
 
 ```
- 7f  8000000000000004  d1337354  !obj3!=  fffffffffffffffe ffffffffffffffff  6f
- |   |                 |         |        |                |                 |
- |   pool + 2^63       |         name     snap (NOSNAP)    gen (NO_GEN)      'o'
- shard_id + 0x80       object hash, BIT-REVERSED
+%7f%80%00%00%00%00%00%00%04%8d%d1o%86%21obj3%21%3d%ff…%fe%ff…%ffo
+%7f%80%00%00%00%00%00%00%04%8d%d1o%86%21obj3%21%3d%ff…%fe%ff…%ffo%00%00%00%00x
+%7f%80%00%00%00%00%00%00%04%8d%d1o%86%21obj3%21%3d%ff…%fe%ff…%ffo%00%06%00%00x
+%7f%80%00%00%00%00%00%00%04%8d%d1o%86%21obj3%21%3d%ff…%fe%ff…%ffo%00%0c%00%00x
+%7f%80%00%00%00%00%00%00%04%8d%d1o%86%21obj3%21%3d%ff…%fe%ff…%ffo%00%12%00%00x
+%7f%80%00%00%00%00%00%00%04%8d%d1o%86%21obj3%21%3d%ff…%fe%ff…%ffo%00%18%00%00x
+%7f%80%00%00%00%00%00%00%04%8d%d1o%86%21obj3%21%3d%ff…%fe%ff…%ffo%00%1e%00%00x
+%7f%80%00%00%00%00%00%00%04%8d%d1o%86%21obj3%21%3d%ff…%fe%ff…%ffo%00%24%00%00x
+%7f%80%00%00%00%00%00%00%04%8d%d1o%86%21obj3%21%3d%ff…%fe%ff…%ffo%00%2a%00%00x
+%7f%80%00%00%00%00%00%00%04%8d%d1o%86%21obj3%21%3d%ff…%fe%ff…%ffo%000%00%00x
+%7f%80%00%00%00%00%00%00%04%8d%d1o%86%21obj3%21%3d%ff…%fe%ff…%ffo%006%00%00x
+%7f%80%00%00%00%00%00%00%04%8d%d1o%86%21obj3%21%3d%ff…%fe%ff…%ffo%00%3c%00%00x
 ```
 
-| Field | Bytes | Why it is shaped that way |
+(`%ff…%fe` and `%ff…%ff` stand for the two 8-byte runs written out in full
+below; nothing else is elided.)
+
+Every one is the same prefix, built by `_key_encode_prefix()`
+([BlueStore.cc:368](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L368)) and then `get_object_key()`. Field by field:
+
+```
+%7f  %80%00%00%00%00%00%00%04  %8d%d1o%86  %21obj3%21%3d  <snap>  <gen>  o
+ 1B          8B                    4B          variable     8B      8B   1B
+```
+
+| Bytes | Field | Value here | Why it is shaped that way |
+|---|---|---|---|
+| `%7f` | shard id | `NO_SHARD` (−1) | `shard.id + 0x80`, so −1 → `0x7f`. First, so an EC shard's keys group together |
+| `%80…%04` | pool | 4 | `pool + 2^63`, so the meta pool (−1) sorts below real pools instead of above them |
+| `%8d%d1o%86` | hash | `0x8dd16f86` | the object hash **bit-reversed** — what makes one PG's objects a contiguous range |
+| `%21obj3%21%3d` | namespace + name | `!obj3!=` | `!` separates, `!=` closes an empty namespace before the name |
+| `%ff…%fe` | snap | `CEPH_NOSNAP` | 8 BE bytes; `head` is `…fffe`, so it sorts after all its snapshots |
+| `%ff…%ff` | generation | `NO_GEN` | 8 BE bytes |
+| `o` | type | `ONODE_KEY_SUFFIX` | ends an onode key |
+
+The eleven shard keys append a 4-byte big-endian logical offset and
+`EXTENT_SHARD_KEY_SUFFIX` `'x'` to that whole key — which is the strict-prefix
+property §2.4 relies on:
+
+| Suffix | Shard | Value |
 |---|---|---|
-| shard id | 1 | `shard.id + 0x80`, so `NO_SHARD` (−1) encodes `0x7f`; first, so an EC shard's keys group together |
-| pool | 8 BE | biased by 2^63 so negative pool ids (meta = −1) sort below real ones |
-| hash | 4 BE | bit-reversed, which is what makes one PG's objects a contiguous range |
-| name | var | between `!` separators, `!=` closing the namespace/name pair |
-| snap, gen | 8 + 8 BE | `head` is `…fffe` / `…ffff`, so it sorts after its snapshots |
-| type | 1 | `ONODE_KEY_SUFFIX` `'o'` ends an onode key |
+| — | onode | 410 B |
+| `%00%00%00%00x` | 0x0 | 453 B |
+| `%00%06%00%00x` | 0x60000 | 455 B |
+| `%00%0c%00%00x` | 0xc0000 | 455 B |
+| `%00%12%00%00x` … `%00%2a%00%00x` | 0x120000 … 0x2a0000 | 455 B each |
+| `%000%00%00x` | 0x300000 | 455 B |
+| `%006%00%00x` | 0x360000 | 455 B |
+| `%00%3c%00%00x` | 0x3c0000 | 305 B |
 
-A shard key is that whole key plus a 4-byte big-endian logical offset and
-`EXTENT_SHARD_KEY_SUFFIX` `'x'` — hence the strict-prefix property:
-
-```
-O …obj3!=…o                 onode,   410 bytes
-O …obj3!=…o%00%00%00%00x    shard 0x0,       453 bytes
-O …obj3!=…o%00%06%00%00x    shard 0x60000,   455 bytes
-…
-O …obj3!=…o%00%3c%00%00x    shard 0x3c0000,  305 bytes
-```
-
-A trap when reading `ceph-kvstore-tool` output: it uses `url_escape()`, which
-passes through only alphanumerics and `-._~/`. So 0x30 survives as the digit
-`0` — shard 0x300000 prints `o%000%00%00x` — while 0x3c, just as printable,
-becomes `%3c`. Printability is not the rule, and sorting that text does not
-give you key order: `'0'` and `'6'` sort *after* `'%'`, so shards 0x300000 and
-0x360000 land after 0x3c0000. Sort the unescaped bytes instead.
+Those last three rows are the trap. `ceph-kvstore-tool` escapes with
+`url_escape()`, which passes through only alphanumerics and `-._~/` — so 0x30
+and 0x36 survive as the characters `0` and `6`, while 0x3c, equally printable,
+becomes `%3c`. Printability is not the rule. Two consequences: the type byte
+is not findable by searching for `o`, because `0x6f` also appears inside this
+object's *hash* (`%8d%d1o%86`); and sorting the escaped text does not give key
+order, since `'0'` and `'6'` sort after `'%'`. The listing above is in true
+key order because `list` iterates the database — pipe it through `sort` and
+shards 0x300000 and 0x360000 will move below 0x3c0000.
 
 Two more key spaces the transaction touches, both trivially encoded:
 
