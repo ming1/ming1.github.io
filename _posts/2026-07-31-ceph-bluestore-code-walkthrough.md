@@ -100,26 +100,28 @@ in-flight transaction — and two more own free space and the device.
 | Type | Why it exists |
 |---|---|
 | [`Transaction`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/Transaction.h#L107) | the unit the OSD submits: an op array plus interned collection and object names, decoded by the backend |
-| [`CollectionImpl`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/ObjectStore.h#L142) / `CollectionHandle` | a refcounted handle that is both a name cache and the ordering token — same handle means sequential |
+| [`CollectionImpl`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/ObjectStore.h#L142) / `CollectionHandle` | a refcounted handle: the ordering token, and the already-resolved collection — same handle means sequential |
 | [`Collection`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1716) | BlueStore's per-PG container: its own onode cache and `shared_mutex`, so PGs contend with each other as little as possible |
 | [`OpSequencer`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2231) | the queue that makes ordering real; outlives its collection so delete-then-recreate keeps the stream |
 | [`Onode`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1379) | one object's metadata — size, attrs, and the extent map |
 | [`ExtentMap`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L965) | logical offset → `Extent`; sharded so a small overwrite dirties one shard, not a megabyte |
 | [`Blob`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L658) | the unit of *physical* allocation: device extents, checksums, compression flags |
 | [`SharedBlob`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L554) | refcounted extent ownership between clones — copy-on-write without copying |
-| [`BufferSpace`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L427) | the per-collection data cache, distinct from the onode cache |
+| [`BufferSpace`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L427) | the per-*onode* data cache, charged against the collection's buffer cache shard — object data, not the onode metadata cache |
 | [`TransContext`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1906) | one in-flight write: its state, its KV transaction, its aios |
 | [`Allocator`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/Allocator.h#L25) | in-memory free space, restored at mount — usually from a BlueFS file, not rebuilt (Part 7) |
-| [`BitmapFreelistManager`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BitmapFreelistManager.h#L16) | the persistent free-space record |
-| [`BlueFS`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.h#L265) / [`BlueRocksEnv`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueRocksEnv.h#L19) | a minimal filesystem existing only to host RocksDB's files |
+| [`BitmapFreelistManager`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BitmapFreelistManager.h#L16) | the *legacy* persistent free-space record in RocksDB — mostly idle on a stock OSD, see Part 7 |
+| [`BlueFS`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.h#L265) / [`BlueRocksEnv`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueRocksEnv.h#L19) | a minimal filesystem, built to host RocksDB's files and now also the allocation file of Part 7 |
 | [`BlockDevice`](https://github.com/ceph/ceph/blob/v21.3.0/src/blk/BlockDevice.h#L150) / [`KernelDevice`](https://github.com/ceph/ceph/blob/v21.3.0/src/blk/kernel/KernelDevice.h#L40) | the device abstraction and its O_DIRECT + aio implementation |
 
 Two splits explain most of the design. **Logical versus physical**: an
 `Extent` is a range of the *object*, a `Blob` owns ranges of the *device*, and
 keeping them apart is what lets several small writes share one blob and lets
 clones share extents without copying. **In-memory versus persistent**: the
-`Allocator` decides where to put data and the freelist manager records it, and
-conflating the two is the most common way to misread the space code.
+`Allocator` decides where to put data and something else records it
+persistently — which component depends on the config, as Part 7 shows.
+Conflating the deciding with the recording is the most common way to misread
+the space code.
 
 One thing to carry forward: the metadata types are cached per collection, and
 that is a locking decision as much as a performance one. It is why
