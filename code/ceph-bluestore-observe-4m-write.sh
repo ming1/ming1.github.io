@@ -252,6 +252,25 @@ for p, k, f in sorted(man, key=lambda r: (r[0], unesc(r[1]).encode('latin1'))):
     else:
         lab = f"statfs pool {int.from_bytes(raw[:8],'big',signed=True)}"
     print(f"   {p}  {lab:<34} {len(raw)+1:>3}B key {len(v):>5}B val   {hx(v)}")
+
+# --- how the two index spaces line up over the same bytes
+dev = {}                                     # shard -> device range of its blobs
+for i, (off, _) in enumerate(sorted(sizes.items())):
+    end = sorted(sizes)[i+1] if i+1 < len(sizes) else 1 << 30
+    px = [x for e in ono["extents"] if off <= e["logical_offset"] < end
+          for x in e["blob"]["extents"]]
+    dev[off] = (min(x["offset"] for x in px),
+                max(x["offset"]+x["length"] for x in px))
+print(f"\n   freelist keys vs extent-map shards over the same {size>>20} MiB:")
+print(f"   {'b key (device)':<18}{'covers':<26}{'bits set by us':<16}shards living there")
+bits_tot = 0
+for a in want:
+    s, e = max(a, min(d[0] for d in dev.values())), min(a+span, max(d[1] for d in dev.values()))
+    n = max(0, (e-s)) // 4096; bits_tot += n
+    ov = ", ".join(f"0x{o:x}" for o, (lo, hi) in sorted(dev.items()) if lo < a+span and hi > a)
+    print(f"   0x{a:<16x}0x{a:x}-0x{a+span:x}      {n:>3}/{span//4096:<12}{ov}")
+check(bits_tot == size // 4096,
+      f"{bits_tot} blocks marked = {size} B at 4 KiB each")
 print(f"   totals: {klen} B of keys, {vlen} B of values"
       f"  ({100*klen/(klen+vlen):.0f}% keys)")
 # Optional: ceph-dencoder can decode the onode value, but the O value is the

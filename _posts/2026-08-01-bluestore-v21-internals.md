@@ -1879,7 +1879,7 @@ order, since `'0'` and `'6'` sort after `'%'`. The listing above is in true
 key order because `list` iterates the database — pipe it through `sort` and
 shards 0x300000 and 0x360000 will move below 0x3c0000.
 
-Two more key spaces the transaction touches, both trivially encoded:
+Both of these keys are trivially encoded:
 
 | Prefix | Key | Encoding |
 |---|---|---|
@@ -1895,6 +1895,41 @@ absent from this store entirely. So the 4 MiB write writes the freelist bits
 covering `0x19c9d000~400000` and one statfs merge for pool 4 — nothing else of
 BlueStore's own; the OSD's PG-log omap writes ride in the same transaction and
 are excluded here.
+
+The freelist keys deserve the same key/value treatment, but a `b` value cannot
+be recovered after the fact — the merge operator XORs, so what you read back
+is the *accumulated* bitmap for that region, not one write's contribution.
+These come from a separate scripted run of the identical procedure
+([`code/ceph-bluestore-observe-4m-write.sh`]({{ site.baseurl }}/code/ceph-bluestore-observe-4m-write.sh)); the allocator placed that
+object at `0x1d49d000`, so the addresses differ from `obj3` above while the
+structure is identical:
+
+| `b` key | Covers | Bits this write set | Value read back | Shards living there |
+|---|---|---|---|---|
+| `%00%00%00%00%1dH%00%00` | `0x1d480000`+512K | 99/128 | `ff × 16` (128 set) | 0x0, 0x60000 |
+| `%00%00%00%00%1dP%00%00` | `0x1d500000`+512K | 128/128 | `ff × 16` | 0x60000, 0xc0000 |
+| `%00%00%00%00%1dX%00%00` | `0x1d580000`+512K | 128/128 | `ff × 16` | 0xc0000, 0x120000 |
+| `%00%00%00%00%1d%60%00%00` | `0x1d600000`+512K | 128/128 | `ff × 16` | 0x120000, 0x180000, 0x1e0000 |
+| `%00%00%00%00%1dh%00%00` | `0x1d680000`+512K | 128/128 | `ff × 16` | 0x1e0000, 0x240000 |
+| `%00%00%00%00%1dp%00%00` | `0x1d700000`+512K | 128/128 | `ff × 16` | 0x240000, 0x2a0000 |
+| `%00%00%00%00%1dx%00%00` | `0x1d780000`+512K | 128/128 | `ff × 16` | 0x2a0000, 0x300000, 0x360000 |
+| `%00%00%00%00%1d%80%00%00` | `0x1d800000`+512K | 128/128 | `ff × 16` | 0x360000, 0x3c0000 |
+| `%00%00%00%00%1d%88%00%00` | `0x1d880000`+512K | 29/128 | `ff ff ff 1f 00 …` | 0x3c0000 |
+
+99 + 7×128 + 29 = **1024** blocks, which is 4 MiB at 4 KiB each — the script
+asserts exactly that before printing the table. The first row is where the
+accumulated-versus-contributed distinction shows: this write set 99 bits, but
+the value reads back all 128, because the region's other 29 blocks were
+already allocated to something else.
+
+Note that the two key spaces do not line up anywhere. Eleven shards and nine
+freelist keys cut the same 4 MiB — at 384 KiB (6 blobs) and 512 KiB — and
+neither is aware of the other: most `b` keys straddle two shards, two straddle
+three, and the ends are partial because the allocation did not begin on a
+512 KiB boundary. One is indexed by *logical* offset within the object, the
+other by *device* offset. And `%00%00%00%00%1dx%00%00` is a reminder to
+decode rather than pattern-match: that is `0x1d780000`, a freelist key ending
+in a literal `x`, not an extent-map shard.
 
 | What | Keys | Key bytes | Value bytes |
 |---|---|---|---|
