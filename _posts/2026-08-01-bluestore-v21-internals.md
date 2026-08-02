@@ -11,7 +11,9 @@ tags: [ceph, bluestore, storage, rocksdb, bluefs, allocator, c++]
 *An engineering reverse-engineering document. Every class, function, and line
 reference in this text was verified against the `v21.3.0` tag of the Ceph
 source tree (`git describe --tags --exact-match HEAD` → `v21.3.0`). Line
-numbers refer to that tag; they will drift.*
+numbers refer to that tag; they will drift. §3.6 is the one empirical
+section: its traces come from a build off `main`, and it says so where it
+matters — its source and config claims are still tag-verified.*
 
 ---
 
@@ -765,9 +767,11 @@ encoding with flag bits packed into the low nibble of the blob id
 
 A sequentially written object therefore encodes each extent in close to a
 single varint: contiguous + zero offset + same length means logical_offset,
-blob_offset and length are all omitted. This is why a 4 MiB sequentially
-written object's extent map is a few dozen bytes while a randomly written one
-is kilobytes.
+blob_offset and length are all omitted. The extent records of a sequentially
+written object therefore cost close to nothing, while a randomly written
+one's do not. The map as a whole is a different matter: the blobs those
+records point at still carry checksums, so a 4 MiB sequential object measures
+4,853 bytes of extent map, 4 KiB of it checksum (§3.6).
 
 The decoder is split into an abstract `ExtentDecoder` base and a concrete
 `ExtentDecoderFull` ([BlueStore.h:1046](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1046), 1083). The indirection exists so that
@@ -1628,8 +1632,8 @@ everything that follows:
 |---|---|---|
 | `bluestore_min_alloc_size_hdd` | 4 KiB | the allocation unit |
 | `bluestore_max_blob_size_hdd` | 64 KiB | a 4 MiB write becomes 64 blobs |
-| `bluestore_prefer_deferred_size_hdd` | 64 KiB | any overwrite ≤ 64 KiB is deferred |
-| `bluestore_extent_map_shard_target_size` | 500 | ~6 extents per shard |
+| `bluestore_prefer_deferred_size_hdd` | 64 KiB | an overwrite < 64 KiB into allocated space is deferred |
+| `bluestore_extent_map_shard_target_size` | 500 bytes | ~6 extents per shard |
 
 *The traced binary is built from `main`, ahead of the tag. Every log string
 quoted below, and all four defaults, were checked to exist unchanged at
@@ -1645,10 +1649,11 @@ Four instruments, each answering a different question:
 | which *values* changed | `… list-crc [prefix]`, diffed across snapshots |
 | what is in a value | `ceph-objectstore-tool … dump`, `ceph-dencoder` |
 
-Only the first works on a running OSD; the rest need the store closed, so the
-sequence below is stop → dump → start around each write. Use the admin socket
-rather than `ceph tell` to raise the debug level — `tell` goes through the
-monitor and may not land before the write does.
+Only the first works on a running OSD; the next two need the store closed, so
+the sequence below is stop → dump → start around each write. Use the admin
+socket rather than `ceph tell` to raise the debug level — `tell` has to fetch
+an osdmap first and may not land before the write does. `bluestore_write_v2`
+is false at these defaults, so this is the v1 path of §3.3, not §3.4's.
 
 ### Case 1: 4 MiB to a new object
 
@@ -1659,7 +1664,7 @@ rados -p wtest put obj3 4m.bin      # 4 MiB, offset 0, object does not exist
 The trace, filtered to this transaction:
 
 ```
-_do_write #4:8dd16f86:::obj3:head# 0x0~400000 - have 0x0 (0) bytes
+_do_write #4:8dd16f86:::obj3:head# 0x0~400000 - have 0x0 (0) bytes …
 _choose_write_options prefer csum_order 12 target_blob_size 0x10000 compress=0 buffered=0
 _do_write_big 0x0~400000 target_blob_size 0x10000 compress 0
 _do_alloc_write txc 0x557393eff180 64 blobs
@@ -1694,7 +1699,7 @@ dominates the extent map.
 per shard, and 11 shards. `ceph-objectstore-tool … dump` shows the onode's
 view — the shard directory it must keep to know where each shard ends:
 
-```json
+```
 "nid": 9330, "size": 4194304,
 "extent_map_shards": [ {"offset": 0,       "bytes": 453},
                        {"offset": 393216,  "bytes": 455},
@@ -1711,21 +1716,34 @@ O …obj3!=…o%00%06%00%00x    shard 0x60000,   455 bytes
 O …obj3!=…o%00%3c%00%00x    shard 0x3c0000,  305 bytes
 ```
 
-A trap when reading `ceph-kvstore-tool` output: it escapes only
-non-printables, so the shard at 0x300000 prints as `o%000%00%00x` — that
-middle `0` is the byte 0x30, not a digit. Shard 0x360000 prints `%006`.
+A trap when reading `ceph-kvstore-tool` output: it uses `url_escape()`, which
+passes through only alphanumerics and `-._~/`. So 0x30 survives as the digit
+`0` — shard 0x300000 prints `o%000%00%00x` — while 0x3c, just as printable,
+becomes `%3c`. Printability is not the rule.
 
 Beyond the object itself the transaction writes the freelist (`b`) bits
-covering `0x19c9d000~400000`, a per-pool and a store-wide statfs merge (`T`),
-and `S nid_max` because the new object consumed nid 9330. Nothing else:
+covering `0x19c9d000~400000`, and a per-pool plus a store-wide statfs merge
+(`T`). That is all of BlueStore's own metadata; the OSD's PG-log omap writes
+ride in the same transaction and are excluded here.
 
 | What | Keys | Bytes |
 |---|---|---|
 | onode | 1 × `O …o` | 410 |
 | extent map | 11 × `O …o…x` | 4,853 |
-| freelist bits | 9 × `b` (512 KiB of bitmap each) | merge ops |
+| freelist bits | 9 × `b`, each covering 512 KiB of device | merge ops |
 | statfs | 2 × `T` | merge ops |
-| id watermark | `S nid_max` | ~8 |
+
+The freelist row is derived, not measured: `list` cannot show it, because at
+128 blocks per key these are merges into keys that already existed. Nine
+follows from the 4 MiB extent and 512 KiB of device coverage per key.
+
+What is *not* in the table is `S nid_max`. It does change here, but not
+because this object consumed nid 9330 — `_assign_nid()` ([BlueStore.cc:14529](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L14529))
+only bumps an in-memory counter. The key is rewritten by `_kv_sync_thread()`
+([BlueStore.cc:15406](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15406)) when the preallocated window is half spent, so with
+`bluestore_nid_prealloc` = 1024 it lands roughly once per 512 new objects.
+Catching it in this particular transaction is sampling, not causation — a
+good illustration of why a single observation cannot establish attribution.
 
 5,263 bytes of object metadata for 4 MiB of data — 0.13%. The data itself
 went straight to the device; `_txc_finalize_kv` records `released 0x[]`
@@ -1739,8 +1757,8 @@ rados -p wtest put obj3 4k.bin --offset 1048576   # 0x100000, inside the 4 MiB
 ```
 
 ```
-_do_write #4:8dd16f86:::obj3:head# 0x100000~1000 - have 0x400000 (4194304) bytes
-_dump_onode … nid 9330 size 0x400000 in 11 shards, 0 spanning blobs
+_do_write #4:8dd16f86:::obj3:head# 0x100000~1000 - have 0x400000 (4194304) bytes …
+_dump_onode … nid 9330 size 0x400000 (4194304) … in 11 shards, 0 spanning blobs
 fault_range 0x100000~1000
 maybe_load_shard opening shard 0xc0000
 maybe_load_shard open shard for range 0xc0000~120000 (455 bytes)
@@ -1750,7 +1768,7 @@ _do_write_big Blob(0x564370289d80 blob([0x19d9d000~10000] llen=0x10000 csum crc3
 _do_write_big_apply_deferred  reading head 0x0 and tail 0x0
 _do_alloc_write txc 0x56436f3f3500 0 blobs
 _wctx_finish lex_old 0x100000~1000: 0x0~1000 Blob(0x564370289d80 …)
-compress_extent_map 0x100000~1000 next shard 0x120000 merging 0x100000~1000 … and 0x101000~f000 …
+compress_extent_map 0x100000~1000 next shard 0x120000 merging 0x100000~1000: … and 0x101000~f000: …
 dirty_range mark shard 0xc0000 dirty
 update  shard 0xc0000 is 455 bytes (was 455) from 6 extents
 _record_onode onode #4:8dd16f86:::obj3:head# is 410 (…)
@@ -1771,8 +1789,10 @@ exactly one AU, so it takes the else branch with zero head and zero tail.
 
 **One shard is read, one shard is written.** `fault_range` faults in shard
 0xc0000 alone — 455 bytes decoded, 6 extents — and `dirty_range` marks that
-shard alone. The other ten shards are neither read nor written. That is the
-entire point of sharding the extent map.
+shard alone. The other ten shards are neither read nor written. (That trace
+line prints `0xc0000~120000` as start~*end*, not the usual start~length: it
+is the one shard spanning 0xc0000 to 0x120000.) §2.4 argues that this is the
+point of sharding the extent map; this is the measurement.
 
 **Nothing is allocated and nothing is released.** `_do_alloc_write` reports
 `0 blobs`; `_txc_finalize_kv` reports `allocated 0x[] released 0x[]`. The
@@ -1782,12 +1802,27 @@ extent's reference and `compress_extent_map` immediately merges the split
 back together, so the shard re-encodes to the same shape it had — 455 bytes,
 6 extents. Only the one crc32c word covering that 4 KiB chunk differs.
 
-**The payload goes into RocksDB, not to the device.** 4 KiB ≤
-`prefer_deferred_size` of 64 KiB, so `_do_write_big_apply_deferred`
-([BlueStore.cc:17014](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L17014)) builds a deferred op instead. `reading head 0x0 and tail
-0x0` means no read-modify-write was needed: the write is already aligned to
-both the AU and the 4 KiB checksum chunk. Kill the OSD before the deferred
-queue drains and the payload is sitting in the `L` prefix:
+**The payload goes into RocksDB, not to the device.** The test is
+`BigDeferredWriteContext::can_defer()` ([BlueStore.cc:16984](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L16984)), and it is
+narrower than "small writes are deferred":
+
+```cpp
+res = blob_aligned_len() < prefer_deferred_size &&
+  blob_aligned_len() <= ondisk &&
+  blob.is_allocated(b_off, blob_aligned_len());
+```
+
+Strictly less than, so a 64 KiB overwrite is *not* deferred by this path; and
+the range must already be allocated inside a mutable blob, which is why case
+1 — all new allocation — deferred nothing. (The outer gate at
+[BlueStore.cc:17111](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L17111) admits requests up to `2 ×
+prefer_deferred_size`, because one write straddling two blobs can produce two
+deferred blocks.) Here 4 KiB < 64 KiB and the blob is allocated, so
+`_do_write_big_apply_deferred` ([BlueStore.cc:17014](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L17014)) builds a deferred op.
+`reading head 0x0 and tail 0x0` means no read-modify-write was needed: the
+write is already aligned to both the AU and the 4 KiB checksum chunk. Kill
+the OSD before the deferred queue drains and the payload is sitting in the
+`L` prefix:
 
 ```
 $ ceph-kvstore-tool bluestore-kv dev/osd0 list L
@@ -1802,7 +1837,7 @@ $ ceph-dencoder type bluestore_deferred_transaction_t import L.bin decode dump_j
 ```
 
 `bluestore_deferred_transaction_t` ([bluestore_types.h:1363](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h#L1363)) is 4,135 bytes
-for a 4 KiB payload — 39 bytes of framing. Offset 433,704,960 is 0x19D9D000,
+for a 4 KiB payload — 39 bytes of framing. Offset 433,704,960 is 0x19d9d000,
 which is the allocation base from case 1 plus 1 MiB: the object was laid out
 contiguously, so the logical offset maps straight through.
 
@@ -1835,8 +1870,9 @@ sequential journal write on the critical path instead of a random one.
 
 Restart the OSD and the deferred op replays. Snapshotting the object's keys
 again shows **no change at all** — replay writes data to an address the
-metadata already committed to, which is exactly why it is safe to replay
-blindly.
+metadata already committed to, which is what makes it idempotent. Not
+unconditional, though: §4.8 covers the filter that first discards records
+pointing at blocks BlueFS has since been given.
 
 ### Reading the evidence yourself
 
@@ -1851,8 +1887,8 @@ is the authority.
 
 One number above is history-dependent. `obj3` got a single contiguous 4 MiB
 extent because that region of the device was clean. Repeating the same write
-later on the same store still produced twelve `O` keys — same blob count,
-same shard count — but touched 11 freelist keys spanning two disjoint
+later on the same store still produced twelve `O` keys with a byte-identical
+set of shard suffixes — but touched 11 freelist keys spanning two disjoint
 regions instead of 9 contiguous ones. Blob count follows `max_blob_size` and
 is a property of the write; extent count follows how much the allocator can
 hand you in one piece, and is a property of the store's history.
@@ -2544,10 +2580,12 @@ central performance fact about BlueStore small writes, and it is why:
 - Sharded column families matter — they keep the compaction fan-out per key
   class independent.
 
-For a 4 MiB write the picture inverts completely: 4 MiB of data, one blob
-(well, 64 of them at `max_blob_size` 64 KiB), a handful of extent map entries
-thanks to the delta encoding, and roughly the same ~1 KiB of RocksDB traffic.
-Metadata amplification is under 0.1%.
+For a 4 MiB write the picture inverts, though less dramatically than the
+delta encoding alone would suggest: 4 MiB of data, 64 blobs at
+`max_blob_size` 64 KiB, and — measured in §3.6 — 5,263 bytes of RocksDB
+traffic across 12 keys. Metadata amplification is 0.13%. The extent *records*
+do collapse to almost nothing; what does not collapse is 64 B of checksum per
+blob, which is 4 KiB of the 5,263.
 
 ## 5.6 Compaction and operational impact
 
