@@ -1695,6 +1695,48 @@ Each blob carries `crc32c/0x1000/64`: csum chunk 4 KiB (`csum_order 12`), 64
 checksum for 4 MiB of data, and it is the checksum, not the extent list, that
 dominates the extent map.
 
+**Why 64 blobs and not one.** `_set_blob_size()` ([BlueStore.cc:6106](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L6106)) takes
+`bluestore_max_blob_size` if set and otherwise falls through to the `_hdd` /
+`_ssd` variant, so the cap here is 64 KiB and `_do_write_big` emits one blob
+per chunk of it. Note this is a partition of *metadata*, not of space: the 64
+blobs came from one `allocate()` call and share one contiguous physical
+extent.
+
+Splitting costs metadata rather than saving it. Checksum volume is invariant —
+the chunk is 4 KiB whatever the blob size, so 4 MiB carries 4 KiB of crc32c
+either way — and what the split adds is 64 blob records and 64 extent records
+where one of each would do. That is most of the gap between the 4,853 bytes
+measured below and the ~4.1 KiB a single blob would need.
+
+What it buys is granularity, because the blob is the unit of four things that
+get expensive with size:
+
+- **Compression.** `get_release_size()` ([bluestore_types.h:1069](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h#L1069)) returns the
+  *whole* logical length for a compressed blob, and reading one byte means
+  decompressing all of it — hence the separate
+  `bluestore_compression_max_blob_size`.
+- **The `unused` bitmap is 16 bits.** `add_unused()` ([bluestore_types.h:742](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h#L742))
+  computes `chunk_size = blob_len / (sizeof(unused)*8)`. At 64 KiB that is
+  4 KiB — exactly one AU. At 4 MiB it would be 256 KiB, and "never written"
+  could not be tracked any finer.
+- **Sharding.** A blob referenced from more than one shard trips
+  `blob_escapes_range()` ([BlueStore.cc:3857](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L3857)), and `reshard()` states the choice:
+  *"We have two options: (1) split the blob into pieces at the shard
+  boundaries … or (2) mark it spanning. We prefer to cut the blob if we can."*
+  Spanning blobs live in the onode, not in a shard, so every access to any
+  part of the object pays for them — and `can_split()`
+  ([bluestore_types.h:610](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h#L610)) refuses for shared, compressed and
+  `HAS_UNUSED` blobs, so cutting is not always available.
+- **Sharing on clone**, which is per blob.
+
+`max_blob_size_hdd` = 64 KiB is 16 × `min_alloc_size`, the one size at which
+that 16-bit bitmap resolves to exactly one allocation unit. No comment states
+that as intent, so take it as a fit worth noticing rather than a documented
+rationale. Either way the trade is a bet about the future: an object written
+once and never touched would be cheaper as one blob, and BlueStore spends
+~750 bytes up front because it cannot know that, and because splitting later
+is far more expensive than splitting now.
+
 64 extents at ~75 bytes each against a 500-byte shard target gives 6 extents
 per shard, and 11 shards. `ceph-objectstore-tool … dump` shows the onode's
 view — the shard directory it must keep to know where each shard ends:
