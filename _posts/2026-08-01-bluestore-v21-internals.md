@@ -778,6 +778,27 @@ reuses a single `Blob` for the whole scan. It serves
 `read_allocation_from_onodes()` during NCB recovery, where you want to visit
 tens of millions of onodes and only care about their pextents.
 
+**Why one seek finds all of it.** The ordering is not incidental. A shard key
+is the onode key *plus* a suffix, so the onode is a strict prefix of every one
+of its shards and therefore sorts immediately before them. The suffix is a
+4-byte **big-endian** offset followed by `x`, and big-endian is what makes
+bytewise order equal numeric order — so the shards then follow in ascending
+offset:
+
+```
+…6F                     onode          (type byte 'o' = 0x6F)
+…6F 00000000 78         shard @ 0      ('x' = 0x78)
+…6F 00060000 78         shard @ 0x60000
+…6F 000C0000 78         shard @ 0xC0000
+```
+
+So an object and its entire extent map are one contiguous key range, walked
+with a single iterator rather than N point lookups — and a range read for a
+byte span maps to a range scan over consecutive shard keys. The same trick
+operates one level up: because the object hash is bit-reversed in the key, a
+PG's objects are contiguous too, which is what makes PG listing, backfill and
+scrub range scans instead of scattered gets.
+
 ### Which key does an operation actually read?
 
 The `o` key is unavoidable; the `x` keys are on demand.
