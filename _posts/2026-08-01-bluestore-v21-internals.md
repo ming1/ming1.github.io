@@ -699,7 +699,8 @@ at 500.
 So the *logical* span of a shard is derived, never configured. §3.6 traces the
 arithmetic on a live object: `extent_avg 75, target 500, slop 100` gives 6
 extents per shard, which at 64 KiB blobs is 384 KiB of object per shard, and
-the shards measure 453–455 bytes.
+the full shards measure 453–455 bytes (the tail shard, holding what is left,
+is 305).
 
 Two consequences. Because most of a shard is checksum — 384 of 455 bytes in
 that measurement — `target_size` acts as a cap on *blobs per shard*, and the
@@ -873,8 +874,10 @@ ceph-kvstore-tool bluestore-kv <store> list O | grep 'x$'   # shards
 ```
 
 A small store shows no `x` keys at all — the extent map stays inlined in the
-onode value until it grows enough to warrant splitting, so shard keys appear
-only once overwrites have fragmented an object.
+onode value until it grows enough to warrant splitting. Note that "enough" is
+encoded size, not fragmentation: §3.6 shows a single sequential 4 MiB write to
+a brand-new object producing eleven shards immediately, because 64 blobs at
+~75 bytes each dwarf the 500-byte target.
 
 ## 2.5 Blob
 
@@ -1851,6 +1854,10 @@ asserts before printing. Row one shows accumulated versus contributed: this
 write set 99 bits, but the value reads back all 128, because the region's other
 29 blocks were already allocated.
 
+The borrowed addresses cost nothing here: `0x1d49d000` and `obj3`'s
+`0x19c9d000` are both `0x1d000` past a 512 KiB boundary, so `obj3` splits its
+own nine keys 99 / 7×128 / 29 identically, starting at `0x19c80000`.
+
 The two key spaces line up nowhere. Eleven shards and nine freelist keys cut
 the same 4 MiB — at 384 KiB and 512 KiB — and neither is aware of the other:
 most `b` keys straddle two shards, two straddle three, and the ends are partial
@@ -1879,10 +1886,12 @@ target roughly doubles the shard count and adds another ~460 bytes the knob
 cannot see; small shards cost more than 500 bytes suggests. Object name length
 is invisible the same way — it sits in the prefix all twelve keys repeat.
 
-**5,263 bytes of object metadata for 4 MiB of data — 0.13%.** The data itself
-went straight to the device; `_txc_finalize_kv` records `released 0x[]` because
-nothing was overwritten, and the state trace crosses `aio_wait`, the tell that
-real I/O was issued at prepare time.
+**5,263 bytes of object metadata for 4 MiB of data — 0.13%**, counting the
+twelve `O` values only; with their keys and the other two prefixes it is 5,842
+across 22 keys, 0.14%. The data itself went straight to the device;
+`_txc_finalize_kv` records `released 0x[]` because nothing was overwritten, and
+the state trace crosses `aio_wait`, the tell that real I/O was issued at
+prepare time.
 
 What is *not* in the table is `S nid_max`. It does change here, but per §2.3
 that is `_kv_sync_thread()` raising the ceiling on its half-window trigger, not
@@ -1898,8 +1907,8 @@ space.
 
 Splitting costs metadata rather than saving it: checksum volume is invariant
 under the split — the chunk is 4 KiB whatever the blob size — so what the split
-adds is 64 blob records and 64 extent records where one of each would do, most
-of the gap between the 4,853 bytes above and the ~4.1 KiB a single blob needs.
+adds is 64 blob records and 64 extent records where one of each would do: most
+of the gap between the 4,853 bytes above and the ~4,100 a single blob needs.
 
 What it buys is granularity, the blob being the unit of four things that get
 expensive with size:
