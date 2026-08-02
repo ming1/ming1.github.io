@@ -30,8 +30,8 @@ BlueStore is roughly 20k lines in one `.cc` file, and reading it linearly does
 not work. What works is knowing the doorways, knowing who runs the code, and
 then following one operation all the way down. That is the shape of this post:
 the API contract (Part 1), the threads (Part 2), the objects and their
-lifetimes (Part 3), then one 64 KiB write traced from `queue_transactions()`
-to the device (Part 4). The read path (Part 5) is a short contrast, Part 6
+lifetimes (Part 3, after the cast in Part 0), then one 64 KiB write traced
+from `queue_transactions()` to the device (Part 4). The read path (Part 5) is a short contrast, Part 6
 consolidates the locking, and Parts 7 onward each expand one step of the
 write trace. Part 12 re-cuts the same material by entry point, for when you
 know which call you are changing.
@@ -72,6 +72,58 @@ read the signature and know what a function will *take*; in BlueStore you
 must trace the callers for even that. Part 6 decodes those suffixes: a legend
 for them does exist, but it is an easily-missed comment at the bottom of
 `BlueFS.h`, and it gives the letters without the grammar.
+
+# Part 0: the cast
+
+Before any of the mechanism, the objects. This part is orientation only —
+what each type is *for* and how it connects to the others. The C++ mechanics
+(what is refcounted, who frees what) are Part 3; the code that drives them is
+Parts 4 onward.
+
+The chain from an OSD write down to a disk extent is shorter than the file
+size suggests:
+
+```
+ Transaction            what the OSD hands over: a list of ops
+   └─ CollectionHandle  names the target, and IS the ordering stream
+        └─ Collection   one PG's container: onode cache + a lock
+             └─ Onode   one object's metadata
+                  └─ ExtentMap    logical offset -> Extent
+                       └─ Extent  a logical range, pointing into a...
+                            └─ Blob      physical extents + checksums
+                                 └─ SharedBlob   refcounts, only if cloned
+```
+
+Alongside that, one object tracks the write itself — `TransContext`, the
+in-flight transaction — and two more own free space and the device.
+
+| Type | Why it exists |
+|---|---|
+| [`Transaction`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/Transaction.h#L107) | the unit the OSD submits: an op array plus interned collection and object names, decoded by the backend |
+| [`CollectionImpl`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/ObjectStore.h#L142) / `CollectionHandle` | a refcounted handle that is both a name cache and the ordering token — same handle means sequential |
+| [`Collection`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1716) | BlueStore's per-PG container: its own onode cache and `shared_mutex`, so PGs contend with each other as little as possible |
+| [`OpSequencer`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2231) | the queue that makes ordering real; outlives its collection so delete-then-recreate keeps the stream |
+| [`Onode`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1379) | one object's metadata — size, attrs, and the extent map |
+| [`ExtentMap`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L965) | logical offset → `Extent`; sharded so a small overwrite dirties one shard, not a megabyte |
+| [`Blob`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L658) | the unit of *physical* allocation: device extents, checksums, compression flags |
+| [`SharedBlob`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L554) | refcounted extent ownership between clones — copy-on-write without copying |
+| [`BufferSpace`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L427) | the per-collection data cache, distinct from the onode cache |
+| [`TransContext`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1906) | one in-flight write: its state, its KV transaction, its aios |
+| [`Allocator`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/Allocator.h#L25) | in-memory free space, rebuilt at mount |
+| [`BitmapFreelistManager`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BitmapFreelistManager.h#L16) | the persistent free-space record |
+| [`BlueFS`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.h#L265) / [`BlueRocksEnv`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueRocksEnv.h#L19) | a minimal filesystem existing only to host RocksDB's files |
+| [`BlockDevice`](https://github.com/ceph/ceph/blob/v21.3.0/src/blk/BlockDevice.h#L150) / [`KernelDevice`](https://github.com/ceph/ceph/blob/v21.3.0/src/blk/kernel/KernelDevice.h#L40) | the device abstraction and its O_DIRECT + aio implementation |
+
+Two splits explain most of the design. **Logical versus physical**: an
+`Extent` is a range of the *object*, a `Blob` owns ranges of the *device*, and
+keeping them apart is what lets several small writes share one blob and lets
+clones share extents without copying. **In-memory versus persistent**: the
+`Allocator` decides where to put data and the freelist manager records it, and
+conflating the two is the most common way to misread the space code.
+
+One thing to carry forward: the metadata types are cached per collection, and
+that is a locking decision as much as a performance one. It is why
+`Collection` owns a lock and a cache rather than the store owning one of each.
 
 # Part 1: the contract
 
