@@ -1649,9 +1649,8 @@ if (wctx->compress && wctx->target_blob_size < min_alloc_size * 2)
 
 ## 3.6 Two writes, observed
 
-Everything above is what the code says. This section is what it does: a 4 MiB
-write to a new object, then a 4 KiB overwrite inside it, with every byte of
-metadata each one produces identified by name.
+What the code above does, measured: a 4 MiB write to a new object, then a
+4 KiB overwrite inside it, with every byte of metadata named.
 
 The store is a single-OSD `vstart.sh` cluster whose block device is a file on
 rotational media, so BlueStore classifies it `hdd`. Four defaults decide
@@ -1664,10 +1663,9 @@ everything that follows:
 | `bluestore_prefer_deferred_size_hdd` | 64 KiB | an overwrite < 64 KiB into allocated space is deferred |
 | `bluestore_extent_map_shard_target_size` | 500 bytes | ~6 extents per shard |
 
-*The traced binary is built from `main`, ahead of the tag. Every log string
-quoted below, and all four defaults, were checked to exist unchanged at
-`v21.3.0` — but treat the trace as evidence about that build, and the source
-as evidence about the tag.*
+*The traced binary is built from `main`, ahead of the tag; every log string
+below and all four defaults were checked unchanged at `v21.3.0`. The trace is
+evidence about that build, the source about the tag.*
 
 Four instruments, each answering a different question:
 
@@ -1686,11 +1684,10 @@ is false at these defaults, so this is the v1 path of §3.3, not §3.4's.
 
 Case 1 is scripted end to end in
 [`code/ceph-bluestore-observe-4m-write.sh`]({{ site.baseurl }}/code/ceph-bluestore-observe-4m-write.sh),
-against a `vstart.sh` cluster. It validates before it reports — that the trace
-really covers this object, that the dumped onode *is* the object written, that
-the key count matches the shard directory, that every freelist key the traced
-extent implies is actually in the diff — and exits non-zero if any check
-fails. Three traps it encodes are worth knowing even if you never run it:
+against a `vstart.sh` cluster. It exits non-zero unless the trace covers this
+object, the dumped onode is the object written, the key count matches the shard
+directory, and every freelist key the traced extent implies is in the diff.
+Three traps it encodes:
 
 - **Never run the stop step as an `ssh` one-liner.** `pkill -f 'ceph-osd -i 0'`
   matches the argv of the shell running it and kills your own session.
@@ -1740,58 +1737,10 @@ Each blob carries `crc32c/0x1000/64`: csum chunk 4 KiB (`csum_order 12`), 64
 checksum for 4 MiB of data, and it is the checksum, not the extent list, that
 dominates the extent map.
 
-**Why 64 blobs and not one.** `_set_blob_size()` ([BlueStore.cc:6106](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L6106)) takes
-`bluestore_max_blob_size` if set and otherwise falls through to the `_hdd` /
-`_ssd` variant, so the cap here is 64 KiB and `_do_write_big` emits one blob
-per chunk of it. Note this is a partition of *metadata*, not of space: the 64
-blobs came from one `allocate()` call and share one contiguous physical
-extent.
-
-Splitting costs metadata rather than saving it. Checksum volume is invariant —
-the chunk is 4 KiB whatever the blob size, so 4 MiB carries 4 KiB of crc32c
-either way — and what the split adds is 64 blob records and 64 extent records
-where one of each would do. That is most of the gap between the 4,853 bytes
-measured below and the ~4.1 KiB a single blob would need.
-
-What it buys is granularity, because the blob is the unit of four things that
-get expensive with size:
-
-- **Compression.** `get_release_size()` ([bluestore_types.h:1069](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h#L1069)) returns the
-  *whole* logical length for a compressed blob, and reading one byte means
-  decompressing all of it — hence the separate
-  `bluestore_compression_max_blob_size`.
-- **The `unused` bitmap is 16 bits.** `add_unused()` ([bluestore_types.h:742](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h#L742))
-  computes `chunk_size = blob_len / (sizeof(unused)*8)`. At 64 KiB that is
-  4 KiB — exactly one AU. At 4 MiB it would be 256 KiB, and "never written"
-  could not be tracked any finer.
-- **Sharding.** A blob referenced from more than one shard trips
-  `blob_escapes_range()` ([BlueStore.cc:3857](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L3857)), and `reshard()` states the choice:
-  *"We have two options: (1) split the blob into pieces at the shard
-  boundaries … or (2) mark it spanning. We prefer to cut the blob if we can."*
-  Spanning blobs live in the onode, not in a shard, so every access to any
-  part of the object pays for them — and `can_split()`
-  ([bluestore_types.h:610](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h#L610)) refuses for shared, compressed and
-  `HAS_UNUSED` blobs, so cutting is not always available.
-- **Sharing on clone**, which is per blob.
-
-`max_blob_size_hdd` = 64 KiB is 16 × `min_alloc_size`, the one size at which
-that 16-bit bitmap resolves to exactly one allocation unit. No comment states
-that as intent, so take it as a fit worth noticing rather than a documented
-rationale. Either way the trade is a bet about the future: an object written
-once and never touched would be cheaper as one blob, and BlueStore spends
-~750 bytes up front because it cannot know that, and because splitting later
-is far more expensive than splitting now.
-
 64 extents at ~75 bytes each against a 500-byte shard target gives 6 extents
-per shard, and 11 shards. `ceph-objectstore-tool … dump` shows the onode's
-view — the shard directory it must keep to know where each shard ends:
+per shard, and 11 shards.
 
-```
-"nid": 9330, "size": 4194304,
-"extent_map_shards": [ {"offset": 0,       "bytes": 453},
-                       {"offset": 393216,  "bytes": 455},
-                       … {"offset": 3932160, "bytes": 305} ]
-```
+#### The twelve keys, decoded
 
 Twelve RocksDB keys result, all under `O`. Here they are verbatim, exactly as
 `ceph-kvstore-tool bluestore-kv <path> list O` prints them, in the order the
@@ -1823,86 +1772,67 @@ Every one is the same prefix, built by `_key_encode_prefix()`
  1B          8B                    4B          variable     8B      8B   1B
 ```
 
-| Bytes | Field | Value here | Why it is shaped that way |
-|---|---|---|---|
-| `%7f` | shard id | `NO_SHARD` (−1) | `shard.id + 0x80`, so −1 → `0x7f`. First, so an EC shard's keys group together |
-| `%80…%04` | pool | 4 | `pool + 2^63`, so the meta pool (−1) sorts below real pools instead of above them |
-| `%8d%d1o%86` | hash | `0x8dd16f86` | the object hash **bit-reversed** — what makes one PG's objects a contiguous range |
-| `%21obj3%21%3d` | namespace + name | `!obj3!=` | `!` separates, `!=` closes an empty namespace before the name |
-| `%ff…%fe` | snap | `CEPH_NOSNAP` | 8 BE bytes; `head` is `…fffe`, so it sorts after all its snapshots |
-| `%ff…%ff` | generation | `NO_GEN` | 8 BE bytes |
-| `o` | type | `ONODE_KEY_SUFFIX` | ends an onode key |
+| Bytes | Field | Value here |
+|---|---|---|
+| `%7f` | shard id | `NO_SHARD` (−1), encoded `id + 0x80` |
+| `%80…%04` | pool | 4, biased by 2^63 |
+| `%8d%d1o%86` | hash | `0x8dd16f86`, bit-reversed |
+| `%21obj3%21%3d` | namespace + name | `!obj3!=` |
+| `%ff…%fe` / `%ff…%ff` | snap / generation | `CEPH_NOSNAP`, `NO_GEN` |
+| `o` | type | `ONODE_KEY_SUFFIX` |
 
-The eleven shard keys append a 4-byte big-endian logical offset and
-`EXTENT_SHARD_KEY_SUFFIX` `'x'` to that whole key — which is the strict-prefix
-property §2.4 relies on:
+§5.2 covers why each field is shaped that way. The eleven shard keys append a
+4-byte big-endian logical offset and `EXTENT_SHARD_KEY_SUFFIX` `'x'` to that
+whole key — the strict-prefix property of §2.4.
 
-Pairing each key with its parsed value is what makes the design legible: the
-**key** says *which object and which logical offset*, and nothing else; the
-**value** holds everything about that range — its extents, the blobs they
-point at, and the checksums. That division is why a 4 KiB overwrite in Case 2
-can find its shard with one seek and rewrite one value, without reading or
-touching the other ten.
-
-In key order, with the logical range each value covers, the device range its
-blobs point at, and the split between checksum and everything else:
+So the **key** says which object and which logical offset; the **value** holds
+that range's extents, the blobs they point at, and the checksums. In key
+order:
 
 | Suffix | Value | Contents |
 |---|---|---|
-| *(none, ends at `o`)* | 410 B | onode: `nid 9330`, `size 0x400000`, attrs `_` 263 B + `snapset` 35 B, the 11-entry shard directory — 408 B, plus 2 B of spanning-blob region (empty) and 0 B inline extents |
+| *(none, ends at `o`)* | 410 B | onode: `nid 9330`, `size 0x400000`, attrs `_` 263 B + `snapset` 35 B, the 11-entry shard directory — 408 B, plus 2 B spanning-blob region (empty), 0 B inline extents |
 | `%00%00%00%00x` | 453 B | 6 extents, logical `0x0`–`0x60000` → device `0x19c9d000`–`0x19cfd000`; 384 B csum + 69 B framing |
-| `%00%06%00%00x` | 455 B | 6 extents, `0x60000`–`0xc0000` → `0x19cfd000`–`0x19d5d000`; 384 + 71 |
-| `%00%0c%00%00x` | 455 B | 6 extents, `0xc0000`–`0x120000` → `0x19d5d000`–`0x19dbd000`; 384 + 71 |
-| `%00%12%00%00x` | 455 B | 6 extents, `0x120000`–`0x180000` → `0x19dbd000`–`0x19e1d000`; 384 + 71 |
-| `%00%18%00%00x` | 455 B | 6 extents, `0x180000`–`0x1e0000` → `0x19e1d000`–`0x19e7d000`; 384 + 71 |
-| `%00%1e%00%00x` | 455 B | 6 extents, `0x1e0000`–`0x240000` → `0x19e7d000`–`0x19edd000`; 384 + 71 |
-| `%00%24%00%00x` | 455 B | 6 extents, `0x240000`–`0x2a0000` → `0x19edd000`–`0x19f3d000`; 384 + 71 |
-| `%00%2a%00%00x` | 455 B | 6 extents, `0x2a0000`–`0x300000` → `0x19f3d000`–`0x19f9d000`; 384 + 71 |
-| `%000%00%00x` | 455 B | 6 extents, `0x300000`–`0x360000` → `0x19f9d000`–`0x19ffd000`; 384 + 71 |
-| `%006%00%00x` | 455 B | 6 extents, `0x360000`–`0x3c0000` → `0x19ffd000`–`0x1a05d000`; 384 + 71 |
-| `%00%3c%00%00x` | 305 B | 4 extents, `0x3c0000`–`0x400000` → `0x1a05d000`–`0x1a09d000`; 256 B csum + 49 B framing |
+| `%00%06%00%00x` | 455 B | 6 extents, `0x60000`–`0xc0000` → `0x19cfd000`–`0x19d5d000` |
+| *… 8 more, 455 B each, 6 extents, 384 + 71 …* | | |
+| `%00%3c%00%00x` | 305 B | 4 extents, `0x3c0000`–`0x400000` → `0x1a05d000`–`0x1a09d000`; 256 + 49 |
 
-Read the device column downward and the single allocation is visible in the
-metadata: each shard's range begins exactly where the previous one ended,
-`0x19c9d000` through `0x1a09d000`, which is the `prealloc [0x19c9d000~400000]`
-of the trace sliced eleven ways. The shard boundary is a *logical* cut; it
-implies nothing about physical placement, and on an aged store these ranges
-would be scattered while the logical column stayed identical.
+The device column runs `0x19c9d000` to `0x1a09d000` without a gap:
+`prealloc [0x19c9d000~400000]` sliced eleven ways. The shard boundary is a
+*logical* cut and implies nothing about physical placement.
 
-Those last three rows are the trap. `ceph-kvstore-tool` escapes with
-`url_escape()`, which passes through only alphanumerics and `-._~/` — so 0x30
-and 0x36 survive as the characters `0` and `6`, while 0x3c, equally printable,
-becomes `%3c`. Printability is not the rule. Two consequences: the type byte
-is not findable by searching for `o`, because `0x6f` also appears inside this
-object's *hash* (`%8d%d1o%86`); and sorting the escaped text does not give key
-order, since `'0'` and `'6'` sort after `'%'`. The listing above is in true
-key order because `list` iterates the database — pipe it through `sort` and
-shards 0x300000 and 0x360000 will move below 0x3c0000.
+Three of those suffixes are a trap. `ceph-kvstore-tool` escapes with
+`url_escape()`, which passes only alphanumerics and `-._~/` — so 0x30 and 0x36
+survive as `0` and `6` (`%000%00%00x` is shard 0x300000, `%006%00%00x` is
+0x360000), while 0x3c, equally printable, becomes `%3c`. Printability is not
+the rule. Two consequences: the type byte is not findable by searching for
+`o`, since `0x6f` also sits inside this object's *hash* (`%8d%d1o%86`) — note
+against §2.4's `grep 'o$'` suggestion; and sorting the escaped text does not
+give key order, since `'0'` and `'6'` sort after `'%'`. The listing above is
+ordered because `list` iterates the database.
 
-Both of these keys are trivially encoded:
+#### The other two prefixes: b and T
+
+Beyond the twelve `O` keys the write touches two more, both trivially encoded:
 
 | Prefix | Key | Encoding |
 |---|---|---|
-| `b` | device offset | `make_offset_key()` → `_key_encode_u64(offset)`, 8 BE bytes; one key per `blocks_per_key × bytes_per_block` = 512 KiB of device |
+| `b` | device offset | `make_offset_key()` → `_key_encode_u64(offset)`, 8 BE bytes; one key per `blocks_per_key × bytes_per_block` = 512 KiB of device (§7.5) |
 | `T` | pool id | `get_pool_stat_key()` → `_key_encode_u64(pool_id)`, 8 BE bytes; `%ff × 8` is pool −1, the *meta* pool, not a store-wide total |
 
-That last point is worth stating plainly, because the key invites the wrong
-reading: with per-pool statfs enabled — the default — a transaction merges
-exactly **one** `T` key, its own pool's. The genuinely store-wide counter has
-its own literal key `bluestore_statfs`
-(`BLUESTORE_GLOBAL_STATFS_KEY`, [BlueStore.cc:147](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L147)), and it is
-absent from this store entirely. So the 4 MiB write writes the freelist bits
+With per-pool statfs enabled — the default — a transaction merges exactly
+**one** `T` key, its own pool's. The store-wide counter has its own literal key
+`bluestore_statfs` (`BLUESTORE_GLOBAL_STATFS_KEY`, [BlueStore.cc:147](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L147)),
+absent from this store entirely. So the 4 MiB write adds the freelist bits
 covering `0x19c9d000~400000` and one statfs merge for pool 4 — nothing else of
-BlueStore's own; the OSD's PG-log omap writes ride in the same transaction and
-are excluded here.
+BlueStore's own. (The OSD's PG-log omap writes ride in the same transaction and
+are excluded here.)
 
-The freelist keys deserve the same key/value treatment, but a `b` value cannot
-be recovered after the fact — the merge operator XORs, so what you read back
-is the *accumulated* bitmap for that region, not one write's contribution.
-These come from a separate scripted run of the identical procedure
-([`code/ceph-bluestore-observe-4m-write.sh`]({{ site.baseurl }}/code/ceph-bluestore-observe-4m-write.sh)); the allocator placed that
-object at `0x1d49d000`, so the addresses differ from `obj3` above while the
-structure is identical:
+A `b` value cannot be recovered after the fact: the merge operator XORs (§7.5),
+so what reads back is the region's *accumulated* bitmap, not one write's
+contribution. These come from a separate run of the same script
+([`code/ceph-bluestore-observe-4m-write.sh`]({{ site.baseurl }}/code/ceph-bluestore-observe-4m-write.sh)), where the allocator placed the
+object at `0x1d49d000` — different addresses, identical structure:
 
 | `b` key | Covers | Bits this write set | Value read back | Shards living there |
 |---|---|---|---|---|
@@ -1916,56 +1846,84 @@ structure is identical:
 | `%00%00%00%00%1d%80%00%00` | `0x1d800000`+512K | 128/128 | `ff × 16` | 0x360000, 0x3c0000 |
 | `%00%00%00%00%1d%88%00%00` | `0x1d880000`+512K | 29/128 | `ff ff ff 1f 00 …` | 0x3c0000 |
 
-99 + 7×128 + 29 = **1024** blocks, which is 4 MiB at 4 KiB each — the script
-asserts exactly that before printing the table. The first row is where the
-accumulated-versus-contributed distinction shows: this write set 99 bits, but
-the value reads back all 128, because the region's other 29 blocks were
-already allocated to something else.
+99 + 7×128 + 29 = **1024** blocks — 4 MiB at 4 KiB each, which the script
+asserts before printing. Row one shows accumulated versus contributed: this
+write set 99 bits, but the value reads back all 128, because the region's other
+29 blocks were already allocated.
 
-Note that the two key spaces do not line up anywhere. Eleven shards and nine
-freelist keys cut the same 4 MiB — at 384 KiB (6 blobs) and 512 KiB — and
-neither is aware of the other: most `b` keys straddle two shards, two straddle
-three, and the ends are partial because the allocation did not begin on a
-512 KiB boundary. One is indexed by *logical* offset within the object, the
-other by *device* offset. And `%00%00%00%00%1dx%00%00` is a reminder to
-decode rather than pattern-match: that is `0x1d780000`, a freelist key ending
-in a literal `x`, not an extent-map shard.
+The two key spaces line up nowhere. Eleven shards and nine freelist keys cut
+the same 4 MiB — at 384 KiB and 512 KiB — and neither is aware of the other:
+most `b` keys straddle two shards, two straddle three, and the ends are partial
+because the allocation did not begin on a 512 KiB boundary. One is indexed by
+*logical* offset within the object, the other by *device* offset. Decode rather
+than pattern-match: `%00%00%00%00%1dx%00%00` is `0x1d780000`, a freelist key
+ending in a literal `x`, not an extent-map shard.
 
 | What | Keys | Key bytes | Value bytes |
 |---|---|---|---|
 | onode | 1 × `O …o` | 37 | 410 |
 | extent map | 11 × `O …o…x` | 462 (42 each) | 4,853 |
-| freelist bits | 9 × `b`, each covering 512 KiB of device | 72 (8 each) | 9 × 16 B merge operands |
+| freelist bits | 9 × `b` | 72 (8 each) | 9 × 16 B merge operands |
 | statfs | 1 × `T` (this pool) | 8 | one merge operand |
 | | | **579** | **5,263** + operands |
 
-The freelist row is derived, not measured: `list` cannot show it, because at
-128 blocks per key these are merges into keys that already existed. Nine
-follows from the 4 MiB extent and 512 KiB of device coverage per key.
+The freelist row is derived, not measured: at 128 blocks per key these are
+merges into pre-existing keys, invisible to `list`.
 
-The key column is worth a moment, because nothing in BlueStore's own
-accounting includes it. `reshard_decision`'s `extent_avg` is computed from
-`inline_bl.length()` or the sum of `shard_info->bytes` — encoded *values*, in
-both branches — so `bluestore_extent_map_shard_target_size` is blind to the
-499 bytes of `O` key space this object occupies, about 9% of what RocksDB
-actually stores for it. Halving the target would roughly double the shard
-count and add another ~460 bytes of keys that the knob cannot see, which makes
-the real cost of small shards steeper than 500 bytes suggests. Object name
-length lands in the same place: it sits in the prefix every one of the twelve
-keys repeats.
+BlueStore's own accounting excludes the key column. `reshard_decision`'s
+`extent_avg` comes from `inline_bl.length()` or the sum of
+`shard_info->bytes` — encoded *values* in both branches — so
+`bluestore_extent_map_shard_target_size` is blind to the 499 bytes of `O` key
+space this object occupies, ~9% of what RocksDB stores for it. Halving the
+target roughly doubles the shard count and adds another ~460 bytes the knob
+cannot see; small shards cost more than 500 bytes suggests. Object name length
+is invisible the same way — it sits in the prefix all twelve keys repeat.
 
-What is *not* in the table is `S nid_max`. It does change here, but not
-because this object consumed nid 9330 — `_assign_nid()` ([BlueStore.cc:14529](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L14529))
-only bumps an in-memory counter. The key is rewritten by `_kv_sync_thread()`
-([BlueStore.cc:15406](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15406)) when the preallocated window is half spent, so with
-`bluestore_nid_prealloc` = 1024 it lands roughly once per 512 new objects.
-Catching it in this particular transaction is sampling, not causation — a
-good illustration of why a single observation cannot establish attribution.
+**5,263 bytes of object metadata for 4 MiB of data — 0.13%.** The data itself
+went straight to the device; `_txc_finalize_kv` records `released 0x[]` because
+nothing was overwritten, and the state trace crosses `aio_wait`, the tell that
+real I/O was issued at prepare time.
 
-5,263 bytes of object metadata for 4 MiB of data — 0.13%. The data itself
-went straight to the device; `_txc_finalize_kv` records `released 0x[]`
-because nothing was overwritten, and the state trace crosses `aio_wait`,
-which is the tell that real I/O was issued at prepare time.
+What is *not* in the table is `S nid_max`. It does change here, but per §2.3
+that is `_kv_sync_thread()` raising the ceiling on its half-window trigger, not
+this object consuming nid 9330. Catching it in this transaction is sampling,
+not causation.
+
+#### Why 64 blobs and not one
+
+`_set_blob_size()` ([BlueStore.cc:6106](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L6106)) takes `bluestore_max_blob_size` if set
+and otherwise the `_hdd` / `_ssd` variant, so the cap is 64 KiB and
+`_do_write_big` emits one blob per chunk. This partitions *metadata*, not
+space.
+
+Splitting costs metadata rather than saving it: checksum volume is invariant
+under the split — the chunk is 4 KiB whatever the blob size — so what the split
+adds is 64 blob records and 64 extent records where one of each would do, most
+of the gap between the 4,853 bytes above and the ~4.1 KiB a single blob needs.
+
+What it buys is granularity, the blob being the unit of four things that get
+expensive with size:
+
+- **Compression.** `get_release_size()` ([bluestore_types.h:1069](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h#L1069)) returns the
+  *whole* logical length for a compressed blob (§2.5) — hence the separate
+  `bluestore_compression_max_blob_size`.
+- **The `unused` bitmap is 16 bits** (§2.5). At 64 KiB each bit is 4 KiB —
+  exactly one AU; at 4 MiB it would be 256 KiB.
+- **Sharding.** A blob referenced from more than one shard trips
+  `blob_escapes_range()` ([BlueStore.cc:3857](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L3857)), and `reshard()` states the choice:
+  *"We have two options: (1) split the blob into pieces at the shard
+  boundaries … or (2) mark it spanning. We prefer to cut the blob if we can."*
+  §2.4 covers what spanning blobs cost, and `can_split()`
+  ([bluestore_types.h:610](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h#L610)) refuses for shared, compressed and
+  `HAS_UNUSED` blobs, so cutting is not always available.
+- **Sharing on clone**, which is per blob.
+
+64 KiB is 16 × `min_alloc_size`, the one size at which that 16-bit bitmap
+resolves to exactly one allocation unit — a fit worth noticing, though no
+comment states it as intent. The trade is a bet: an object written once and
+never touched would be cheaper as one blob, but BlueStore spends ~750 bytes up
+front because it cannot know that, and splitting later costs far more than
+splitting now.
 
 ### Case 2: 4 KiB overwrite inside that object
 
@@ -1996,13 +1954,11 @@ _txc_state_proc txc 0x56436f3f3500 kv_submitted
 _deferred_queue txc 0x56436f3f3500 osr 0x56436f339180
 ```
 
-Five things worth stopping on.
+Five things.
 
-**It goes to `_do_write_big`, not `_do_write_small`.** The split condition in
-§3.3 sends a request to `_do_write_small()` only when it lands in a single AU
-*and* `length != min_alloc_size`. A 4 KiB write at a 4 KiB-aligned offset is
-exactly one AU, so it takes the else branch with zero head and zero tail.
-"Big" means AU-aligned, not large.
+**It goes to `_do_write_big`, not `_do_write_small`.** §3.3's split condition
+excludes a write that is exactly one AU, so this takes the else branch with
+zero head and zero tail. "Big" means AU-aligned, not large.
 
 **One shard is read, one shard is written.** `fault_range` faults in shard
 0xc0000 alone — 455 bytes decoded, 6 extents — and `dirty_range` marks that
@@ -2020,8 +1976,7 @@ back together, so the shard re-encodes to the same shape it had — 455 bytes,
 6 extents. Only the one crc32c word covering that 4 KiB chunk differs.
 
 **The payload goes into RocksDB, not to the device.** The test is
-`BigDeferredWriteContext::can_defer()` ([BlueStore.cc:16984](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L16984)), and it is
-narrower than "small writes are deferred":
+`BigDeferredWriteContext::can_defer()` ([BlueStore.cc:16984](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L16984)):
 
 ```cpp
 res = blob_aligned_len() < prefer_deferred_size &&
@@ -2030,12 +1985,10 @@ res = blob_aligned_len() < prefer_deferred_size &&
 ```
 
 Strictly less than, so a 64 KiB overwrite is *not* deferred by this path; and
-the range must already be allocated inside a mutable blob, which is why case
-1 — all new allocation — deferred nothing. (The outer gate at
-[BlueStore.cc:17111](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L17111) admits requests up to `2 ×
-prefer_deferred_size`, because one write straddling two blobs can produce two
-deferred blocks.) Here 4 KiB < 64 KiB and the blob is allocated, so
-`_do_write_big_apply_deferred` ([BlueStore.cc:17014](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L17014)) builds a deferred op.
+the range must already be allocated inside a mutable blob, which is why Case 1
+— all new allocation — deferred nothing. Here 4 KiB < 64 KiB and the blob is
+allocated, so `_do_write_big_apply_deferred` ([BlueStore.cc:17014](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L17014)) builds a
+deferred op.
 `reading head 0x0 and tail 0x0` means no read-modify-write was needed: the
 write is already aligned to both the AU and the 4 KiB checksum chunk. Kill
 the OSD before the deferred queue drains and the payload is sitting in the
@@ -2079,28 +2032,24 @@ the same transaction carries `_setattrs … 2 keys` — the OSD bumping
 and BlueStore metadata share one key, so an OSD-level version bump is a
 BlueStore-level onode rewrite.
 
-So the total cost of a 4 KiB client write is 410 + 455 + 4,135 ≈ 5 KiB into
-RocksDB now, plus 4 KiB to the device later, plus the `L` key's deletion:
-roughly 9 KiB of device traffic for 4 KiB of user data before RocksDB
-compaction rewrites the metadata again (§5.5), bought in exchange for one
-sequential journal write on the critical path instead of a random one.
+Total cost of a 4 KiB client write: 410 + 455 + 4,135 ≈ 5 KiB into RocksDB now,
+4 KiB to the device later, plus the `L` key's deletion. Roughly 9 KiB of device
+traffic for 4 KiB of user data, before RocksDB compaction rewrites the metadata
+again (§5.5) — bought for one sequential journal write on the critical path
+instead of a random one.
 
 Restart the OSD and the deferred op replays. Snapshotting the object's keys
-again shows **no change at all** — replay writes data to an address the
-metadata already committed to, which is what makes it idempotent. Not
-unconditional, though: §4.8 covers the filter that first discards records
-pointing at blocks BlueFS has since been given.
+again shows **no change at all** (§4.8, including the filter that first
+discards records pointing at blocks BlueFS has since been given).
 
 ### Reading the evidence yourself
 
 Two snapshots of a closed store are bit-identical, so `list-crc` diffs have a
-zero noise floor. A *live* OSD is a different matter: repeating this pair of
-writes with a store-wide diff, 238 and 215 values changed, of which 195 were
-the same `P` keys both times — osdmap epoch bookkeeping, unrelated to either
-write, and attributable only because it recurs. Scope the diff to
-the object and it is exact; for the question "what did *this transaction*
-write", the trace, and specifically `_txc_finalize_kv` and `_record_onode`,
-is the authority.
+zero noise floor. On a *live* OSD, a store-wide diff of this same pair of
+writes showed 238 and 215 changed values, 195 of them the same `P` keys both
+times — osdmap epoch bookkeeping, identifiable only because it recurs. Scope
+the diff to the object and it is exact; for "what did *this transaction*
+write", `_txc_finalize_kv` and `_record_onode` in the trace are the authority.
 
 One number above is history-dependent. `obj3` got a single contiguous 4 MiB
 extent because that region of the device was clean. Repeating the same write
