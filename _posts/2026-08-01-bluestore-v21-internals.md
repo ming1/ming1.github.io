@@ -1837,16 +1837,37 @@ The eleven shard keys append a 4-byte big-endian logical offset and
 `EXTENT_SHARD_KEY_SUFFIX` `'x'` to that whole key — which is the strict-prefix
 property §2.4 relies on:
 
-| Suffix | Shard | Value |
+Pairing each key with its parsed value is what makes the design legible: the
+**key** says *which object and which logical offset*, and nothing else; the
+**value** holds everything about that range — its extents, the blobs they
+point at, and the checksums. That division is why a 4 KiB overwrite in Case 2
+can find its shard with one seek and rewrite one value, without reading or
+touching the other ten.
+
+In key order, with the logical range each value covers, the device range its
+blobs point at, and the split between checksum and everything else:
+
+| Suffix | Value | Contents |
 |---|---|---|
-| — | onode | 410 B |
-| `%00%00%00%00x` | 0x0 | 453 B |
-| `%00%06%00%00x` | 0x60000 | 455 B |
-| `%00%0c%00%00x` | 0xc0000 | 455 B |
-| `%00%12%00%00x` … `%00%2a%00%00x` | 0x120000 … 0x2a0000 | 455 B each |
-| `%000%00%00x` | 0x300000 | 455 B |
-| `%006%00%00x` | 0x360000 | 455 B |
-| `%00%3c%00%00x` | 0x3c0000 | 305 B |
+| *(none, ends at `o`)* | 410 B | onode: `nid 9330`, `size 0x400000`, attrs `_` 263 B + `snapset` 35 B, the 11-entry shard directory — 408 B, plus 2 B of spanning-blob region (empty) and 0 B inline extents |
+| `%00%00%00%00x` | 453 B | 6 extents, logical `0x0`–`0x60000` → device `0x19c9d000`–`0x19cfd000`; 384 B csum + 69 B framing |
+| `%00%06%00%00x` | 455 B | 6 extents, `0x60000`–`0xc0000` → `0x19cfd000`–`0x19d5d000`; 384 + 71 |
+| `%00%0c%00%00x` | 455 B | 6 extents, `0xc0000`–`0x120000` → `0x19d5d000`–`0x19dbd000`; 384 + 71 |
+| `%00%12%00%00x` | 455 B | 6 extents, `0x120000`–`0x180000` → `0x19dbd000`–`0x19e1d000`; 384 + 71 |
+| `%00%18%00%00x` | 455 B | 6 extents, `0x180000`–`0x1e0000` → `0x19e1d000`–`0x19e7d000`; 384 + 71 |
+| `%00%1e%00%00x` | 455 B | 6 extents, `0x1e0000`–`0x240000` → `0x19e7d000`–`0x19edd000`; 384 + 71 |
+| `%00%24%00%00x` | 455 B | 6 extents, `0x240000`–`0x2a0000` → `0x19edd000`–`0x19f3d000`; 384 + 71 |
+| `%00%2a%00%00x` | 455 B | 6 extents, `0x2a0000`–`0x300000` → `0x19f3d000`–`0x19f9d000`; 384 + 71 |
+| `%000%00%00x` | 455 B | 6 extents, `0x300000`–`0x360000` → `0x19f9d000`–`0x19ffd000`; 384 + 71 |
+| `%006%00%00x` | 455 B | 6 extents, `0x360000`–`0x3c0000` → `0x19ffd000`–`0x1a05d000`; 384 + 71 |
+| `%00%3c%00%00x` | 305 B | 4 extents, `0x3c0000`–`0x400000` → `0x1a05d000`–`0x1a09d000`; 256 B csum + 49 B framing |
+
+Read the device column downward and the single allocation is visible in the
+metadata: each shard's range begins exactly where the previous one ended,
+`0x19c9d000` through `0x1a09d000`, which is the `prealloc [0x19c9d000~400000]`
+of the trace sliced eleven ways. The shard boundary is a *logical* cut; it
+implies nothing about physical placement, and on an aged store these ranges
+would be scattered while the logical column stayed identical.
 
 Those last three rows are the trap. `ceph-kvstore-tool` escapes with
 `url_escape()`, which passes through only alphanumerics and `-._~/` — so 0x30
