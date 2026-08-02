@@ -778,6 +778,50 @@ reuses a single `Blob` for the whole scan. It serves
 `read_allocation_from_onodes()` during NCB recovery, where you want to visit
 tens of millions of onodes and only care about their pextents.
 
+### Which key does an operation actually read?
+
+The `o` key is unavoidable; the `x` keys are on demand.
+
+**`o` — on every onode cache miss, whatever you are doing.** It holds nid,
+size, attrs, flags and the shard directory, and you cannot know which shards
+exist without reading it first. One point-get, and on the write path it is the
+only KV *read* at all.
+
+**`x` — only when you need to know where bytes live**, and then only the
+shards covering the range touched. That is what `fault_range()` does: walk
+`extent_map_shards`, load the covering ones, leave the rest on disk.
+
+| Operation | `o` | `x` |
+|---|---|---|
+| `stat` (size) | yes | no — size is in the onode |
+| `getattr` / `setattr` | yes | no — attrs are in the onode |
+| omap get/set/rm | yes | **no** |
+| `read` | yes | yes, covering the range |
+| `write` / `zero` / `truncate` | yes | yes, covering the range |
+| deep `fsck` | yes | yes, all of them |
+
+The omap row is the one worth internalizing. Omap operations need the onode
+only to obtain its `nid`, then go straight to the `M`/`P`/`m`/`p` prefixes
+keyed by that nid — they never touch the extent map. So an omap-heavy
+workload, an RGW bucket index or a PG log, reads onodes constantly and shard
+keys never, and stresses RocksDB in a completely different shape from a block
+workload.
+
+Two consequences. A random 4 KiB read of a large object costs **two** KV
+lookups on a cold cache — the onode, then the single shard covering that
+offset — not one, and not the whole map. The cost scales with the range
+touched, not with the object's fragmentation. And when inspecting a store by
+hand, `list O` returns both kinds interleaved; filter on the trailing byte:
+
+```bash
+ceph-kvstore-tool bluestore-kv <store> list O | grep 'o$'   # onodes
+ceph-kvstore-tool bluestore-kv <store> list O | grep 'x$'   # shards
+```
+
+A small store shows no `x` keys at all — the extent map stays inlined in the
+onode value until it grows enough to warrant splitting, so shard keys appear
+only once overwrites have fragmented an object.
+
 ## 2.5 Blob
 
 ```cpp
