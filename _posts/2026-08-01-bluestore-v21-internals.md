@@ -389,6 +389,38 @@ Both default to "absent", which is why a replicated object's JSON dump shows
 neither. The **g** is what the ObjectStore API speaks: every method in
 `ObjectStore.h` takes a `ghobject_t`, never a bare `hobject_t`.
 
+Those two name an object. The third fundamental struct is what the name
+*resolves to*: [`bluestore_onode_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h#L1160), the persisted onode — the
+value stored under an `O` key.
+
+```cpp
+struct bluestore_onode_t {
+  uint64_t nid = 0;              ///< numeric id (locally unique)
+  uint64_t size = 0;             ///< object size
+  std::map<mempool::bluestore_cache_meta::string, ceph::buffer::ptr> attrs;
+  ...
+  std::vector<shard_info> extent_map_shards;  ///< extent map shards (if any)
+```
+
+Note what it does *not* contain: the object's name. Identity lives in the key;
+the value holds only state. That asymmetry is deliberate — the name is long and
+variable-length, so repeating it inside the value would waste space in the one
+record read on every cache miss.
+
+Note also what it does not contain inline: the extent map, once the object is
+large enough. `extent_map_shards` is a list of shard descriptors, and the
+shards live under their own sibling keys. §2.4 covers why.
+
+The `nid` is the field to understand first, because it explains the omap
+schema. It is a `u64` the store hands out from a watermark in its superblock,
+and its comment says exactly what it is worth — *locally unique*. It is
+meaningful only inside this BlueStore instance: the same RADOS object on
+another OSD carries a different one, and deleting and recreating an object
+yields a fresh one rather than the old value. Its purpose is compactness. Omap
+keys are prefixed with the nid rather than the full object name, so an object
+with thousands of omap entries pays a `u64` per key instead of a full
+`ghobject_t`. §2.3 returns to the rest of the fields.
+
 Three things follow that matter later in this part.
 
 **The key is not the name.** BlueStore's `O` key is built from these fields in
