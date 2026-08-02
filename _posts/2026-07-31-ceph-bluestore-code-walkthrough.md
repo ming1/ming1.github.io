@@ -109,7 +109,7 @@ in-flight transaction — and two more own free space and the device.
 | [`SharedBlob`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L554) | refcounted extent ownership between clones — copy-on-write without copying |
 | [`BufferSpace`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L427) | the per-collection data cache, distinct from the onode cache |
 | [`TransContext`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1906) | one in-flight write: its state, its KV transaction, its aios |
-| [`Allocator`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/Allocator.h#L25) | in-memory free space, rebuilt at mount |
+| [`Allocator`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/Allocator.h#L25) | in-memory free space, restored at mount — usually from a BlueFS file, not rebuilt (Part 7) |
 | [`BitmapFreelistManager`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BitmapFreelistManager.h#L16) | the persistent free-space record |
 | [`BlueFS`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.h#L265) / [`BlueRocksEnv`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueRocksEnv.h#L19) | a minimal filesystem existing only to host RocksDB's files |
 | [`BlockDevice`](https://github.com/ceph/ceph/blob/v21.3.0/src/blk/BlockDevice.h#L150) / [`KernelDevice`](https://github.com/ceph/ceph/blob/v21.3.0/src/blk/kernel/KernelDevice.h#L40) | the device abstraction and its O_DIRECT + aio implementation |
