@@ -1777,7 +1777,28 @@ view — the shard directory it must keep to know where each shard ends:
                        … {"offset": 3932160, "bytes": 305} ]
 ```
 
-Twelve RocksDB keys result, all under `O`, and — per §2.4 — contiguous:
+Twelve RocksDB keys result, all under `O`, and — per §2.4 — contiguous. The
+prefix is built by `_key_encode_prefix()` ([BlueStore.cc:368](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L368)), and decoding
+one is the fastest way to internalise the layout:
+
+```
+ 7f  8000000000000004  d1337354  !obj3!=  fffffffffffffffe ffffffffffffffff  6f
+ |   |                 |         |        |                |                 |
+ |   pool + 2^63       |         name     snap (NOSNAP)    gen (NO_GEN)      'o'
+ shard_id + 0x80       object hash, BIT-REVERSED
+```
+
+| Field | Bytes | Why it is shaped that way |
+|---|---|---|
+| shard id | 1 | `shard.id + 0x80`, so `NO_SHARD` (−1) encodes `0x7f`; first, so an EC shard's keys group together |
+| pool | 8 BE | biased by 2^63 so negative pool ids (meta = −1) sort below real ones |
+| hash | 4 BE | bit-reversed, which is what makes one PG's objects a contiguous range |
+| name | var | between `!` separators, `!=` closing the namespace/name pair |
+| snap, gen | 8 + 8 BE | `head` is `…fffe` / `…ffff`, so it sorts after its snapshots |
+| type | 1 | `ONODE_KEY_SUFFIX` `'o'` ends an onode key |
+
+A shard key is that whole key plus a 4-byte big-endian logical offset and
+`EXTENT_SHARD_KEY_SUFFIX` `'x'` — hence the strict-prefix property:
 
 ```
 O …obj3!=…o                 onode,   410 bytes
@@ -1790,19 +1811,33 @@ O …obj3!=…o%00%3c%00%00x    shard 0x3c0000,  305 bytes
 A trap when reading `ceph-kvstore-tool` output: it uses `url_escape()`, which
 passes through only alphanumerics and `-._~/`. So 0x30 survives as the digit
 `0` — shard 0x300000 prints `o%000%00%00x` — while 0x3c, just as printable,
-becomes `%3c`. Printability is not the rule.
+becomes `%3c`. Printability is not the rule, and sorting that text does not
+give you key order: `'0'` and `'6'` sort *after* `'%'`, so shards 0x300000 and
+0x360000 land after 0x3c0000. Sort the unescaped bytes instead.
 
-Beyond the object itself the transaction writes the freelist (`b`) bits
-covering `0x19c9d000~400000`, and a per-pool plus a store-wide statfs merge
-(`T`). That is all of BlueStore's own metadata; the OSD's PG-log omap writes
-ride in the same transaction and are excluded here.
+Two more key spaces the transaction touches, both trivially encoded:
+
+| Prefix | Key | Encoding |
+|---|---|---|
+| `b` | device offset | `make_offset_key()` → `_key_encode_u64(offset)`, 8 BE bytes; one key per `blocks_per_key × bytes_per_block` = 512 KiB of device |
+| `T` | pool id | `get_pool_stat_key()` → `_key_encode_u64(pool_id)`, 8 BE bytes; `%ff × 8` is pool −1, the *meta* pool, not a store-wide total |
+
+That last point is worth stating plainly, because the key invites the wrong
+reading: with per-pool statfs enabled — the default — a transaction merges
+exactly **one** `T` key, its own pool's. The genuinely store-wide counter has
+its own literal key `bluestore_statfs`
+(`BLUESTORE_GLOBAL_STATFS_KEY`, [BlueStore.cc:147](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L147)), and it is
+absent from this store entirely. So the 4 MiB write writes the freelist bits
+covering `0x19c9d000~400000` and one statfs merge for pool 4 — nothing else of
+BlueStore's own; the OSD's PG-log omap writes ride in the same transaction and
+are excluded here.
 
 | What | Keys | Bytes |
 |---|---|---|
 | onode | 1 × `O …o` | 410 |
 | extent map | 11 × `O …o…x` | 4,853 |
 | freelist bits | 9 × `b`, each covering 512 KiB of device | merge ops |
-| statfs | 2 × `T` | merge ops |
+| statfs | 1 × `T` (this pool) | merge op |
 
 The freelist row is derived, not measured: `list` cannot show it, because at
 128 blocks per key these are merges into keys that already existed. Nine
