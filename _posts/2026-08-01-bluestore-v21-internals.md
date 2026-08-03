@@ -359,14 +359,49 @@ This is not a free lunch, and an honest reading of the design must name the cost
 
 # Part 2 — The Object Model
 
-## 2.1 The names underneath: hobject_t and ghobject_t
+## 2.1 Basic objects
 
-Before the object *model* there is the object *name*, and BlueStore does not
-define it — it inherits it from RADOS. Two structs matter, and the difference
-between them is a common source of confusion.
+Six types that everything else in this post assumes. Two come from RADOS, two
+are the interface and its implementation, two are BlueStore's own.
 
-[`hobject_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/hobject.h#L49) is the hashed object name: what RADOS means by "an
-object".
+### ObjectStore
+
+[`ObjectStore`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/ObjectStore.h#L65) is the abstract interface the OSD sees: a transactional,
+object-plus-omap store. It defines what a backend must provide — atomic
+transaction submission, reads, collection lifecycle — and nothing about how.
+FileStore, MemStore, KStore and BlueStore all implement it.
+
+The important thing is what it does *not* promise: no `write()` method. All
+mutation arrives through
+[`queue_transactions()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/ObjectStore.h#L241), which takes a batch of
+encoded op arrays. That single funnel is what makes atomicity and ordering
+expressible at all, and §3.1 traces it end to end.
+
+### BlueStore
+
+[`BlueStore`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L261) is the implementation: object metadata in RocksDB, object
+data in raw device extents, RocksDB itself on BlueFS. It is the only
+`ObjectStore` in production use.
+
+Its defining choice is that metadata and data live in different systems with
+different durability mechanics — a key-value store for the first, allocated
+extents for the second — and that the two are reconciled inside one RocksDB
+transaction. Everything below is a consequence of that split.
+
+### coll_t and Collection
+
+[`coll_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.h#L657) names a container of objects, normally a PG. BlueStore mirrors
+each as a [`Collection`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1716) (the `C` prefix in the schema), which
+subclasses the interface's [`CollectionImpl`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/ObjectStore.h#L142).
+
+An object's *placement* derives from its name alone, so the collection is not
+needed to locate anything. What it is for is scoping: it owns the onode cache
+and the lock protecting it, and it carries the `OpSequencer` that defines
+write ordering. One PG, one ordering stream.
+
+### hobject_t
+
+[`hobject_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/hobject.h#L49) is the hashed object name — what RADOS means by "an object".
 
 | Field | Role |
 |---|---|
@@ -377,8 +412,14 @@ object".
 | `pool` | pool id |
 | `nspace` | namespace, empty for ordinary data |
 
-[`ghobject_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/hobject.h#L476) wraps that and adds two fields BlueStore must carry
-but rarely uses:
+`hash` is the load-bearing field: it is global, reproducible on any node, and
+it is what BlueStore stores *bit-reversed* in the key so that a PG's objects
+form one contiguous range (§2.4).
+
+### ghobject_t
+
+[`ghobject_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/hobject.h#L476) wraps `hobject_t` with two fields BlueStore must carry but
+rarely uses:
 
 ```cpp
 struct ghobject_t {
@@ -387,13 +428,14 @@ struct ghobject_t {
   shard_id_t shard_id = shard_id_t::NO_SHARD;  // erasure-coded shard
 ```
 
-Both default to "absent", which is why a replicated object's JSON dump shows
-neither. The **g** is what the ObjectStore API speaks: every method in
-`ObjectStore.h` takes a `ghobject_t`, never a bare `hobject_t`.
+Both default to absent, which is why a replicated object's dump shows neither.
+The **g** is what the API speaks: every `ObjectStore` method takes a
+`ghobject_t`, never a bare `hobject_t`.
 
-Those two name an object. The third fundamental struct is what the name
-*resolves to*: [`bluestore_onode_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h#L1160), the persisted onode — the
-value stored under an `O` key.
+### bluestore_onode_t
+
+[`bluestore_onode_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h#L1160) is what a name resolves to — the value stored
+under an `O` key.
 
 ```cpp
 struct bluestore_onode_t {
@@ -404,41 +446,19 @@ struct bluestore_onode_t {
   std::vector<shard_info> extent_map_shards;  ///< extent map shards (if any)
 ```
 
-Note what it does *not* contain: the object's name. Identity lives in the key;
-the value holds only state. That asymmetry is deliberate — the name is long and
-variable-length, so repeating it inside the value would waste space in the one
-record read on every cache miss.
+Two absences define it. It does not hold the object's **name** — identity is
+in the key, the value is state only, so the one record read on every cache
+miss does not repeat a long variable-length string. And past a size threshold
+it does not hold the **extent map** either: `extent_map_shards` describes
+sibling keys that do (§2.4).
 
-Note also what it does not contain inline: the extent map, once the object is
-large enough. `extent_map_shards` is a list of shard descriptors, and the
-shards live under their own sibling keys. §2.4 covers why.
-
-The `nid` is the field to understand first, because it explains the omap
-schema. It is a `u64` the store hands out from a watermark in its superblock,
-and its comment says exactly what it is worth — *locally unique*. It is
-meaningful only inside this BlueStore instance: the same RADOS object on
-another OSD carries a different one, and deleting and recreating an object
-yields a fresh one rather than the old value. Its purpose is compactness. Omap
-keys are prefixed with the nid rather than the full object name, so an object
-with thousands of omap entries pays a `u64` per key instead of a full
-`ghobject_t`. §2.3 returns to the rest of the fields.
-
-Three things follow that matter later in this part.
-
-**The key is not the name.** BlueStore's `O` key is built from these fields in
-a deliberate order — shard, pool, *bit-reversed* hash, namespace, name, snap,
-generation — so that a PG's objects form one contiguous range. §2.4 covers why
-the reversal is load-bearing.
-
-**`hash` places the object; `nid` indexes it locally.** The hash is global and
-reproducible on any node; the nid is a private `u64` this store hands out for
-compact omap keys, and the same object on another OSD will have a different
-one. Never compare nids across stores.
-
-**Collections are named separately.** A `coll_t` names the PG-shaped container,
-and BlueStore mirrors each as a `Collection` — the `C` prefix in the schema.
-An object's placement is derivable from its `hobject_t` alone; the collection
-is how BlueStore groups them for locking and caching.
+`nid` is the field to understand first. A `u64` handed out from a superblock
+watermark, and *locally unique* exactly as its comment says — the same RADOS
+object on another OSD carries a different one, and deleting and recreating an
+object yields a fresh one. Its purpose is compactness: omap keys are prefixed
+with the nid instead of the full name, so an object with thousands of omap
+entries pays 8 bytes per key rather than a whole `ghobject_t`. Never compare
+nids across stores. §2.3 covers the remaining fields.
 
 ## 2.2 The five-level mapping
 
