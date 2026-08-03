@@ -395,6 +395,36 @@ A `Transaction` also carries three `Context` lists — `on_applied`,
 any of it runs. §3.1 covers what each one actually promises; only `on_commit`
 means durable.
 
+### bufferlist
+
+[`ceph::buffer::list`](https://github.com/ceph/ceph/blob/v21.3.0/src/include/buffer.h#L417) is how every byte in this post travels: the encoded
+`Transaction`, the value under an `O` key, a client's write payload, the
+result of `read()`. It is a list of [`ptr`](https://github.com/ceph/ceph/blob/v21.3.0/src/include/buffer.h#L167)s, each a
+reference-counted window onto a shared `raw` allocation.
+
+The consequence that matters is that a bufferlist is **discontiguous by
+default**. Appending, splitting and sharing are pointer work with no copy —
+which is why data can cross the wire, a `Transaction`, BlueStore and the
+device without being copied — but "the data" is a chain of segments, not a
+buffer. Anything needing one flat region must say so, and pays for it:
+[`c_str()`](https://github.com/ceph/ceph/blob/v21.3.0/src/include/buffer.h#L1190) and [`rebuild()`](https://github.com/ceph/ceph/blob/v21.3.0/src/include/buffer.h#L1087) collapse the chain into a
+fresh allocation.
+
+The device layer is where that bites. O_DIRECT needs aligned memory and
+`writev` caps out at `IOV_MAX` segments, so `KernelDevice`
+([KernelDevice.cc:1133](https://github.com/ceph/ceph/blob/v21.3.0/src/blk/kernel/KernelDevice.cc#L1133)) flattens on either condition:
+
+```cpp
+if ((!buffered || bl.get_num_buffers() >= IOV_MAX) &&
+    bl.rebuild_aligned_size_and_memory(block_size, block_size, IOV_MAX)) {
+  dout(20) << __func__ << " rebuilding buffer to be aligned" << dendl;
+}
+```
+
+A misaligned payload copies, and so does a well-aligned one arriving in too
+many pieces — one of the few places a client's buffer discipline shows up
+directly in OSD CPU. `debug_bdev = 20` prints the line when it happens.
+
 ### BlueStore
 
 [`BlueStore`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L261) is the implementation: object metadata in RocksDB, object
