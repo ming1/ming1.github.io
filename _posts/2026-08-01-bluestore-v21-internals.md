@@ -377,6 +377,24 @@ mutation arrives through
 encoded op arrays. That single funnel is what makes atomicity and ordering
 expressible at all, and §3.1 traces it end to end.
 
+### Transaction
+
+[`ObjectStore::Transaction`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/Transaction.h#L107) is what that funnel carries: a batch of
+mutations applied atomically, all or nothing.
+
+It is not an object graph but an **encoded byte buffer** — a stream of opcodes
+(`OP_TOUCH`, `OP_WRITE`, `OP_SETATTR`, …) with their arguments, plus side
+tables of the object and collection names they reference. Callers append ops;
+the backend decodes and dispatches them one at a time. That representation is
+why the same struct can be journalled and shipped between daemons, and why the
+header warns that its encoding is versioned across releases.
+
+A `Transaction` also carries three `Context` lists — `on_applied`,
+`on_commit`, `on_applied_sync` — which
+[`collect_contexts()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/Transaction.h#L338) harvests out of a batch before
+any of it runs. §3.1 covers what each one actually promises; only `on_commit`
+means durable.
+
 ### BlueStore
 
 [`BlueStore`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L261) is the implementation: object metadata in RocksDB, object
