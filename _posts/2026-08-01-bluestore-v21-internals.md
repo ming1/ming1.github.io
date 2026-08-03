@@ -1938,12 +1938,12 @@ is the one shard spanning 0xc0000 to 0x120000.) §2.4 argues that this is the
 point of sharding the extent map; this is the measurement.
 
 **Nothing is allocated and nothing is released.** `_do_alloc_write` reports
-`0 blobs`; `_txc_finalize_kv` reports `allocated 0x[] released 0x[]`. The
-write lands inside blob `0x19d9d000~10000`, which already covers that range,
-so the allocator and the freelist are untouched. `_wctx_finish` drops the old
-extent's reference and `compress_extent_map` immediately merges the split
-back together, so the shard re-encodes to the same shape it had — 455 bytes,
-6 extents. Only the one crc32c word covering that 4 KiB chunk differs.
+`0 blobs`, `_txc_finalize_kv` reports `allocated 0x[] released 0x[]`: the write
+lands inside blob `0x19d9d000~10000`, which already covers that range, so the
+allocator and freelist are untouched. `_wctx_finish` drops the old extent's
+reference and `compress_extent_map` merges the split back together, so the
+shard re-encodes to the shape it had — 455 bytes, 6 extents, differing in the
+one crc32c word covering that 4 KiB chunk.
 
 **The payload goes into RocksDB, not to the device.** The test is
 `BigDeferredWriteContext::can_defer()` ([BlueStore.cc:16984](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L16984)):
@@ -1960,15 +1960,25 @@ the range must already be allocated inside a mutable blob, which is why Case 1
 allocated, so `_do_write_big_apply_deferred` ([BlueStore.cc:17014](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L17014)) builds a
 deferred op.
 `reading head 0x0 and tail 0x0` means no read-modify-write was needed: the
-write is already aligned to both the AU and the 4 KiB checksum chunk. Kill
-the OSD before the deferred queue drains and the payload is sitting in the
-`L` prefix:
+write is already aligned to both the AU and the 4 KiB checksum chunk.
+
+**Exactly two of the twelve `O` keys change, and one key is created.** Kill the
+OSD before the deferred queue drains and `list-crc`, scoped to the object,
+gives the whole delta — same `P` prefix as Case 1:
+
+| Key | Before | After |
+|---|---|---|
+| `P` `o` | 410 B, crc `1541530968` | 410 B, crc `2257851591` |
+| `P` `o%00%0c%00%00x` | 455 B, crc `2301837008` | 455 B, crc `710042713` |
+| the other ten `x` keys | | *unchanged* |
+| `L` `%00%00%00%00%00%00%0b%bb` | *absent* | **4,135 B** — the payload |
+| `b`, `T` | | *untouched* |
+
+Both changed values keep their length; only their contents differ. The `L` key
+is `bluestore_deferred_transaction_t` ([bluestore_types.h:1363](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h#L1363)) — 4 KiB of
+payload in 4,135 bytes, so 39 of framing:
 
 ```
-$ ceph-kvstore-tool bluestore-kv dev/osd0 list L
-L	%00%00%00%00%00%00%0b%bb
-
-$ ceph-kvstore-tool bluestore-kv dev/osd0 get L … out L.bin   # 4135 bytes
 $ ceph-dencoder type bluestore_deferred_transaction_t import L.bin decode dump_json
 { "seq": 3003,
   "ops": [ { "op": 1, "data_len": 4096,
@@ -1976,22 +1986,9 @@ $ ceph-dencoder type bluestore_deferred_transaction_t import L.bin decode dump_j
   "released extents": [] }
 ```
 
-`bluestore_deferred_transaction_t` ([bluestore_types.h:1363](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h#L1363)) is 4,135 bytes
-for a 4 KiB payload — 39 bytes of framing. Offset 433,704,960 is 0x19d9d000,
-which is the allocation base from case 1 plus 1 MiB: the object was laid out
-contiguously, so the logical offset maps straight through.
-
-**Exactly two of the object's twelve keys are rewritten.** `list-crc` before
-and after, scoped to the object, is conclusive:
-
-```
-  1c1
-< …obj3!=…o                  1541530968      onode
-> …obj3!=…o                  2257851591
-  4c4
-< …obj3!=…o%00%0c%00%00x     2301837008      shard 0xc0000
-> …obj3!=…o%00%0c%00%00x      710042713
-```
+The key is the sequence number, big-endian: `%0b%bb` = 3003 = `seq`. Offset
+433,704,960 is 0x19d9d000 — Case 1's allocation base plus 1 MiB, the object
+being laid out contiguously, so the logical offset maps straight through.
 
 The shard is expected — it holds the checksum. The onode is less obvious: its
 encoded length did not change (410 bytes both times) and neither did
