@@ -436,6 +436,19 @@ different durability mechanics — a key-value store for the first, allocated
 extents for the second — and that the two are reconciled inside one RocksDB
 transaction. Everything below is a consequence of that split.
 
+### KeyValueDB and BlockDevice
+
+The two substrates. [`KeyValueDB`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/KeyValueDB.h#L25) is the interface every metadata write goes
+through — RocksDB behind it in practice — and a `KeyValueDB::Transaction` is
+the object BlueStore accumulates keys into and submits atomically.
+[`BlockDevice`](https://github.com/ceph/ceph/blob/v21.3.0/src/blk/BlockDevice.h#L150) is the data path: `KernelDevice` normally, with SPDK and
+PMEM alternatives, offering aligned reads, aio writes and `flush()`.
+
+That is the split from the BlueStore subsection made concrete. Metadata takes
+the first path and gets RocksDB's atomicity for free; data takes the second and
+gets none, which is the entire reason for the transaction machinery in Part 4.
+Parts 5 and 10 cover them.
+
 ### coll_t and Collection
 
 [`coll_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.h#L657) names a container of objects, normally a PG. BlueStore mirrors
@@ -446,6 +459,29 @@ An object's *placement* derives from its name alone, so the collection is not
 needed to locate anything. What it is for is scoping: it owns the onode cache
 and the lock protecting it, and it carries the `OpSequencer` that defines
 write ordering. One PG, one ordering stream.
+
+### OpSequencer
+
+[`OpSequencer`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2231) is the ordering stream — one per collection, held by it,
+outliving it if need be. It owns `q`, the intrusive list of in-flight
+transactions, and `qlock`.
+
+It is where write ordering *lives*. Device aios complete in whatever order the
+hardware picks, but RocksDB commits must follow the order the OSD queued them,
+and the reconciliation is a walk of this queue rather than anything the aio
+thread knows (§4.3). A transaction joins `q` the moment it is created — before
+decoding, costing or throttling — so nothing downstream can reorder it.
+
+### TransContext
+
+[`TransContext`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1906) is one transaction in flight: the `KeyValueDB::Transaction`
+being built, the onodes it dirtied, the aios outstanding, the callbacks owed,
+and a state.
+
+It is the one type here that is **not** refcounted. `_txc_create()` makes it,
+`_txc_finish()` `delete`s it — on a different thread from the one that made it
+— so the rule is that no code touches a txc after handing it forward. Its
+state field drives the machine in §4.2.
 
 ### hobject_t
 
@@ -480,6 +516,29 @@ Both default to absent, which is why a replicated object's dump shows neither.
 The **g** is what the API speaks: every `ObjectStore` method takes a
 `ghobject_t`, never a bare `hobject_t`.
 
+### Onode
+
+[`Onode`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1379) is the in-memory object: the persisted record plus everything
+BlueStore needs to work with it.
+
+```cpp
+struct Onode {
+  std::atomic_int nref = 0;   ///< reference count
+  Collection *c;
+  ghobject_t oid;
+  bluestore_onode_t onode;    ///< metadata stored as value in kv store
+  bool exists;
+  ExtentMap extent_map;
+  BufferSpace bc;             ///< buffer cache
+```
+
+Keep the two apart: `Onode` is the runtime object, refcounted and cached;
+`onode` is the flat struct inside it that gets encoded into a value. The
+`ExtentMap` and `BufferSpace` beside it are *not* part of that value — the
+extent map is written to its own shard keys, the buffer cache is never
+persisted at all. An `Onode` lives in its collection's `OnodeSpace`
+([BlueStore.h:1681](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1681)), which is why cache accounting is per-collection.
+
 ### bluestore_onode_t
 
 [`bluestore_onode_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h#L1160) is what a name resolves to — the value stored
@@ -507,6 +566,11 @@ object yields a fresh one. Its purpose is compactness: omap keys are prefixed
 with the nid instead of the full name, so an object with thousands of omap
 entries pays 8 bytes per key rather than a whole `ghobject_t`. Never compare
 nids across stores. §2.3 covers the remaining fields.
+
+Four more types are fundamental but earn their own treatment rather than a
+paragraph here: `Blob`, `Extent` and `ExtentMap` (§2.2 and §2.4–2.6), `BlueFS`
+(Part 6), `Allocator` and `FreelistManager` (Part 7), and the cache shards
+(Part 8).
 
 ## 2.2 The five-level mapping
 
