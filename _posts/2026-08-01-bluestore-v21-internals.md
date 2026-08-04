@@ -666,12 +666,44 @@ exists because omap keys must be prefixed by something short and
 order-stable. An omap key is:
 
 ```
-"m" | pool(s64) | nid(u64) | user_key         (PREFIX_PERPOOL_OMAP)
-"p" | pool(u64) | hash(u32) | nid(u64) | key  (PREFIX_PERPG_OMAP)
+"P" |                          nid(u64) | '.' | user_key   pgmeta omap
+"m" | pool(u64) |              nid(u64) | '.' | user_key   per-pool omap
+"p" | pool(u64) | hash(u32) |  nid(u64) | '.' | user_key   per-PG omap
 ```
 
-Prefixing with the full `ghobject_t` would make every omap key hundreds of
-bytes. Prefixing with `nid` makes it 8–20.
+`calc_omap_key()` ([BlueStore.cc:4877](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L4877)) builds it, and
+`calc_userkey_offset_in_omap_key()` ([BlueStore.cc:5026](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L5026)) *is* the prefix
+length — it exists so `decode_omap_key()` can `substr()` the user key back
+out:
+
+| Variant | Prefix, after the one-byte column prefix | Bytes |
+|---|---|---|
+| pgmeta | `nid` + `.` | 9 |
+| per-pool | `pool` + `nid` + `.` | 17 |
+| per-PG | `pool` + `hash` + `nid` + `.` | 21 |
+
+Prefixing with the full `ghobject_t` instead means the `O`-key layout — shard,
+pool, bit-reversed hash, namespace, name, snap, generation, with escaping
+inflating any `!`, `~`, `%` or `#` in the name to two bytes. §3.6 measures that
+at **37 bytes** for a four-character name in an empty namespace, and that is
+the floor: an RGW object carries a user-supplied name that can run to a
+kilobyte, and it would appear in *every one of that object's omap keys*.
+
+The multiplier is what makes it matter. An RGW bucket-index shard holds
+millions of omap entries, each repeating the prefix: ~21 MB of keys per million
+entries, against ~230 MB if the name went in at 230 bytes. RocksDB then stores
+those keys in every SST that holds them and rewrites them at each compaction
+level, so the difference is multiplied again by write amplification on the
+metadata device.
+
+The price is that omap keys are store-local. A nid means nothing on another
+OSD, so omap keys cannot be copied between stores — and changing the omap
+*format*, per-pool to per-PG say, means rewriting every omap key of every
+object, which is what `rewrite_omap_key()` ([BlueStore.cc:5012](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L5012)) and the
+`calc_omap_key(new_flags, …)` call in the repair path are for. Note also why
+this is an *allocated* integer rather than a hash of the name: the prefix has
+to be collision-free as well as short, since two objects sharing one would
+interleave their omap in the same key range.
 
 `nid` values are handed out from a preallocated range. `_kv_sync_thread()`
 bumps the persisted ceiling in the *earlier* transaction of the batch:
