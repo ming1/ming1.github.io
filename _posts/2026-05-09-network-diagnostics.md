@@ -1663,7 +1663,6 @@ Connection works but is slow
 | `/sys/class/net` counters | Network | — | No | Proving encapsulation (same payload on two interfaces) |
 | nstat | Transport | — | No | Host-wide TCP retransmission rate |
 | vmstat | — | — | No | CPU steal time on a VPS |
-| wg show | Network | — | Yes | WireGuard peer state: allowed-ips, handshake age, rx/tx counters |
 
 # How Linux Policy Routing Works
 
@@ -1783,18 +1782,86 @@ correct. On an outbound whose job is to reach the internet *from the tunnel*,
 the same mark silently converts "exit via the remote endpoint" into "exit via
 this machine's own address" — no error, opposite privacy properties.
 
-# How WireGuard Cryptokey Routing Works
+# Running Two WireGuard Tunnels at Once
 
-A service reachable over a VPN can fail in a way that looks like nothing else:
-every port times out, no RST, no ICMP unreachable, while other hosts through the
-same tunnel answer normally. That signature is specific to WireGuard's routing
-model, and understanding it explains both the failure and why the fix is
-sometimes *a second tunnel interface* rather than an extra line of config.
+Sometimes you need resources from two separate private networks at the same
+time — two customers, two datacentres, an office and a lab. Each runs its own
+WireGuard gateway, and each issues you an address out of **its own** addressing
+plan.
 
-## AllowedIPs is used twice, in opposite directions
+The instinct is to add the second network's subnets to the tunnel you already
+have. That does not work, and the reason is exactly why the answer is a second
+interface.
 
-`AllowedIPs` looks like "a list of routes to install". It is actually used for
-two different jobs — one when sending, one when receiving:
+## An interface carries exactly one identity
+
+A WireGuard *peer* is just a public key plus the address ranges it may speak
+for, so one interface can serve many peers happily — the usual hub-and-spoke
+shape. If a single network gave you a single address, one interface is right
+and a second would be clutter.
+
+It stops being enough when a second gateway gives you a second address:
+
+```
+   your machine
+        |
+        +--[ wg-a ]--> gateway A --> 10.1.0.0/24
+        |    addr 10.10.0.5      <- issued by A
+        |    key  approved by A
+        |    mtu  1280
+        |
+        +--[ wg-b ]--> gateway B --> 10.2.0.0/24
+             addr 10.20.0.7      <- issued by B
+             key  approved by B
+             mtu  1420
+```
+
+Everything on those inner lines is a property of the **interface**, not of the
+peer, and none of it can be held twice at once:
+
+| Property | Why it cannot be shared |
+|----------|-------------------------|
+| Private key | Each gateway approved a different public key for you |
+| Address | This is the source stamp — see below |
+| MTU | Gateways differ in how much room the underlay leaves |
+| DNS | Each site resolves its own internal names |
+
+## The address is the point: it is your return path
+
+The kernel stamps a packet's source address according to **which interface it
+leaves by**, and the reply comes back to whatever was stamped on it:
+
+```bash
+ip route get 10.2.0.10
+# 10.2.0.10 dev wg-b src 10.20.0.7
+#           ^^^^^^^^     ^^^^^^^^^^
+#           leaves here, stamped with this
+```
+
+If `10.2.0.0/24` were listed on `wg-a`, packets would go out stamped
+`10.10.0.5` — an address gateway B never issued and has no way to route back
+to. The request might well arrive; the reply has nowhere to go.
+
+Listed on `wg-b`, they leave stamped `10.20.0.7`, an address B assigned you
+itself:
+
+```
+   you                         gateway B                     app
+   10.20.0.7  --[ wg-b ]-->    routes it  ------------->  10.2.0.10
+              src=10.20.0.7                                    |
+              <------------- reply to 10.20.0.7 <--------------+
+                             (an address B issued you,
+                              so it knows the way back)
+```
+
+**Each tunnel lets you speak under the name that network gave you.** That is
+the whole motivation for running two.
+
+## How the kernel picks a tunnel: cryptokey routing
+
+WireGuard ties an address range to a public key, so "where do I send this" and
+"who is allowed to say this" are one lookup — hence *cryptokey routing*. The
+`AllowedIPs` list does both jobs, in opposite directions:
 
 ```
 SENDING — "which peer do I encrypt this to?"
@@ -1804,9 +1871,7 @@ SENDING — "which peer do I encrypt this to?"
             v
     check dst against every peer's AllowedIPs   (longest prefix wins)
             |
-            +-- peer B lists 10.2.0.0/24 ---> encrypt, send to B
-            |
-            +-- nobody lists it -----------> send FAILS loudly (ENOKEY)
+            +-- peer B lists 10.2.0.0/24 ---> encrypt, send to gateway B
 
 
 RECEIVING — "is this peer allowed to claim this source?"
@@ -1817,191 +1882,56 @@ RECEIVING — "is this peer allowed to claim this source?"
     decrypt, then look at src = 10.2.0.10
             |
             +-- src is inside B's AllowedIPs ---> accept
-            |
-            +-- src is outside it ------------> DROP, silently, no error
 ```
 
-This is called **cryptokey routing**: an address range is tied to a public key,
-so "where do I send it" and "who is allowed to say this" are the same lookup. A
-peer can only ever speak for the ranges you listed for it.
+One rule follows from the send side: within your machine, a prefix should
+appear on **one** interface only. If the same range is listed on both, whichever
+wins the route lookup takes the traffic — and a restart can flip which one that
+is.
 
-## Why the failure mode is silence
+## Applications need no changes at all
 
-The inbound check drops; it never rejects. There is no RST, no ICMP
-administratively-prohibited, no log line — a misconfigured tunnel produces
-timeouts and nothing else.
-
-There is exactly one loud failure, and the contrast is diagnostic. If a
-destination matches **no peer at all**, the send fails immediately at the
-socket with `ENOKEY`:
+The pleasant part of this setup is that nothing above the kernel has to know it
+exists. There is no proxy to point at, no SOCKS port, no per-application
+setting. Ordinary destination-based routing sorts everything out:
 
 ```
-error while sending packet on wg-a: [Errno 126] Required key not available
-```
-
-So the two misconfigurations are distinguishable without a packet capture:
-
-| Behaviour | Meaning |
-|-----------|---------|
-| Immediate `Required key not available` | The prefix is on **no** peer — routing sends it to the tunnel, WireGuard has no key for it |
-| Silent timeout | The prefix is on the **wrong** peer — encrypted and sent, then discarded somewhere beyond |
-
-That makes the *shape* of the failure diagnostic:
-
-| Symptom | Likely cause |
-|---------|--------------|
-| Connection **refused** (RST) | Host reachable, nothing listening |
-| Some ports open, others refused | Host reachable, service-level filtering |
-| **Every port silent, no RST** | Packets never reach a live host — routing, or a tunnel discarding them |
-| Silent for one prefix, fine for others through the same tunnel | Wrong peer for that prefix |
-
-The last row is the interesting one, and it is worth checking before blaming the
-remote end: a tunnel that carries some destinations correctly is *working*, so a
-single dead prefix points at which peer owns that prefix, not at a broken link.
-
-## Listing a prefix does not create reachability
-
-Adding a prefix to `AllowedIPs` tells **your** kernel where to send traffic. It
-cannot tell the peer at the other end how to route the reply.
-
-If a prefix is listed on the wrong tunnel, your side installs the route happily
-and encrypts to that gateway — which has no route for it, or forwards it while
-the reply takes a path that fails the inbound check. Either way, silence. The
-config looks correct because, locally, it *is* correct.
-
-## The real reason: your source address is your return path
-
-Here is the key idea, and it is simpler than it sounds. **The kernel stamps a
-packet's source address based on which interface it leaves by.** The reply comes
-back to whatever address you stamped on it. So picking the wrong interface means
-signing your packets with the wrong name.
-
-One command shows the stamp:
-
-```bash
-ip route get 10.2.0.10
-# 10.2.0.10 dev wg-b src 10.20.0.7
-#           ^^^^^^^^     ^^^^^^^^^^
-#           goes out here, stamped with this
-```
-
-Say you have two peerings. Gateway **A** gave you the address `10.10.0.5`, and
-gateway **B** gave you `10.20.0.7`. The app you want is at `10.2.0.10`, and it
-lives behind **B**:
-
-```
-WRONG — 10.2.0.0/24 was listed on wg-a
-
-   you                         gateway A
-   10.10.0.5  --[ wg-a ]-->    "10.2.0.10? not my network"
-              src=10.10.0.5           |
-                                      v
-                                 dropped, or forwarded and the reply is
-                                 addressed to 10.10.0.5 — a name B has
-                                 never issued and cannot route back to
-
-   result: silence, and the config looks fine because locally it IS fine
-
-
-RIGHT — 10.2.0.0/24 listed on wg-b
-
-   you                         gateway B                     app
-   10.20.0.7  --[ wg-b ]-->    routes it  ------------->  10.2.0.10
-              src=10.20.0.7                                    |
-              <------------- reply to 10.20.0.7 <--------------+
-                             (an address B issued you,
-                              so it knows the way back)
-```
-
-Nothing was broken at the far end. The packets were simply going out with the
-wrong return address.
-
-## Why a second interface, and not just another peer
-
-One interface can hold many peers. If they all belong to the same network and
-that network gave you one address, that is the right shape — a hub with spokes,
-and a second interface would just be clutter.
-
-You need a second *interface* when two independent gateways each hand you an
-address out of **their own** addressing plan, because an interface carries
-exactly one identity:
-
-```
-   your machine
+   curl https://app.site-b.example      (resolves to 10.2.0.10)
         |
-        +--[ wg-a ]--> gateway A --> 10.1.0.0/24 + some public hosts
-        |    addr 10.10.0.5      <- issued by A
-        |    key  approved by A
-        |    mtu  1280
+        v  routing table: 10.2.0.0/24 -> dev wg-b
         |
-        +--[ wg-b ]--> gateway B --> 10.2.0.0/24
-             addr 10.20.0.7      <- issued by B      <- the app lives here
-             key  approved by B
-             mtu  1420
+        +--> src stamped 10.20.0.7, encrypted to gateway B
+
+
+   curl https://wiki.site-a.example     (resolves to 10.1.0.9)
+        |
+        v  routing table: 10.1.0.0/24 -> dev wg-a
+        |
+        +--> src stamped 10.10.0.5, encrypted to gateway A
+
+
+   curl https://example.com             (a public address)
+        |
+        v  routing table: no tunnel prefix matches -> default route
+        |
+        +--> straight out your normal interface, untouched
 ```
 
-Everything on those inner lines is **per interface**, not per peer:
+Three consequences worth spelling out:
 
-| Property | Why it forces a second interface |
-|----------|----------------------------------|
-| Private key | Each gateway approved a different public key for you |
-| Address | This is the source stamp — the return path |
-| MTU | Gateways differ in how much overhead the underlay leaves |
-| DNS | Each site resolves its own internal names |
+- **Only the listed prefixes are captured.** Both tunnels are split tunnels:
+  anything not matching an `AllowedIPs` entry takes the default route. Normal
+  internet traffic is unaffected, and neither gateway sees it.
+- **The application never chooses.** `curl`, a browser and a package manager all
+  make a plain `connect()`. The kernel resolves which interface to use and which
+  source address to stamp. Nothing needs to be tunnel-aware, and nothing breaks
+  if a tunnel is added or removed later.
+- **Names resolve per site.** Each interface can carry its own DNS servers, so
+  each network's internal names resolve against that network's resolver, while
+  public names keep using your normal one.
 
-So two gateways cannot share one interface: it has a single address, and one of
-the two would end up transmitting under a name its gateway does not recognize.
-
-One more rule: within an interface, `AllowedIPs` must be unambiguous. A prefix
-left on the wrong interface is not harmless clutter — if it wins the route
-lookup, it silently steals the traffic.
-
-## Diagnosing it
-
-```bash
-# 1. Which interface and source address does this destination use?
-ip route get IP_ADDR
-
-# 2. What does each interface actually carry, and is it alive?
-wg show                       # allowed-ips, last handshake, transfer counters
-wg show <iface> latest-handshakes
-
-# 3. Does the live state match the config file?
-#    (a config file is only authoritative if something applies it)
-diff <(grep -i '^AllowedIPs' /etc/wireguard/<iface>.conf | cut -d= -f2- \
-        | tr -d ' ' | tr ',' '\n' | sort) \
-     <(wg show <iface> allowed-ips | awk '{$1="";print}' | tr ' ' '\n' \
-        | grep -v '^$' | sort)
-```
-
-**What to look for**:
-
-- **A handshake that is current while traffic still fails**: the tunnel itself
-  is healthy. The question is not "is the VPN up" but "which peer owns this
-  prefix".
-- **rx far below tx** in the transfer counters: you are sending into the tunnel
-  and getting little back. Treat this as a hint, not proof — the counters are
-  totals for the whole peer, so one busy working prefix easily masks one dead
-  prefix, and a tunnel with a genuine black hole can still show healthy-looking
-  numbers.
-- **A prefix present in the config but absent from `wg show`**: something other
-  than that file is managing the interface (see the note below).
-- **The same prefix on two interfaces**: whichever wins the route lookup takes
-  the traffic, and a restart can flip it. Remove the stale entry — a tunnel that
-  works "by luck of ordering" fails later, and looks like a new bug.
-
-Two operational hazards worth stating plainly:
-
-**A config file is not authoritative unless something applies it.** If a network
-manager owns the interface, it keeps its own copy of the peer configuration, and
-editing the `.conf` changes nothing. `wg show` reads the kernel; the file reads
-your intent. When they disagree, the kernel is right.
-
-**Do not health-check a tunnel through its service manager.** The `wg-quick@`
-unit is `Type=oneshot` with `RemainAfterExit=yes`: it reports `active (exited)`
-forever, even after the interface is deleted, and never restarts it. Check
-`wg show <iface> latest-handshakes` instead — a handshake older than a few
-minutes means the tunnel is dead regardless of what the unit claims.
+The result is that both private networks behave like ordinary parts of your
+machine's network, at the same time, with no client-side plumbing at all.
 
 # Why TCP Collapses Under Packet Loss
 
