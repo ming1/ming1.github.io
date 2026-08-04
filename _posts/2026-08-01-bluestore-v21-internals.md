@@ -483,6 +483,26 @@ It is the one type here that is **not** refcounted. `_txc_create()` makes it,
 — so the rule is that no code touches a txc after handing it forward. Its
 state field drives the machine in §4.2.
 
+### GarbageCollector
+
+[`GarbageCollector`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1301) exists because of one asymmetry: a compressed blob can
+only be released whole. `get_release_size()` returns its entire logical
+length, so overwriting part of one frees nothing — the old compressed extents
+stay pinned by whatever fraction of the blob is still referenced.
+
+It is a per-write advisor, not a background thread. `estimate()` walks the
+blobs a write touches and returns *how many allocation units rewriting the
+survivors would recover*; `get_extents_to_collect()` names the ranges. Its
+`affected_blobs` map is documented as compressed blobs only, so an
+uncompressed object never gives it anything to do — §3.6's trace shows the
+call firing and returning `expected benefit = 0 AUs`.
+
+`_do_write()` runs it before `_wctx_finish()`, since that empties the
+`old_extents` the estimate depends on, and acts only if the benefit clears
+`bluestore_gc_enable_total_threshold`. Both GC thresholds default to **0**,
+so the gate is effectively "collect whenever there is anything to collect" —
+the restraint comes from `estimate()` finding nothing, not from the knob.
+
 ### hobject_t
 
 [`hobject_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/hobject.h#L49) is the hashed object name — what RADOS means by "an object".
