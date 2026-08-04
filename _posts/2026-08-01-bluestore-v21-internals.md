@@ -981,11 +981,44 @@ encoding with flag bits packed into the low nibble of the blob id
 
 A sequentially written object therefore encodes each extent in close to a
 single varint: contiguous + zero offset + same length means logical_offset,
-blob_offset and length are all omitted. The extent records of a sequentially
-written object therefore cost close to nothing, while a randomly written
-one's do not. The map as a whole is a different matter: the blobs those
-records point at still carry checksums, so a 4 MiB sequential object measures
-4,853 bytes of extent map, 4 KiB of it checksum (§3.6).
+blob_offset and length are all omitted.
+
+**Worked example.** Take one shard of the 4 MiB object in §3.6 — 6 extents,
+64 KiB blobs, written sequentially — and encode its second extent. The encoder
+walks with a cursor `pos` (last extent's end) and `prev_len`:
+
+```
+extent: logical 0x70000 ~0x10000  ->  blob_offset 0, blob #2
+
+  pos == 0x70000 ?  yes  -> BLOBID_FLAG_CONTIGUOUS   omit logical_offset
+  blob_offset == 0 ?  yes  -> BLOBID_FLAG_ZEROOFFSET   omit blob_offset
+  length == prev_len ? yes -> BLOBID_FLAG_SAMELENGTH   omit length
+
+  emitted:  varint(0 | 0x1 | 0x2 | 0x4) = one byte 0x07
+```
+
+One byte. Every field the extent record could carry was inferable, so none is
+written. What follows it in the stream is the *blob*, and that is where the
+bytes actually go — the whole 455-byte shard divides as:
+
+| | Bytes |
+|---|---|
+| header — `struct_v` + extent count | 2 |
+| leading gap — `denc_varint_lowz(0x60000)`, this shard not starting at 0 | 2 |
+| first extent: 1 blobid + 1 explicit length + 74 blob | 76 |
+| 5 × (1 blobid + 74 blob) | 375 |
+| **total** | **455** |
+
+The same arithmetic gives 453 for shard 0 (no leading gap) and 305 for the
+4-extent tail shard — it reproduces all three to the byte. Two details fall
+out of it. The first extent of *every* shard costs one byte more, because
+`prev_len` resets to 0 per shard so `SAMELENGTH` cannot be set. And of the
+74 bytes per blob, 64 are checksum.
+
+So the delta encoding does what it claims — extent records cost 1–2 bytes on a
+sequential object, against ~11 on a fragmented one where nothing can be
+inferred — but it is not what determines the size of an extent map. A 4 MiB
+sequential object measures 4,853 bytes, and 4 KiB of that is checksum (§3.6).
 
 The decoder is split into an abstract `ExtentDecoder` base and a concrete
 `ExtentDecoderFull` ([BlueStore.h:1046](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1046), 1083). The indirection exists so that
