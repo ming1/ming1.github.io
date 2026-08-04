@@ -7,10 +7,16 @@ tags: [ceph, bluestore, storage, quiz, debugging, concurrency]
 * TOC
 {:toc}
 
-> Companion to [Reading BlueStore's Code]({{ site.baseurl }}/storage/reading-bluestores-code-threads-locks-and-the-path-of-one-write).
+> Companion to [BlueStore Internals: A Source-Level Walkthrough of Ceph
+> v21.3.0]({{ site.baseurl }}/storage/bluestore-v21-internals),
+> and follows its parts one for one — Part *n* here quizzes Part *n* there.
+> [Reading BlueStore's Code]({{ site.baseurl }}/storage/ceph-bluestore-code-walkthrough)
+> is the shorter companion, strongest on threads and locks (Part 4 here) and
+> on the BlueFS lock-suffix grammar (Part 6).
+>
 > Every answer is verified against Ceph tag
-> [`v21.3.0`](https://github.com/ceph/ceph/tree/v21.3.0). Each part's last
-> question is the hard one.
+> [`v21.3.0`](https://github.com/ceph/ceph/tree/v21.3.0). Each part ends with
+> a harder question, marked.
 >
 > The point is not recall. Most questions carry a **Find it yourself** hint —
 > the command or grep that answers it — because the durable skill is knowing
@@ -35,7 +41,80 @@ behaviour on *that build*, never on the tag — check the tag separately. And a
 failed grep is not evidence of absence; it usually means you guessed the wrong
 word.
 
-# Part 0: the cast
+# Part 1 — Why BlueStore Exists
+
+**1.** FileStore wrote every byte of client data twice. Why could it not
+journal only metadata, as a filesystem does?
+
+<details><summary>Answer</summary>
+Because it did not know which filesystem blocks belonged to which transaction.
+A journal that replays metadata only is safe when the filesystem itself
+guarantees the data blocks are already there; FileStore had no such handle on
+ext4/XFS internals, so the only crash-safe option was to journal the payload
+too. A 4 MiB object write cost 8 MiB of device bandwidth before replication —
+6× from the client's view on a 3× pool.
+</details>
+
+**2.** `ObjectStore` is neither a block interface nor a POSIX one. What is it
+closer to, and why does that rule out a filesystem backend being a natural
+fit?
+
+<details><summary>Answer</summary>
+A small database engine: transactions over objects, with atomic multi-object
+updates and an ordered key-value side (omap/xattrs). Filesystems provide no
+multi-object atomicity at all, which is the mismatch FileStore papered over
+with its own journal.
+</details>
+
+**3.** Why RocksDB rather than a purpose-built B-tree?
+
+<details><summary>Answer</summary>
+Crash consistency and compaction are a multi-year engineering project, and
+RocksDB already is one. Two properties matter most for BlueStore: a batch is
+atomic, so a deferred op and the onode referencing it commit together; and
+<code>submit_transaction_sync()</code> gives an explicit durability point, so
+BlueStore chooses exactly when it pays <code>fdatasync</code>. LevelDB was
+rejected for lacking column families, compaction control, and merge operators —
+which BlueStore uses for statfs deltas and the freelist XOR.
+</details>
+
+**4.** BlueStore avoids a kernel filesystem. So why does it contain one?
+
+<details><summary>Answer</summary>
+RocksDB demands one: it calls <code>Env::NewWritableFile</code>,
+<code>RenameFile</code>, <code>GetChildren</code>, <code>LockFile</code>.
+BlueFS is the minimum filesystem satisfying that interface — no nesting, no
+permissions, no rename-within-directory semantics beyond what RocksDB uses.
+</details>
+
+**5.** What does "spillover" actually mean, mechanically?
+
+<details><summary>Answer</summary>
+<code>RocksDBBlueFSVolumeSelector</code> maps each file to one of `BDEV_WAL`,
+`BDEV_DB`, `BDEV_SLOW` by directory-name hint. When the DB device fills,
+<code>select_prefer_bdev()</code> falls back to `BDEV_SLOW` — which is
+BlueStore's main block device, typically the HDD. Spillover is that fallback
+firing, not a distinct error path.
+<br><br><b>Find it yourself:</b> <code>ceph daemon osd.0 perf dump | grep -i
+slow_used</code>, and <code>bluefs stats</code> for the per-device breakdown.
+</details>
+
+**6 (hard).** Name three things BlueStore gave up by leaving the filesystem,
+and the operational cost of each.
+
+<details><summary>Answer</summary>
+Any three of: <b>filesystem tooling</b> — you cannot <code>ls</code> an OSD,
+so <code>ceph-bluestore-tool</code> and <code>ceph-objectstore-tool</code> are
+the only lenses; <b>kernel readahead and page cache</b> — BlueStore implements
+its own caching, less sophisticated than the kernel's; <b>fsck maturity</b> —
+<code>_fsck()</code> is the entry to thousands of lines of hand-written
+checking that must track every on-disk format change; <b>simple space
+accounting</b> — free space is now split between the BlueStore allocator and
+BlueFS, which can starve each other; <b>CPU</b> — checksums, onode
+encode/decode and RocksDB's own cost all became the OSD's problem.
+</details>
+
+# Part 2 — The Object Model
 
 **1.** Which object owns the onode cache, and which owns the *buffer* cache?
 
@@ -103,144 +182,7 @@ operation.
 <code>grep -A5 'name: bluestore_allocation_from_file' src/common/options/global.yaml.in</code>
 </details>
 
-# Part 1: the contract
-
-**1.** What does `queue_transactions()` return when a transaction cannot be
-applied?
-
-<details><summary>Answer</summary>
-Nothing — it always returns 0. There is no error path. A transaction that
-cannot be applied aborts the process; <code>-ENOSPC</code> crashes deliberately
-rather than partially applying. The only escape is a debug build with
-<code>objectstore_debug_throw_on_failed_txc</code>, which throws a raw
-<code>int</code>.
-<br><br><b>Find it yourself:</b> read the tail of
-<code>BlueStore::queue_transactions</code> — the last statement is
-<code>return 0;</code> and there is no other <code>return</code> in the body.
-</details>
-
-**2.** Which of the three transaction callbacks actually means "durable"?
-
-<details><summary>Answer</summary>
-Only <code>on_commit</code>. <code>on_applied_sync</code> runs inline on the
-caller's thread and <code>on_applied</code> is merely queued beside it — both
-before any I/O. Readability is immediate because the in-memory onodes were
-already mutated.
-<br><br><b>Find it yourself:</b> <code>ceph daemon osd.0 perf dump | jq
-.bluestore</code> — the <code>state_kv_commiting_lat</code> counter is the stage
-<code>on_commit</code> waits for.
-</details>
-
-**3.** `ceph-osd --mkjournal` prints "created new journal" and exits 0. What did
-it do?
-
-<details><summary>Answer</summary>
-Nothing. BlueStore's <code>mkjournal()</code> is <code>return 0;</code>, and
-<code>needs_journal</code>/<code>wants_journal</code>/<code>allows_journal</code>
-all return false. The quartet survives only because <code>ceph_osd</code> still
-parses those flags.
-</details>
-
-**4.** Why does the interface's `is_sync_onreadable()` have no callers?
-
-<details><summary>Answer</summary>
-Because it expressed exactly the property BlueStore has unconditionally —
-immediate readability — so nothing ever needed to ask. A grep across all of
-<code>src/</code> returns exactly one line: its own declaration.
-<br><br><b>Find it yourself:</b>
-<code>grep -rn 'is_sync_onreadable' src/ | wc -l</code> → 1
-</details>
-
-**5 (hard).** A transaction names a collection that was never opened. What
-happens, and why is that not an error return?
-
-<details><summary>Answer</summary>
-A segfault. <code>_txc_add_transaction</code> resolves each named collection
-into <code>cvec</code>, which holds a null <code>CollectionRef</code> for an
-unknown cid, and the object path then dereferences it unconditionally at
-<code>std::unique_lock l(c->lock)</code> with no null check. Consistent with
-this API's whole posture: the contract is "this must succeed", so a caller
-error is a bug to crash on, not a condition to report.
-</details>
-
-# Part 2: execution contexts
-
-**1.** Name the four threads one write transaction passes through, in order.
-
-<details><summary>Answer</summary>
-<code>tp_osd_tp</code> (prepare) → <code>bstore_aio</code> (aio_wait, io_done)
-→ <code>bstore_kv_sync</code> (commit) → <code>bstore_kv_final</code>
-(kv_submitted, finishing, done).
-<br><br><b>Find it yourself:</b> set <code>ceph daemon osd.0 config set
-debug_bluestore 30/30</code>, do one write, then grep the log for a single
-<code>txc</code> pointer. The thread id is the second field of every line;
-resolve ids with <code>gdb -p $(cat out/osd.0.pid) -ex "info threads"</code>.
-</details>
-
-**2.** Why must you use the admin socket rather than `ceph tell osd.N
-injectargs` to raise the debug level for such a trace?
-
-<details><summary>Answer</summary>
-<code>tell</code> goes through the monitor and may not take effect before your
-write completes — producing a log with no write-path lines at all. The admin
-socket applies locally and synchronously, and a <code>config get</code>
-afterwards confirms it before you spend a write.
-</details>
-
-**3.** A live OSD shows four `bstore_aio` threads. Do all four advance
-transactions?
-
-<details><summary>Answer</summary>
-No — only one. There is one aio thread per open block device, and this OSD
-opened four (data, DB, WAL, slow). BlueFS creates its devices with a null
-completion callback and a null <code>ioc->priv</code>, so its three threads
-only wake a caller blocked in <code>aio_wait()</code>. Only the data device has
-<code>aio_cb</code> wired.
-<br><br><b>Find it yourself:</b>
-<code>git show v21.3.0:src/blk/kernel/KernelDevice.cc | sed -n '750,756p'</code>
-— the branch tests <code>ioc->priv</code>, not the device callback.
-</details>
-
-**4.** Why is there no `bstore_discard` thread on a stock OSD?
-
-<details><summary>Answer</summary>
-Two gates, both closed by default: <code>bdev_async_discard_threads</code> is 0
-and <code>bdev_enable_discard</code> is false.
-<br><br><b>Find it yourself:</b> <code>gdb -p $(cat out/osd.0.pid) -ex "info
-threads" | grep -oE '"[a-z_]+"' | sort | uniq -c</code>
-</details>
-
-**5.** Which states in `TransContext::state_t` can never appear in a trace?
-
-<details><summary>Answer</summary>
-<code>STATE_DEFERRED_DONE</code> is dead code — present in the enum and in
-<code>get_state_name()</code>, never assigned anywhere.
-<code>STATE_KV_QUEUED</code> and <code>STATE_DEFERRED_QUEUED</code> never appear
-in <code>_txc_state_proc</code> logging either, but for a different reason: they
-are parking states with no <code>case</code>, and passing one in hits
-<code>ceph_abort_msg("unexpected txc state")</code>.
-<br><br><b>Find it yourself:</b>
-<code>grep -rn STATE_DEFERRED_DONE src/os/bluestore/</code> → two hits, both
-declarations.
-</details>
-
-**6 (hard).** Your trace of a 4 KiB write shows `prepare` and `io_done` on the
-*same* thread and no `aio_wait` at all. Explain.
-
-<details><summary>Answer</summary>
-4 KiB is below <code>bluestore_prefer_deferred_size</code>, so the write is
-deferred: the payload rides inside the RocksDB transaction and <em>no data aio
-is issued at prepare time</em>. With no pending aios the state machine falls
-straight through <code>STATE_PREPARE</code> on the caller's thread. The 64 KiB
-case is the has-I/O case; treating it as canonical is a common mistake.
-<br><br><b>Find it yourself:</b> <code>ceph daemon osd.0 config get
-bluestore_prefer_deferred_size_hdd</code>, then trace one write on each side of
-that threshold and diff the state sequences.
-</details>
-
-# Part 3: the nouns and their lifetimes
-
-**1.** Almost everything in the metadata layer is intrusively refcounted. Which
+**6.** Almost everything in the metadata layer is intrusively refcounted. Which
 type is not, and what replaces refcounting for it?
 
 <details><summary>Answer</summary>
@@ -254,7 +196,7 @@ the state machine never touches a transaction after handing it forward.
 <code>git show v21.3.0:src/os/bluestore/BlueStore.cc | grep -n 'may destroy txc'</code>
 </details>
 
-**2.** An `Onode` *is* refcounted. What holds a reference to it for the
+**7.** An `Onode` *is* refcounted. What holds a reference to it for the
 duration of a transaction?
 
 <details><summary>Answer</summary>
@@ -266,7 +208,7 @@ with the txc.
 <code>git show v21.3.0:src/os/bluestore/BlueStore.h | sed -n '1976,1978p'</code>
 </details>
 
-**3.** Why does `TransContext` need `modified_objects` in addition to
+**8.** Why does `TransContext` need `modified_objects` in addition to
 `onodes`?
 
 <details><summary>Answer</summary>
@@ -276,7 +218,7 @@ comment states the purpose exactly: <em>"objects we modified (and need a
 ref)"</em> — the set exists for the reference, not for the write.
 </details>
 
-**4.** Why is the onode cache per-collection?
+**9.** Why is the onode cache per-collection?
 
 <details><summary>Answer</summary>
 Lock contention, and the header says so: <em>"cache onodes on a per-collection
@@ -287,7 +229,7 @@ path takes it shared while <code>_txc_add_transaction</code> takes it unique.
 <code>git show v21.3.0:src/os/bluestore/BlueStore.h | grep -n 'per-collection basis'</code>
 </details>
 
-**5.** Who owns a `Buffer`?
+**10.** Who owns a `Buffer`?
 
 <details><summary>Answer</summary>
 The <code>BufferSpace</code> it sits in — <code>Buffer</code> is not
@@ -296,7 +238,7 @@ refcounted. And the <code>BufferSpace</code> is embedded in the
 only the <code>BufferCacheShard *</code> the buffers are charged against.
 </details>
 
-**6 (hard).** `dump_mempools` reports per-type numbers. What makes that
+**11 (hard).** `dump_mempools` reports per-type numbers. What makes that
 attribution real rather than an estimate, and what would you have to add to a
 new cached type to keep it honest?
 
@@ -312,7 +254,65 @@ then <code>grep -rn MEMPOOL_CLASS_HELPERS src/os/bluestore/BlueStore.h</code>
 and check the list of types matches the pools in the output.
 </details>
 
-# Part 4: one write, end to end
+**12.** What does `queue_transactions()` return when a transaction cannot be
+applied?
+
+<details><summary>Answer</summary>
+Nothing — it always returns 0. There is no error path. A transaction that
+cannot be applied aborts the process; <code>-ENOSPC</code> crashes deliberately
+rather than partially applying. The only escape is a debug build with
+<code>objectstore_debug_throw_on_failed_txc</code>, which throws a raw
+<code>int</code>.
+<br><br><b>Find it yourself:</b> read the tail of
+<code>BlueStore::queue_transactions</code> — the last statement is
+<code>return 0;</code> and there is no other <code>return</code> in the body.
+</details>
+
+**13.** Which of the three transaction callbacks actually means "durable"?
+
+<details><summary>Answer</summary>
+Only <code>on_commit</code>. <code>on_applied_sync</code> runs inline on the
+caller's thread and <code>on_applied</code> is merely queued beside it — both
+before any I/O. Readability is immediate because the in-memory onodes were
+already mutated.
+<br><br><b>Find it yourself:</b> <code>ceph daemon osd.0 perf dump | jq
+.bluestore</code> — the <code>state_kv_commiting_lat</code> counter is the stage
+<code>on_commit</code> waits for.
+</details>
+
+**14.** `ceph-osd --mkjournal` prints "created new journal" and exits 0. What did
+it do?
+
+<details><summary>Answer</summary>
+Nothing. BlueStore's <code>mkjournal()</code> is <code>return 0;</code>, and
+<code>needs_journal</code>/<code>wants_journal</code>/<code>allows_journal</code>
+all return false. The quartet survives only because <code>ceph_osd</code> still
+parses those flags.
+</details>
+
+**15.** Why does the interface's `is_sync_onreadable()` have no callers?
+
+<details><summary>Answer</summary>
+Because it expressed exactly the property BlueStore has unconditionally —
+immediate readability — so nothing ever needed to ask. A grep across all of
+<code>src/</code> returns exactly one line: its own declaration.
+<br><br><b>Find it yourself:</b>
+<code>grep -rn 'is_sync_onreadable' src/ | wc -l</code> → 1
+</details>
+
+**16 (hard).** A transaction names a collection that was never opened. What
+happens, and why is that not an error return?
+
+<details><summary>Answer</summary>
+A segfault. <code>_txc_add_transaction</code> resolves each named collection
+into <code>cvec</code>, which holds a null <code>CollectionRef</code> for an
+unknown cid, and the object path then dereferences it unconditionally at
+<code>std::unique_lock l(c->lock)</code> with no null check. Consistent with
+this API's whole posture: the contract is "this must succeed", so a caller
+error is a bug to crash on, not a condition to report.
+</details>
+
+# Part 3 — The Complete Write Path
 
 **1.** Which thread performs deferred writes?
 
@@ -395,116 +395,157 @@ and dump the <code>L</code> prefix; restart, wait, and dump again.
 <code>ceph-kvstore-tool bluestore-kv &lt;store&gt; list L</code>
 </details>
 
-# Part 5: one read, end to end
-
-**1.** What does `read()` return for an offset past the end of the object?
+**7.** In `queue_transactions()`, at which step is a transaction's position in
+the ordering stream fixed?
 
 <details><summary>Answer</summary>
-0. <code>ObjectStore.h</code> is explicit: <em>"if reading from an offset past
-the end of the object, we return 0 (not, say, -EINVAL)"</em>.
+Step 3. <code>_txc_create()</code> queues the txc on <code>osr->q</code>
+<em>immediately</em> — before decoding, before costing, and crucially before
+throttling. That is what makes it impossible for the throttle to reorder
+transactions.
+</details>
+
+**8.** Steps 1–9 run on the caller's thread. Does that mean no other thread can
+see the transaction?
+
+<details><summary>Answer</summary>
+No. It means no other thread <em>advances</em> it. From step 3 onward the txc
+is on <code>osr->q</code> and is structurally visible to anything walking that
+queue under <code>qlock</code> — <code>_txc_finish_io</code> can see it as a
+predecessor blocking a later transaction. Queued is not the same as running.
+</details>
+
+**9.** Which changes exist only in memory until step 6?
+
+<details><summary>Answer</summary>
+Dirty onodes, extent-map shards and shared-blob records — those are what
+<code>_txc_write_nodes()</code> encodes into the KV transaction. Omap and
+collection ops are different: they already wrote their own keys into
+<code>txc->t</code> back in step 4.
+</details>
+
+**10.** `throttle.try_start_transaction(...)` — what does the "try" apply to?
+
+<details><summary>Answer</summary>
+Only the <em>deferred</em> byte pool. The call blocks unconditionally in
+<code>throttle_bytes.get(txc.cost)</code> regardless. If the deferred pool
+cannot be had it raises <code>deferred_aggressive</code>, calls
+<code>deferred_try_submit()</code> to drain rather than block behind deferred
+work, wakes kv_sync, and lowers the flag again.
+</details>
+
+**11.** `open_collection()` on an unknown cid — what comes back?
+
+<details><summary>Answer</summary>
+A <b>null handle</b>, not an error code. The caller must test it. Consistent
+with the rest of this API's posture (Part 1): callers are expected to know what
+exists.
+</details>
+
+**12.** A newly created collection is not visible to `open_collection()`. When
+does that change?
+
+<details><summary>Answer</summary>
+Only when a transaction carrying <code>OP_MKCOLL</code> runs
+<code>_create_collection()</code>, which moves it from
+<code>new_coll_map</code> to <code>coll_map</code>.
+<code>create_new_collection()</code> builds the object, binds it to cache
+shards and attaches an <code>OpSequencer</code> — but publication is a
+transactional act, not a constructor side effect.
+</details>
+
+**13 (hard).** One transaction allocates a region and frees the same region.
+What reaches the freelist?
+
+<details><summary>Answer</summary>
+Nothing. <code>_txc_finalize_kv()</code> reconciles the allocated and released
+interval sets first, so a region both allocated and freed in one transaction
+cancels out; only the remainder goes to <code>fm->allocate()</code> /
+<code>fm->release()</code> and to the statfs counters. This is also why the
+<code>allocated</code>/<code>released</code> pair in its debug line is the
+authoritative answer to "did this transaction touch space", rather than
+anything you can infer from the allocator's own state.
+<br><br><b>Find it yourself:</b> at <code>debug_bluestore 30</code>, grep a
+single txc pointer for <code>_txc_finalize_kv</code> and read the two interval
+sets.
+</details>
+
+# Part 4 — The Transaction Engine
+
+**1.** Name the four threads one write transaction passes through, in order.
+
+<details><summary>Answer</summary>
+<code>tp_osd_tp</code> (prepare) → <code>bstore_aio</code> (aio_wait, io_done)
+→ <code>bstore_kv_sync</code> (commit) → <code>bstore_kv_final</code>
+(kv_submitted, finishing, done).
+<br><br><b>Find it yourself:</b> set <code>ceph daemon osd.0 config set
+debug_bluestore 30/30</code>, do one write, then grep the log for a single
+<code>txc</code> pointer. The thread id is the second field of every line;
+resolve ids with <code>gdb -p $(cat out/osd.0.pid) -ex "info threads"</code>.
+</details>
+
+**2.** Why must you use the admin socket rather than `ceph tell osd.N
+injectargs` to raise the debug level for such a trace?
+
+<details><summary>Answer</summary>
+<code>tell</code> goes through the monitor and may not take effect before your
+write completes — producing a log with no write-path lines at all. The admin
+socket applies locally and synchronously, and a <code>config get</code>
+afterwards confirms it before you spend a write.
+</details>
+
+**3.** A live OSD shows four `bstore_aio` threads. Do all four advance
+transactions?
+
+<details><summary>Answer</summary>
+No — only one. There is one aio thread per open block device, and this OSD
+opened four (data, DB, WAL, slow). BlueFS creates its devices with a null
+completion callback and a null <code>ioc->priv</code>, so its three threads
+only wake a caller blocked in <code>aio_wait()</code>. Only the data device has
+<code>aio_cb</code> wired.
 <br><br><b>Find it yourself:</b>
-<code>git show v21.3.0:src/os/ObjectStore.h | grep -n -B2 -A2 'past the end'</code>
+<code>git show v21.3.0:src/blk/kernel/KernelDevice.cc | sed -n '750,756p'</code>
+— the branch tests <code>ioc->priv</code>, not the device callback.
 </details>
 
-**2.** What does `read(c, oid, 0, 0, bl)` mean?
+**4.** Why is there no `bstore_discard` thread on a stock OSD?
 
 <details><summary>Answer</summary>
-The whole object. BlueStore special-cases zero offset with zero length into
-<code>length = o->onode.size</code>. Nothing in <code>ObjectStore.h</code>
-documents it — it is a convention you only learn from the implementation.
+Two gates, both closed by default: <code>bdev_async_discard_threads</code> is 0
+and <code>bdev_enable_discard</code> is false.
+<br><br><b>Find it yourself:</b> <code>gdb -p $(cat out/osd.0.pid) -ex "info
+threads" | grep -oE '"[a-z_]+"' | sort | uniq -c</code>
 </details>
 
-**3.** Which lock does the read path take, and in which mode?
+**5.** Which states in `TransContext::state_t` can never appear in a trace?
 
 <details><summary>Answer</summary>
-<code>c->lock</code>, <b>shared</b> — that is the whole point of
-<code>Collection::lock</code> being a <code>shared_mutex</code>. Concurrent
-reads of the same collection proceed together; a write excludes them.
-</details>
-
-**4.** When does `read()` return `-ENOENT`?
-
-<details><summary>Answer</summary>
-Only two cases: the collection does not exist, or the onode does not. Every
-other "nothing there" outcome — hole, past EOF, zero-length object — is a
-successful read of 0 bytes.
-</details>
-
-**5 (hard).** Read latency and write latency have very different shapes under
-load. What in the code explains that?
-
-<details><summary>Answer</summary>
-The read path has no handoff. <code>BlueStore::read</code> runs start to finish
-on the caller's thread: lookup, fault in shards, issue device reads,
-<em>wait on them inline</em>, verify checksums, return. A slow device read
-therefore occupies an OSD op thread for its full duration. The write path
-hands off at prepare — <code>_txc_aio_submit</code> returns immediately and
-<code>bstore_aio</code> picks the transaction up later — so a slow write
-consumes queue depth rather than an op thread.
-<br><br><b>Find it yourself:</b> <code>ceph daemon osd.0 perf dump | jq
-.bluestore</code> and compare the <code>read_lat</code> counters against the
-<code>state_*_lat</code> series, which exists only for writes.
-</details>
-
-# Part 6: the locking reference
-
-**1.** BlueFS annotates function names with letter suffixes — `_LD`, `_LNF`,
-`_WF_WD_WLD_WLNF_WNF`. Is there a legend?
-
-<details><summary>Answer</summary>
-Yes, and it is easy to miss: a comment at the very bottom of
-<code>BlueFS.h</code>, below the vselector classes, giving both the letters and
-the acquisition order as a directional graph, ending
-<em>"Claim: Deadlock is possible IFF graph contains cycles."</em> Searching for
-"legend" or "locking" does not find it, because it calls itself a graph.
+<code>STATE_DEFERRED_DONE</code> is dead code — present in the enum and in
+<code>get_state_name()</code>, never assigned anywhere.
+<code>STATE_KV_QUEUED</code> and <code>STATE_DEFERRED_QUEUED</code> never appear
+in <code>_txc_state_proc</code> logging either, but for a different reason: they
+are parking states with no <code>case</code>, and passing one in hits
+<code>ceph_abort_msg("unexpected txc state")</code>.
 <br><br><b>Find it yourself:</b>
-<code>git show v21.3.0:src/os/bluestore/BlueFS.h | sed -n '1409,1426p'</code>
+<code>grep -rn STATE_DEFERRED_DONE src/os/bluestore/</code> → two hits, both
+declarations.
 </details>
 
-**2.** What is the acquisition order, and which letter maps to which lock?
+**6 (hard).** Your trace of a 4 KiB write shows `prepare` and `io_done` on the
+*same* thread and no `aio_wait` at all. Explain.
 
 <details><summary>Answer</summary>
-<code>W &lt; L &lt; N &lt; D &lt; F</code> — <code>FileWriter::lock</code>,
-<code>log.lock</code>, <code>nodes.lock</code>, <code>dirty.lock</code>,
-<code>File::lock</code>. Note that <code>dirty</code> nests <em>under</em> both
-log and nodes rather than beside them.
+4 KiB is below <code>bluestore_prefer_deferred_size</code>, so the write is
+deferred: the payload rides inside the RocksDB transaction and <em>no data aio
+is issued at prepare time</em>. With no pending aios the state machine falls
+straight through <code>STATE_PREPARE</code> on the caller's thread. The 64 KiB
+case is the has-I/O case; treating it as canonical is a common mistake.
+<br><br><b>Find it yourself:</b> <code>ceph daemon osd.0 config get
+bluestore_prefer_deferred_size_hdd</code>, then trace one write on each side of
+that threshold and diff the state sequences.
 </details>
 
-**3.** Does a suffix name the locks the function holds, or the locks it takes?
-
-<details><summary>Answer</summary>
-The locks it <b>acquires itself</b> — never those its caller must already hold.
-<code>_flush_range_F</code> opens with
-<code>ceph_assert(ceph_mutex_is_locked(h->lock))</code> yet carries only
-<code>F</code>: it <em>requires</em> W and <em>takes</em> F. Read a suffix as
-"the lock-sets this call may grab".
-</details>
-
-**4.** Groups are separated by `_`. Do they mean successive episodes?
-
-<details><summary>Answer</summary>
-No — that is the reading the notation invites and it is wrong. A group is a
-<b>distinct maximal lock-set the function may acquire</b>, unioned across
-branches rather than sequenced. Three things force that reading:
-<code>_flush_and_sync_log_LD</code> performs three separate episodes and gets
-one group; <code>sync_metadata</code> is annotated <code>_LNF_NF_LD_D</code>
-but its <em>first</em> act is an LD episode; and <code>compact_log</code>
-(<code>_LNF_LD_NF_D</code>) and <code>_maybe_compact_log_LNF_NF_LD_D</code>
-dispatch to the same two alternatives while carrying the same groups in
-different orders.
-</details>
-
-**5.** What single pair of functions pins the meaning of `W` beyond argument?
-
-<details><summary>Answer</summary>
-<code>fsync(FileWriter*) /*_WF_WD_WLD_WLNF_WNF*/</code> and
-<code>_fsync(FileWriter*, bool) /*_F_D_LD_LNF_NF*/</code>. <code>fsync</code>
-does nothing but take <code>h->lock</code> and call <code>_fsync</code>, and
-every group of the inner annotation reappears in the outer one with exactly one
-letter added — <code>W</code>. The suffix composes.
-</details>
-
-**6 (hard).** `kv_committing` is documented as protected by `kv_lock`, but
+**7 (hard).** `kv_committing` is documented as protected by `kv_lock`, but
 `_kv_sync_thread` iterates and mutates it after unlocking. Is that a bug?
 
 <details><summary>Answer</summary>
@@ -518,7 +559,196 @@ nothing in the type system will stop you.
 and follow where <code>kv_lock</code> is released.
 </details>
 
-# Part 7: space — the allocator family and the freelist
+# Part 5 — The RocksDB Metadata Engine
+
+**1.** All BlueStore metadata is in one RocksDB instance. What separates the
+namespaces?
+
+<details><summary>Answer</summary>
+A single-character key prefix — `S` super, `T` statfs, `C` collection,
+`O` object, `M` omap, `P` pgmeta omap, `m` per-pool omap, `p` per-PG omap,
+`L` deferred, `B`/`b` bitmap freelist, `X` shared blob. Not column families:
+those exist too, but they are a performance mechanism layered on top, and the
+prefix is what makes a key unambiguous.
+<br><br><b>Find it yourself:</b>
+<code>git show v21.3.0:src/os/bluestore/BlueStore.cc | sed -n '134,150p'</code>
+</details>
+
+**2.** Three omap prefixes exist — `M`, `m`, `p`. Why three?
+
+<details><summary>Answer</summary>
+They are successive generations of the same idea, kept for compatibility.
+`M` keys are `u64 nid + keyname`; `m` prefixes a pool id so per-pool omap
+usage is computable without a full scan; `p` adds the PG hash so a PG's omap
+is a contiguous range, which makes PG removal and backfill range operations
+instead of scans.
+</details>
+
+**3.** `bluestore_rocksdb_cf` defaults true. Read the default CF spec
+`O(3,0-13)` — what does it say?
+
+<details><summary>Answer</summary>
+Onodes get 3 column-family shards, with the shard chosen by hashing key
+characters [0,13) — that prefix being shard id, pool and hash, i.e. everything
+that identifies the PG. So one PG's onodes land in one shard, and compaction
+in one CF does not disturb the others. The full default also gives that CF a
+dedicated binned-LRU block cache.
+<br><br><b>Find it yourself:</b>
+<code>ceph daemon osd.0 config get bluestore_rocksdb_cfs</code>
+</details>
+
+**4.** Why does statfs use a RocksDB *merge* rather than a read-modify-write?
+
+<details><summary>Answer</summary>
+Because every transaction updates it. A read-modify-write would serialize all
+transactions on one key; a merge operator lets RocksDB append deltas and fold
+them lazily at read or compaction time, so concurrent transactions never
+conflict.
+<br><br><b>Find it yourself:</b> under the null freelist manager
+<code>is_statfs_recoverable()</code> is true and the merge is skipped
+altogether — statfs is recomputed from the allocator at mount. Check with
+<code>ceph-kvstore-tool bluestore-kv &lt;store&gt; list T</code>.
+</details>
+
+**5 (hard).** A 4 KiB client write costs about 4 KiB of data and under a
+kilobyte of onode plus shard. Why is the honest figure 5–15 KiB of metadata,
+and where does the rest come from?
+
+<details><summary>Answer</summary>
+RocksDB writes it more than once. The WAL takes it first, the memtable flush
+writes it again into an L0 SST, and every compaction level it survives rewrites
+it once more — amortized, but real. The BlueStore-level number (onode + shard)
+is only the input to the LSM; §5.5 accounts for the rest, and §11.3 measures it
+end to end. This is the cost RocksDB's maturity was bought with, named plainly
+in §1.3.
+</details>
+
+# Part 6 — BlueFS Internals
+
+**1.** What exactly is `BlueRocksEnv`?
+
+<details><summary>Answer</summary>
+A <code>rocksdb::EnvWrapper</code> around <code>Env::Default()</code> — not a
+full <code>rocksdb::Env</code> implementation. Its own comment says it will
+<em>"forward most of it to POSIX."</em> Only file and directory operations
+reach BlueFS; threads, clocks and the rest fall straight through.
+</details>
+
+**2.** Which RocksDB durability call does BlueStore *not* implement?
+
+<details><summary>Answer</summary>
+<code>WritableFile::Fsync()</code>. It is not overridden at all — it resolves
+to RocksDB's base-class default, <code>Status Fsync() { return Sync(); }</code>.
+The net effect matches <code>Sync()</code>, but nothing in BlueStore's source
+implements it, so grepping for it in <code>src/os/bluestore/</code> finds
+nothing and proves nothing.
+</details>
+
+**3.** `Flush()` and `Sync()` both sound like "write it out". What is the
+difference?
+
+<details><summary>Answer</summary>
+<code>Sync()</code> and <code>Close()</code> call <code>BlueFS::fsync()</code>;
+<code>Flush()</code> calls <code>BlueFS::flush()</code>, which moves data
+<em>without</em> a journal write. And <code>Close()</code> does
+<em>only</em> the fsync — the real close happens later in
+<code>~BlueRocksWritableFile()</code> via <code>close_writer()</code>.
+</details>
+
+**4.** A BlueFS log dump shows one `op_file_update_inc` per file per flush, not
+one per write. Why?
+
+<details><summary>Answer</summary>
+Because the write path defers its metadata. <code>_flush_range_F</code> does
+not touch <code>log.t</code> at all — it only sets <code>is_dirty</code> and
+puts the file on a dirty list. <code>_consume_dirty()</code> then synthesizes
+exactly one <code>op_file_update_inc</code> per dirty file at flush time.
+<br><br><b>Find it yourself:</b>
+<code>ceph-bluestore-tool --path &lt;store&gt; bluefs-log-dump</code> and count
+the ops against the number of files.
+</details>
+
+**5.** Does everything defer that way?
+
+<details><summary>Answer</summary>
+No — only the write path. <code>preallocate()</code>, <code>truncate()</code>
+and every namespace operation append to <code>log.t</code> inline.
+<code>truncate()</code> even carries the comment that gives the scheme away:
+<em>"skipping log.t.op_file_update_inc, it will be done by flush()."</em> And
+<code>_consume_dirty()</code> concedes it from the other side: <em>"some bluefs
+ops may have already been stored in log.t."</em>
+</details>
+
+**6 (hard).** Why is `bluefs-log-dump` output identical to what
+`debug_bluefs = 20` logs during a real mount?
+
+<details><summary>Answer</summary>
+Because it is the same code. <code>log_dump()</code> is
+<code>_replay(noop=true, to_stdout=true)</code> — the mount path executed
+without applying anything. It also asserts the filesystem is not mounted
+(<code>ceph_assert(log.writer == nullptr &amp;&amp; "cannot log_dump on mounted
+BlueFS")</code>), which is why the tool refuses to run against a live OSD.
+<br><br><b>Find it yourself:</b>
+<code>git show v21.3.0:src/os/bluestore/BlueFS.cc | sed -n '1976,1990p'</code>
+</details>
+
+**7.** BlueFS annotates function names with letter suffixes — `_LD`, `_LNF`,
+`_WF_WD_WLD_WLNF_WNF`. Is there a legend?
+
+<details><summary>Answer</summary>
+Yes, and it is easy to miss: a comment at the very bottom of
+<code>BlueFS.h</code>, below the vselector classes, giving both the letters and
+the acquisition order as a directional graph, ending
+<em>"Claim: Deadlock is possible IFF graph contains cycles."</em> Searching for
+"legend" or "locking" does not find it, because it calls itself a graph.
+<br><br><b>Find it yourself:</b>
+<code>git show v21.3.0:src/os/bluestore/BlueFS.h | sed -n '1409,1426p'</code>
+</details>
+
+**8.** What is the acquisition order, and which letter maps to which lock?
+
+<details><summary>Answer</summary>
+<code>W &lt; L &lt; N &lt; D &lt; F</code> — <code>FileWriter::lock</code>,
+<code>log.lock</code>, <code>nodes.lock</code>, <code>dirty.lock</code>,
+<code>File::lock</code>. Note that <code>dirty</code> nests <em>under</em> both
+log and nodes rather than beside them.
+</details>
+
+**9.** Does a suffix name the locks the function holds, or the locks it takes?
+
+<details><summary>Answer</summary>
+The locks it <b>acquires itself</b> — never those its caller must already hold.
+<code>_flush_range_F</code> opens with
+<code>ceph_assert(ceph_mutex_is_locked(h->lock))</code> yet carries only
+<code>F</code>: it <em>requires</em> W and <em>takes</em> F. Read a suffix as
+"the lock-sets this call may grab".
+</details>
+
+**10.** Groups are separated by `_`. Do they mean successive episodes?
+
+<details><summary>Answer</summary>
+No — that is the reading the notation invites and it is wrong. A group is a
+<b>distinct maximal lock-set the function may acquire</b>, unioned across
+branches rather than sequenced. Three things force that reading:
+<code>_flush_and_sync_log_LD</code> performs three separate episodes and gets
+one group; <code>sync_metadata</code> is annotated <code>_LNF_NF_LD_D</code>
+but its <em>first</em> act is an LD episode; and <code>compact_log</code>
+(<code>_LNF_LD_NF_D</code>) and <code>_maybe_compact_log_LNF_NF_LD_D</code>
+dispatch to the same two alternatives while carrying the same groups in
+different orders.
+</details>
+
+**11.** What single pair of functions pins the meaning of `W` beyond argument?
+
+<details><summary>Answer</summary>
+<code>fsync(FileWriter*) /*_WF_WD_WLD_WLNF_WNF*/</code> and
+<code>_fsync(FileWriter*, bool) /*_F_D_LD_LNF_NF*/</code>. <code>fsync</code>
+does nothing but take <code>h->lock</code> and call <code>_fsync</code>, and
+every group of the inner annotation reappears in the outer one with exactly one
+letter added — <code>W</code>. The suffix composes.
+</details>
+
+# Part 7 — The Allocation Engine
 
 **1.** `bluestore_allocator` defaults to `hybrid`. What algorithm is that?
 
@@ -598,7 +828,178 @@ scanning <em>every onode</em>, which is why a crashed OSD with a large store
 can take a long time to come back.
 </details>
 
-# Part 8: cache and memory
+# Part 8 — The Read Path
+
+**1.** What does `read()` return for an offset past the end of the object?
+
+<details><summary>Answer</summary>
+0. <code>ObjectStore.h</code> is explicit: <em>"if reading from an offset past
+the end of the object, we return 0 (not, say, -EINVAL)"</em>.
+<br><br><b>Find it yourself:</b>
+<code>git show v21.3.0:src/os/ObjectStore.h | grep -n -B2 -A2 'past the end'</code>
+</details>
+
+**2.** What does `read(c, oid, 0, 0, bl)` mean?
+
+<details><summary>Answer</summary>
+The whole object. BlueStore special-cases zero offset with zero length into
+<code>length = o->onode.size</code>. Nothing in <code>ObjectStore.h</code>
+documents it — it is a convention you only learn from the implementation.
+</details>
+
+**3.** Which lock does the read path take, and in which mode?
+
+<details><summary>Answer</summary>
+<code>c->lock</code>, <b>shared</b> — that is the whole point of
+<code>Collection::lock</code> being a <code>shared_mutex</code>. Concurrent
+reads of the same collection proceed together; a write excludes them.
+</details>
+
+**4.** When does `read()` return `-ENOENT`?
+
+<details><summary>Answer</summary>
+Only two cases: the collection does not exist, or the onode does not. Every
+other "nothing there" outcome — hole, past EOF, zero-length object — is a
+successful read of 0 bytes.
+</details>
+
+**5 (hard).** Read latency and write latency have very different shapes under
+load. What in the code explains that?
+
+<details><summary>Answer</summary>
+The read path has no handoff. <code>BlueStore::read</code> runs start to finish
+on the caller's thread: lookup, fault in shards, issue device reads,
+<em>wait on them inline</em>, verify checksums, return. A slow device read
+therefore occupies an OSD op thread for its full duration. The write path
+hands off at prepare — <code>_txc_aio_submit</code> returns immediately and
+<code>bstore_aio</code> picks the transaction up later — so a slow write
+consumes queue depth rather than an op thread.
+<br><br><b>Find it yourself:</b> <code>ceph daemon osd.0 perf dump | jq
+.bluestore</code> and compare the <code>read_lat</code> counters against the
+<code>state_*_lat</code> series, which exists only for writes.
+</details>
+
+# Part 9 — Snapshots, Clones, and Shared Blobs
+
+**1.** RADOS implements snapshots above the ObjectStore. What does it therefore
+require of BlueStore?
+
+<details><summary>Answer</summary>
+That two objects can reference the same physical extents, and that "cheap"
+means O(metadata) rather than O(data). The OSD creates a clone object — a
+<code>ghobject_t</code> with a non-`head` snap id — and issues
+<code>OP_CLONE</code> / <code>OP_CLONERANGE2</code>. Satisfying that needs
+reference counting <em>below</em> the object level, which is what `SharedBlob`
+is for.
+</details>
+
+**2.** `SharedBlobSet::lookup()` treats an entry with `nref == 0` as absent
+rather than returning it. Why?
+
+<details><summary>Answer</summary>
+The map holds <b>bare pointers</b>, deliberately, so it does not keep shared
+blobs alive. An entry whose refcount has already reached zero is racing with
+its own destructor, so it must be reported missing. It is a weak-reference
+table without <code>weak_ptr</code> — avoiding a control-block allocation per
+shared blob.
+<br><br><b>Find it yourself:</b>
+<code>git show v21.3.0:src/os/bluestore/BlueStore.h | sed -n '617,625p'</code>
+</details>
+
+**3.** Why does `_clone()` call `oldo->flush()` before doing anything?
+
+<details><summary>Answer</summary>
+To wait for the source object's outstanding kv writes to land. The clone is
+built from the source's in-memory extent map, so any not-yet-committed change
+to the source must be settled first or the clone would capture a state that
+does not match what is on disk.
+</details>
+
+**4.** A clone shares extents. What must happen the first time either object is
+written to?
+
+<details><summary>Answer</summary>
+Copy-on-write at blob granularity, gated by
+<code>bluestore_clone_cow</code>. The shared blob's reference tracking decides
+whether a range can be overwritten in place or must be reallocated first —
+which is also why `can_split()` refuses to cut a shared blob, and why an
+overwrite that would have been deferred on an unshared object may not be.
+</details>
+
+**5 (hard).** After deleting every snapshot of an object, its blobs may still
+be marked shared. What removes the sharing, and why is it not automatic?
+
+<details><summary>Answer</summary>
+Unsharing happens when the last reference in the `SharedBlob`'s ref map drops
+and the code notices the blob is now singly-owned — it is opportunistic, driven
+by the dereference path, not by a scan. Nothing walks the store looking for
+newly-unshareable blobs, because that would be O(objects). So an object can
+carry the cost of sharing — the extra `X` key, the COW check on write — long
+after the snapshot that caused it is gone.
+<br><br><b>Find it yourself:</b>
+<code>ceph-kvstore-tool bluestore-kv &lt;store&gt; list X</code> before and
+after removing a snapshot.
+</details>
+
+# Part 10 — Mount, Recovery, and fsck
+
+**1.** Is `mkfs()` safe to re-run against a live store?
+
+<details><summary>Answer</summary>
+Yes — it checks the <code>mkfs_done</code> marker and returns early. But
+"returns early" is conditional: with <code>bluestore_fsck_on_mkfs</code>
+(default <b>true</b>) it runs a full fsck first and may return that error
+instead of 0.
+<br><br><b>Find it yourself:</b>
+<code>git show v21.3.0:src/os/bluestore/BlueStore.cc | grep -n 'mkfs_done'</code>
+</details>
+
+**2.** In `_mount()`, does deferred replay run before or after the KV threads
+start?
+
+<details><summary>Answer</summary>
+After. The order is <code>_kv_start()</code> → <code>_deferred_replay()</code>
+→ <code>mempool_thread.init()</code>. Replay <em>needs</em> kv_sync and
+kv_final running, because the transactions it fabricates go through the normal
+commit path. Getting this backwards is a common mental-model error.
+<br><br><b>Find it yourself:</b>
+<code>git show v21.3.0:src/os/bluestore/BlueStore.cc | sed -n '9629,9642p'</code>
+</details>
+
+**3.** Part 2 said the state machine runs on four threads. When does it run
+somewhere else?
+
+<details><summary>Answer</summary>
+During deferred replay. <code>_deferred_replay()</code> fabricates a
+<code>TransContext</code>, sets it to <code>STATE_KV_DONE</code> and calls
+<code>_txc_state_proc</code> <b>on the mounting thread</b> — the only time the
+state machine runs off the four threads of Part 2.
+</details>
+
+**4.** Why does `_fsck()` start the KV threads?
+
+<details><summary>Answer</summary>
+Solely to replay before checking, and the source is candid about it: <em>"we
+need finisher and kv_{sync,finalize}_thread *just* for replay"</em>. An fsck
+that ran against unreplayed deferred writes would report corruption that does
+not exist.
+<br><br><b>Find it yourself:</b>
+<code>git show v21.3.0:src/os/bluestore/BlueStore.cc | grep -n 'just. for replay'</code>
+</details>
+
+**5 (hard).** `umount()` returned `-EIO`. What happened, and was anything left
+unflushed?
+
+<details><summary>Answer</summary>
+Nothing was left unflushed — the error comes last. <code>umount()</code> drains
+every sequencer, shuts down the mempool thread and stops the KV threads, and
+only then optionally fscks on the way out
+(<code>bluestore_fsck_on_umount</code>, default <b>false</b>), returning
+<code>-EIO</code> when that finds a positive error count. So <code>-EIO</code>
+from umount is a report about the store's consistency, not a failure to write.
+</details>
+
+# Part 11 — Performance Analysis
 
 **1.** BlueStore runs two caches. Name them, and say why they are sharded.
 
@@ -657,78 +1058,7 @@ during a sustained write, and watch <code>bluestore_cache_buffer</code> and
 <code>bluestore_cache_data</code> move out of phase.
 </details>
 
-# Part 9: the persistence substrate
-
-**1.** What exactly is `BlueRocksEnv`?
-
-<details><summary>Answer</summary>
-A <code>rocksdb::EnvWrapper</code> around <code>Env::Default()</code> — not a
-full <code>rocksdb::Env</code> implementation. Its own comment says it will
-<em>"forward most of it to POSIX."</em> Only file and directory operations
-reach BlueFS; threads, clocks and the rest fall straight through.
-</details>
-
-**2.** Which RocksDB durability call does BlueStore *not* implement?
-
-<details><summary>Answer</summary>
-<code>WritableFile::Fsync()</code>. It is not overridden at all — it resolves
-to RocksDB's base-class default, <code>Status Fsync() { return Sync(); }</code>.
-The net effect matches <code>Sync()</code>, but nothing in BlueStore's source
-implements it, so grepping for it in <code>src/os/bluestore/</code> finds
-nothing and proves nothing.
-</details>
-
-**3.** `Flush()` and `Sync()` both sound like "write it out". What is the
-difference?
-
-<details><summary>Answer</summary>
-<code>Sync()</code> and <code>Close()</code> call <code>BlueFS::fsync()</code>;
-<code>Flush()</code> calls <code>BlueFS::flush()</code>, which moves data
-<em>without</em> a journal write. And <code>Close()</code> does
-<em>only</em> the fsync — the real close happens later in
-<code>~BlueRocksWritableFile()</code> via <code>close_writer()</code>.
-</details>
-
-**4.** A BlueFS log dump shows one `op_file_update_inc` per file per flush, not
-one per write. Why?
-
-<details><summary>Answer</summary>
-Because the write path defers its metadata. <code>_flush_range_F</code> does
-not touch <code>log.t</code> at all — it only sets <code>is_dirty</code> and
-puts the file on a dirty list. <code>_consume_dirty()</code> then synthesizes
-exactly one <code>op_file_update_inc</code> per dirty file at flush time.
-<br><br><b>Find it yourself:</b>
-<code>ceph-bluestore-tool --path &lt;store&gt; bluefs-log-dump</code> and count
-the ops against the number of files.
-</details>
-
-**5.** Does everything defer that way?
-
-<details><summary>Answer</summary>
-No — only the write path. <code>preallocate()</code>, <code>truncate()</code>
-and every namespace operation append to <code>log.t</code> inline.
-<code>truncate()</code> even carries the comment that gives the scheme away:
-<em>"skipping log.t.op_file_update_inc, it will be done by flush()."</em> And
-<code>_consume_dirty()</code> concedes it from the other side: <em>"some bluefs
-ops may have already been stored in log.t."</em>
-</details>
-
-**6 (hard).** Why is `bluefs-log-dump` output identical to what
-`debug_bluefs = 20` logs during a real mount?
-
-<details><summary>Answer</summary>
-Because it is the same code. <code>log_dump()</code> is
-<code>_replay(noop=true, to_stdout=true)</code> — the mount path executed
-without applying anything. It also asserts the filesystem is not mounted
-(<code>ceph_assert(log.writer == nullptr &amp;&amp; "cannot log_dump on mounted
-BlueFS")</code>), which is why the tool refuses to run against a live OSD.
-<br><br><b>Find it yourself:</b>
-<code>git show v21.3.0:src/os/bluestore/BlueFS.cc | sed -n '1976,1990p'</code>
-</details>
-
-# Part 10: the device layer
-
-**1.** How does `BlockDevice::create` choose a backend?
+**6.** How does `BlockDevice::create` choose a backend?
 
 <details><summary>Answer</summary>
 Two steps. If the <code>bdev_type</code> config option is set it is taken
@@ -738,7 +1068,7 @@ through to the kernel device. The resulting enum then selects an implementation
 in <code>create_with_type()</code>.
 </details>
 
-**2.** How many backends exist at `v21.3.0`?
+**7.** How many backends exist at `v21.3.0`?
 
 <details><summary>Answer</summary>
 Three: <code>KernelDevice</code>, <code>NVMEDevice</code> (SPDK) and
@@ -746,7 +1076,7 @@ Three: <code>KernelDevice</code>, <code>NVMEDevice</code> (SPDK) and
 your mental model includes one, it is from a different branch.
 </details>
 
-**3.** Is any backend selected by path prefix?
+**8.** Is any backend selected by path prefix?
 
 <details><summary>Answer</summary>
 Yes, but not the one people assume. SPDK's <code>support()</code> does a
@@ -758,7 +1088,7 @@ is what you get when nothing else claims the path.
 <code>git show v21.3.0:src/blk/spdk/NVMEDevice.cc | sed -n '724,735p'</code>
 </details>
 
-**4.** Does BlueStore use io_uring?
+**9.** Does BlueStore use io_uring?
 
 <details><summary>Answer</summary>
 Only if you ask. <code>KernelDevice</code> uses libaio by default; io_uring is
@@ -768,7 +1098,7 @@ device is opened more than once — an <code>fd_directs</code> array alongside
 different descriptor, not a different code path.
 </details>
 
-**5 (hard).** `KernelDevice::flush()` can return without issuing a syscall. Why
+**10 (hard).** `KernelDevice::flush()` can return without issuing a syscall. Why
 is it still not free, and why does it `fdatasync` an O_DIRECT fd at all?
 
 <details><summary>Answer</summary>
@@ -784,137 +1114,54 @@ the instruction behind every "committed" callback in Part 1.
 <code>git show v21.3.0:src/blk/kernel/KernelDevice.cc | sed -n '505,540p'</code>
 </details>
 
-# Part 11: construction and teardown
+# Part 12 — Comparison with Modern Storage Engines
 
-**1.** Is `mkfs()` safe to re-run against a live store?
-
-<details><summary>Answer</summary>
-Yes — it checks the <code>mkfs_done</code> marker and returns early. But
-"returns early" is conditional: with <code>bluestore_fsck_on_mkfs</code>
-(default <b>true</b>) it runs a full fsck first and may return that error
-instead of 0.
-<br><br><b>Find it yourself:</b>
-<code>git show v21.3.0:src/os/bluestore/BlueStore.cc | grep -n 'mkfs_done'</code>
-</details>
-
-**2.** In `_mount()`, does deferred replay run before or after the KV threads
-start?
+**1.** SeaStore and BlueStore make a different bet in kind, not degree. What is
+the difference?
 
 <details><summary>Answer</summary>
-After. The order is <code>_kv_start()</code> → <code>_deferred_replay()</code>
-→ <code>mempool_thread.init()</code>. Replay <em>needs</em> kv_sync and
-kv_final running, because the transactions it fabricates go through the normal
-commit path. Getting this backwards is a common mental-model error.
-<br><br><b>Find it yourself:</b>
-<code>git show v21.3.0:src/os/bluestore/BlueStore.cc | sed -n '9629,9642p'</code>
+BlueStore assumes a general block device and delegates metadata durability to a
+mature external LSM. SeaStore assumes flash, makes everything log-structured
+including metadata, and owns the whole stack so it can be lock-free and
+copy-free end to end. Its directory listing gives it away — `lba/`,
+`backref/`, `async_cleaner.cc`: the apparatus of a store that must relocate
+data during cleaning, which BlueStore never does.
 </details>
 
-**3.** Part 2 said the state machine runs on four threads. When does it run
-somewhere else?
+**2.** BlueStore's metadata is an LSM, but its access pattern is point lookups
+and short range scans. Is that a good fit?
 
 <details><summary>Answer</summary>
-During deferred replay. <code>_deferred_replay()</code> fabricates a
-<code>TransContext</code>, sets it to <code>STATE_KV_DONE</code> and calls
-<code>_txc_state_proc</code> <b>on the mounting thread</b> — the only time the
-state machine runs off the four threads of Part 2.
+Arguably not — a B-tree would suit better, which is exactly the choice SeaStore
+made. What the LSM buys is mature crash consistency and better write batching,
+which was the deciding factor in §1.3. The mismatch shows up as compaction
+write amplification on the metadata device.
 </details>
 
-**4.** Why does `_fsck()` start the KV threads?
+**3.** Why has io_uring delivered less for BlueStore than the theory predicts?
 
 <details><summary>Answer</summary>
-Solely to replay before checking, and the source is candid about it: <em>"we
-need finisher and kv_{sync,finalize}_thread *just* for replay"</em>. An fsck
-that ran against unreplayed deferred writes would report corruption that does
-not exist.
-<br><br><b>Find it yourself:</b>
-<code>git show v21.3.0:src/os/bluestore/BlueStore.cc | grep -n 'just. for replay'</code>
+Because BlueStore's threads still block on completion. io_uring saves syscalls
+via shared submission and completion queues, but those savings are amortized
+over an architecture that pays context switches elsewhere. Its full value needs
+a run-to-completion event loop above it — Crimson's model, not BlueStore's.
+The same argument explains SPDK's modest gains here.
+<br><br><b>Find it yourself:</b> <code>ceph daemon osd.0 config get
+bdev_ioring</code> — default false.
 </details>
 
-**5 (hard).** `umount()` returned `-EIO`. What happened, and was anything left
-unflushed?
+**4 (hard).** Place BlueStore on the two axes "kernel-FS-dependent ↔ raw
+userspace" and "in-place update ↔ log-structured", and say what its ceiling
+is.
 
 <details><summary>Answer</summary>
-Nothing was left unflushed — the error comes last. <code>umount()</code> drains
-every sequencer, shuts down the mempool thread and stops the KV threads, and
-only then optionally fscks on the way out
-(<code>bluestore_fsck_on_umount</code>, default <b>false</b>), returning
-<code>-EIO</code> when that finds a positive error count. So <code>-EIO</code>
-from umount is a report about the store's consistency, not a failure to write.
+Raw device and userspace on the first axis; in-place update on the second, but
+with copy-on-write for data and an external LSM for metadata — a pragmatic
+middle, sharing that region with bcachefs while FileStore sits at the
+kernel-FS extreme and SeaStore at log-structured. It bought roughly 2× write
+throughput over FileStore plus end-to-end checksums, without requiring a new
+threading model. Its ceiling <em>is</em> that threading model — blocking
+threads and mutexes — which is precisely what the next generation is built to
+raise.
 </details>
 
-# Part 12: the main APIs
-
-**1.** In `queue_transactions()`, at which step is a transaction's position in
-the ordering stream fixed?
-
-<details><summary>Answer</summary>
-Step 3. <code>_txc_create()</code> queues the txc on <code>osr->q</code>
-<em>immediately</em> — before decoding, before costing, and crucially before
-throttling. That is what makes it impossible for the throttle to reorder
-transactions.
-</details>
-
-**2.** Steps 1–9 run on the caller's thread. Does that mean no other thread can
-see the transaction?
-
-<details><summary>Answer</summary>
-No. It means no other thread <em>advances</em> it. From step 3 onward the txc
-is on <code>osr->q</code> and is structurally visible to anything walking that
-queue under <code>qlock</code> — <code>_txc_finish_io</code> can see it as a
-predecessor blocking a later transaction. Queued is not the same as running.
-</details>
-
-**3.** Which changes exist only in memory until step 6?
-
-<details><summary>Answer</summary>
-Dirty onodes, extent-map shards and shared-blob records — those are what
-<code>_txc_write_nodes()</code> encodes into the KV transaction. Omap and
-collection ops are different: they already wrote their own keys into
-<code>txc->t</code> back in step 4.
-</details>
-
-**4.** `throttle.try_start_transaction(...)` — what does the "try" apply to?
-
-<details><summary>Answer</summary>
-Only the <em>deferred</em> byte pool. The call blocks unconditionally in
-<code>throttle_bytes.get(txc.cost)</code> regardless. If the deferred pool
-cannot be had it raises <code>deferred_aggressive</code>, calls
-<code>deferred_try_submit()</code> to drain rather than block behind deferred
-work, wakes kv_sync, and lowers the flag again.
-</details>
-
-**5.** `open_collection()` on an unknown cid — what comes back?
-
-<details><summary>Answer</summary>
-A <b>null handle</b>, not an error code. The caller must test it. Consistent
-with the rest of this API's posture (Part 1): callers are expected to know what
-exists.
-</details>
-
-**6.** A newly created collection is not visible to `open_collection()`. When
-does that change?
-
-<details><summary>Answer</summary>
-Only when a transaction carrying <code>OP_MKCOLL</code> runs
-<code>_create_collection()</code>, which moves it from
-<code>new_coll_map</code> to <code>coll_map</code>.
-<code>create_new_collection()</code> builds the object, binds it to cache
-shards and attaches an <code>OpSequencer</code> — but publication is a
-transactional act, not a constructor side effect.
-</details>
-
-**7 (hard).** One transaction allocates a region and frees the same region.
-What reaches the freelist?
-
-<details><summary>Answer</summary>
-Nothing. <code>_txc_finalize_kv()</code> reconciles the allocated and released
-interval sets first, so a region both allocated and freed in one transaction
-cancels out; only the remainder goes to <code>fm->allocate()</code> /
-<code>fm->release()</code> and to the statfs counters. This is also why the
-<code>allocated</code>/<code>released</code> pair in its debug line is the
-authoritative answer to "did this transaction touch space", rather than
-anything you can infer from the allocator's own state.
-<br><br><b>Find it yourself:</b> at <code>debug_bluestore 30</code>, grep a
-single txc pointer for <code>_txc_finalize_kv</code> and read the two interval
-sets.
-</details>
