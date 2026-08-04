@@ -1793,6 +1793,18 @@ The instinct is to add the second network's subnets to the tunnel you already
 have. That does not work, and the reason is exactly why the answer is a second
 interface.
 
+## What it buys you
+
+- **Both networks at the same time.** No toggling one VPN off to reach the
+  other, and long-lived sessions on both stay up.
+- **The correct identity on each.** You appear under the address that network
+  issued you, so its ACLs, firewall rules and audit logs behave as designed —
+  rather than seeing traffic from an address it does not recognise.
+- **Independent lifecycles.** Re-key, restart or reconfigure one tunnel without
+  disturbing the other. A gateway going down takes only its own routes with it.
+- **No cost to anything else.** Only the listed prefixes are captured, and
+  applications need no configuration at all — both covered below.
+
 ## An interface carries exactly one identity
 
 A WireGuard *peer* is just a public key plus the address ranges it may speak
