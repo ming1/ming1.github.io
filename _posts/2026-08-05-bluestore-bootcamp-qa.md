@@ -751,4 +751,27 @@ logical data — has two hazards, each defended:
 The asymmetry is deliberate: proactive delay where txc ordering already
 exists (cheap), reactive filter where it doesn't (cheap at mount). Patches
 touching allocation release or deferred paths must not move either fence.
+
+**Follow-up I asked: "will replay allocate blobs and write to the allocated
+area?"** No — replay allocates nothing, ever. Allocation happened in the
+original write's prepare phase, and the resulting **absolute device offsets
+were baked into the op** before commit. An `L` value
+(`bluestore_deferred_op_t`) contains only:
+
+```
+op      = OP_WRITE
+extents = vector<bluestore_pextent_t>   // raw (device_offset, length)
+data    = bufferlist                    // payload bytes
+```
+
+No oid, no blob, no onode, no logical offset — nothing symbolic. Replay (and
+the normal apply path — they share `DeferredBatch`) streams `data` onto
+`extents`, blind to their meaning; the metadata describing those extents
+committed in the *same* kv txn as the `L` key, so it's already consistent.
+This is the deep reason both fences above must exist: a raw physical address
+carries no ownership back-reference, so ownership changes must be prevented
+or filtered around replay — it can't detect them. It also completes X1's
+invariant: everything fallible (allocation, ENOSPC) lives in prepare;
+post-commit machinery is restricted to operations that cannot fail — raw
+writes to pre-owned addresses and key deletes.
 </details>
