@@ -542,3 +542,34 @@ transition is some thread calling `_txc_state_proc(txc)` when *its*
 obligation completes. The state enum answers one question: "which thread owes
 this txc work next?"
 </details>
+
+### X2 ⚠️ — What exact operation, in which thread, is the durability point? When does the client's commit ack fire relative to it?
+
+<details markdown="1"><summary>Answer</summary>
+
+The durability point is in **`_kv_sync_thread`** (thread ③), a two-step
+barrier sequence:
+
+1. **`bdev->flush()`** — before submitting the batch, the block device's
+   volatile cache is flushed if any txc in the batch wrote data aios. The
+   data written back in `AIO_WAIT` is not durable until this barrier —
+   *aio completion ≠ persistence*.
+2. **`db->submit_transaction_sync()`** — the batch's metadata + any `L`
+   deferred payloads commit with one RocksDB WAL fsync. **The return of this
+   call is the commit point.** Crash before it: the transaction never
+   happened (any data blocks already on disk are unreferenced orphans —
+   harmless until reallocated). Crash after it: the transaction fully
+   happened; deferred replay finishes the rest.
+
+The ordering between the two steps is the entire crash-consistency contract:
+**metadata must never become durable before the data it points at** —
+reversed, a crash yields valid-looking onodes referencing garbage.
+
+The client ack comes strictly after: `_txc_committed_kv()` called from
+**`_kv_finalize_thread`** (thread ④) queues the commit callbacks onto
+finisher threads, in order.
+
+*My mistake: answered `_txc_committed_kv()` from `_kv_finalize_thread` — 
+that's the ack (part b), not the durability point; by the time ④ runs it,
+durability already happened in ③.*
+</details>
