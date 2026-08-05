@@ -1061,3 +1061,50 @@ fence): the BlueFS journal is the only record of what BlueFS owns.
 
 *My mistake: said "shares the freelist."*
 </details>
+
+### F5 💬 — What does one `db->submit_transaction_sync()` decompose into down the BlueFS stack?
+
+(Asked as a grill question; I requested the explanation — re-test me.)
+
+<details markdown="1"><summary>Answer</summary>
+
+```
+RocksDB: WriteBatch → append record to WAL file
+  └─ BlueRocksEnv (BlueRocksWritableFile::Append)   … into FileWriter buffer
+RocksDB: WAL Sync()
+  └─ BlueFS::fsync(FileWriter)
+       ① _flush        — write buffered WAL bytes to file extents (direct I/O)
+       ② metadata?     — if fnode changed (file grew): op_file_update to the
+                         BlueFS journal → _flush_and_sync_log = SECOND write+sync
+       ③ flush_bdev    — device cache barrier
+  ← returns → kv batch durable
+```
+
+Legacy mode paid step ② on *every* kv commit (each append grows
+`fnode.size`) — two syncs per commit, and constant BlueFS journal growth
+(F2's compaction pressure). X2's single-device flush elision comes from
+step ③: the WAL's device barrier covers the shared device's deferred/data
+aios too; on multi-device layouts it barriers only the WAL device, so
+kv_sync must force_flush the data device itself. Corollary: kv commit
+latency ≈ WAL-device sync latency — the entire case for separate NVMe WAL.
+</details>
+
+### F6 💬 — Envelope mode: what problem, what mechanism?
+
+(Asked as a grill question; I requested the explanation — re-test me.)
+
+<details markdown="1"><summary>Answer</summary>
+
+**Default true at v21.3.0.** Problem: F5's step ② — the per-append fnode
+update doubling syscalls. Mechanism (`BlueFS.h:285`, ASCII art in-source):
+each flush is wrapped as `[u64 length][payload][8-byte stamp]` in
+preallocated space; `fnode.size` is never updated per append. At open,
+BlueFS *discovers* content length by indexing envelopes
+(`_read_envelope`): valid = plausible length + the file's unique stamp;
+first mismatch (torn write or stale garbage from recycled space) =
+end-of-valid-data. A mini-journal inside the file — RocksDB's own
+WAL-record trick pushed one layer down. Net: one sync per kv commit
+(~50% fewer fdatasync per the option doc), less BlueFS journal traffic.
+Ops footnote: the option doc says `downgrade-wal-to-v1`; the tool actually
+implements `revert-wal-to-plain` (doc/tool mismatch).
+</details>
