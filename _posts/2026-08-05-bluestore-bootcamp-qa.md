@@ -561,9 +561,23 @@ barrier sequence:
    harmless until reallocated). Crash after it: the transaction fully
    happened; deferred replay finishes the rest.
 
-The ordering between the two steps is the entire crash-consistency contract:
-**metadata must never become durable before the data it points at** —
-reversed, a crash yields valid-looking onodes referencing garbage.
+The ordering between the two steps is the entire crash-consistency contract.
+Stated precisely (refined after cross-checking against X4): **no committed
+metadata may reference data that is neither durable at its referenced
+location *nor* recoverable from the same commit.** Direct writes satisfy the
+first clause — hence flush before sync; deferred writes satisfy the second —
+their payload rides inside the very kv transaction (`L` key), making
+metadata + data atomic. Reversed for direct writes, a crash yields
+valid-looking onodes referencing garbage.
+
+Two sharpenings from the X4 cross-check: the `bdev->flush()` here and X4's
+"done→stable" flush are **the same single flush** at the top of one
+`_kv_sync_thread` iteration (:15359–96), serving both customers at once —
+this batch's direct data *and* previously-applied deferred writes awaiting
+`L` cleanup. And on a single shared device the explicit flush is sometimes
+elided: RocksDB's WAL fsync through BlueFS on the same device already acts
+as the barrier (comment at :15360) — the barrier is fused into the sync, not
+absent.
 
 The client ack comes strictly after: `_txc_committed_kv()` called from
 **`_kv_finalize_thread`** (thread ④) queues the commit callbacks onto
