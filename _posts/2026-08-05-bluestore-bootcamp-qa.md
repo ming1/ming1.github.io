@@ -643,3 +643,48 @@ covers plain direct writes too — between `aio_write` and FINISHING the
 overlay serves reads there as well. One uniform rule, not a deferred-only
 trick.
 </details>
+
+### X4 ⚠️ — Deferred lifecycle after "L durable": every step until "L deleted." What triggers the batch submit? Which kv txn carries the cleanup?
+
+<details markdown="1"><summary>Answer</summary>
+
+1. **KV_DONE → DEFERRED_QUEUED** — in **`_kv_finalize_thread`** (states past
+   submission are never advanced by kv_sync). `_deferred_queue()`
+   (BlueStore.cc:15645) appends the txc to its **osr's** `DeferredBatch`;
+   `prepare_write()` merges payloads by disk offset — overlapping same-block
+   writes within a batch dedupe, last-wins.
+2. **The batch sits until a trigger fires:**
+   - volume: `deferred_queue_size >= deferred_batch_ops` — **64 hdd /
+     16 ssd** — or deferred-throttle pressure (kv_finalize loop, :15612);
+   - staleness bound: osr queue piles past `bluestore_max_deferred_txc`
+     (**32**) → forced submit (`_txc_finish`, :15021);
+   - urgency: `deferred_aggressive` (drains, fsync-like ops, umount) →
+     immediate. Under light load a lone deferred write can sit parked
+     for a long time — legal, it's already durable.
+3. **Apply** — `_deferred_submit_unlock()` issues the merged aios to final
+   locations; `_deferred_aio_finish()` pushes the batch into
+   `deferred_done_queue`, kv_sync's inbox.
+4. **Stable ≠ done** — in `_kv_sync_thread` (:15359–96), done batches
+   graduate to `deferred_stable` only after **`bdev->flush()`** (on a single
+   shared device, BlueFS's commit flush may stand in). Deleting `L` before
+   the applied data is flushed would be the crash hole: power loss kills
+   both copies.
+5. **Cleanup rides a stranger's fsync** — per stable batch:
+   `synct->rm_single_key(PREFIX_DEFERRED, key)` (:15452) joins **the current
+   batch's `synct`**, sharing the `submit_transaction_sync()` of whatever
+   new writes are committing. Then `_kv_finalize_thread` walks
+   DEFERRED_CLEANUP → FINISHING → DONE — only now do buffers unpin (X3) and
+   allocations release (:15044: only after preceding deferred writes that
+   might land in those blocks finished).
+
+Fsync accounting: a deferred write consumes exactly **one** fsync in its
+whole life (its commit batch) — apply is plain aio, the flush is a shared
+barrier, cleanup piggybacks. Contrast FileStore: same WAL idea, but
+double-writing *all* data instead of only small payloads.
+
+*My mistake: put the KV_SUBMITTED→KV_DONE transition in `_kv_sync_thread`
+(it's `_kv_finalize_thread`'s), called the deletion "done in the
+DEFERRED_CLEANUP stage" (the rm rides kv_sync's `synct` while txcs still
+wait; the state machine catches up after), and skipped the entire middle:
+batching, triggers, apply, and the flush-before-delete rule.*
+</details>
