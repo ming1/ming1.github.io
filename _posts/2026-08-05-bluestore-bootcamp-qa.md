@@ -896,3 +896,61 @@ everything fallible or unbounded is pushed to the txc's front door where
 blocking a client thread is legal; every internal queue is bounded by
 construction. These two gets are BlueStore's entire admission control.
 </details>
+
+### Trace P1 ❌ — How many WFATE lines does a 1 MiB write emit from the big path, and where?
+
+<details markdown="1"><summary>Answer</summary>
+
+**16**, not 1 — `big_new_blob` at `0x0, 0x10000, … 0xf0000`, each
+`~0x10000`. The instrumented `wctx->write` sits inside `_do_write_big`'s
+chopping loop, which carves writes into `max_blob_size` (64 K) chunks — one
+blob, one log line per iteration. Same mechanism that gave S1's 4 MiB object
+its 64 blobs (and 64 `X` entries after cloning).
+
+*My mistake: predicted 1 line.*
+</details>
+
+### Trace P2 ⚠️ — Which WFATE tags are structurally unreachable on the c28 store, and why? (A premise-checking lesson)
+
+<details markdown="1"><summary>Answer</summary>
+
+Only the two `unused` tags — and the reasoning must survive a premise check
+that my teacher's own claim failed. `small_unused_*` die because
+`min_alloc_size == block_size` (4 K = 4 K): the `mark_unused` argument to
+`wctx->write` (`min_alloc_size != block_size`, :16949) is false and
+`_do_write_big` passes false unconditionally — no blob ever acquires an
+`unused` bit. This argument is *media-independent*, so it survives.
+
+`big_deferred` was declared unreachable from `prefer_deferred_size_ssd = 0` —
+but that premise assumed SSD. c28's disks are rotational
+(`bluestore_bdev_rotational: 1` in `ceph osd metadata`), the OSD runs the
+HDD profile (`prefer_deferred_size = 64 K`), and a 4 KiB AU-aligned
+overwrite promptly fired `WFATE big_deferred`, falsifying the claim.
+Verify the media profile before reasoning from per-media defaults — and
+note the deferral decision by size happens in `_do_alloc_write` (:17552),
+*below* the WFATE tags: small new blobs on this store defer invisibly.
+
+Companion lesson from the same trace: two ops were silent because their
+input file had vanished (host reboot cleared `/tmp`) and the error hid
+behind `2>/dev/null` — instrumentation silence means "path not taken" only
+if the op actually ran.
+</details>
+
+### Trace P3 ✅ (witnessed) — The kill-9 crash experiment: what should the cold store show, and what happens at mount?
+
+<details markdown="1"><summary>Answer</summary>
+
+Park a deferred write (an rmw overwrite defers unconditionally; a single op
+sits far below the 64-op HDD batch trigger), `kill -9` the OSD, then:
+
+```
+cold store:  L  %00%00%00%00%00%00%0b%c0        one L key (seq 3008)
+next mount:  _deferred_replay start → completed 1 events
+data check:  t1 bytes 1024–3072 == the pre-crash write
+```
+
+Crash window (a) of X5, end to end: nonzero `L` in a cold store is crash
+evidence (T5's rule); replay applies the payload to its pre-decided physical
+extents; the client-acked write survived SIGKILL with the final disk
+location receiving its bytes only during replay.
+</details>

@@ -130,7 +130,71 @@ the same lines.
 
 ## Station 3 — Transaction engine
 
-*(in progress)*
+**Scope:** txc state machine, the four-thread relay, durability point,
+OpSequencer, deferred lifecycle, crash windows, throttles.
+
+### Grill results
+
+| Q | Topic | Verdict | The settle |
+|---|-------|---------|-----------|
+| X1 | states & threads for a direct write | 💬 assist | four-thread baton; states are checkpoints of completed obligations; switch falls through empty ones |
+| X2 | durability point vs client ack | ⚠️ | `bdev->flush()` + `submit_transaction_sync()` in kv_sync; I answered with the ack (`_txc_committed_kv`, kv_finalize) |
+| X3 | sequencer scope; stale reads under deferred | 💬 assist | per-PG order at three gates; pinned STATE_WRITING buffers shadow disk until placement |
+| X4 | deferred lifecycle & triggers | ⚠️ | batch per osr; triggers 64/16 ops, >32 osr backlog, aggressive; cleanup piggybacks a later `synct` after `bdev->flush()` |
+| X5 | three crash windows | 💬 assist | replay is progress-blind idempotent redo; two reallocation fences (delayed release + BlueFS trim) |
+| X6 | throttles | 💬 assist | cost = bytes + ios×per-io; submit→commit (64M) and submit→deferred-complete (192M); midpoint doubles as drain signal |
+
+Cross-examinations by the learner that improved the material: the X2↔X4
+consistency check (→ the two-clause durability invariant: *no committed
+metadata may reference data neither durable at its location nor recoverable
+from the same commit*; and the discovery that both roles share one flush);
+"does replay allocate?" (→ deferred ops are raw physical writes — everything
+fallible lives in prepare); "does a reader get data during deferred writing?"
+(→ buffers pinned until *placement*, positional not temporal).
+
+### Trace on c28 — Patch #1 live
+
+Prediction round on a 5-op workload, then the reveal:
+
+```
+op1  1K  new object   → WFATE small_new_blob      0x0~400      as predicted
+op3  2K@1K overwrite  → WFATE small_deferred_rmw  0x400~800    the ungated safety-defer, live
+op4  1M  new object   → WFATE big_new_blob ×16    0x0..0xf0000 the 64K chopping loop
+op2  4K  new object   → WFATE big_new_blob        0x0~1000     (after re-run)
+op5  4K@0 overwrite   → WFATE big_deferred        0x0~1000     ← falsified my premise!
+```
+
+Three lessons the trace taught that no reading would have:
+
+1. **Silence is ambiguous.** Ops 2 and 5 initially produced zero lines — not
+   because of an exotic code path but because their input file had vanished
+   (host had rebooted; `/tmp` cleared) and the failure went to `2>/dev/null`.
+   Verify the op ran before interpreting instrumentation silence.
+2. **"Structurally impossible" is only as good as its premises.** I declared
+   `big_deferred` unreachable based on SSD defaults — but c28's disks are
+   rotational (`bluestore_bdev_rotational: 1`), so the OSD runs the HDD
+   profile (`prefer_deferred_size = 64K`) and had been journaling small
+   writes all day. Only the two `unused` tags are truly dead here
+   (min_alloc == block_size kills the whole unused mechanism,
+   media-independent).
+3. **Instrumentation coverage gaps announce themselves.** The small-path
+   blob-reuse fates (`wctx->write` at :16835/:16898) carry no WFATE line,
+   and the final defer-by-size decision lives below our tags in
+   `_do_alloc_write` — op1/op2's little blobs were deferred invisibly.
+
+### Crash experiment — X5 witnessed
+
+Parked a deferred write (rmw overwrite; batch trigger 64 ops away),
+`kill -9`, autopsied cold:
+
+```
+L  %00%00%00%00%00%00%0b%c0          ← one L key, seq 3008: crash evidence
+_deferred_replay start / completed 1 events    ← at next mount
+t1 bytes 1024–3072 == pre-crash write          ← data intact, never lost
+```
+
+A committed-but-unapplied write survived SIGKILL purely via RocksDB; the
+final location received the bytes only during replay.
 
 ## Station 3 — Transaction engine
 
