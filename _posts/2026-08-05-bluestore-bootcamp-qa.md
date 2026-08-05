@@ -954,3 +954,110 @@ evidence (T5's rule); replay applies the payload to its pre-decided physical
 extents; the client-acked write survived SIGKILL with the final disk
 location receiving its bytes only during replay.
 </details>
+
+## Station 4 — BlueFS + RocksDB
+
+### F1 ⚠️ — What does BlueFS store, and what does it deliberately NOT have that every general-purpose FS has?
+
+<details markdown="1"><summary>Answer</summary>
+
+Stores only RocksDB's files: SSTs, WAL (`.log`), MANIFEST, CURRENT. The
+absences and their replacements:
+
+1. **No on-disk namespace** (inode table, directory blocks) → the whole
+   namespace (flat dirs → files → fnodes) is rebuilt in RAM by journal
+   replay at every mount. Flat means flat: no nesting; `db/`, `db.wal/` are
+   just prefixes RocksDB expects.
+2. **No free-space structure** (bitmap/freelist) → free space is *derived*
+   at mount: device minus every extent claimed by live fnodes. The journal
+   is BlueFS's only persistent metadata object.
+3. **No data journaling / no fsck** → RocksDB's own integrity machinery
+   (WAL CRCs, SST checksums, MANIFEST) covers content; BlueFS promises only
+   metadata consistency.
+
+The bet: with ~hundreds of files, always-in-RAM metadata + full replay
+beats any on-disk structure. Every absence is something RocksDB made
+redundant.
+
+*My answer covered the "stores" half only.*
+</details>
+
+### F2 ⚠️ — Journal at mount, why compaction, and the crash-safe switch (explained in detail)
+
+<details markdown="1"><summary>Answer</summary>
+
+Mount = full journal replay rebuilding all metadata in RAM ✓. Compaction is
+needed because the journal **only appends** — every WAL fsync, SST
+create/unlink, file extension adds ops; live state stays ~100s of KiB while
+history grows unboundedly, and mount time follows log size.
+
+**Trigger** (`_should_start_compact_log_L_N`, BlueFS.cc:3035): compact when
+log ≥ `bluefs_log_compact_min_size` (16 M) *and* actual/state-only-estimate ≥
+`bluefs_log_compact_min_ratio` (5.0). Default path is **async**
+(`bluefs_compact_log_sync=false`); sync stop-the-world variant serves
+mount/umount/layout changes.
+
+**Async algorithm** (`_compact_log_async_LD_LNF_D`, :3402):
+
+1. **Jump** — under `log.lock`: allocate a fresh tail for the current log,
+   append `op_file_update_inc` + **`op_jump(seq+1, offset)`** (an explicit
+   replay discontinuity), flush. Writers resume immediately into the
+   post-jump tail; everything ≤ seq_now is frozen.
+2. **Snapshot** — encode every dir/fnode as one transaction
+   (`_compact_log_dump_metadata_NF`), release the lock, then leisurely
+   allocate + build a **new log fnode** chaining three pieces:
+   `[starter] → [compacted body] → (jump) → [old log's live tail]`.
+   The tiny starter exists because the body's extent list may not fit the
+   4 K superblock; the chain's third link *adopts the live tail*, so
+   nothing written during compaction waits or is lost.
+3. **Switch** — write starter+body, `flush_bdev`, then `_write_super`: a
+   single-block overwrite at a fixed offset = the atomic commit point.
+   Crash before → old chain replays; the new extents are unreferenced and,
+   because free space is derived from fnodes, auto-freed — no leak
+   possible. Crash after → new chain. Old pre-jump extents released only
+   after the super is durable.
+
+Same invariant as X2, third layer today: *never point durable metadata at
+data that isn't durable yet* — here the superblock plays the kv-commit
+role.
+
+**Bonus convention**: BlueFS function suffixes (`_LNF_LD`, `_L_N`…) declare
+which locks are taken and in what order (L=log, N=nodes, D=dirty, F=File,
+W=writer) — lock discipline promoted into names; patches inherit the
+obligation.
+
+*My answer had replay ✓ but "SSTs get deleted" as the compaction driver
+(it's append-only growth) and no switch mechanism.*
+</details>
+
+### F3 ⚠️ — Spillover: precise definition, the policy dimension, detection
+
+<details markdown="1"><summary>Answer</summary>
+
+New allocations for db-tier files falling back to the **slow** (shared)
+device when the db device is full — existing data does not migrate ✓
+(direction). The policy dimension: `bluestore_volume_selection_policy`
+(`use_some_extra` vs `rocksdb_original`) exists because RocksDB level-size
+targets never match real partition sizes — "full" is policy, not a byte
+count. Detection: `BLUEFS_SPILLOVER` health warning, `ceph daemon osd.N
+bluefs stats`, `slow_used_bytes` perf counters.
+</details>
+
+### F4 ❌ — How do BlueFS and BlueStore share the slow device consistently across crashes?
+
+<details markdown="1"><summary>Answer</summary>
+
+**Shared allocator, not shared freelist** — the distinction is load-bearing.
+Both draw from the in-memory `shared_alloc` at runtime (no overlap possible
+while running), but persistent truth is split: BlueStore's FreelistManager
+records only BlueStore's view; **BlueFS's ownership is written down solely
+in its journal's fnode extents**. The union is rebuilt at every mount:
+allocator initialized from FM's free set, then BlueFS's replayed extents
+subtracted (`init_rm_free`). Crash consistency falls out: an extent BlueFS
+grabbed but never journaled reverts to free on both sides — the allocation
+is lost *with* the file that wanted it, harmless. This is also why
+`_deferred_replay` must ask `bluefs->foreach_block_extents()` (X5's second
+fence): the BlueFS journal is the only record of what BlueFS owns.
+
+*My mistake: said "shares the freelist."*
+</details>
