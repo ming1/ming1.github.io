@@ -573,3 +573,49 @@ finisher threads, in order.
 that's the ack (part b), not the durability point; by the time ④ runs it,
 durability already happened in ③.*
 </details>
+
+### X3 💬 — What does OpSequencer guarantee, at what scope? And what stops a read from returning stale bytes while a deferred write is committed but not yet applied?
+
+(Asked as a grill question; I requested the explanation — re-test me.)
+
+<details markdown="1"><summary>Answer</summary>
+
+**Scope: one `OpSequencer` per `Collection` = per PG** (`c->osr`).
+Guarantee: transactions on the same collection become durable and visible in
+**submission order**; reads through the store see all completed prior writes
+on that PG. Across collections: no ordering at all (PGs are the parallelism
+unit). Enforced at three points:
+
+1. **aio reorder gate** — `_txc_finish_io` holds a txc at IO_DONE until all
+   older txcs on its osr arrive (device completions come in any order);
+2. **FIFO kv batching** — kv_queue preserves arrival order into ③'s batches;
+3. **per-osr `DeferredBatch`** — even post-commit deferred applies group per
+   sequencer.
+
+**The stale-read window:** a deferred overwrite is committed (payload durable
+in `L`, metadata updated) but the final location still holds old bytes — and
+since deferred overwrites reuse the *same pextents*, a disk read would return
+old data that *passes checksum*. Protection = the buffer cache as a write
+overlay, three verified properties:
+
+1. every write inserts its bytes as `STATE_WRITING` buffers tagged with the
+   txc — even with buffered writes off: `_buffer_cache_write(...,
+   wctx->buffered ? 0 : FLAG_NOCACHE)` still inserts; NOCACHE only changes
+   the buffer's fate afterwards;
+2. the read path overlays the buffer map over disk (only holes hit the
+   device), and writing buffers are not evictable — trim touches clean
+   buffers only;
+3. the release point is exact: `TransContext::finish_writing()` is called
+   from `_txc_finish` (BlueStore.cc:14994), which asserts STATE_FINISHING —
+   for a deferred txc that is only reached **after DEFERRED_CLEANUP**, i.e.,
+   after the payload physically landed. Then `_finish_write` (:1933) erases
+   NOCACHE buffers or flips the rest to STATE_CLEAN. The RAM shadow outlives
+   disk staleness by construction.
+
+Consequence: the read path has **zero** deferred-awareness — no special
+cases; the pinned-writing-buffer invariant makes deferred I/O invisible to
+readers. Patches must never release write buffers before data placement:
+that failure mode is silent stale reads that pass checksum. Across restarts
+the overlay isn't needed: `_deferred_replay` completes at mount before any
+op is accepted.
+</details>
