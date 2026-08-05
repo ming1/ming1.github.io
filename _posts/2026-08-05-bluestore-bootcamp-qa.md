@@ -775,3 +775,43 @@ invariant: everything fallible (allocation, ENOSPC) lives in prepare;
 post-commit machinery is restricted to operations that cannot fail — raw
 writes to pre-owned addresses and key deletes.
 </details>
+
+### X6 💬 — The two throttles: what does each meter, where acquired/released, what runaway does each prevent?
+
+(Asked as a grill question; I requested the explanation — re-test me.)
+
+<details markdown="1"><summary>Answer</summary>
+
+Both meter **txc cost** = `bytes + ios × bluestore_throttle_cost_per_io`
+(**670,000** hdd / **4,000** ssd) — the io surcharge makes the throttle
+IOPS-aware: 64 MiB of budget ≈ 95 in-flight IOs on HDD vs ~16,000 on SSD.
+
+**`throttle_bytes` (64 MiB) — the *submit → commit* window** (BlueStore.h:2130
+comment). Acquired with a blocking `get(txc.cost)` in `queue_transactions`
+(:19403), every txc — this is the only place client backpressure physically
+happens. Released in `_kv_sync_thread` (:15445) **deliberately before**
+`submit_transaction_sync`: new ops prepare while the fsync is in flight, so
+the batcher never wakes to an empty queue. Prevents: unbounded
+prepare→commit pipe (RAM pinned by payloads/buffers, kv batches growing
+until commit latency explodes).
+
+**`throttle_deferred_bytes` (64+128 = 192 MiB ceiling) — the *submit →
+deferred-apply-complete* window.** Taken only by txcs with a `deferred_txn`,
+two-stage (:19405): `get_or_fail()`; on failure the submitter flips
+`deferred_aggressive`, force-submits all parked batches, then blocks in
+`finish_start_transaction` until space frees. Released in
+`_deferred_aio_finish` (:15831) when the batch's aio lands — spanning the
+entire deferred residency. Prevents: unbounded committed-but-unapplied
+backlog = unbounded pinned writing buffers + unbounded `L` keys in RocksDB +
+unbounded crash-replay time.
+
+The elegant bit: `should_submit_deferred()` = `past_midpoint()` — the
+limiter doubles as the drain signal. At 50% occupancy it nudges batches out;
+at 100% backpressure becomes forced urgency. The throttle *regulates* the
+backlog around the midpoint rather than merely capping it.
+
+And note what there isn't: no throttle anywhere past `queue_transactions` —
+everything fallible or unbounded is pushed to the txc's front door where
+blocking a client thread is legal; every internal queue is bounded by
+construction. These two gets are BlueStore's entire admission control.
+</details>
