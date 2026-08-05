@@ -702,3 +702,53 @@ DEFERRED_CLEANUP stage" (the rm rides kv_sync's `synct` while txcs still
 wait; the state machine catches up after), and skipped the entire middle:
 batching, triggers, apply, and the flush-before-delete rule.*
 </details>
+
+### X5 💬 — Three crash windows for a deferred write: (a) after kv commit before aio, (b) mid-aio, (c) after apply+flush before cleanup commits. What does mount replay do in each, and why is it correct?
+
+(Asked as a grill question; I requested the explanation — re-test me.)
+
+<details markdown="1"><summary>Answer</summary>
+
+State on disk per window (`L` present and cleanup uncommitted in all three):
+
+| Window | Final location |
+|---|---|
+| (a) before aio | old bytes |
+| (b) mid-aio | torn — some blocks new, some old |
+| (c) after apply+flush | correct bytes |
+
+**Replay does the same thing in all three — it cannot tell them apart and
+doesn't need to.** `_deferred_replay()` (BlueStore.cc:15847, called from
+`_mount`) iterates all `L` keys in seq order, decodes each
+`bluestore_deferred_transaction_t`, re-queues the writes via a
+`DeferredBatch` on the meta collection's osr, drains, and lets the normal
+cleanup path flush + delete the keys.
+
+Correctness rests on one property: a deferred op is a **pure physical write**
+(offset, length, bytes) — no RMW, no dependency on current disk content, so
+replay from any partial state converges: (a) first application — the `L`
+copy is authoritative; (b) the torn mix is overwritten wholesale, and no
+reader ever saw it (replay completes before the store accepts ops); (c)
+identical bytes over identical bytes — harmless no-op. Textbook idempotent
+redo logging: recovery needs zero knowledge of progress; the only cost of
+ambiguity is re-doing finished work.
+
+**The hidden precondition** — target blocks must still belong to the same
+logical data — has two hazards, each defended:
+
+1. **Reallocation to another object**: prevented *proactively* —
+   `_txc_release_alloc` runs only after preceding deferred writes on the osr
+   are stable (:15044: "release to allocator only after all preceding txc's
+   have also finished any deferred writes that potentially land in these
+   blocks"). Space a pending deferred op might touch never reaches the
+   allocator early.
+2. **Reallocation to BlueFS** (allocates outside txc ordering — freed blocks
+   may have become an SST between commit and crash): corrected *reactively*
+   at replay — `_eliminate_outdated_deferred()` collects BlueFS's current
+   extents and surgically trims overlapping portions out of each deferred op
+   before applying; the durable new owner wins.
+
+The asymmetry is deliberate: proactive delay where txc ordering already
+exists (cheap), reactive filter where it doesn't (cheap at mount). Patches
+touching allocation release or deferred paths must not move either fence.
+</details>
