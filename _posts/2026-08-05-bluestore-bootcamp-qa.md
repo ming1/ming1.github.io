@@ -618,4 +618,28 @@ readers. Patches must never release write buffers before data placement:
 that failure mode is silent stale reads that pass checksum. Across restarts
 the overlay isn't needed: `_deferred_replay` completes at mount before any
 op is accepted.
+
+**Follow-up I asked: "so a reader still gets data during deferred writing,
+because the write buffer outlives the data write?"** Yes, with one
+sharpening: readers are neither blocked nor given stale data — they get the
+*new* bytes from RAM immediately. And the buffer doesn't outlive the write
+*operation*; it outlives the **placement of data at its final disk
+location**:
+
+```
+prepare ── kv commit (L durable) ── …window: disk stale… ── deferred aio lands ── cleanup ── FINISHING
+   │                                                                                           │
+   └─ buffer inserted (STATE_WRITING, pinned, unevictable) ────────────────────────────────────┴─ finish_writing():
+                                                                                                  NOCACHE → dropped
+                                                                                                  else    → STATE_CLEAN
+```
+
+The guarantee is positional, not temporal: while any byte's authoritative
+copy isn't yet at the address the metadata points to, a pinned RAM copy
+shadows it; the moment placement completes, the shadow is released (or
+demoted to an ordinary evictable clean buffer). Corollaries: reads are
+*fastest* during the window (RAM hit by construction), and the same rule
+covers plain direct writes too — between `aio_write` and FINISHING the
+overlay serves reads there as well. One uniform rule, not a deferred-only
+trick.
 </details>
