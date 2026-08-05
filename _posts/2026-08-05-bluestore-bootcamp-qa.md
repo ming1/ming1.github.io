@@ -28,6 +28,20 @@ namespace, escaped key/name with `<`/`=`/`>` marker, snap (u64), generation
 (u64), suffix `'o'` (`_get_object_key`, BlueStore.cc:457). Extent-map shards
 append u32 offset + `'x'` to the same stem.
 
+A real key from the c28 store (`ceph-kvstore-tool bluestore-kv dev/osd0 list`),
+annotated:
+
+```
+    shard  pool (u64, biased)        rev-hash     ns  name     sep  snap                     gen                    sfx
+O   %7f    %80%00%00%00%00%00%00%02  %86%bb%db%dd %21 s1small %21 %3d  %ff%ff%ff%ff%ff%ff%ff%fe %ff%ff%ff%ff%ff%ff%ff%ff  o
+```
+
+`%7f` = NO_SHARD (−1 + 0x80 bias) · pool `0x8000…02` = pool 2 · `%21` = `'!'`
+terminating the empty namespace and the name · `%3d` = `'='` (locator equals
+name) · snap `…fe` = head · gen `ff…` = NO_GEN. The `'o'`/`'x'` suffix trick
+(source comment at :515): "the trailing char lets us quickly test whether it
+is a shard key without decoding any of the prefix bytes."
+
 **The why I missed:** PG membership is decided by the *low* bits of the hash.
 Bit-reversal moves them to the most-significant position of the sort key, so
 every object of a PG shares a key prefix — one collection = one contiguous key
@@ -135,15 +149,33 @@ flags + pool + hash + **nid** + user key.
 
 <details markdown="1"><summary>Answer (this question found a subtlety)</summary>
 
-Nowhere, for ordinary blobs. `Blob::encode()` (BlueStore.h:815) writes
-`bluestore_blob_t` + sbid-if-shared + tracker-if-`include_ref_map` — but
-`encode_some` passes `include_ref_map=false` for shard-resident blobs
-(BlueStore.cc:4098); only spanning blobs pass `true` (:4293). Decode rebuilds
-refs by replaying `get_ref()` per extent (:4212 — "we build ref_map
-dynamically for non-spanning blobs"), legal because all extents referencing a
-non-spanning blob are in the same shard. Derived state is elided from disk
-when an invariant guarantees reconstructibility. Spanning blobs must persist
-it — their referents may be in never-loaded shards.
+Nowhere, for ordinary blobs. The composite serializer (BlueStore.h:815):
+
+```cpp
+void encode(..., uint64_t sbid, bool include_ref_map) const {
+  denc(blob, p, struct_v);          // bluestore_blob_t: pextents, csum, flags
+  if (blob.is_shared())
+    denc(sbid, p);                  // shared-blob id, only if FLAG_SHARED
+  if (include_ref_map)
+    used_in_blob.encode(p);         // the use tracker
+}
+```
+
+But the two call sites disagree on the last flag:
+
+```cpp
+// encode_some — shard-resident blobs (BlueStore.cc:4098):
+p->blob->encode(app, struct_v, p->blob->get_sbid(), false);  // NOT stored
+// encode_spanning_blobs (:4293):
+i.second->encode(p, struct_v, i.second->get_sbid(), true);   // stored
+```
+
+Decode rebuilds refs by replaying `get_ref()` per extent (:4212 — comment:
+"we build ref_map dynamically for non-spanning blobs"), legal because all
+extents referencing a non-spanning blob are in the same shard. Derived state
+is elided from disk when an invariant guarantees reconstructibility. Spanning
+blobs must persist it — their referents may be in never-loaded shards
+(BlueStore.h:1057: "only spanning blobs have references stored").
 
 Also: `bluestore_*_t` = on-disk records; runtime classes own the *container*
 serializers, because framing depends on runtime facts (shared? spanning?).
@@ -155,8 +187,26 @@ serializers, because framing depends on runtime facts (shared? spanning?).
 
 PG 2.**1**. Stored hash is bit-reversed: stored bit 31−k = original bit k, so
 the PG bits (original low bits) are the stored **top** bits read in reverse:
-`0x86 = 1000 0110` → top 3 = `100` → reversed = `001` = 1. Live proof:
-`ceph osd map` printed `pg 2.bbdbdd61` = bitreverse(0x86bbdbdd).
+
+```
+0x86 = 1000 0110
+       ^^^ top 3 bits = 100 → reverse → 001 = 1 → PG 2.1
+```
+
+Live proof — key dump vs mon, both objects:
+
+```
+stored in key:  86 bb db dd     ceph osd map: pg 2.bbdbdd61   (s1small)
+stored in key:  7a 7e be 9e     ceph osd map: pg 2.797d7e5e   (s1big)
+```
+
+`bitreverse(0x86bbdbdd) = 0xbbdbdd61`, `bitreverse(0x7a7ebe9e) = 0x797d7e5e` —
+the mon prints the PG suffix as the raw hash, the key stores its bit-reverse.
+
+Bonus catch from the same output: `s1big → pg 2.1e` is impossible with
+pg_num=8 (0x1e = 30) — the autoscaler had already raised pg_num to 32 in the
+osdmap while on-disk collections were still `2.0–2.7`; the split executes at
+next mount by *subdividing key ranges*.
 
 *My mistake: took `0x86 & 7 = 6` — the low bits of the first stored byte are
 original bits 24–26, noise for placement.*
@@ -167,9 +217,25 @@ original bits 24–26, noise for placement.*
 <details markdown="1"><summary>Answer</summary>
 
 `%fe` = −2 = `CEPH_NOSNAP` = **head** (rados.h:39). −1 is `CEPH_SNAPDIR`, not
-head — the classic trap. `%01` is the clone for snapid 1. Reserving the top
-two u64 values means real snapids sort naturally below head: clones ascending,
-head last, all contiguous — snap trim/scrub walk one iterator run.
+head — the classic trap. The constants:
+
+```c
+#define CEPH_SNAPDIR ((__u64)(-1))  /* reserved for hidden .snap dir */
+#define CEPH_NOSNAP  ((__u64)(-2))  /* "head", "live" revision */
+#define CEPH_MAXSNAP ((__u64)(-3))  /* largest valid snapid */
+```
+
+`%01` is the clone preserving pre-snapshot data for snapid 1. The two keys
+observed, differing only in the snap field:
+
+```
+…%21s1big%21%3d %00%00%00%00%00%00%00%01 %ff…%ff o   ← clone (snap 1)
+…%21s1big%21%3d %ff%ff%ff%ff%ff%ff%ff%fe %ff…%ff o   ← head  (NOSNAP)
+```
+
+Reserving the top u64 values means real snapids (1…MAXSNAP) sort naturally
+below head with no comparator special-casing: clones ascending, head last,
+all contiguous — snap trim/scrub/clone-lookup walk one iterator run.
 </details>
 
 ### Trace T3 ✅ — Only 4 KiB overwritten, yet 64 `X` entries. Why 64, why not 1?
@@ -178,30 +244,62 @@ head last, all contiguous — snap trim/scrub walk one iterator run.
 
 The 4 MiB write was pre-chopped by `_do_write_big` into 64 × 64 KiB
 (`bluestore_max_blob_size`) blobs; sbid and `X` entry are **per blob**;
-cloning arms sharing **eagerly for every blob in the range** (sbids allocated
-in one burst: 0x2801, 0x2802, …). What's lazy is un-sharing and freeing.
-BlueStore "COW" is really *redirect-on-write + refcount the leftovers*.
+cloning arms sharing **eagerly for every blob in the range**. The dump shows
+the burst allocation:
+
+```
+X  %00%00%00%00%00%00%28%01     ← sbid 0x2801
+X  %00%00%00%00%00%00%28%02     ← sbid 0x2802
+X  %00%00%00%00%00%00%28%03     ← … 64 consecutive entries
+```
+
+The 4 KiB overwrite at offset 8192 then punched its range out of the head's
+reference into blob #0 — the shared ref_map keeps the old 4 KiB alive solely
+for the clone. No data was copied at any point; what's lazy is un-sharing and
+freeing. BlueStore "COW" is really *redirect-on-write + refcount the
+leftovers*.
 </details>
 
 ### Trace T4 ❌ — What decides extent-map shard cut points? Why did head and clone cut differently?
 
 <details markdown="1"><summary>Answer</summary>
 
-Cuts follow **encoded bytes**, not logical offsets: target 500 B ≈ 6 blob
-records × ~80 B = the observed 0x60000 (384 KiB) stride; boundaries land on
-blob starts to avoid minting spanning blobs. Head and clone re-cut
-independently after the clone (+sbid bytes) and the 8 KiB overwrite (+extent,
-+new blob) changed their encoded sizes. Small objects stay inline (~50 B ≪
-threshold). Sharding is adaptive output formatting, not fixed layout.
+Cuts follow **encoded bytes**, not logical offsets. The observed shard keys
+(u32 offset + `'x'` appended to the onode stem):
+
+```
+clone: 0x000000 0x060000 0x0c0000 0x120000 0x180000 …   (uniform 384 KiB stride)
+head:  0x000000 0x040000 0x0a0000 0x100000 0x160000 …   (first stride 256 KiB)
+s1small: (no 'x' keys at all — inline extent map)
+```
+
+The arithmetic: target 500 B ÷ ~80 B per blob record (pextent + csum vector +
+sbid + extent entry) ≈ 6 blobs per shard × 64 KiB = the 0x60000 stride.
+Boundaries land on blob starts to avoid minting spanning blobs. Head and
+clone re-cut independently after the clone (+8 sbid bytes in every blob
+record) and the 8 KiB overwrite (+1 extent, +1 blob in the first region)
+changed their encoded sizes — same lineage, different geometry. `s1small`'s
+single extent encodes to ~50 B ≪ threshold → inline. Sharding is adaptive
+output formatting, not fixed layout.
 </details>
 
 ### Trace T5 ❌ — Histogram: 809 `b`, 91 `P`, 0 `L`, 0 `M` — explain each
 
 <details markdown="1"><summary>Answer</summary>
 
+The measured histogram (fresh vstart OSD: two objects written, one snap, one
+overwrite, clean stop — 1062 keys total):
+
+```
+809 b · 91 P · 68 O · 64 X · 10 C · 7 S · 6 p · 4 B · 3 T · 0 L · 0 M/m
+```
+
 - **809 `b`**: bitmap-freelist keys exist only for 512 KiB regions
   (128 blocks × 4 KiB) whose state ever *toggled* — absent key = initial
-  state, thanks to the XOR merge operator. ~4% of a 10 GiB device touched.
+  state, thanks to the XOR merge operator. 809 × 512 KiB ≈ 404 MiB touched ≈
+  4% of the 10 GiB device (a fully-materialized map would need ~20,480
+  keys). Corollary: allocate and free are the *same* XOR op — double-free is
+  invisible at this layer; only fsck catches it.
 - **91 `P`**: PG-layer omap (pg_info, PG log, dup ops) — every `rados put`
   appends log entries in the same BlueStore transaction.
 - **0 `L`**: deferred entries are transient (commit → apply → delete); a
@@ -259,14 +357,38 @@ Deferral ≠ small/big routing. Two rules:
 
 1. **Perf rule (strict `<`)**: at I/O issue for *safe* targets (new
    allocations :17552, unused fills :16683): `size < prefer_deferred_size` →
-   stage in `L`. HDD default 64 K (so a 64 K write goes *direct*); SSD
-   default 0 → never.
+   stage in `L`. HDD default 64 K (so a 64 K write goes *direct* — strict
+   less-than); SSD default 0 → never. Visible in the unused-fill branch:
+
+   ```cpp
+   if (b_len < prefer_deferred_size) {          // :16683 — perf choice
+       ... _get_deferred_op(txc, ...)           // journal, batch later
+   } else {
+       b->get_blob().map_bl(... aio_write ...)  // direct now
+   }
+   ```
+
 2. **Safety rule (no choice)**: chunk-aligned overwrite of **allocated,
-   already-written** bytes (:16730) defers unconditionally — committed
-   metadata points at those bytes; a torn direct write leaves neither version
-   under a valid csum. WAL-through-RocksDB is the only crash-safe in-place
-   mutation. Big writes get the same logic up to 2× prefer size
+   already-written** bytes defers unconditionally — the branch at :16730
+   contains *no* `prefer_deferred_size` test at all:
+
+   ```cpp
+   // chunk-aligned deferred overwrite?
+   if (b->get_blob().get_ondisk_capacity() >= b_off + b_len &&
+       b_off % chunk_size == 0 && b_len % chunk_size == 0 &&
+       b->get_blob().is_allocated(b_off, b_len)) {
+     ... // RMW head/tail reads, then always _get_deferred_op
+   ```
+
+   Why no choice: committed metadata points at those exact bytes; a torn
+   direct write leaves neither version under a valid csum.
+   WAL-through-RocksDB is the only crash-safe in-place mutation. Big writes
+   get the same logic up to 2× prefer size
    (`BigDeferredWriteContext::can_defer` :16984, :17111).
+
+Example on defaults: the same 4 KiB overwrite defers on HDD (rule 1 or 2) and
+on SSD *only* when it lands on already-written chunk-aligned bytes (rule 2) —
+which is why "SSD never journals data" is false.
 
 Compressed: *does this I/O land on live bytes?* → must defer. *Else, is it
 small enough that journaling beats seeking?* → defer by choice. *Else direct.*
@@ -298,13 +420,23 @@ use tracker's job; missed the compression specificity.*
 
 `typedef uint16_t unused_t` (bluestore_types.h:525) — 16 bits per blob, each
 covering blob_len/16 (4 K/bit on a 64 K blob; 256 B/bit on a 4 K blob),
-persisted via `FLAG_HAS_UNUSED`. A set bit = **never written since
-allocation** (virgin bytes) — *not* "currently unreferenced"; `mark_used` is
-one-way. It answers "is a torn write here harmless?" (safety), while the use
-tracker answers "does anyone need these bytes?" (accounting). A write landing
-entirely in unused+allocated+chunk-aligned territory skips both the RMW read
-and the mandatory deferral. Bonus: blobs with unused bits refuse to split
-(:614 "splitting unused set is complex").
+persisted via `FLAG_HAS_UNUSED`. The granularity, straight from `is_unused`:
+
+```cpp
+uint64_t chunk_size = blob_len / (sizeof(unused)*8);   // blob_len / 16
+```
+
+A set bit = **never written since allocation** (virgin bytes) — *not*
+"currently unreferenced"; `mark_used` is one-way (a later punch does not
+restore the bit). It answers "is a torn write here harmless?" (safety), while
+the use tracker answers "does anyone need these bytes?" (accounting). The
+exploit gate (:16670): the write must be chunk-aligned, within on-disk
+capacity, `is_unused()` **and** `is_allocated()` over the whole range — then
+it skips both the RMW read and the mandatory deferral. Where unused bits come
+from: a sub-chunk write into a fresh blob allocates a full min_alloc AU but
+marks the never-written remainder unused (the `wctx->write(...,
+min_alloc_size != block_size, ...)` argument at :16949). Bonus: blobs with
+unused bits refuse to split (:614 "splitting unused set is complex").
 
 *My mistake: called it per-AU and "isn't used" (ambiguous about the virgin
 vs unreferenced distinction).*
