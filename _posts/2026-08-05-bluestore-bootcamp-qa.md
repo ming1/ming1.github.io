@@ -42,11 +42,25 @@ name) · snap `…fe` = head · gen `ff…` = NO_GEN. The `'o'`/`'x'` suffix tri
 (source comment at :515): "the trailing char lets us quickly test whether it
 is a shard key without decoding any of the prefix bytes."
 
-**The why I missed:** PG membership is decided by the *low* bits of the hash.
-Bit-reversal moves them to the most-significant position of the sort key, so
-every object of a PG shares a key prefix — one collection = one contiguous key
-range (`_get_coll_key_range`), listing = one range scan, PG split = range
-subdivision with zero key movement.
+**The why I missed:** PG membership is decided by the *low* bits of the hash
+(`ps = hash & (pg_num-1)`, roughly). If the raw hash were the sort key, one
+PG's objects would be scattered across the keyspace in `pg_num`-strided
+stripes — listing a collection would take `pg_num` disjoint scans.
+Bit-reversal moves the low bits to the most-significant position of the sort
+key, so every object of a PG shares a key *prefix* — one collection = one
+contiguous key range (`_get_coll_key_range` computes it from pgid + the
+cnode's split `bits`), listing = one range scan, and PG splits are cheap:
+splitting subdivides one range into two contiguous halves — no keys move.
+
+The `'o'`/`'x'` suffix detail earns its own point: an onode key ends in
+`'o'`; its extent-map shards are the same stem + u32 offset + `'x'` — so an
+onode and all its shards are adjacent, fetched by one iterator sweep.
+
+**Design move to internalize** (it recurs all over BlueStore): *encode your
+dominant query into the sort order.* Seen three times in one station: the
+bit-reversed hash (collection listing), the `'o'`/`'x'` suffixes
+(onode+shards in one scan), and freelist bitmap keys sorted by disk offset
+(sequential mount replay).
 
 *My mistake: said "because the pool field is in the key" — pool alone gives
 pool-contiguity, not PG-contiguity.*
@@ -56,16 +70,25 @@ pool-contiguity, not PG-contiguity.*
 
 <details markdown="1"><summary>Answer</summary>
 
-Resharding is **not** decided at write time. At transaction finalize
-(`_record_onode` → `ExtentMap::update()`), each dirty shard is *encoded*; if
-the encoded bytes exceed `bluestore_extent_map_shard_max_size` (**1200 B**),
-`request_reshard()` marks the range and `reshard()` re-cuts aiming at
-`_target_size` (**500 B**); shards under `_min_size` (**150 B**) merge with a
-neighbor. Inline→sharded is just the special case "the inline map outgrew the
-onode value."
+Resharding is **not** decided at write time. During the write itself,
+`punch_hole()`/`set_lba()` just mutate the in-memory map and mark ranges
+dirty — nothing measures anything. Only at **transaction finalize**
+(`_record_onode` → `ExtentMap::update()`), when each dirty shard is
+*encoded*, does BlueStore notice "this blob of encoded bytes is too big": if
+the encoding exceeds `bluestore_extent_map_shard_max_size` (**1200 B**),
+`request_reshard()` marks the range and the deferred `reshard()` re-cuts
+boundaries aiming at `_target_size` (**500 B**); a shard under `_min_size`
+(**150 B**) merges with its neighbor. Inline→sharded is just the special
+case "the inline map's encoding outgrew what we tolerate inside the onode
+value."
+
+Why 500 B is a considered number: refcounts and extents ride in the shard
+(see the use-tracker question), so **every overwrite rewrites its whole
+shard value** — target size balances "KV bytes rewritten per overwrite"
+against "entries read per onode load."
 
 *My mistake: named the option names but not the trigger mechanism, the
-finalize-time timing, or the values.*
+finalize-time timing, or the values (150/500/1200).*
 </details>
 
 ### Q3 ⚠️ — What is a spanning blob, why must it live in the onode, what identifier does it get?
@@ -73,31 +96,59 @@ finalize-time timing, or the values.*
 <details markdown="1"><summary>Answer</summary>
 
 A blob whose referencing extents live in **more than one shard**. Shards are
-loaded (`fault_range`) and encoded independently — a shard cannot point into a
-sibling shard that may not be in memory. So `reshard()` assigns the blob an id
-(`Blob::id`, −1 when not spanning), hoists it into
+loaded (`fault_range`) and encoded independently — a shard cannot contain a
+pointer into a sibling shard that may not even be in memory. So `reshard()`
+assigns the blob an id (`Blob::id`, −1 when not spanning), hoists it into
 `ExtentMap::spanning_blob_map`, which is encoded **in the onode value** and
-always resident; shard extents reference it by bid.
+therefore always resident once the onode loads; shard extents reference it
+by bid.
+
+Two properties worth keeping: spanning blobs are **pure encoding fallout** —
+no write path ever asks for one; they exist only because sharding created
+encoding boundaries that blobs may straddle (the resharder even tries to
+place cuts on blob starts to avoid minting them — see trace T4). And the
+invariant any reshard patch must preserve: *no shard may encode a reference
+to state outside itself except via the onode-resident spanning map* — fsck
+checks it (a spanning blob no shard references is an error).
 
 *My mistake: defined it as "a blob with multiple (possibly non-contiguous)
-extents" — that describes every blob.*
+extents" — that describes every blob (that's Q6's answer, not Q3's).*
 </details>
 
 ### Q4 ❌ — After overwriting 4 KiB in the middle of a 64 KiB blob, what decides the old bytes can be freed, at what granularity?
 
 <details markdown="1"><summary>Answer</summary>
 
-**`bluestore_blob_use_tracker_t`** — not the freelist (that's downstream
-bookkeeping). `punch_hole()` drops the old extent → `Blob::put_ref()` →
-tracker decrements **per-AU byte counts** (union: single `total_bytes` for
-≤1-AU blobs, `bytes_per_au[]` otherwise). An AU hitting zero emits its pextent
-slice as released → txc's released set → freed via FreelistManager **after**
-kv commit (freeing before metadata durability would be a crash hole).
+**`bluestore_blob_use_tracker_t`** — not the freelist. The freelist is
+downstream *bookkeeping* that records the verdict; it never decides
+anything. The full chain for the 4 KiB overwrite:
+
+1. The overwrite logically punches out the middle: `punch_hole()` drops or
+   trims the old `Extent`.
+2. Dropping an extent calls **`Blob::put_ref(offset, length)`** on the old
+   blob, which forwards to the tracker.
+3. The tracker keeps **per-AU byte counts** — `au_size` fixed at blob init
+   (min_alloc-based), space-optimized union: a ≤1-AU blob keeps a single
+   `total_bytes` (`num_au == 0`); bigger blobs keep `bytes_per_au[]`.
+   `put()` subtracts the de-referenced bytes from each covered AU.
+4. An AU hitting **zero** emits its slice of the blob's pextents as a
+   released range → collected into the txc's released set.
+5. Only then does the release flow to the FreelistManager — deliberately
+   **after** kv commit: freeing disk space that old metadata might still
+   reference *before* new metadata is durable is a crash-consistency hole
+   (and per Station 3 X4/X5: even later than commit when pending deferred
+   writes could land in those blocks).
+
+So the *decision* granularity is per-AU, but *accounting* inside each AU is
+bytes — which lets many small extents share an AU and release it only when
+the last byte goes. If the blob is **shared** (post-clone), step 4 doesn't
+free directly: released ranges are checked against the SharedBlob's ref_map,
+freeing only what no clone still references.
 
 Three tiers of "who owns disk bytes": use tracker (*does this blob need
 them*) → shared-blob ref_map (*does any clone need them*) → freelist
 (*durable record nobody does*). Free-space patches must walk all three in
-order.
+order — skipping straight to the freelist is the classic corruption bug.
 
 *My mistake: answered "the freelist tracks it."*
 </details>
@@ -140,7 +191,18 @@ blocks · `M` legacy omap · `P` pgmeta omap · `m` per-pool omap · `p` per-pg
 omap.
 
 Omap linkage: no pointer — the omap key is *derived*: prefix chosen by onode
-flags + pool + hash + **nid** + user key.
+flags + pool + hash + **nid** (the onode's unique id, allocated from the
+`S`-key `nid_max` sequence) + user key. That's why omap needs no rewrite on
+object rename, and why fsck can attribute stray omap to owners by nid.
+
+Why *four* prefixes for one feature — three generations of the same lesson:
+`M` (legacy, one global namespace) made per-pool space accounting impossible
+without a full scan → `m` (per-pool) fixed accounting but RGW bucket-index
+PGs still couldn't be scrubbed/split in isolation → `p` (per-pg) isolates
+per-PG. `P` (pgmeta) was always separate: it's the *OSD's own* PG
+bookkeeping (pg log/info — written by every client op in the same
+transaction), not user data. An onode's flags say which generation its omap
+lives in, so stores migrate lazily.
 
 *My mistake: missed the entire omap family (M/P/m/p) and `b`.*
 </details>
@@ -327,12 +389,31 @@ an all-aligned workload never executes `_do_write_small` at all.
 
 <details markdown="1"><summary>Answer</summary>
 
-The cost ladder: (1) **fill `unused`** bytes of a nearby mutable blob
-(allocated-but-never-written; direct or deferred-for-batching); (2) **deferred
-in-place RMW overwrite** of chunk-aligned allocated bytes (:16730); (3)
-**reuse blob** — `can_reuse_blob` allocates new AUs into the existing blob;
-(4) **new blob** (:16947), punching the old range. Each rung costs more
-allocation/metadata churn.
+The cost ladder, in the order `_do_write_small` tries it:
+
+1. **Fill `unused` space** (:16670) — the target falls in a nearby mutable
+   blob's *allocated-but-never-written* region (the `unused` bitmap): pad to
+   csum-chunk and write **directly** — no RMW, no new allocation. (On HDD it
+   may still defer for batching — `b_len < prefer_deferred_size`, :16683 —
+   *allowed* to be direct because torn writes over virgin bytes are
+   harmless.)
+2. **Deferred in-place RMW overwrite** (:16730) — region already written but
+   pad-able to chunk alignment within allocated space: read head/tail to
+   fill the chunk, then stage via RocksDB `L` — *unconditionally* deferred
+   (W4's safety rule).
+3. **Reuse the blob** — `can_reuse_blob`: the blob has unallocated room
+   (tail growth / holes): allocate *new* AUs into the *existing* blob — new
+   space, old metadata.
+4. **New blob** (:16947, `c->new_blob()`) — pad, allocate a fresh min_alloc
+   unit, write, `punch_hole` the old range out of the old blob (whose space
+   then frees via Q4's use tracker).
+
+Read it as a cost ladder: *free space I already own* → *sequential KV write
+now, disk write later* → *new space in old metadata* → *new space, new
+metadata*. Each rung costs more allocation and/or metadata churn. Fates 1 vs
+2 are decided by one bit (`unused`) with a huge payoff gap: fate 1 is a
+single direct aio; fate 2 is a read (maybe) + a KV commit + a replayed disk
+write.
 
 *My mistakes: listed "blob split" and "full blob rewrite" — neither is a
 write fate; missed unused-fill and blob-reuse.*
