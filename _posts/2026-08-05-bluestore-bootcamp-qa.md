@@ -472,3 +472,73 @@ TransContext; the triggering client op pays the latency. No background
 thread/queue exists. Design: garbage accumulates no faster than the writes
 creating it, no global tracking, no collector locking.
 </details>
+
+## Station 3 — Transaction engine
+
+### X1 💬 — Walk a 64 KiB direct write through the txc states, naming the thread driving each transition. Where are states skipped, and why is that legal?
+
+(Asked as a grill question; I requested the explanation — re-test me on this
+one. Verified against `_txc_state_proc`, BlueStore.cc:14641–14739.)
+
+<details markdown="1"><summary>Answer</summary>
+
+The life of a 64 KiB direct write — four threads, one baton:
+
+```
+ THREAD                        STATE TRANSITIONS                WORK DONE
+─────────────────────────────────────────────────────────────────────────────
+ ① osd op tp thread          PREPARE                          decode ops, mutate onodes,
+   (queue_transactions)         │                              encode metadata, build kv txn,
+                                │ has pending aios?            issue aio_submit ──► disk
+                                ▼ yes
+                             AIO_WAIT                          thread returns; txc parked
+─────────────────────────────────────────────────────────────────────────────
+ ② KernelDevice aio thread   AIO_WAIT ──► IO_DONE             _txc_finish_io: enforce
+   (txc_aio_finish)             │                              OpSequencer order; advance txc
+                                ▼                              only if all older txcs on the
+                             KV_QUEUED                         osr passed IO_DONE; push to
+                                                               kv_queue, wake ③
+─────────────────────────────────────────────────────────────────────────────
+ ③ _kv_sync_thread           KV_QUEUED ──► KV_SUBMITTED       drain whole kv_queue as ONE
+                                                               batch: submit_transaction() per
+                                                               txc + ONE submit_transaction_
+                                                               sync() ◄── durability point;
+                                                               hand batch to ④
+─────────────────────────────────────────────────────────────────────────────
+ ④ _kv_finalize_thread       KV_SUBMITTED ──► KV_DONE         _txc_committed_kv: client commit
+                                │                              callbacks via finishers
+                                ▼ (no deferred_txn)
+                             FINISHING ──► DONE                _txc_finish: release throttles,
+                                                               pop osr queue
+```
+
+Four load-bearing details:
+
+1. **The switch falls through — that's how states are skipped.** A txn with
+   no data aio (pure metadata, or all-deferred) falls through `AIO_WAIT` and
+   `IO_DONE` in the same invocation, in thread ①. Legal because states are
+   *checkpoints of completed obligations*, not actions — an empty obligation
+   is trivially complete. The 64 KiB direct write parks at `AIO_WAIT` and
+   skips only the `DEFERRED_*` states.
+2. **Ordering is enforced at exactly one gate.** Aio completions arrive in
+   device order; `_txc_finish_io` (thread ②) re-imposes per-OpSequencer
+   order: a txc waits until all older txcs on its osr reach IO_DONE, and a
+   landing txc advances its parked successors. Past this gate, the FIFO
+   kv_queue preserves order structurally.
+3. **The commit is batched — BlueStore's group commit.** Thread ③ never
+   fsyncs per transaction: it drains everything queued, submits each kv txn
+   async, then issues one `submit_transaction_sync()` for the batch. Under
+   load, hundreds of writes share one RocksDB WAL fsync — this is where
+   small-write throughput comes from, and why `_kv_sync_thread` is hot in
+   every profile. (`bluestore_sync_submit_transaction`, default false, moves
+   the async submit into thread ②; the sync stays in ③.)
+4. **Client visibility comes after durability, from thread ④.** The data aio
+   finished long ago in ②, but `_txc_committed_kv` fires commit callbacks
+   only after ③'s sync returned: data-without-metadata is invisible by
+   design — the crash-consistency story in one sentence.
+
+The mental model: a txc never migrates threads by being moved — every
+transition is some thread calling `_txc_state_proc(txc)` when *its*
+obligation completes. The state enum answers one question: "which thread owes
+this txc work next?"
+</details>
