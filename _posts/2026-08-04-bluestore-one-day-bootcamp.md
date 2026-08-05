@@ -89,6 +89,47 @@ economics.
 
 ## Station 2 — Write path
 
+**Scope:** `_do_write` routing, `_do_write_small` fate ladder, `_do_write_big`,
+deferred-vs-direct decision, compression gates, GC, the `unused` bitmap.
+
+### Grill results
+
+| Q | Topic | Verdict | The settle |
+|---|-------|---------|-----------|
+| W1 | 4 KiB aligned write: small or big? | ✅ | big — the split is AU geometry, not byte count; all-aligned workloads never run `_do_write_small` |
+| W2 | small-write fate ladder | ⚠️ | unused-fill → deferred RMW → blob reuse → new blob; "blob split"/"full rewrite" aren't fates |
+| W3 | csum where/granularity/compressed | ✅ | `calc_csum` in `_do_alloc_write`, per csum-chunk (order 12 default), over the *disk* bytes; chunk = min read unit |
+| W4 | deferred vs direct conditions | ❌ | strict `size < prefer_deferred_size` for safe targets; in-place overwrite of live bytes defers *unconditionally* (:16730) — WAL is the only crash-safe in-place mutation |
+| W5 | GC: what garbage, what bounds | ⚠️ | compressed blobs only (indivisible bitstream); `_do_gc` rewrites survivors in the same txc; foreground, polluter-pays, benefit-gated |
+| W6 | `unused` bitmap | ⚠️ | `uint16_t`, blob_len/16 per bit, means never-written-since-allocation (≠ unreferenced); dodges RMW + mandatory deferral |
+
+Sidebar questions worth keeping: `min_alloc_size` = 4 K both media, frozen at
+mkfs into the `S` key (code reads the store's value, never the config);
+compression gates at this tag are min = max = 64 K + required_ratio 0.875 —
+on defaults only full 64 K blobs ever compress; GC is always foreground —
+no background collector exists.
+
+### Corrections logged against the teacher
+
+Fate 1 (unused-fill) is *not* always direct: on HDD it defers when
+`b_len < prefer_deferred_size` (:16683) purely for batching — it is *allowed*
+to be direct because torn writes over virgin bytes are harmless; live-byte
+overwrites have no such choice.
+
+### Patch #1 (written by the learner, built on c28)
+
+Six `dout(5)` "WFATE" markers, one per write fate, uniform grep-able format:
+
+`small_unused_deferred` (:16683) · `small_unused_direct` (:16695) ·
+`small_deferred_rmw` (:16730 branch) · `small_new_blob` (terminal fallback,
+:16947 `c->new_blob()`) · `big_deferred` (defer-big) · `big_new_blob`/
+`big_reuse_blob` (discriminated at the `wctx->write` site — learner's
+improvement over the spec). Purpose: make the fate ladder observable per
+write with `debug_bluestore=5/5`, then measure Patch #2's config flip with
+the same lines.
+
+## Station 3 — Transaction engine
+
 *(in progress)*
 
 ## Station 3 — Transaction engine
