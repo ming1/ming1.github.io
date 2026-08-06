@@ -3569,6 +3569,7 @@ Key points:
   is why losing a bucket's encoding while still returning 0 was silent data
   loss rather than an error.
 
+
 ```
 Caller:
 
