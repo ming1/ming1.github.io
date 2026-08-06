@@ -3342,6 +3342,335 @@ There is also a recovery path for a damaged log:
 probing for the next valid one. It is disabled by default and is a
 last-resort data-recovery tool, not a normal path.
 
+## 6.9 Data structure
+
+### BlueFS journal data
+
+```
+log                              BlueFS.h:609   guarded by log.lock
+  .seq_live                      seq the log is writing to (mirror of dirty.seq_live)
+  .writer                        FileWriter for the journal file itself (ino 1)
+  .t                             bluefs_transaction_t: ops accumulated for next flush
+dirty                            BlueFS.h:617   guarded by dirty.lock
+  .seq_stable                    highest seq durable on disk
+  .seq_live                      seq new dirty files register under
+  .files                         map<seq, list<File>> - metadata waiting to be journaled
+  .pending_release               extents to free once the next flush is durable
+File (per file)
+  .fnode                         ino/size/mtime/extents + allocated_commited (delta baseline)
+  .dirty_seq                     which dirty.files bucket this file sits in (<= seq_stable = clean)
+coordination                     BlueFS.h:630
+  log_cond / log_is_compacting / log_forbidden_to_expand    flush <-> compaction handshake
+```
+
+```
+dirty.files + File::dirty_seq
+
+WRITE (register/move): BlueFS::_signal_dirty_to_log_D      [private]  BlueFS.cc:4024
+  BlueFS::_fsync                          [private]  (call :4479)  cond: h->file->is_dirty || force_dirty
+    BlueFS::fsync / BlueFS::close_writer  [public]   -> (see LD tree: rocksdb Sync/Close/~WritableFile, BlueStore, tools)
+
+READ (encode into log.t): BlueFS::_consume_dirty           [private]  BlueFS.cc:3743
+  BlueFS::_flush_and_sync_log_LD          (call :3924)  -> (see LD tree roots)
+  BlueFS::_flush_and_sync_log_jump_D      (call :3953)  -> (see jump tree roots)
+
+ERASE (mark stable): BlueFS::_clear_dirty_set_stable_D     [private]  BlueFS.cc:3855
+  BlueFS::_flush_and_sync_log_LD          (call :3936)  -> (see LD tree roots)
+  BlueFS::_flush_and_sync_log_jump_D      (call :3969)  -> (see jump tree roots)
+
+READ (emptiness check): BlueFS::sync_metadata   [public]   can_skip_flush  -> (see LD tree roots)
+```
+
+```
+seq counters (dirty.seq_live / dirty.seq_stable / log.seq_live)
+
+ADVANCE (retire seq N, open N+1): BlueFS::_log_advance_seq [private]  BlueFS.cc:3722
+  BlueFS::_flush_and_sync_log_LD          (call :3923)
+  BlueFS::_flush_and_sync_log_jump_D      (call :3952)  -> (see jump tree roots)
+
+BUMP (extension steals a seq): BlueFS::_extend_log         [private]  BlueFS.cc:3780
+  BlueFS::_maybe_extend_log               [private]  (ca
+    BlueFS::_flush_and_sync_log_LD        (call :3929)  -> (see LD tree roots)      <- the #79068 site
+    BlueFS::_compact_log_async_LD_LNF_D   (call :3418)
+
+STABILIZE (seq_stable = N): BlueFS::_clear_dirty_set_sta
+
+INIT (from replay): BlueFS::_replay                     6
+  BlueFS::mount / BlueFS::fsck            [public]
+
+READ (dirty_seq vs seq_stable): BlueFS::_fsync  decides whether to flush  -> (see LD tree)
+```
+
+```
+log.t (the pending transaction)
+
+APPEND ops (all under log.lock):
+  BlueFS::_consume_dirty                  op_file_update
+  namespace/metadata mutators             op_dir_link/unlink, op_file_remove, op_alloc_add...
+    BlueFS::open_for_write / mkdir / rmdir / unlink / re
+    BlueFS::truncate / preallocate       [public]  <- BlueRocks* boundary + BlueStore  -> (see LD/jump trees)
+    BlueFS::_drop_link_DF                [private]  <- u
+  BlueFS::_compact_log_async_LD_LNF_D     op_jump (:3496 region)  -> (see jump tree roots)
+
+ENCODE + CLEAR: BlueFS::_flush_and_sync_log_core           [private]  BlueFS.cc:3821
+  BlueFS::_flush_and_sync_log_LD          (call :3930)
+  BlueFS::_flush_and_sync_log_jump_D      (call :3957)  -> (see jump tree roots)
+```
+
+```
+log.writer (the journal file, ino 1)
+
+APPEND encoded txn: BlueFS::_flush_and_sync_log_core       -> (see above)
+APPEND extension txn + allocate: BlueFS::_extend_log
+REWIND pos after compaction: BlueFS::_flush_and_sync_log_jump_D   -> (see jump tree roots)
+REPLACE wholesale: BlueFS::_rewrite_log_and_layout_sync_
+  BlueFS::_compact_log_sync_LNF_LD  <- compact_log [public]  cond: bluefs_compact_log_sync
+  ceph-bluestore-tool (bluefs migrate/rm-device paths)
+OPEN at mount: BlueFS::_replay / mount
+```
+
+```
+dirty.pending_release
+
+PRODUCE (queue extents to free):
+  BlueFS::_drop_link_DF                   [private]  Blume-overwrite [public]
+  BlueFS::truncate                        [public]   BlueFS.cc:4422   <- BlueRocksWritableFile::Truncate
+  BlueFS::_compact_log_async_LD_LNF_D     BlueFS.cc:3671 jump tree roots)
+  BlueFS::_rewrite_log_and_layout_sync_LNF_LD  BlueFS.cc:3372  -> (see above)
+
+CONSUME (swap out, then free after flush is durable):
+  BlueFS::_flush_and_sync_log_LD :3925 / _flush_and_sync
+    -> BlueFS::_release_pending_allocations  -> (see LD / jump tree roots)
+```
+
+### File::is_dirty
+
+```
+SET (allocation added extents): BlueFS.cc:4126        in _flush_range_F   cond: allocated < end
+SET (size/mtime advanced):      BlueFS.cc:4135        in _flush_range_F   cond: new_data > 0 && !envelope_mode
+  BlueFS::_flush_range_F                 [private]    BlueFS.cc:4085
+    BlueFS::flush_range                  [public]     BlueFS.cc:4066   cond: !envelope_mode
+      BlueRocksWritableFile::RangeSync   [rocksdb boundary]  BlueRocksEnv.cc:282
+    BlueFS::_flush_envelope_F            [private]    BlueFS.cc:4082   (envelope framing; only the :4126 allocation SET can fire below it)
+      BlueFS::flush_range                (call :4064)  cond: envelope_mode
+      BlueFS::_flush_F                   (call :4341)  cond: envelope_mode
+    BlueFS::_flush_F                     [private]    BlueFS.cc:4343   cond: !envelope_mode
+      BlueFS::append_try_flush           [public]     BlueFS.cc:4286  cond: buffer exceeded  <- BlueRocksWritableFile::Append
+      BlueFS::flush                      [public]     BlueFS.cc:4306  <- BlueRocksWritableFile::Flush
+      BlueFS::truncate                   [public]     BlueFS.cc:4387  (pre-truncate data flush)  <- BlueRocksWritableFile::Truncate
+      BlueFS::_fsync                     [private]    BlueFS.cc:4474  -> (see LD tree: fsync/close_writer roots)
+
+SET (extents chopped / size cut): BlueFS.cc:4448, :4452   in truncate
+  BlueFS::truncate                       [public]     BlueFS.cc:4335  cond: changed_extents || offset != fnode.size
+    BlueRocksWritableFile::Truncate      [rocksdb boundary]  BlueRocksEnv.cc:216
+
+SET (preallocation added extents): BlueFS.cc:4725     in preallocate   cond: want > 0 after p2roundup
+  BlueFS::preallocate                    [public]     BlueFS.cc:4668
+    BlueRocksWritableFile::Allocate      [rocksdb boundary]  BlueRocksEnv.cc:297
+
+READ (the condition):  BlueFS.cc:4478    in _fsync    `is_dirty || force_dirty` -> _signal_dirty_to_log_D
+CLEAR:                 BlueFS.cc:4480    in _fsync    right after signaling
+  BlueFS::_fsync                         [private]    BlueFS.cc:4434
+    BlueFS::fsync                        [public]     BlueFS.cc:4428  -> (see LD tree: rocksdb Sync/Close/InvalidateCache, BlueStore, tools)
+    BlueFS::close_writer                 [public]     BlueFS.cc:4883  -> (see LD tree: ~BlueRocksWritableFile, BlueStore, tools)
+```
+
+
+## 6.10 Interfaces
+
+### BlueFS::_fsync
+
+```
+force_dirty
+
+PRODUCE true: BlueFS::close_writer       [public]     BlueFS.cc:4877  cond: h->file->envelope_mode()
+                                                      (pairs with fnode.encoding = ENVELOPE_FIN, same block)
+  BlueRocksWritableFile::~BlueRocksWritableFile  [rocksdb boundary]  BlueRocksEnv.cc:183
+  BlueFS::revert_wal_to_plain(dir,file)  [private]    BlueFS.cc:2427  -> (see LD tree)
+  BlueStore / tool callers               -> (see LD tree: close_writer roots)
+
+PRODUCE false: BlueFS::fsync             [public]     BlueFS.cc:4431  (always false on the plain-fsync path)
+
+CONSUME: BlueFS::_fsync                  [private]    BlueFS.cc:4478  `is_dirty || force_dirty`
+  -> gates _signal_dirty_to_log_D (registers fnode delta in dirty.files[dirty.seq_live])
+```
+
+
+### BlueFS::_signal_dirty_to_log_D
+
+The producer side of BlueFS journaling (`BlueFS.cc:4024`): called from `_fsync()`
+when `is_dirty || force_dirty`, it queues the file's fnode delta for the next
+log flush. Key points:
+
+- Entry contract: caller must hold `h->lock` (asserted); takes `dirty.lock`
+  itself for its whole scope; deliberately does NOT take `log.lock` — so
+  registration runs concurrently with an in-flight log flush.
+- Core is a three-way classification of `file->dirty_seq` against the seq
+  counters:
+  - `<= seq_stable` (clean) → fresh registration into `dirty.files[seq_live]`;
+  - `> seq_stable && != seq_live` (dirty, older bucket) → move to the current
+    bucket (erase-then-push is mandatory: buckets are intrusive lists, a File
+    is its own list node and may sit in at most one bucket). This move is the
+    self-healing that usually masked tracker#79068;
+  - `== seq_live` → no-op.
+- Lock split: `h->lock` owns fnode *content*; `dirty.lock` owns the
+  *bookkeeping* (`dirty_seq`, bucket membership, `deleted`, and `mtime`, the
+  one fnode field written here).
+- Correctness rests on two invariants, not locks:
+  1. the fnode is published to `_consume_dirty()` (which encodes it under
+     `log.lock + dirty.lock` only) by a temporal discipline — `_fsync()` holds
+     `h->lock` from before the fnode mutations until its log flush returns, so
+     mutation and encoding never overlap;
+  2. every value `dirty.seq_live` ever takes must eventually be consumed —
+     the invariant `_extend_log()`'s seq bump violated (tracker#79068: file
+     registered here into the bucket the bump skipped; exact-match
+     `_consume_dirty()` never found it; `_clear_dirty_set_stable_D()` erased
+     it while marking the file clean, losing the update after fsync returned
+     0). This function was correct all along; the fix (range-consume) belongs
+     to the consumer side.
+
+### _flush_and_sync_log_LD
+
+The consumer side of BlueFS journaling (`BlueFS.cc:3910`): takes everything
+queued since the last flush, writes it as one journal transaction, makes it
+durable, then does the bookkeeping. `_LD` = takes log.lock + dirty.lock.
+Key points:
+
+- The parameter `want_seq` is a durability *request*, not a command: "make
+  everything up to this seq durable — including by doing nothing." Non-zero
+  only from `_fsync()` (the file's `dirty_seq`); `mkfs()`/`sync_metadata()`
+  pass 0 = unconditional. The early-out (`want_seq <= seq_stable`) is how a
+  storm of concurrent fsyncs collapses into few journal writes: late arrivals
+  find their seq already stabilized by another thread's flush and return
+  without writing anything.
+- Structure is claim-then-fulfill. Under both locks it claims one coherent
+  unit of work: `_log_advance_seq()` retires seq S (new fsyncs now register
+  under S+1), `_consume_dirty(S)` encodes the dirty buckets into `log.t`,
+  and `pending_release` is swapped out to a local. Then the locks are
+  released progressively while the claim is fulfilled — ordering is kept by
+  sequence numbers, not by holding locks.
+- Fulfillment order matters: `_maybe_extend_log()` (runway), encode + append
+  (`_flush_and_sync_log_core()`), then `_flush_bdev(log.writer)` — the
+  durability point; only after it do `_clear_dirty_set_stable_D(S)`
+  (seq_stable = S, buckets <= S erased, files marked clean) and
+  `_release_pending_allocations()` run. Freed extents are returned to the
+  allocator only after the journal txn that frees them is durable — releasing
+  earlier would let new data land on blocks a crash-replay still assigns to
+  deleted files.
+- The two lock-release seams are where the subtleties live: dropping
+  dirty.lock before `_maybe_extend_log()` is the seam that produced
+  tracker#79068 (extend's seq bump could strand a bucket registered in the
+  window; fixed by range-consume in `_consume_dirty()`); dropping log.lock
+  before `_clear_dirty_set_stable_D()` allows a racing flusher to stabilize
+  first, which the "lost a race" guard in clear tolerates (worst case: an
+  empty transaction).
+- `return 0` to `_fsync()` means "your want_seq is <= seq_stable now" — the
+  fsync durability contract is delivered by this function's bdev flush, which
+  is why losing a bucket's encoding while still returning 0 was silent data
+  loss rather than an error.
+
+```
+Caller:
+
+BlueFS::_flush_and_sync_log_LD                                  BlueFS.cc:3878
+│
+├── BlueFS::mkfs                                    [public]    :797  uncond
+│     ├── BlueStore::_open_bluefs (create path)                 BlueStore.cc:7919
+│     └── ceph-bluestore-tool (bluefs-bdev ops)                 bluestore_tool.cc
+│
+├── BlueFS::_fsync                                  [private]   :4460  cond: dirty.seq_stable < file->dirty_seq
+│     ├── BlueFS::fsync                             [public]    :4428
+│     │     ├── BlueRocksWritableFile::Sync                     BlueRocksEnv.cc:233
+│     │     │     └── rocksdb::WritableFileWriter::Sync ← BuildTable / FlushJob::Run /
+│     │     │         DBImpl::SyncWAL / SyncManifest   (rocksdb bg-flush + kv threads)
+│     │     ├── BlueRocksWritableFile::Close                    BlueRocksEnv.cc:224   (SST finalize — the #79068 victim)
+│     │     ├── BlueRocksWritableFile::InvalidateCache          BlueRocksEnv.cc:272
+│     │     ├── BlueStore::inject_bluefs_file                   BlueStore.cc:12216
+│     │     └── BlueStore::invalidate_allocation_file_on_bluefs BlueStore.cc:20307
+│     └── BlueFS::close_writer                      [public]    :4883  (force_dirty iff envelope_mode)
+│           ├── BlueRocksWritableFile::~BlueRocksWritableFile   BlueRocksEnv.cc:183
+│           ├── BlueFS::revert_wal_to_plain(dir,file) [private] BlueFS.cc:2427
+│           ├── BlueStore::inject_bluefs_file                   BlueStore.cc:12217
+│           ├── BlueStore::invalidate_allocation_file_on_bluefs BlueStore.cc:20303
+│           └── BlueStore::store_allocator                      BlueStore.cc:20414
+│
+└── BlueFS::sync_metadata                           [public]    :4714  cond: !(log.t.empty() && dirty.files.empty())
+      ├── BlueRocksDirectory::Fsync                             BlueRocksEnv.cc:314   (rocksdb dir-fsync after SST/MANIFEST ops)
+      ├── BlueRocksEnv::ReuseWritableFile                       BlueRocksEnv.cc:403
+      ├── BlueRocksEnv::DeleteFile                              BlueRocksEnv.cc:444
+      ├── BlueRocksEnv::RenameFile                              BlueRocksEnv.cc:505
+      ├── BlueStore::store_allocator                            BlueStore.cc:20411
+      ├── BlueFS::umount                            [public]    BlueFS.cc:1221
+      │     ├── BlueStore::_close_bluefs                        BlueStore.cc:7932
+      │     ├── BlueStore::add_new_bluefs_device                BlueStore.cc:8998
+      │     ├── BlueStore::migrate_to_new_bluefs_device         BlueStore.cc:9144
+      │     └── ceph-bluestore-tool                             bluestore_tool.cc:1079
+      ├── BlueFS::migrate_file                      [public]    BlueFS.cc:2093
+      │     └── BlueFS::RebalanceToDB::advance ← BlueFS::SpilloverCleanerThread::entry  BlueFS.cc:5581/:5484
+      └── BlueFS::revert_wal_to_plain()             [public]    BlueFS.cc:2447
+            └── BlueStore::revert_wal_to_plain ← bluestore_tool  BlueStore.cc:11052 / bluestore_tool.cc:743
+
+```
+
+
+### _flush_and_sync_log_jump_D
+
+```
+BlueFS::_flush_and_sync_log_jump_D                        [private]           BlueFS.cc:3912
+  BlueFS::_compact_log_async_LD_LNF_D                     [private]           BlueFS.cc:3402 (call :3483)  cond: log_is_compacting was false
+    BlueFS::compact_log                                   [public]            BlueFS.cc:3024 (call :3030)  cond: !bluefs_replay_recovery_disable_compact && !bluefs_compact_log_sync
+      BlueStore::store_allocator                          [private]           BlueStore.cc:20394 (call :20410)
+        BlueStore::_close_db                              [private]           BlueStore.cc:8342 (call :8417)  cond: do_destage && fm->is_null_manager()
+          BlueStore::_close_db_and_around                 [private]           BlueStore.cc:8088
+            BlueStore::umount                             [public]            BlueStore.cc:9665
+            BlueStore::cold_close                       re.cc:9708
+            BlueStore::_mount                             [private]           BlueStore.cc:9556  cond: mount-failure rollback
+            BlueStore::expand_devices                   re.cc:9196
+            BlueStore::_fsck                              [private]           BlueStore.cc:10990  (<- fsck/repair [public])
+            BlueStore::migrate_to_new_bluefs_device     re.cc:9070
+            BlueStore::add_new_bluefs_device              [public]            BlueStore.cc:8937
+            BlueStore::push_allocation_to_rocksdb       re.cc:21514  (<- ceph-bluestore-tool)
+          BlueStore::mkfs                                 [public]            BlueStore.cc:8662 (call :8903)
+    BlueFS::_maybe_compact_log_LNF_NF_LD_D              cc:4723 (call :4731)  cond:!bluefs_replay_recovery_disable_compact && _should_start_compact_log_L_N() && !bluefs_compact_log_sync
+      BlueFS::append_try_flush                          cc:4230 (call :4264)
+        BlueRocksWritableFile::Append                     [rocksdb boundary]  BlueRocksEnv.cc:198  (driver: rocksdb WAL/SST/MANIFEST writes)
+        BlueFS::revert_wal_to_plain(dir,file)           cc:2398 (call :2419)
+          BlueFS::revert_wal_to_plain()                   [public]            BlueFS.cc:2433
+            BlueStore::revert_wal_to_plain              re.cc:11046  (<- ceph-bluestore-tool :743)
+      BlueFS::flush                                       [public]            BlueFS.cc:4268 (call :4278)  cond: flushed
+        BlueRocksWritableFile::Flush                    ksEnv.cc:228
+      BlueFS::_fsync                                      [private]           BlueFS.cc:4434 (call :4462)
+        BlueFS::fsync                                   cc:4428
+          BlueRocksWritableFile::Sync                     [rocksdb boundary]  BlueRocksEnv.cc:233
+          BlueRocksWritableFile::Close                  ksEnv.cc:223
+          BlueRocksWritableFile::InvalidateCache          [rocksdb boundary]  BlueRocksEnv.cc:271
+          BlueStore::invalidate_allocation_file_on_bluefre.cc:20284  (<- _open_db_and_around <-mount/cold_open/fsck/...)
+          BlueStore::store_allocator                    locator)
+          bluefs_import                                   [tool root]         bluestore_tool.cc:249
+        BlueFS::close_writer                            cc:4870 (call :4883)
+          BlueRocksWritableFile::~BlueRocksWritableFile   [rocksdb boundary]  BlueRocksEnv.cc:182
+          BlueStore::invalidate_allocation_file_on_bluef
+          BlueStore::store_allocator                      -> (see BlueStore::store_allocator)
+          BlueFS::revert_wal_to_plain(dir,file)         to_plain)
+          bluefs_import                                   [tool root]         bluestore_tool.cc:249
+      BlueFS::sync_metadata                             cc:4698 (call :4719)  cond: !avoid_compact
+        BlueRocksDirectory::Fsync                         [rocksdb boundary]  BlueRocksEnv.cc:312
+        BlueRocksEnv::ReuseWritableFile                 ksEnv.cc:385
+        BlueRocksEnv::DeleteFile                          [rocksdb boundary]  BlueRocksEnv.cc:438
+        BlueRocksEnv::RenameFile                        ksEnv.cc:495
+        BlueStore::store_allocator                        -> (see BlueStore::store_allocator)
+        BlueStore::commit_to_real_manager               re.cc:21617  (<- push_allocation_to_rocksdb <-ceph-bluestore-tool)
+
+Tests and debug-injection callers (kept out of the main tree):
+
+BlueFS::compact_log       <- test_bluefs.cc:576,628,667,731,792,1903,1986,2063
+BlueFS::sync_metadata     <- test_bluefs.cc:411,570,573,
+BlueFS::append_try_flush  <- test_bluefs.cc:298,970,1049,1138,1585
+BlueStore::inject_bluefs_file (BlueStore.cc:12203) <- st,12401
+```
+
+## 6.11 contexts
+
 ---
 
 # Part 7 — The Allocation Engine
