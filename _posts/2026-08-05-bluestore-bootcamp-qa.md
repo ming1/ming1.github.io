@@ -1281,3 +1281,29 @@ the first fit, don't shop); scarcity → thrift (shop the size tree for the
 snuggest match, protect the last big chunks). Same reflex as the throttle
 midpoint: policy changes *before* exhaustion, not at the wall.
 </details>
+
+### A3 ✅ — HybridAllocator: what runaway does it contain, and how?
+
+<details markdown="1"><summary>Answer</summary>
+
+Plain AVL memory is **O(number of free ranges)** — ~72 bytes per range (two
+intrusive tree hooks + offsets), regardless of the range's size. A
+pathologically fragmented big device can hold hundreds of millions of
+ranges → unbounded gigabytes of allocator RAM. Hybrid caps the primary
+(AVL, or Btree2 in `hybrid_btree2`) at `bluestore_hybrid_alloc_mem_cap`
+(**64 MiB**) and spills overflow into a BitmapAllocator whose memory is
+**fixed**: ~1 bit per AU (~30 MiB/TB at 4 K) — bounded and predictable
+regardless of fragmentation.
+
+The choice of *what* spills is the design: **long ranges stay in the tree,
+short crumbs go to the bitmap.** A tree node costs the same 72 bytes
+whether it describes 4 KiB or 4 GiB — terrible value for crumbs; the
+bitmap describes crumbs at a bit apiece and a fragmented region is just a
+run of bits. Each structure holds the shape of free space it's best at.
+Lookup order follows: allocate tries the primary first, falls back to
+bitmap; releases fill the primary until the cap bites.
+
+Recurring design reflex (third appearance): *degrade policy before the
+resource wall* — AVL's best-fit switch, the deferred throttle midpoint,
+RAM-capped spilling.
+</details>
