@@ -1258,3 +1258,26 @@ Every free path in BlueStore is shaped by that one fear.
 of the Q4 miss (the tracker decides, the freelist records). Flagged for
 capstone re-test.*
 </details>
+
+### A2 ✅ — AvlAllocator: why two trees, and when does first-fit give way to best-fit?
+
+<details markdown="1"><summary>Answer</summary>
+
+Freeing needs *"who are my neighbors?"* — an offset question (merge
+adjacent free chunks). Best-fit needs *"who's the snuggest chunk ≥ N?"* — a
+size question. One sort order can't answer both in O(log n), so every free
+chunk sits in **both trees at once**: `range_tree` (by offset) and
+`range_size_tree` (by size) index the same nodes, updated together.
+
+"First-fit" is really **next-fit with memory**: rolling cursors (one per
+alignment class) resume where the last allocation stopped — consecutive
+allocations land near each other (HDD-friendly), wear spreads across the
+device, and the low-offset region doesn't grind to crumbs.
+
+The switch: best-fit is forced when the largest free chunk <
+`bluestore_avl_alloc_bf_threshold` (128 KiB) **or** free <
+`bluestore_avl_alloc_bf_free_pct` (4%). Plain terms: plenty → speed (take
+the first fit, don't shop); scarcity → thrift (shop the size tree for the
+snuggest match, protect the last big chunks). Same reflex as the throttle
+midpoint: policy changes *before* exhaustion, not at the wall.
+</details>
