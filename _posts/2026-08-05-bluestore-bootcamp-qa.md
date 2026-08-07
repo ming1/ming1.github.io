@@ -1147,3 +1147,37 @@ implements `revert-wal-to-plain` (doc/tool mismatch).
   preallocation vs envelope-discovered payload; the gap is envelope mode
   operating.
 </details>
+
+### FT1 💬 — The cold journal dump shows zero `op_jump`. Why, exactly?
+
+<details markdown="1"><summary>Answer</summary>
+
+`op_jump` is written only by async compaction's Part-1 boundary freeze — so
+its absence ⇔ this journal never compacted (`log_compactions: 0` agrees).
+The trigger math (`_should_start_compact_log_L_N`, :3035): gate 1,
+`log_bytes (468 KiB) >= bluefs_log_compact_min_size (16 MiB)` — fails
+outright; the ratio gate is never consulted. ~34× more journal traffic
+needed. When it gets there, gate 2 passes trivially (state-only estimate
+for 28 files ≈ tens of KiB → ratio ≈ 250 ≫ 5.0): **for normal file
+populations the size gate binds; the ratio gate exists for
+many-thousands-of-files OSDs** where a 16 MiB log might be mostly state.
+Meta-connection: the log grows this slowly *because* envelope mode removed
+per-kv-commit WAL fnode updates — F6's benefit visible as F2's absence.
+</details>
+
+### FT2 💬 — Reconcile 80 links − 53 unlinks with 28 files; and 18 MiB alloc vs 326 KiB REAL on db.wal
+
+<details markdown="1"><summary>Answer</summary>
+
+(i) 80 − 53 = **27 named files**; the 28th fnode is **the journal itself** —
+ino 1, referenced by the superblock, present in no directory. The +1 is its
+signature in any BlueFS accounting. Bonus: `op_file_remove` (30) <
+`op_dir_unlink` (53) — the 23 extras are renames (link new + unlink old, no
+remove): RocksDB's `CURRENT` swaps and WAL recycling, fossilized in the
+histogram.
+
+(ii) 18 MiB = journaled **preallocation** (the skeleton: op_file_update per
+runway extension); 326 KiB REAL = payload actually written, tracked only by
+**envelope discovery**, never journaled. The gap *is* envelope mode
+operating.
+</details>

@@ -202,7 +202,40 @@ final location received the bytes only during replay.
 
 ## Station 4 — BlueFS + RocksDB
 
-*(pending)*
+**Scope:** what BlueFS is (and isn't), journal + compaction, spillover,
+shared-device consistency, the anatomy of a kv sync, envelope mode.
+
+### Grill results
+
+| Q | Topic | Verdict | The settle |
+|---|-------|---------|-----------|
+| F1 | what BlueFS stores / deliberately lacks | ⚠️ | no on-disk namespace, no free-space structure, no data journaling — replay, fnode-derivation, and RocksDB's own CRCs replace them |
+| F2 | journal, compaction need + crash-safe switch | ⚠️ | append-only growth (not SST deletion) is the driver; async compaction = jump op → state snapshot → new chain adopting the live tail → atomic superblock switch |
+| F3 | spillover | ⚠️ | db-tier *new allocations* falling to slow; `bluestore_volume_selection_policy`; `BLUEFS_SPILLOVER` / `bluefs stats` |
+| F4 | shared-device consistency | ❌ | shared *allocator*, not shared freelist; persistent truth split FM vs BlueFS journal, unioned at mount via `init_rm_free` |
+| F5 | anatomy of `submit_transaction_sync` | 💬 assist | WAL append → BlueFS fsync = data flush (+ fnode journal commit in legacy mode) + device barrier; single-device flush elision traced to its origin |
+| F6 | envelope mode | 💬 assist | `[len][data][stamp]` self-describing flushes; appends never dirty the fnode → one sync per kv commit; recovery by stamp-checked envelope indexing |
+
+### Trace on c28
+
+Live `bluefs stats` + a cold `bluefs-log-dump` (438 lines):
+
+```
+3 devices: WAL 1000 MiB / DB 1 GiB / slow 100 GiB  (so the multi-device
+  force_flush path applies here, not the single-device elision)
+28 files: log 4 MiB alloc / 468 KiB real · db.wal 18 MiB alloc / 326 KiB REAL
+  · 26 SSTs+meta on db · db.slow 0 (no spillover) · log_compactions: 0
+journal ops: 1 op_init · 80 op_file_update_inc · 57 op_file_update ·
+  80 op_dir_link · 53 op_dir_unlink · 30 op_file_remove · 4 op_dir_create ·
+  0 op_jump
+```
+
+Readings: zero `op_jump` ⇔ never compacted — the 16 MiB size gate binds at
+34× the current log (and envelope mode is *why* growth is this slow);
+80−53 = 27 named files + the journal's own dirless fnode = 28; the 23
+unlink-without-remove ops are RocksDB renames fossilized; 18 MiB alloc vs
+326 KiB REAL on the WAL is envelope mode operating (journaled skeleton vs
+stamp-discovered payload).
 
 ## Station 5 — Allocation & freelist
 
