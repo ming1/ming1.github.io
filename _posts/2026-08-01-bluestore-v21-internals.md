@@ -3670,6 +3670,46 @@ BlueFS::append_try_flush  <- test_bluefs.cc:298,970,1049,1138,1585
 BlueStore::inject_bluefs_file (BlueStore.cc:12203) <- st,12401
 ```
 
+### BlueFS::_allocate
+
+The single entry point for giving a BlueFS file more raw disk space
+(`BlueFS.cc:4579`): allocate `len` bytes on device `id`, append the resulting
+extents to the fnode, report each to the volume selector via `cb`. Returns 0
+or -ENOSPC. Key points:
+
+- Signature: `_allocate(id, len, alloc_unit, node, cb, alloc_attempts,
+  permit_dev_fallback)`. Takes no BlueFS locks itself - the fnode is
+  protected by the caller's context (file/log lock); the Allocator has its
+  own internal lock. `alloc_unit == 0` means "the device's default".
+- Callers: `_flush_range_F` (file growth on write), `preallocate` (RocksDB
+  `Allocate()`), `_extend_log` (journal growth), log compaction/rewrite,
+  device migration.
+- Contiguity hint: if the fnode's last extent is on the same device, its end
+  offset is passed as the allocator hint; combined with
+  `append_extent()`'s merge of adjacent extents this keeps fnode extent
+  lists (and so journal update ops) short.
+- All-or-nothing per device: a partial allocation (`alloc_len < need`) is
+  released immediately and treated as failure - a BlueFS file never keeps a
+  half-satisfied request from one tier.
+- Two-dimensional fallback ladder on failure, via tail recursion:
+  1. same device, smaller unit: on a device shared with BlueStore, retry
+     with the shared allocator's (smaller) alloc unit - a fragmented main
+     device often can't produce bluefs-sized chunks
+     (`l_bluefs_alloc_shared_size_fallbacks`);
+  2. next device: WAL -> DB -> SLOW with the default unit, if
+     `permit_dev_fallback` (`l_bluefs_alloc_shared_dev_fallbacks`).
+- Cooldown: after a failed large-unit attempt on the shared device,
+  `cooldown_deadline` (conf `bluefs_failed_shared_alloc_cooldown`) makes
+  subsequent allocations skip straight to the shared unit instead of
+  re-probing a fragmented allocator with hopeless large requests each time;
+  the deadline resets lazily via an atomic `fetch_and(0)` when it elapses.
+- Success path bookkeeping: per-device `max_bytes` high-water gauge and
+  `shared_alloc->bluefs_used` accounting (how much of the shared device
+  BlueFS has taken from BlueStore).
+- ENOSPC is fatal on the write path: `_flush_range_F` responds with
+  `ceph_abort_msg("bluefs enospc")` - by then all tiers and units have been
+  tried.
+
 ## 6.11 contexts
 
 ---
