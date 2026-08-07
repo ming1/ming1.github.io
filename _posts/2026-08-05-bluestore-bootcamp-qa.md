@@ -1108,6 +1108,38 @@ WAL-record trick pushed one layer down. Net: one sync per kv commit
 Ops footnote: the option doc says `downgrade-wal-to-v1`; the tool actually
 implements `revert-wal-to-plain` (doc/tool mismatch).
 
+**The plain-language version** (how I'd explain it to someone new):
+
+*The problem.* Normally, when RocksDB appends to its WAL and fsyncs, BlueFS
+must persist two things: the data itself, and the metadata fact "this file
+is now longer" (`fnode.size` in the BlueFS journal). That's two writes +
+two syncs per kv commit — half the fsync budget goes to bookkeeping about
+the other half.
+
+*The trick.* Stop recording the file's length in metadata at all.
+Preallocate the WAL's space up front and make every flush self-describing
+on disk:
+
+```
+[length][ data ][stamp]  [length][ data ][stamp]  [length][ data ][stamp] ...
+```
+
+Each chunk is an "envelope": a u64 length, the payload, and an 8-byte stamp
+unique to this file's incarnation. `fnode.size` never changes on append →
+no journal write → one sync per kv commit.
+
+*Reading without a size.* At open, BlueFS walks the file chunk by chunk:
+read a length, skip the payload, check the stamp. Valid stamp → that flush
+really completed, keep going. Wrong stamp → torn write or leftover garbage
+from whatever previously occupied the space → end of valid data. The file's
+effective size is *discovered*, not stored.
+
+*Why the stamp is the clever bit:* preallocated space is full of old bytes,
+and a bare length field could accidentally look plausible. The
+per-incarnation stamp makes stale data statistically impossible to mistake
+for a real flush — the same role seq+CRC play inside RocksDB's own WAL
+records. Envelope mode is that idea pushed one layer down.
+
 **Follow-up: the full mechanism** (links at v21.3.0):
 
 - **Metadata**: per-file, persisted — `bluefs_fnode_t` gains `encoding`
