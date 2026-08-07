@@ -1107,4 +1107,43 @@ WAL-record trick pushed one layer down. Net: one sync per kv commit
 (~50% fewer fdatasync per the option doc), less BlueFS journal traffic.
 Ops footnote: the option doc says `downgrade-wal-to-v1`; the tool actually
 implements `revert-wal-to-plain` (doc/tool mismatch).
+
+**Follow-up: the full mechanism** (links at v21.3.0):
+
+- **Metadata**: per-file, persisted — `bluefs_fnode_t` gains `encoding`
+  (`PLAIN`/`ENVELOPE`/`ENVELOPE_FIN`,
+  [bluefs_types.h#L38](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluefs_types.h#L38))
+  and `content_size` (#L89) — payload size vs envelope-inclusive `size`; for
+  a live `ENVELOPE` file *neither is trusted* until indexing. Any envelope
+  file bumps the superblock version
+  ([BlueFS.cc#L1302](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.cc#L1302))
+  — old binaries refuse to mount; downgrade converts envelope→plain
+  ([#L2445](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.cc#L2445)).
+- **Stamp**: `generate_stamp(super.uuid, ino)`
+  ([#L2650](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.cc#L2650))
+  — uuid catches a previous OSD life, ino catches previous owners of the
+  recycled blocks.
+- **Write**: length slot reserved via `append_hole` on first append
+  ([#L4235](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.cc#L4235));
+  `_flush_envelope_F`
+  ([#L4038](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.cc#L4038))
+  appends the stamp and back-fills the length — one contiguous write,
+  direct I/O forced (#L4065).
+- **Journal interplay — the point**: appends don't mark the file dirty
+  ([#L4100](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.cc#L4100):
+  "Don't mark regular appends as dirty on envelope files") → fsync skips
+  `_flush_and_sync_log`. Still journaled: creation, **preallocation**
+  (op_file_update per runway extension — the "allocated" number),
+  rename/unlink, and one final size-truthful update at orderly close →
+  `ENVELOPE_FIN` (#L4876). Journal = skeleton; envelopes = pulse.
+- **Recovery**: read requires indexing (`_envmode_index_file`, #L2647):
+  scan from 0 up to `fnode.allocated`, stamp-check each envelope (#L2743);
+  bad stamp = end of data — except below a FIN-confirmed `fnode.size`,
+  where a corrupt envelope gets an artificial replacement (#L2699) so
+  RocksDB's own WAL CRCs adjudicate. `content_size`/`size` recomputed from
+  findings. Truncate asserts `offset == content_size || 0` (#L4359) —
+  RocksDB only truncates at content end.
+- **Observed on c28**: `db.wal 18 MiB allocated / 326 KiB REAL` — journaled
+  preallocation vs envelope-discovered payload; the gap is envelope mode
+  operating.
 </details>
