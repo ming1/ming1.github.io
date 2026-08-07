@@ -1342,4 +1342,37 @@ compaction.
 reconstruct.* Freelist flips, envelope WAL chunks, rebuilt-on-decode use
 trackers — one house style. Mechanics: `XorMergeOperator` registered on the
 `b` prefix; `bluestore_freelist_blocks_per_key` = 128.
+
+**Follow-up I asked: does RocksDB support an XOR operator?** No — RocksDB
+has no built-in XOR; it supports a pluggable *MergeOperator interface*
+(shipping only samples like uint64-add and string-append), and Ceph brings
+its own. The entire operator is ~16 lines
+(`BitmapFreelistManager.cc:32`):
+
+```cpp
+struct XorMergeOperator : public KeyValueDB::MergeOperator {
+  void merge_nonexistent(const char *rdata, size_t rlen, std::string *new_value) override {
+    *new_value = std::string(rdata, rlen);          // 0 ⊕ mask = mask
+  }
+  void merge(const char *ldata, size_t llen,
+             const char *rdata, size_t rlen, std::string *new_value) override {
+    ceph_assert(llen == rlen);
+    *new_value = std::string(ldata, llen);
+    for (size_t i = 0; i < rlen; ++i)
+      (*new_value)[i] ^= rdata[i];                  // the whole trick
+  }
+  const char *name() const override { return "bitwise_xor"; }
+};
+```
+
+Three details: `merge_nonexistent` *is* the "absent key ≡ all zeros"
+sparsity property (folding onto a missing key returns the operand);
+`name()` is a safety contract — RocksDB persists the operator name per
+column family and refuses to open under a different one, so stored
+operands can never be folded with wrong semantics; registration is
+per-prefix, and `BlueStore.cc:8279` registers a *second* merge operator on
+the `T`/statfs prefix (int64-array adder) — statfs deltas stack the same
+blind way. Plain framing: merge = "write a lambda into the database and
+let it run later" — the fold cost moves to reads/compaction, the right
+trade exactly when writes are the hot path.
 </details>
