@@ -1376,3 +1376,40 @@ blind way. Plain framing: merge = "write a lambda into the database and
 let it run later" — the fold cost moves to reads/compaction, the right
 trade exactly when writes are the hot path.
 </details>
+
+### A5 ⚠️ — What does `get_fragmentation_score()` measure, and what are three distinct costs of fragmentation?
+
+<details markdown="1"><summary>Answer</summary>
+
+**The score, plainly:** "if I pick two free bytes at random, how likely are
+they in the same contiguous chunk?" Pristine disk → ≈0; free space as 4 K
+crumbs → ≈1. Computed by walking free ranges with quadratic weighting
+(each extent contributes ~`len·(len+1)/2`), so it answers "can I still get
+big contiguous allocations?" — not "how many pieces exist." Live:
+`ceph daemon osd.N bluestore allocator score block` and
+`... allocator fragmentation histogram`.
+
+**Three costs:**
+
+1. **CPU** — longer tree walks, plus fragmentation flips the allocator's
+   own policy against you: A2's best-fit switch engages (every allocation
+   shops the size tree) and A3's spill starts (bitmap scans), while
+   O(ranges) RAM grows. Slower *and* hungrier as the disk ages.
+2. **Metadata growth** — the sneaky one: one pextent becomes five →
+   PExtentVectors and blob records fatten → shard encodings cross the
+   1200 B max → more shards, re-cuts, spanning blobs → bigger onodes, more
+   KV bytes rewritten per overwrite. Disk fragmentation metastasizes into
+   *metadata* fragmentation, taxing every future access forever.
+3. **I/O pattern** — one logical write chopped across scattered extents =
+   several disk I/Os where one would do; HDD seeks on later sequential
+   reads; and per-extent I/O sizes dropping below `prefer_deferred_size`
+   mean *more* journaling exactly when the disk can least afford
+   double-writes.
+
+The shape of all three: fragmentation's cost is not wasted *space* (BlueStore
+wastes almost none) — it's a **tax on time**. That's why the score tracks
+contiguity, and why "my OSD got slow after two years" so often ends at
+`allocator score`.
+
+*My answer: tree-walking CPU only.*
+</details>
