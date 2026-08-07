@@ -1307,3 +1307,39 @@ Recurring design reflex (third appearance): *degrade policy before the
 resource wall* — AVL's best-fit switch, the deferred throttle midpoint,
 RAM-capped spilling.
 </details>
+
+### A4 💬 — Why is the freelist update an XOR merge operator instead of read-modify-write?
+
+(Asked as a grill question; I requested the explanation — re-test me.)
+
+<details markdown="1"><summary>Answer</summary>
+
+**The problem:** read-modify-write would put a **database read inside the
+write path** — every commit paying a point lookup just for accounting — and
+two txcs in one kv batch touching the same bitmap key would need to see
+each other's uncommitted values. Prepare's speed rests on never reading
+what isn't already in RAM.
+
+**The trick:** allocate and free are both just *bit-flips*, and flipping
+needs no knowledge of the current value. So txcs write *flips*, not
+*states*: each emits a RocksDB **merge operand** ("XOR this mask into that
+key") — blind, no read, no lock. RocksDB folds operands lazily at
+read/compaction time; XOR's associativity makes any fold order correct.
+Ten txcs flipping bits in one key = ten stacked operands, zero conflict.
+Free bonuses: sparsity ("no operands" ≡ initial state — T5's 809 of 20,480
+keys) and symmetry (allocate/free are one code path, `_xor()`).
+
+**The price:** the freelist is *semantically blind* — a double-free is just
+another flip, silently re-toggling state; merge cannot assert what RMW
+could. BlueStore accepts it: the freelist is a recorder, not a validator
+(A1's clerk), and validation moves wholesale to **fsck**, which
+cross-checks the folded bitmap against truth derived from every onode's
+extents. Minor costs: mount-time reads pay the fold; merge traffic feeds
+compaction.
+
+**The deep pattern** (same as envelope mode's discovered-not-stored size):
+*when the write path is hot, record deltas blindly and make reads
+reconstruct.* Freelist flips, envelope WAL chunks, rebuilt-on-decode use
+trackers — one house style. Mechanics: `XorMergeOperator` registered on the
+`b` prefix; `bluestore_freelist_blocks_per_key` = 128.
+</details>
