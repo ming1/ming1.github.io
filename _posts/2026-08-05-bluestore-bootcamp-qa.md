@@ -1213,3 +1213,48 @@ runway extension); 326 KiB REAL = payload actually written, tracked only by
 **envelope discovery**, never journaled. The gap *is* envelope mode
 operating.
 </details>
+
+## Station 5 — Allocation & freelist
+
+The subject in one plain paragraph: BlueStore needs to answer two different
+questions about disk space — *"which free bytes should this write use,
+right now?"* (a speed question, answered from RAM by the **Allocator**) and
+*"after a crash, which bytes were free?"* (a truth question, answered from
+RocksDB by the **FreelistManager**). Keeping them separate lets the fast
+question stay fast and the durable question stay cheap — almost everything
+in this station is a consequence of that split.
+
+### A1 ⚠️ — Place four events (allocate-for-write, free-decision, persist, return-to-allocator) with their component and their moment in the txc lifecycle
+
+<details markdown="1"><summary>Answer</summary>
+
+Plain version — the life of a disk extent through one overwrite: the write
+asks the **Allocator** (RAM): "give me space" — instantly answered. The txc
+writes into RocksDB, via the **FreelistManager**: "these bytes are now
+taken, those others are now free" — the durable *record*. But who *decided*
+those others were free? Not the FreelistManager — it's a clerk: it writes
+down verdicts, it never issues them. The verdict came from the **blob's use
+tracker** (and the shared-blob ref_map if cloned): "no extent references
+these bytes anymore." And finally, much later, someone tells the Allocator
+"you may hand these bytes out again" — deliberately *last*, after the
+commit is durable *and* any deferred writes aimed at those bytes have
+landed.
+
+| Event | Component | When in the txc lifecycle |
+|---|---|---|
+| allocate-for-write | **Allocator** (`allocate()`) | prepare, `_do_alloc_write` — thread ① |
+| free-*decision* | **use tracker / SharedBlob ref_map** — *not* FM | prepare, `punch_hole → put_ref` |
+| persist both facts | **FreelistManager** (`allocate()`/`release()` ops into the txc's kv txn) | rides the same `submit_transaction_sync` as everything else |
+| return-to-allocator | **Allocator** (`release()`) | `_txc_release_alloc` in `_txc_finish` — *after* DONE, delayed past deferred stability (X4/X5's fence) |
+
+The asymmetry to memorize: **allocation is Allocator-first, FM-second;
+freeing is FM-first, Allocator-last.** Taking space can be optimistic — a
+lost in-memory allocation after a crash is harmless (X5 showed why). Giving
+space back must be pessimistic: handing bytes out while old metadata or an
+in-flight deferred write still references them is the corruption jackpot.
+Every free path in BlueStore is shaped by that one fear.
+
+*My mistake: assigned the free-decision to the FreelistManager — a repeat
+of the Q4 miss (the tracker decides, the freelist records). Flagged for
+capstone re-test.*
+</details>
