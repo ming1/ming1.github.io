@@ -880,11 +880,27 @@ O  <ghobject key>'o' 00 3e 00 00 'x'          shard 2: logical 0x3e0000, 212 B
 
 Each shard record's key is the full onode key plus the shard's logical
 start offset as a BE u32 plus `'x'` (§4.5); its value is the bare §5.3
-payload encoding the extents of [its offset, the next shard's offset) —
-shard 1's 500 bytes, for example, encode the 31 extents in
-[0x1f0000, 0x3e0000). The observed cut points fall every 31 extents
-(498–500 encoded bytes, just under the 500-byte target); 0x1f0000 = 31 ×
-the 64 KiB stride.
+payload encoding the extents of [its offset, the next shard's offset).
+The observed cut points fall every 31 extents (498–500 encoded bytes,
+just under the 500-byte target); 0x1f0000 = 31 × the 64 KiB stride:
+
+```
+ object logical space (size 0x4a1000)
+ 0x0                 0x1f0000              0x3e0000          0x4a1000
+  |                     |                     |                  |
+  |<-- extents 0..30 -->|<-- extents 31..61 ->|<- extents 62..74 >|
+  |     31 extents      |     31 extents      |    13 extents     |
+  +---------------------+---------------------+-------------------+
+            |                     |                     |
+            v                     v                     v
+   ..'o' 00 00 00 00 'x'  ..'o' 00 1f 00 00 'x'  ..'o' 00 3e 00 00 'x'
+         498 B                  500 B                  212 B
+
+   ..'o'  onode, 368 B
+          shard_info[] = {(0x0, 498), (0x1f0000, 500), (0x3e0000, 212)}
+          fault_range() consults this index and reads only the shards a
+          request touches; .bytes sizes the read before it is issued
+```
 
 The 368-byte onode value ends without an inline-map section — its tail
 bytes:
@@ -899,16 +915,15 @@ bytes:
 02 00                 spanning blobs: v=2, count=0   -- nothing follows
 ```
 
-Three contrasts with the inline form:
+Against the inline form:
 
-* the onode value ends at the spanning-blob section — there is no third
-  section;
-* a shard value is the bare §5.3 payload with no le32 length prefix: the
-  writer stores the raw `encode_some()` output, and the reader asserts
-  the KV value length equals `shard_info.bytes`;
-* the spanning count is 0 even though the map is sharded: every blob here
-  is 4 KiB referenced by a single extent, so no blob crosses a cut
-  (§5.2 — see §5.4.3 for one that does).
+| | inline (§5.4.1) | sharded (§5.4.2) |
+|---|---|---|
+| records per object | 1 | 4: onode + 3 shards |
+| extent map stored in | section 3 of the `O` value | separate `'x'` records (§4.5) |
+| map length prefix | le32 before the payload | none — the length is `shard_info.bytes`, which the reader asserts against the KV value length |
+| `extent_map_shards` | empty | 3 entries |
+| spanning section | `02 00`, empty | `02 00`, still empty — every blob is one 4 KiB extent, so none crosses a cut (§5.4.3 shows one that does) |
 
 Shard 0's 498-byte value is a 2-byte header plus 31 records of exactly
 16 bytes:
@@ -957,8 +972,16 @@ byte-for-byte copies of extent 1.
 
 Every write carried the same 4 KiB payload, so all 75 blobs share one
 crc32c (`0x90f56d6c`) and the records repeat byte-for-byte except for the
-advancing lba words — which step by exactly 4096: the logically
-64 KiB-strided writes were allocated physically contiguous.
+advancing lba words — which step by exactly 4096, so the logically
+strided writes landed physically contiguous:
+
+```
+ logical   0x0          0x10000      0x20000        (64 KiB stride)
+           [4K]  ....   [4K]  ....   [4K]
+             |            |            |
+             v            v            v
+ physical  0x69b000    0x69c000     0x69d000        (4 KiB apart)
+```
 
 The same state dependence sets the shard sizes. A shard's decode position
 starts at 0, so shard 0's first record opens `03 07` (CONTIGUOUS, length)
@@ -1071,15 +1094,16 @@ ff ff ff ff ff ff ff ff ff 01  07   pextent[0]: lba INVALID_OFFSET
 
 The entry length reconciles exactly:
 
-| Part | Bytes |
-|---|---|
-| blob_id + pextent count | 2 |
-| 8 holes × 11 B + 8 real × 5 B | 128 |
-| flags | 1 |
-| csum header (3) + 64 B array | 67 |
-| sbid | 8 |
-| use tracker (`80 20 10` + 8 × 1 B + 8 × 2 B) | 27 |
-| **total** | **233** |
+```
+ +------+------+--------------------+-------+------------+--------+-----------+
+ | id   | cnt  | 16 pextents        | flags | csum       | sbid   | tracker   |
+ | 00   | 10   | 8 holes x 11 B     |  14   | 04 0c 40   | le64   | 80 20 10  |
+ |      |      | 8 real  x  5 B     |       | + 64 B     |        | + 8x1 B   |
+ |      |      |                    |       |            |        | + 8x2 B   |
+ +------+------+--------------------+-------+------------+--------+-----------+
+    1 B    1 B         128 B           1 B      67 B        8 B       27 B
+                                                            total = 233 B
+```
 
 The blob's original 64 KiB allocation was contiguous; the overwrites
 released every other 4 KiB block, leaving eight real pextents at 8 KiB
@@ -1087,31 +1111,59 @@ stride interleaved with eight holes. The tracker mirrors this: alternating
 0 and 4096 referenced bytes per allocation unit. Both are persisted only
 because the blob is spanning (§5.2).
 
-Why this blob spans: it covers logical [0x10000, 0x20000), and the shard 1
-cut at 0x15000 falls inside that range, so its eight surviving fragments
-are referenced from two different shards — two in shard 0, six in
-shard 1. `BLOBID_FLAG_SPANNING` (bit 3) is set and bits 4+ carry the id
-(§5.3):
+Why this blob spans: it covers logical [0x10000, 0x20000) — window 1 —
+and the shard 1 cut at 0x15000 falls inside that range. Each 64 KiB
+window holds one shared blob, and the overwrites took every other 4 KiB
+block:
 
 ```
-shard 0 (21 extents; 3 inline blobs, 16 back-references, 2 spanning refs)
-  [17] logical 0x11000  blob_off 0x1000   0d 07
-  [19] logical 0x13000  blob_off 0x3000   0d 0f
-        0x0d = CONTIGUOUS|SAMELENGTH|SPANNING, id = 0x0d >> 4 = 0;
-        the single following byte is the blob_offset (varint_lowz)
+ 4 windows, one clone-shared blob each; cuts at 0x15000 and 0x30000
+ 0x0             0x10000    |    0x20000        0x30000  |      0x40000
+ |   window 0    | window 1 |     window 1/2   | window 2 | window 3
+ |<--------- shard 0 ------>|<-------- shard 1 --------->|<- shard 2 ->|
+      21 extents                   27 extents               16 extents
 
-shard 1 (27 extents; 3 inline blobs, 18 back-references, 6 spanning refs)
-  [ 0] logical 0x15000  blob_off 0x5000   08 57 17 07
-        0x08 = SPANNING only: gap 0x15000 (absolute — a shard's decode
-        position starts at 0), blob_offset 0x5000, length 0x1000
-  [ 2] logical 0x17000  blob_off 0x7000   0d 1f
-  [ 4] logical 0x19000  blob_off 0x9000   0d 27
-  [ 6] logical 0x1b000  blob_off 0xb000   0d 2f
-  [ 8] logical 0x1d000  blob_off 0xd000   0d 37
-  [10] logical 0x1f000  blob_off 0xf000   0d 3f
-
-shard 2 (16 extents): no spanning references
+ window 1 in detail (4 KiB blocks; H = head overwrite, S = shared blob)
+                                    shard 0 | shard 1
+ logical 0x10000                            |                   0x20000
+ block      0     1     2     3     4       |  5     6    ...  14    15
+ owner      H     S     H     S     H       |  S     H    ...   H     S
+ S at                0x1000    0x3000       |  0x5000     ...       0xf000
+ blob_off            \____________/          \______________________/
+                     2 refs from shard 0      6 refs from shard 1
 ```
+
+Referenced from two shards, the blob cannot be encoded locally in either;
+being `FLAG_SHARED` it also cannot be split, so it is promoted.
+`BLOBID_FLAG_SPANNING` (bit 3) is set in the referring records and bits
+4+ carry the id (§5.3):
+
+Shard composition:
+
+| Shard | Extents | inline blobs | back-references | spanning refs |
+|---|---|---|---|---|
+| 0 | 21 | 3 | 16 | 2 |
+| 1 | 27 | 3 | 18 | 6 |
+| 2 | 16 | 2 | 14 | 0 |
+
+The eight references to blob id 0, with their complete record bytes:
+
+| Shard | Record | logical | blob_offset | Bytes |
+|---|---|---|---|---|
+| 0 | [17] | 0x11000 | 0x1000 | `0d 07` |
+| 0 | [19] | 0x13000 | 0x3000 | `0d 0f` |
+| 1 | [0] | 0x15000 | 0x5000 | `08 57 17 07` |
+| 1 | [2] | 0x17000 | 0x7000 | `0d 1f` |
+| 1 | [4] | 0x19000 | 0x9000 | `0d 27` |
+| 1 | [6] | 0x1b000 | 0xb000 | `0d 2f` |
+| 1 | [8] | 0x1d000 | 0xd000 | `0d 37` |
+| 1 | [10] | 0x1f000 | 0xf000 | `0d 3f` |
+
+`0x0d` = CONTIGUOUS | SAMELENGTH | SPANNING with id `0x0d >> 4` = 0, so a
+single `varint_lowz` blob_offset byte completes the record. Shard 1's
+first record instead carries `0x08` — SPANNING alone — and therefore
+spells out gap 0x15000 (absolute, since a shard's decode position starts
+at 0), blob_offset 0x5000 and length 0x1000.
 
 A contiguous, same-length spanning reference costs two bytes. The skipped
 indices are the head's own data: within each window the records alternate
