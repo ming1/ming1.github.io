@@ -981,19 +981,27 @@ shard's 292 (2 + 18 + 17 × 16).
 ### 5.4.3 Spanning blobs: 256 KiB cloned object, 8 KiB-stride overwrites
 
 A blob crossing a shard cut is not promoted automatically. During reshard
-a crossing blob is **split** whenever `can_split()` and
-`can_split_at(blob_offset)` both hold; only an unsplittable blob becomes
-spanning ([`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc),
-reshard → `split_blob()`). `can_split()` excludes exactly `FLAG_SHARED`,
-`FLAG_COMPRESSED` and `FLAG_HAS_UNUSED` blobs (§6.2), so an ordinary
-mutable blob is always split instead — which is why the §5.4.2 object,
-built from mutable blobs, reports a spanning count of 0 even though it has
-five shards.
+a crossing blob is **split** when `Blob::can_split()` and
+`Blob::can_split_at(blob_offset)` both hold, and promoted to spanning
+(`_make_spanning()`) only when either test fails
+([`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc)).
+Each test has two halves
+([`src/os/bluestore/BlueStore.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h)):
 
-This specimen uses clone-shared blobs. A 256 KiB object is written, a pool
-snapshot taken, then 32 overwrites at 8 KiB stride both fragment the
-extent map past the sharding threshold and mark the touched blobs
-`FLAG_SHARED`:
+| Test | blob half | use-tracker half |
+|---|---|---|
+| `can_split()` | not `FLAG_SHARED`, `FLAG_COMPRESSED` or `FLAG_HAS_UNUSED` (§6.2) | tracker is per-AU (`num_au > 0`, §6.4) |
+| `can_split_at()` | offset is csum-chunk aligned | offset is AU-aligned and within the tracker |
+
+Both outcomes occur at the same cut in this specimen: the head's own
+mutable blob is split there, while the clone-shared blob covering the same
+window fails the first test and is promoted.
+
+This specimen uses clone-shared blobs. A 256 KiB object is written and a
+pool snapshot taken; the first write afterwards clones the whole object,
+converting all four of its 64 KiB blobs to `FLAG_SHARED` in one operation
+(`_do_clone_range()` → `make_blob_shared()`). The 32 overwrites that
+follow fragment the extent map past the sharding threshold:
 
 ```
 $ rados -p p1 put sp256 /root/obj_256               # 256 KiB -> 64 KiB blobs
@@ -1004,7 +1012,8 @@ $ for w in 0 1 2 3; do for j in $(seq 0 7); do
 ```
 
 The head object (`snap` = `CEPH_NOSNAP`; the clone sorts first under its
-lower snap id, §4.4) occupies five records in total:
+lower snap id, §4.4) is described by eight records — four under `O`, plus
+one `X` record per shared blob:
 
 | Record | Key | Value |
 |---|---|---|
@@ -1012,15 +1021,23 @@ lower snap id, §4.4) occupies five records in total:
 | shard 0 | `<ghobject>'o' 00 00 00 00 'x'` | 494 B |
 | shard 1 | `<ghobject>'o' 00 01 50 00 'x'` | 583 B |
 | shard 2 | `<ghobject>'o' 00 03 00 00 'x'` | 423 B |
-| shared blob | `X` + BE u64 61442 | 56 B |
+| shared blobs | `X` + BE u64 `00 00 00 00 00 00 f0 01` … `f0 04` | 56 B each |
+
+The four sbids 61441–61444 are one per 64 KiB window, assigned in order by
+the clone. Only 61442 belongs to the spanning blob; the other three are
+equally shared but keep all their extents inside a single shard, so
+sharing alone does not promote a blob — crossing a cut does.
 
 Onode value, 1166 B = 6 B frame + 925 B onode struct + 235 B spanning
 section, with no third section (the map is sharded):
 
 ```
-02 01 9d 03 00 00   DENC: struct_v 2, compat 1, payload 0x39d (925)
-                    nid 6161, size 262144, flags 0x00
-                    attrs: "_" 264 B, "snapset" 603 B  (OSD payloads)
+02 01 9d 03 00 00   DENC frame: struct_v 2, compat 1, payload 0x39d (925)
+91 30               nid = 6161                             (varint)
+80 80 10            size = 262144                          (varint)
+02 00 00 00         attrs: le32 count = 2
+                      "_" 264 B, "snapset" 603 B — OSD payloads
+00                  flags = 0x00
 03 00 00 00         extent_map_shards: le32 count = 3
 00        ee 03     shard_info[0]: offset 0x0,     bytes 494
 80 a0 05  c7 04     shard_info[1]: offset 0x15000, bytes 583
@@ -1099,10 +1116,10 @@ shard 1 (27 extents; 3 inline blobs, 18 back-references, 6 spanning refs)
 shard 2 (16 extents): no spanning references
 ```
 
-A contiguous, same-length spanning reference costs two bytes. Sharing
-alone does not promote a blob: shard 0 and shard 2 each define
-`FLAG_SHARED` blobs inline (flags 0x14) that stay local because all their
-extents fall within one shard.
+A contiguous, same-length spanning reference costs two bytes. The skipped
+indices are the head's own data: within each window the records alternate
+between a spanning reference to the shared blob and a back-reference to
+the local blob holding the new 4 KiB writes.
 
 The `X` record for `sbid` 61442 (§6.5), key `BE u64` 0x000000000000f002:
 
