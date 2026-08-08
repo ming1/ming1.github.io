@@ -1011,17 +1011,22 @@ Each test has two halves
 | Test | blob half | use-tracker half |
 |---|---|---|
 | `can_split()` | not `FLAG_SHARED`, `FLAG_COMPRESSED` or `FLAG_HAS_UNUSED` (§6.2) | tracker is per-AU (`num_au > 0`, §6.4) |
-| `can_split_at()` | offset is csum-chunk aligned | offset is AU-aligned and within the tracker |
+| `can_split_at()` | no checksums, or offset is csum-chunk aligned | offset is AU-aligned and within the tracker |
 
-Both outcomes occur at the same cut in this specimen: the head's own
-mutable blob is split there, while the clone-shared blob covering the same
-window fails the first test and is promoted.
+Both outcomes occur at the same cut in this specimen. The head's own
+mutable blob for window 1 is split at 0x15000 into the two halves visible
+in the shards — shard 0's record [16] holds 5 pextents (3 real: blocks
+16, 18, 20) and shard 1's record [1] holds 10 (5 real: blocks 22–30) —
+while the clone-shared blob covering the same window fails the first test
+and is promoted instead.
 
 This specimen uses clone-shared blobs. A 256 KiB object is written and a
-pool snapshot taken; the first write afterwards clones the whole object,
-converting all four of its 64 KiB blobs to `FLAG_SHARED` in one operation
-(`_do_clone_range()` → `make_blob_shared()`). The 32 overwrites that
-follow fragment the extent map past the sharding threshold:
+pool snapshot taken. The first of the 32 overwrites that follow triggers
+the clone of the whole object, which converts all four of its 64 KiB
+blobs to `FLAG_SHARED` (`_do_clone_range()` → `dup_esb()` →
+`make_blob_shared()`; `dup_esb` is the default path since
+`bluestore_elastic_shared_blobs` is true). The 32 overwrites together
+fragment the extent map past the sharding threshold:
 
 ```
 $ rados -p p1 put sp256 /root/obj_256               # 256 KiB -> 64 KiB blobs
@@ -1122,14 +1127,17 @@ cut at block 21 lands inside a window:
           |-------|-------|-------|-------|-------|-------|-------|-------
  owner    HSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHS
  window   [-- window 0 --][-- window 1 --][-- window 2 --][-- window 3 --]
- blob     [-- S0 61441 --][-- S1 61442 --][-- S2 61443 --][-- S3 61444 --]
+ head     [--- head 0 ---][h1a][-- h1b --][--- head 2 ---][--- head 3 ---]
+ shared   [---- 61441 ---][---- 61442 ---][---- 61443 ---][---- 61444 ---]
  shard    [----- shard 0 -----][-------- shard 1 --------][--- shard 2 --]
                                ^                          ^
                           cut 0x15000                cut 0x30000
                           (block 21)                 (block 48)
 
- H = 4 KiB overwritten by the head, in its own blob
- S = 4 KiB still referenced from the clone-shared blob of that window
+ H = 4 KiB overwritten by the head; a window's eight H blocks share one
+     head blob (head 0, head 2, head 3 — and h1a/h1b, see below)
+ S = 4 KiB still referenced from that window's clone-shared blob, named
+     here by its sbid
 ```
 
 | Window | Blocks | sbid | S fragments | Shards holding them | Result |
@@ -1142,13 +1150,17 @@ cut at block 21 lands inside a window:
 Window 1's blob is referenced from two shards, so it cannot be encoded
 locally in either; being `FLAG_SHARED` it also cannot be split, so it is
 promoted. The other three blobs are equally shared but sit wholly inside
-one shard, so they stay inline — the cut at block 48 changes nothing
-because it coincides with a window boundary.
+one shard, so they stay inline. The cut at block 48 promotes nothing
+because it coincides with a window boundary, though it still resets the
+encoder: shard 2's first record can use neither CONTIGUOUS nor
+SAMELENGTH.
 
 `BLOBID_FLAG_SPANNING` (bit 3) is set in the referring records and bits
-4+ carry the id (§5.3):
+4+ carry the id (§5.3).
 
-Shard composition:
+Each shard resolves its extents three ways — blobs defined inline,
+back-references within the shard, and spanning references into the onode
+table:
 
 | Shard | Extents | inline blobs | back-references | spanning refs |
 |---|---|---|---|---|
@@ -1160,14 +1172,14 @@ The eight references to blob id 0, with their complete record bytes:
 
 | Shard | Record | logical | blob_offset | Bytes |
 |---|---|---|---|---|
-| 0 | [17] | 0x11000 | 0x1000 | `0d 07` |
-| 0 | [19] | 0x13000 | 0x3000 | `0d 0f` |
-| 1 | [0] | 0x15000 | 0x5000 | `08 57 17 07` |
-| 1 | [2] | 0x17000 | 0x7000 | `0d 1f` |
-| 1 | [4] | 0x19000 | 0x9000 | `0d 27` |
-| 1 | [6] | 0x1b000 | 0xb000 | `0d 2f` |
-| 1 | [8] | 0x1d000 | 0xd000 | `0d 37` |
-| 1 | [10] | 0x1f000 | 0xf000 | `0d 3f` |
+| 0 | `[17]` | 0x11000 | 0x1000 | `0d 07` |
+| 0 | `[19]` | 0x13000 | 0x3000 | `0d 0f` |
+| 1 | `[0]` | 0x15000 | 0x5000 | `08 57 17 07` |
+| 1 | `[2]` | 0x17000 | 0x7000 | `0d 1f` |
+| 1 | `[4]` | 0x19000 | 0x9000 | `0d 27` |
+| 1 | `[6]` | 0x1b000 | 0xb000 | `0d 2f` |
+| 1 | `[8]` | 0x1d000 | 0xd000 | `0d 37` |
+| 1 | `[10]` | 0x1f000 | 0xf000 | `0d 3f` |
 
 `0x0d` = CONTIGUOUS | SAMELENGTH | SPANNING with id `0x0d >> 4` = 0, so a
 single `varint_lowz` blob_offset byte completes the record. Shard 1's
@@ -1176,9 +1188,9 @@ spells out gap 0x15000 (absolute, since a shard's decode position starts
 at 0), blob_offset 0x5000 and length 0x1000.
 
 A contiguous, same-length spanning reference costs two bytes. The skipped
-indices are the head's own data: within each window the records alternate
-between a spanning reference to the shared blob and a back-reference to
-the local blob holding the new 4 KiB writes.
+indices are the head's own 4 KiB writes: through window 1 the records
+alternate between a spanning reference and the head blob — inline where
+that blob first appears in the shard, a back-reference thereafter.
 
 The `X` record for `sbid` 61442 (§6.5), key `BE u64` 0x000000000000f002:
 
