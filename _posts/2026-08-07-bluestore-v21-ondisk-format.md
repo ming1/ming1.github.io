@@ -1111,30 +1111,40 @@ stride interleaved with eight holes. The tracker mirrors this: alternating
 0 and 4096 referenced bytes per allocation unit. Both are persisted only
 because the blob is spanning (§5.2).
 
-Why this blob spans: it covers logical [0x10000, 0x20000) — window 1 —
-and the shard 1 cut at 0x15000 falls inside that range. Each 64 KiB
-window holds one shared blob, and the overwrites took every other 4 KiB
-block:
+Why this blob spans: the script overwrites 4 KiB at every 8 KiB boundary,
+so across the whole object the head owns every even 4 KiB block and the
+clone-shared blobs retain every odd one. Each 64 KiB window has its own
+shared blob, but the shard cuts fall at blocks 21 and 48 — and only the
+cut at block 21 lands inside a window:
 
 ```
- 4 windows, one clone-shared blob each; cuts at 0x15000 and 0x30000
- 0x0             0x10000    |    0x20000        0x30000  |      0x40000
- |   window 0    | window 1 |     window 1/2   | window 2 | window 3
- |<--------- shard 0 ------>|<-------- shard 1 --------->|<- shard 2 ->|
-      21 extents                   27 extents               16 extents
+          0       8       16      24      32      40      48      56     63
+          |-------|-------|-------|-------|-------|-------|-------|-------
+ owner    HSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHS
+ window   [-- window 0 --][-- window 1 --][-- window 2 --][-- window 3 --]
+ blob     [-- S0 61441 --][-- S1 61442 --][-- S2 61443 --][-- S3 61444 --]
+ shard    [----- shard 0 -----][-------- shard 1 --------][--- shard 2 --]
+                               ^                          ^
+                          cut 0x15000                cut 0x30000
+                          (block 21)                 (block 48)
 
- window 1 in detail (4 KiB blocks; H = head overwrite, S = shared blob)
-                                    shard 0 | shard 1
- logical 0x10000                            |                   0x20000
- block      0     1     2     3     4       |  5     6    ...  14    15
- owner      H     S     H     S     H       |  S     H    ...   H     S
- S at                0x1000    0x3000       |  0x5000     ...       0xf000
- blob_off            \____________/          \______________________/
-                     2 refs from shard 0      6 refs from shard 1
+ H = 4 KiB overwritten by the head, in its own blob
+ S = 4 KiB still referenced from the clone-shared blob of that window
 ```
 
-Referenced from two shards, the blob cannot be encoded locally in either;
-being `FLAG_SHARED` it also cannot be split, so it is promoted.
+| Window | Blocks | sbid | S fragments | Shards holding them | Result |
+|---|---|---|---|---|---|
+| 0 | 0–15 | 61441 | 8 (odd blocks 1–15) | shard 0 | inline, local |
+| 1 | 16–31 | 61442 | 8 (odd blocks 17–31) | shards 0 **and** 1 | **spanning** |
+| 2 | 32–47 | 61443 | 8 (odd blocks 33–47) | shard 1 | inline, local |
+| 3 | 48–63 | 61444 | 8 (odd blocks 49–63) | shard 2 | inline, local |
+
+Window 1's blob is referenced from two shards, so it cannot be encoded
+locally in either; being `FLAG_SHARED` it also cannot be split, so it is
+promoted. The other three blobs are equally shared but sit wholly inside
+one shard, so they stay inline — the cut at block 48 changes nothing
+because it coincides with a window boundary.
+
 `BLOBID_FLAG_SPANNING` (bit 3) is set in the referring records and bits
 4+ carry the id (§5.3):
 
