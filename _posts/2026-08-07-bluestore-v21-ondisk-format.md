@@ -877,9 +877,13 @@ O  <ghobject key>'o' 00 63 00 00 'x'          shard 3: logical 0x630000, 532 B
 O  <ghobject key>'o' 00 84 00 00 'x'          shard 4: logical 0x840000, 292 B
 ```
 
-The observed cut points fall every 33 extents (530–532 encoded bytes,
-slightly above target); the BE u32 in each key is the shard's logical
-start (0x210000 = 33 × 64 KiB stride).
+Each shard record's key is the full onode key plus the shard's logical
+start offset as a BE u32 plus `'x'` (§4.5); its value is the bare §5.3
+payload encoding the extents of [its offset, the next shard's offset) —
+shard 1's 532 bytes, for example, encode the 33 extents in
+[0x210000, 0x420000). The observed cut points fall every 33 extents
+(530–532 encoded bytes, slightly above target); 0x210000 = 33 × the
+64 KiB stride.
 
 The 382-byte onode value now ends without an inline-map section — its
 tail bytes:
