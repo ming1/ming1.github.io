@@ -1029,8 +1029,11 @@ section, with no third section (the map is sharded):
 00 00 00 00         zone_offset_refs: 0
 ```
 
-The two xattrs are 867 of the 925 bytes; BlueStore's own onode fields are
-the remaining ~58.
+The 925 bytes account exactly: 867 of xattr values (264 + 603), 28 of
+xattr framing (the le32 attr count, plus a le32 name length, the name, and
+a le32 value length per attr), and 30 of BlueStore's own fields — nid 2,
+size 3, flags 1, the 17 shard_info bytes shown above, three hint varints,
+and the zone_offset_refs count.
 
 Spanning section — one entry, and 235 = 2 + 233:
 
