@@ -849,14 +849,14 @@ The 30 inline bytes, annotated (§5.3 + §6.3 layouts; cross-checked against
                 4 x le32 crc32c, one per 4 KiB chunk
 ```
 
-### 5.4.2 Sharded form: 150 discontiguous 4 KiB writes
+### 5.4.2 Sharded form: 75 discontiguous 4 KiB writes
 
-Created with 150 strided single-block writes, each becoming its own blob:
+Created with 75 strided single-block writes, each becoming its own blob:
 
 ```
-$ for i in $(seq 0 149); do
+$ for i in $(seq 0 74); do
     rados -p p1 put sharded /root/4k --offset $((i * 65536))
-  done                                  # object size 9768960
+  done                                  # object size 4853760
 ```
 
 Sharding triggers when the encoded inline map exceeds
@@ -866,40 +866,37 @@ then cuts shards sized toward `bluestore_extent_map_shard_target_size`
 shards that fall below `bluestore_extent_map_shard_min_size` (150) become
 merge candidates
 ([`src/common/options/global.yaml.in`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in)).
-150 extents at ~16 B each is far past the threshold; the result is one
-onode record plus five shard records (`ceph-kvstore-tool ... list O`,
-shared ghobject prefix abbreviated):
+At 16 B per record, 75 writes is the smallest count that crosses the
+threshold (2 + 75 × 16 = 1202), and it yields one onode record plus three
+shard records (`ceph-kvstore-tool ... list O`, shared ghobject prefix
+abbreviated):
 
 ```
-O  <ghobject key>'o'                          onode, 382 B
-O  <ghobject key>'o' 00 00 00 00 'x'          shard 0: logical 0x0,      530 B
-O  <ghobject key>'o' 00 21 00 00 'x'          shard 1: logical 0x210000, 532 B
-O  <ghobject key>'o' 00 42 00 00 'x'          shard 2: logical 0x420000, 532 B
-O  <ghobject key>'o' 00 63 00 00 'x'          shard 3: logical 0x630000, 532 B
-O  <ghobject key>'o' 00 84 00 00 'x'          shard 4: logical 0x840000, 292 B
+O  <ghobject key>'o'                          onode, 368 B
+O  <ghobject key>'o' 00 00 00 00 'x'          shard 0: logical 0x0,      498 B
+O  <ghobject key>'o' 00 1f 00 00 'x'          shard 1: logical 0x1f0000, 500 B
+O  <ghobject key>'o' 00 3e 00 00 'x'          shard 2: logical 0x3e0000, 212 B
 ```
 
 Each shard record's key is the full onode key plus the shard's logical
 start offset as a BE u32 plus `'x'` (§4.5); its value is the bare §5.3
 payload encoding the extents of [its offset, the next shard's offset) —
-shard 1's 532 bytes, for example, encode the 33 extents in
-[0x210000, 0x420000). The observed cut points fall every 33 extents
-(530–532 encoded bytes, slightly above target); 0x210000 = 33 × the
-64 KiB stride.
+shard 1's 500 bytes, for example, encode the 31 extents in
+[0x1f0000, 0x3e0000). The observed cut points fall every 31 extents
+(498–500 encoded bytes, just under the 500-byte target); 0x1f0000 = 31 ×
+the 64 KiB stride.
 
-The 382-byte onode value now ends without an inline-map section — its
-tail bytes:
+The 368-byte onode value ends without an inline-map section — its tail
+bytes:
 
 ```
-05 00 00 00            extent_map_shards: le32 count = 5
-00           92 04     shard_info[0]: offset varint 0x0,      bytes varint 530
-80 80 84 01  94 04     shard_info[1]: offset 0x210000, bytes 532
-80 80 88 02  94 04     shard_info[2]: offset 0x420000, bytes 532
-80 80 8c 03  94 04     shard_info[3]: offset 0x630000, bytes 532
-80 80 90 04  a4 02     shard_info[4]: offset 0x840000, bytes 292
-00 00 00               expected_object_size/write_size/hint: varint 0 x3
-00 00 00 00            zone_offset_refs: 0
-02 00                  spanning blobs: v=2, count=0   -- nothing follows
+03 00 00 00           extent_map_shards: le32 count = 3
+00           f2 03    shard_info[0]: offset 0x0,      bytes 498
+80 80 7c     f4 03    shard_info[1]: offset 0x1f0000, bytes 500
+80 80 f8 01  d4 01    shard_info[2]: offset 0x3e0000, bytes 212
+00 00 00              expected_object_size/write_size/hint: varint 0 x3
+00 00 00 00           zone_offset_refs: 0
+02 00                 spanning blobs: v=2, count=0   -- nothing follows
 ```
 
 Three contrasts with the inline form:
@@ -911,38 +908,33 @@ Three contrasts with the inline form:
   the KV value length equals `shard_info.bytes`;
 * the spanning count is 0 even though the map is sharded: every blob here
   is 4 KiB referenced by a single extent, so no blob crosses a cut
-  (§5.2).
+  (§5.2 — see §5.4.3 for one that does).
 
-Shard 0's 530-byte value is a 2-byte header plus 33 records of exactly
+Shard 0's 498-byte value is a 2-byte header plus 31 records of exactly
 16 bytes:
 
 ```
 02              struct_v 2
-21              n = 33 extents
+1f              n = 31 extents
 -- extent 0 --
 03              blobid: CONTIGUOUS|ZEROOFFSET, inline blob follows
 07              length = 4096          (varint_lowz)
-01 48 20 03 00  blob: 1 pextent, lba word 0x00032048 -> device offset 419577856
+01 36 0d 00 00  blob: 1 pextent, lba word 0x00000d36 -> device offset 0x69b000
 07              pextent length = 4096
 04 04 0c 04     flags CSUM; csum_type crc32c; chunk order 12; csum len 4
 6c 6d f5 90     crc32c of the 4 KiB chunk
 -- extent 1 --
 06              blobid: ZEROOFFSET|SAMELENGTH (length omitted)
 3f              gap = 61440 (60 KiB)   (varint_lowz; the 64 KiB stride
-01 4a 20 03 00                          minus the 4 KiB write)
-07 04 04 0c 04
+01 38 0d 00 00                          minus the 4 KiB write)
+07 04 04 0c 04  lba word 0x00000d38 -> 0x69c000 (+4096)
 6c 6d f5 90
 -- extent 2 --
 06 3f           blobid + gap as above
-01 4c 20 03 00  lba word 0x0003204c -> device offset 419586048 (+4096)
+01 3a 0d 00 00  lba word 0x00000d3a -> 0x69d000 (+4096)
 07 04 04 0c 04
 6c 6d f5 90
--- extent 3 --
-06 3f
-01 4e 20 03 00  lba word 0x0003204e -> device offset 419590144 (+4096)
-07 04 04 0c 04
-6c 6d f5 90
--- ... 29 more records of the same shape --
+-- ... 28 more records of the same shape --
 ```
 
 Extents 0 and 1 map identical 4 KiB writes yet encode differently,
@@ -963,20 +955,25 @@ encode to exactly 16 bytes. From extent 1 onward the relative situation
 repeats (same gap, same length), so the remaining records are
 byte-for-byte copies of extent 1.
 
-Every write carried the same 4 KiB payload, so all 150 blobs share one
+Every write carried the same 4 KiB payload, so all 75 blobs share one
 crc32c (`0x90f56d6c`) and the records repeat byte-for-byte except for the
-advancing lba words — which step by exactly 4096: the 150 logically
+advancing lba words — which step by exactly 4096: the logically
 64 KiB-strided writes were allocated physically contiguous.
 
-The same state dependence sets the shard sizes: shards 1–3 encode 532
-bytes against shard 0's 530 because
-the encoder's logical position starts at 0 within each shard, so shard
-0's first record opens `03 07` (CONTIGUOUS, length) while a later shard's
-first record opens with blobid `02`, a 2-byte `varint_lowz` gap carrying
-its absolute logical offset (0x630000 → `c3 31`), and the length byte —
-SAMELENGTH cannot apply to a shard's first record. 18 bytes against 16:
-exactly the observed +2, and the same accounting reproduces the last
-shard's 292 (2 + 18 + 17 × 16).
+The same state dependence sets the shard sizes. A shard's decode position
+starts at 0, so shard 0's first record opens `03 07` (CONTIGUOUS, length)
+while shards 1 and 2 open with an 18-byte record — blobid `02`, a 2-byte
+`varint_lowz` gap carrying the absolute logical offset, and the length
+byte, since SAMELENGTH cannot apply to a shard's first record:
+
+```
+shard 1  02 c3 0f 07 + 14 B inline blob    gap c3 0f = 0x1f0000
+shard 2  02 83 1f 07 + 14 B inline blob    gap 83 1f = 0x3e0000
+```
+
+18 bytes against 16, which reproduces every size: 498 = 2 + 31 × 16,
+500 = 2 + 18 + 30 × 16, 212 = 2 + 18 + 12 × 16, over 31 + 31 + 13 = 75
+extents.
 
 ### 5.4.3 Spanning blobs: 256 KiB cloned object, 8 KiB-stride overwrites
 
