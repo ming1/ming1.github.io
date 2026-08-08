@@ -737,7 +737,9 @@ Because the onode value is read before anything else about the object,
 table before any shard is loaded; shard references then resolve by id
 (§5.3, `BLOBID_FLAG_SPANNING`, id in bits 4+) regardless of which shards
 are faulted in. An unsharded onode has no shard boundaries and always
-encodes `count = 0` — the `02 00` pair in the §5.4.1 specimen.
+encodes `count = 0` — the `02 00` pair in the §5.4.1 specimen. A
+populated spanning section, and the split-versus-promote rule that
+governs it, is captured in §5.4.3.
 
 The reference tracker is persisted only in this section. A shard-local
 blob's reference accounting is rebuilt at decode time from the extents of
@@ -976,6 +978,117 @@ SAMELENGTH cannot apply to a shard's first record. 18 bytes against 16:
 exactly the observed +2, and the same accounting reproduces the last
 shard's 292 (2 + 18 + 17 × 16).
 
+### 5.4.3 Spanning blobs: cloned object with 8 KiB-stride overwrites
+
+A blob crossing a shard cut is not promoted automatically. During reshard,
+a crossing blob is **split** whenever `can_split()` and
+`can_split_at(blob_offset)` both hold, and only an unsplittable blob
+becomes spanning
+([`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc),
+reshard → `split_blob()`). Since `can_split()` excludes only
+`FLAG_SHARED`, `FLAG_COMPRESSED` and `FLAG_HAS_UNUSED` blobs (§6.2), an
+ordinary mutable blob is always split — in the §5.4.2 object every cut
+that landed mid-blob produced a fresh blob with `blob_offset` 0 in the
+next shard, and its spanning count stayed 0.
+
+This specimen therefore uses clone-shared blobs: a 2 MiB object, a pool
+snapshot, then 256 overwrites that both fragment the extent map and mark
+every touched blob `FLAG_SHARED`:
+
+```
+$ rados -p p1 put snapspan /root/2m_rand      # 2 MiB -> 64 KiB blobs
+$ rados -p p1 mksnap snap1                     # next write clones
+$ for w in $(seq 0 31); do for j in $(seq 0 7); do
+    rados -p p1 put snapspan /root/4k --offset $((w * 65536 + j * 8192))
+  done; done
+```
+
+Head object (`snap` = `CEPH_NOSNAP`; the clone sorts first under the lower
+snap id, §4.4):
+
+| | value |
+|---|---|
+| onode record | 7634 B = 6 B frame + 4597 B onode struct + 3031 B spanning section |
+| onode fields | nid 5139, size 2097152, flags 0x00, 20 `shard_info` entries |
+| shard records | 20 (shard[0] 0x0/563 B, shard[1] 0x1c000/552 B, … shard[19] 0x1fc000/52 B) |
+| spanning blobs | 13 |
+| `X` records | 32 |
+
+The onode struct is large only because of the OSD-layer `snapset` attr
+(4187 B of the 4597 — its clone_overlap tracks all 256 fragments); the
+`_` attr is 267 B and BlueStore's own fields are the ones listed above.
+
+Spanning section (§5.2), first entry annotated; the 3031 bytes are
+2 + 13 × 233, every entry being the same size here:
+
+```
+02              struct_v = 2
+0d              count = 13
+-- entry 0, 233 B --
+00              varint blob_id = 0
+10              PExtentVector count = 16          (varint, §6.1)
+ff ff ff ff  ff ff ff ff ff 01   07     pextent[0]: lba INVALID_OFFSET
+                                        (hole), length 4096
+a8 03 00 00                      07     pextent[1]: lba 0x1d4000, length 4096
+ff ff ff ff  ff ff ff ff ff 01   07     pextent[2]: hole
+ac 03 00 00                      07     pextent[3]: lba 0x1d6000
+-- 12 more pextents, alternating hole / real --
+```
+
+The remaining fields of the entry decode as: `flags` = 0x14
+(`FLAG_SHARED` | `FLAG_CSUM`), csum crc32c with chunk order 12 and 64 B
+of checksums (16 × 4 KiB = the full 64 KiB blob), `sbid` = 51202, and a
+use tracker with `au_size` 4096 and `num_au` 16 (§6.4 — persisted here
+because the blob is spanning). The eight surviving pextents step by
+8 KiB from 0x1d4000: the blob's original allocation was contiguous, and
+the overwrites punched out every other 4 KiB block. Blob ids are not
+dense — 0, 10, 11, 20 among the 13 — since they are assigned only to
+blobs that survive as spanning.
+
+Shard 17 (542 B, 24 extents: 4 inline blobs, 15 back-references, 5
+spanning references) shows both reference forms interleaved:
+
+```
+02 18           struct_v 2, n = 24
+02 a3 0e 07     extent 0: gap 0x1c8000 (absolute, shard-local pos starts
+                at 0), length 4096, inline blob follows
+07 56 09 00 00 07 ...   inline blob: 7 pextents, first lba 0x4ab000
+
+decoded records:
+  [0] logical 0x1c8000  blob_off 0x0     inline blob (7 pextents)
+  [1] logical 0x1c9000  blob_off 0x9000  SPANNING id=20
+  [2] logical 0x1ca000  blob_off 0x2000  backref k=1 (extent 0)
+  [3] logical 0x1cb000  blob_off 0xb000  SPANNING id=20
+  [4] logical 0x1cc000  blob_off 0x4000  backref k=1 (extent 0)
+  [5] logical 0x1cd000  blob_off 0xd000  SPANNING id=20
+```
+
+Records [1], [3], [5] carry `BLOBID_FLAG_SPANNING` with the id in bits
+4+ (§5.3) and resolve against the onode's spanning table; their
+`blob_offset` advances by 0x2000 through the shared blob, while the
+interleaved records back-reference a blob defined locally in this shard.
+The shared blob is referenced from more than one shard, which is exactly
+why it could not stay local.
+
+The `X` record for `sbid` 51202 (§6.5), key `BE u64` 0x000000000000c802:
+
+```
+01 01 32 00 00 00   DENC_START(1,1), payload 50 B
+10                  ref_map: 16 entries
+cf 0e  07  01       offset 0x1d3000 (absolute varint_lowz), length 4096, refs 1
+07  07  02          offset delta 4096, length 4096, refs 2
+07  07  01          delta 4096, length 4096, refs 1
+...                 refs alternate 1, 2 for all 16 entries
+```
+
+`ceph-dencoder type bluestore_shared_blob_t` decodes it as offsets
+1912832, 1916928, 1921024 … with `refs` 1, 2, 1 …, and reports
+`"sbid": 0` because the value carries only the ref_map — the id lives in
+the key. The alternation is the clone relationship made visible: blocks
+still referenced by both head and clone hold 2 references, blocks the
+head overwrote hold 1 (the clone alone). Sixteen 4 KiB entries cover the
+original 64 KiB blob.
+
 # 6. Blob Structures
 
 ## 6.1 `bluestore_pextent_t`
@@ -1062,7 +1175,8 @@ each record body:  varint_lowz length, varint refs
 ```
 
 When a put drops the last reference of a range, the released extents land
-in the owning transaction's `released` set (§7.2).
+in the owning transaction's `released` set (§7.2). Captured example:
+§5.4.3.
 
 ## 6.6 Compression header
 
