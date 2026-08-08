@@ -24,7 +24,7 @@ Conventions:
 * `le16`/`le32`/`le64` — fixed-width little-endian integers.
 * `BE u32`/`BE u64` — big-endian binary, used only inside RocksDB *keys* so
   that lexicographic order equals numeric order (`_key_encode_u64()`,
-  `src/os/bluestore/kv.h`).
+  [`src/os/kv.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/kv.h)).
 * All *values* use the encoding primitives of §1.
 * Hex constants are lowercase, given as `0x... (decimal)` on first use.
 * Flag sets are given as hex masks; "bit n" denotes a bit position.
@@ -34,21 +34,21 @@ Conventions:
 # 1. Encoding Primitives
 
 BlueStore metadata is serialized with the `denc` framework
-(`src/include/denc.h`) or the classic `encode()`/`decode()` framework
-(`src/include/encoding.h`, `ENCODE_START`).
+([`src/include/denc.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/include/denc.h)) or the classic `encode()`/`decode()` framework
+([`src/include/encoding.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/include/encoding.h), `ENCODE_START`).
 
 | Primitive | Wire format | Source |
 |---|---|---|
-| fixed int | raw little-endian, natural width | `denc.h` `denc_traits<T>` |
-| `varint` | 7 bits/byte, LSB group first, high bit = continuation | `denc.h` `denc_varint()` |
-| `signed varint` | sign-and-magnitude: bit 0 = sign, magnitude shifted left 1, then varint | `denc.h` `denc_signed_varint()` |
-| `varint_lowz` | bits [1:0] = count of low-order zero nibbles stripped (0–3); remaining bits = `value >> (4*n)`; the whole encoded as varint | `denc.h` `denc_varint_lowz()` |
-| `lba` | 4-byte le32 word + optional varint continuation (layout below) | `denc.h` `denc_lba()` |
-| `string` | le32 length + bytes | `denc.h` / `encoding.h` |
-| `bufferlist` / `bufferptr` | le32 length + raw bytes | `encoding.h` |
-| `map`, `vector`, `list` | le32 element count + elements (exceptions noted per structure) | `denc.h` container traits |
-| `utime_t` | le32 seconds + le32 nanoseconds | `src/include/utime.h` |
-| `uuid_d` | 16 raw bytes | `src/include/uuid.h` |
+| fixed int | raw little-endian, natural width | [`denc.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/include/denc.h) `denc_traits<T>` |
+| `varint` | 7 bits/byte, LSB group first, high bit = continuation | [`denc.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/include/denc.h) `denc_varint()` |
+| `signed varint` | sign-and-magnitude: bit 0 = sign, magnitude shifted left 1, then varint | [`denc.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/include/denc.h) `denc_signed_varint()` |
+| `varint_lowz` | bits [1:0] = count of low-order zero nibbles stripped (0–3); remaining bits = `value >> (4*n)`; the whole encoded as varint | [`denc.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/include/denc.h) `denc_varint_lowz()` |
+| `lba` | 4-byte le32 word + optional varint continuation (layout below) | [`denc.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/include/denc.h) `denc_lba()` |
+| `string` | le32 length + bytes | [`denc.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/include/denc.h) / [`encoding.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/include/encoding.h) |
+| `bufferlist` / `bufferptr` | le32 length + raw bytes | [`encoding.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/include/encoding.h) |
+| `map`, `vector`, `list` | le32 element count + elements (exceptions noted per structure) | [`denc.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/include/denc.h) container traits |
+| `utime_t` | le32 seconds + le32 nanoseconds | [`src/include/utime.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/include/utime.h) |
+| `uuid_d` | 16 raw bytes | [`src/include/uuid.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/include/uuid.h) |
 
 `lba` layout — the low bits of the first le32 word select how many low zero
 bits were stripped from the value (`x` = payload bit):
@@ -86,7 +86,7 @@ Structures marked "bare denc" below omit this 6-byte header.
 ## 2.1 Device roles
 
 An OSD data directory contains up to three block devices
-(`src/os/bluestore/BlueFS.h`, device slots):
+([`src/os/bluestore/BlueFS.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.h), device slots):
 
 | Symlink | BlueFS slot | Constant | Role |
 |---|---|---|---|
@@ -96,7 +96,7 @@ An OSD data directory contains up to three block devices
 
 When `block.db` is absent, the main device is registered in the `BDEV_DB`
 slot and serves both roles; `bluefs_layout_t::shared_bdev` records this
-(`src/os/bluestore/bluefs_types.h`, `BlueStore::_open_bluefs()`).
+([`src/os/bluestore/bluefs_types.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluefs_types.h), `BlueStore::_open_bluefs()`).
 
 ## 2.2 Byte-range map
 
@@ -124,12 +124,12 @@ block.wal: label @ 0 only
 The BlueFS superblock always lives at offset 0x1000 of whichever device
 occupies the `BDEV_DB` slot (§2.1). The first 8 KiB (`SUPER_RESERVED`) of
 that device — and the first 4 KiB of every other device — are excluded from
-allocation (`BlueFS::_get_minimal_reserved()`, `src/os/bluestore/BlueFS.cc`).
+allocation (`BlueFS::_get_minimal_reserved()`, [`src/os/bluestore/BlueFS.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.cc)).
 
-Constants (`src/os/bluestore/bluestore_common.h`):
+Constants ([`src/os/bluestore/bluestore_common.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_common.h)):
 `BDEV_LABEL_BLOCK_SIZE = 4096`, `BLUEFS_SUPER_POSITION = 4096`,
 `BLUEFS_SUPER_BLOCK_SIZE = 4096`, `SUPER_RESERVED = 8192`.
-Replica positions: `bdev_label_positions` (`src/os/bluestore/BlueStore.cc`) =
+Replica positions: `bdev_label_positions` ([`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc)) =
 {0, 1 GiB, 10 GiB, 100 GiB, 1000 GiB}; a replica is written only where
 `position + 4096 <= device size`. Multi-position labels apply to the main
 device when label meta `multi=yes` is present; `epoch` is bumped on every
@@ -137,10 +137,10 @@ label rewrite so stale replicas are detectable.
 
 ## 2.3 Device label — `bluestore_bdev_label_t`
 
-Source: `src/os/bluestore/bluestore_types.h` (`bluestore_bdev_label_t`);
-encode/decode in `src/os/bluestore/bluestore_types.cc`.
+Source: [`src/os/bluestore/bluestore_types.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h) (`bluestore_bdev_label_t`);
+encode/decode in [`src/os/bluestore/bluestore_types.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.cc).
 Code path: `BlueStore::_write_bdev_label()` / `_read_bdev_label()`
-(`src/os/bluestore/BlueStore.cc`).
+([`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc)).
 
 ```
 +-----------------------------------------------+
@@ -188,14 +188,14 @@ established by the trailing crc32c and the osd_uuid match.
 BlueFS is a journal-only filesystem that hosts RocksDB's files. The
 directories RocksDB sees (`db/`, `db.wal/`, `db.slow/`) form a flat
 two-level namespace replayed from a single journal file at every mount.
-Types: `src/os/bluestore/bluefs_types.h`; implementation:
-`src/os/bluestore/BlueFS.cc`; RocksDB glue:
-`src/os/bluestore/BlueRocksEnv.cc` (`BlueRocksEnv`).
+Types: [`src/os/bluestore/bluefs_types.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluefs_types.h); implementation:
+[`src/os/bluestore/BlueFS.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.cc); RocksDB glue:
+[`src/os/bluestore/BlueRocksEnv.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueRocksEnv.cc) (`BlueRocksEnv`).
 
 ## 3.1 Superblock — `bluefs_super_t`
 
-Source: `src/os/bluestore/bluefs_types.h` (`bluefs_super_t`), encode in
-`src/os/bluestore/bluefs_types.cc`.
+Source: [`src/os/bluestore/bluefs_types.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluefs_types.h) (`bluefs_super_t`), encode in
+[`src/os/bluestore/bluefs_types.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluefs_types.cc).
 Code path: `BlueFS::_write_super()` / `_open_super()`.
 Location: offset 0x1000, `BDEV_DB`-slot device (§2.2).
 Frame: `ENCODE_START(_version, compat)`; `_version` 2 = baseline, 3 =
@@ -218,7 +218,7 @@ changes at that level; steady-state journal growth does not touch it.
 
 ## 3.2 File metadata — `bluefs_extent_t`, `bluefs_fnode_t`, `bluefs_fnode_delta_t`
 
-Source: `src/os/bluestore/bluefs_types.h`.
+Source: [`src/os/bluestore/bluefs_types.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluefs_types.h).
 
 `bluefs_extent_t` — one physical run:
 
@@ -261,8 +261,8 @@ the field list differs: there is no `__unused__` byte; in its position sits
 
 ## 3.3 Journal format — `bluefs_transaction_t`
 
-Source: `src/os/bluestore/bluefs_types.h` (`bluefs_transaction_t`), encode
-in `src/os/bluestore/bluefs_types.cc`.
+Source: [`src/os/bluestore/bluefs_types.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluefs_types.h) (`bluefs_transaction_t`), encode
+in [`src/os/bluestore/bluefs_types.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluefs_types.cc).
 
 The journal is the content of inode 1, written in `block_size` (4 KiB)
 units. Each transaction is an `ENCODE_START(1,1)`-framed record:
@@ -302,7 +302,7 @@ payload (classic encoding: `string` = le32 len + bytes, ints fixed LE):
 
 ## 3.4 Replay state machine
 
-Code path: `BlueFS::_replay()` (`src/os/bluestore/BlueFS.cc`).
+Code path: `BlueFS::_replay()` ([`src/os/bluestore/BlueFS.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.cc)).
 
 ```
   pos = 0 (within ino-1 logical space)
@@ -343,7 +343,7 @@ namespace, terminated by `OP_JUMP` to the live tail, then swings
 
 ## 3.5 Envelope mode (v21 WAL fast path)
 
-Source: `src/os/bluestore/BlueFS.h` (`BlueFS::File::envelope_t`).
+Source: [`src/os/bluestore/BlueFS.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.h) (`BlueFS::File::envelope_t`).
 
 Purpose: eliminate one journal update per RocksDB WAL append. A PLAIN file
 requires an `op_file_update_inc` to persist every size change; an ENVELOPE
@@ -352,7 +352,7 @@ journal.
 
 The mode is selected by configuration, not negotiated from disk: when
 `bluefs_wal_envelope_mode` (default true,
-`src/common/options/global.yaml.in`) is set, `BlueFS::open_for_write()`
+[`src/common/options/global.yaml.in`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in)) is set, `BlueFS::open_for_write()`
 assigns `encoding = ENVELOPE` to files whose name ends in `.log`.
 `_write_super()` then records `_version = 3` with compat 3 (§3.1), which
 locks pre-envelope code out; nothing is read back from the superblock to
@@ -404,7 +404,7 @@ recovery on top of §3.
 ## 4.1 Column families
 
 At mkfs, prefixes are split into RocksDB column families per
-`bluestore_rocksdb_cfs` (`src/common/options/global.yaml.in`), default:
+`bluestore_rocksdb_cfs` ([`src/common/options/global.yaml.in`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in)), default:
 
 ```
 m(3) p(3,0-12) O(3,0-13)=block_cache={type=binned_lru}
@@ -429,7 +429,7 @@ Physical placement only; key formats are unaffected.
 
 ## 4.2 Prefix table
 
-Source: `src/os/bluestore/BlueStore.cc` (top-of-file `PREFIX_*` constants).
+Source: [`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc) (top-of-file `PREFIX_*` constants).
 "Keys (ref OSD)" counts are from the captured OSD (1 pool, 8 PGs, 1 user
 object).
 
@@ -451,7 +451,7 @@ object).
 ## 4.3 `S` — superblock fields
 
 Code path: `BlueStore::_open_super_meta()` and mkfs
-(`src/os/bluestore/BlueStore.cc`). Captured values:
+([`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc)). Captured values:
 
 | Key | Value encoding | Captured bytes | Meaning |
 |---|---|---|---|
@@ -468,7 +468,7 @@ may remain unused; on mount, allocation continues from the stored max.
 
 ## 4.4 `O` — object key construction
 
-Source: `src/os/bluestore/BlueStore.cc` (`get_object_key()`,
+Source: [`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc) (`get_object_key()`,
 `_key_encode_prefix()`, `append_escaped()`; suffix constants
 `ONODE_KEY_SUFFIX 'o'`, `EXTENT_SHARD_KEY_SUFFIX 'x'`).
 
@@ -487,7 +487,7 @@ Source: `src/os/bluestore/BlueStore.cc` (`get_object_key()`,
   `~xx` (2 hex digits); terminator `!`. Order-preserving for 7-bit-clean
   names only: the source notes a signed-char comparison bug for bytes above
   0x7f, kept for key compatibility ("we do additional sorting where it is
-  needed", `BlueStore.cc` comment above `append_escaped()`).
+  needed", [`BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc) comment above `append_escaped()`).
 * Name section — three cases:
   * no locator key: `escaped(name)` `!` `=`
   * key == name: `escaped(key)` `!` `=` (name not repeated)
@@ -511,7 +511,7 @@ ff ff ff ff ff ff ff ff     generation = NO_GEN
 
 ## 4.5 `O` — extent-map shard keys
 
-Source: `src/os/bluestore/BlueStore.cc` (`get_extent_shard_key()`,
+Source: [`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc) (`get_extent_shard_key()`,
 `is_extent_shard_key()`).
 
 Full onode key (including the `'o'`) + `BE u32 shard_logical_offset` +
@@ -520,7 +520,7 @@ shards of an object sort immediately after its onode.
 
 ## 4.6 `M`/`P`/`m`/`p` — omap keys
 
-Source: `src/os/bluestore/BlueStore.cc`
+Source: [`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc)
 (`BlueStore::Onode::calc_omap_key()`, `calc_omap_header()`,
 `calc_omap_tail()`).
 
@@ -550,7 +550,7 @@ contiguous range scan.
 
 ## 4.7 `C` — collections
 
-Source: `src/os/bluestore/bluestore_types.h` (`bluestore_cnode_t`).
+Source: [`src/os/bluestore/bluestore_types.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h) (`bluestore_cnode_t`).
 
 Key: ASCII `<pgid>_head` (e.g. `1.4_head`). Value: `DENC_START(1,1)` +
 le32 `bits` = number of significant PG-hash bits; used with the key's pgid
@@ -558,9 +558,9 @@ to bound-check which objects belong to the collection.
 
 ## 4.8 `T` — statfs
 
-Source: `src/os/bluestore/BlueStore.h` (`BlueStore::volatile_statfs`);
+Source: [`src/os/bluestore/BlueStore.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h) (`BlueStore::volatile_statfs`);
 merge operator `Int64ArrayMergeOperator`
-(`src/os/bluestore/bluestore_common.h`).
+([`src/os/bluestore/bluestore_common.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_common.h)).
 
 Key: BE u64 pool id (`0xffffffffffffffff` = meta pool -1), or the single
 legacy key `bluestore_statfs`. Value: 5 signed le64 counters:
@@ -572,7 +572,7 @@ read-modify-write the counters.
 
 An `O` value is three concatenated sections.
 Code path: writer `BlueStore::_record_onode()`, reader
-`BlueStore::Onode::decode_raw()` (`src/os/bluestore/BlueStore.cc`).
+`BlueStore::Onode::decode_raw()` ([`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc)).
 
 ```
 +-------------------------------+------------------------+---------------------------------+
@@ -588,7 +588,7 @@ payload per shard.
 
 ## 5.1 `bluestore_onode_t`
 
-Source: `src/os/bluestore/bluestore_types.h` (`bluestore_onode_t`,
+Source: [`src/os/bluestore/bluestore_types.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h) (`bluestore_onode_t`,
 `_denc_friend`). Frame: `DENC_START`, struct_v 2 or 3, compat 1.
 
 | Field | Type | Since | Description |
@@ -619,7 +619,7 @@ the captured OSD confirms.
 ## 5.2 Spanning-blob section
 
 Code path: `BlueStore::ExtentMap::encode_spanning_blobs()` /
-`ExtentDecoder::decode_spanning_blobs()` (`src/os/bluestore/BlueStore.cc`).
+`ExtentDecoder::decode_spanning_blobs()` ([`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc)).
 
 A blob referenced by extents in more than one shard cannot be encoded
 locally in either shard; it is promoted to a spanning blob, held in the
@@ -638,7 +638,7 @@ the tracker at decode time from the extents of their own shard.
 ## 5.3 Extent-map encoding
 
 Code path: `BlueStore::ExtentMap::encode_some()` /
-`ExtentDecoder::decode_some()` (`src/os/bluestore/BlueStore.cc`,
+`ExtentDecoder::decode_some()` ([`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc),
 `BLOBID_FLAG_*`). One shard value — or the inline map — is:
 
 ```
@@ -720,7 +720,7 @@ The 30 inline bytes, annotated (§5.3 + §6.3 layouts; cross-checked against
 
 ## 6.1 `bluestore_pextent_t`
 
-Source: `src/os/bluestore/bluestore_types.h` (`bluestore_pextent_t`), bare
+Source: [`src/os/bluestore/bluestore_types.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h) (`bluestore_pextent_t`), bare
 denc.
 
 `lba offset` + `varint_lowz length (u32)`. `offset == ~0ull`
@@ -730,7 +730,7 @@ denc.
 
 ## 6.2 `bluestore_blob_t`
 
-Source: `src/os/bluestore/bluestore_types.h` (`bluestore_blob_t`), bare
+Source: [`src/os/bluestore/bluestore_types.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h) (`bluestore_blob_t`), bare
 denc; struct_v (2) inherited from the containing §5.2/§5.3 section.
 
 | Field | Type | Present when |
@@ -747,7 +747,7 @@ denc; struct_v (2) inherited from the containing §5.2/§5.3 section.
 Flags: `0x01` LEGACY_MUTABLE, `0x02` COMPRESSED, `0x04` CSUM,
 `0x08` HAS_UNUSED, `0x10` SHARED.
 
-Checksum types (`src/common/Checksummer.h`, `Checksummer::CSumType`; note
+Checksum types ([`src/common/Checksummer.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/Checksummer.h), `Checksummer::CSumType`; note
 NONE = 1, not 0):
 
 | Value | Type | Element width (B) |
@@ -761,7 +761,7 @@ NONE = 1, not 0):
 
 ## 6.3 Blob wrapper
 
-Source: `src/os/bluestore/BlueStore.h` (`BlueStore::Blob::encode/decode`).
+Source: [`src/os/bluestore/BlueStore.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h) (`BlueStore::Blob::encode/decode`).
 
 ```
 bluestore_blob_t                 (§6.2)
@@ -771,7 +771,7 @@ bluestore_blob_t                 (§6.2)
 
 ## 6.4 Use tracker — `bluestore_blob_use_tracker_t`
 
-Source: `src/os/bluestore/bluestore_types.h`
+Source: [`src/os/bluestore/bluestore_types.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h)
 (`bluestore_blob_use_tracker_t`).
 
 Per-allocation-unit referenced-byte counts for spanning blobs; decides when
@@ -787,7 +787,7 @@ if au_size != 0:
 
 ## 6.5 Shared blobs — `X` value, `bluestore_shared_blob_t`
 
-Source: `src/os/bluestore/bluestore_types.h` (`bluestore_shared_blob_t`,
+Source: [`src/os/bluestore/bluestore_types.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h) (`bluestore_shared_blob_t`,
 `bluestore_extent_ref_map_t`).
 
 Created when a blob is cloned; refcounts on physical ranges. The blob
@@ -806,9 +806,9 @@ in the owning transaction's `released` set (§7.2).
 
 ## 6.6 Compression header
 
-Source: `src/os/bluestore/bluestore_types.h`
+Source: [`src/os/bluestore/bluestore_types.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h)
 (`bluestore_compression_header_t`); algorithm ids
-`src/compressor/Compressor.h` (`Compressor::COMP_ALG_*`).
+[`src/compressor/Compressor.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/compressor/Compressor.h) (`Compressor::COMP_ALG_*`).
 
 Compressed blob payload = header + compressed bytes. Header:
 `DENC_START(2,1)`, u8 algorithm (0 none, 1 snappy, 2 zlib, 3 zstd, 4 lz4,
@@ -822,7 +822,7 @@ so scrub verifies without decompressing.
 ## 7.1 Commit protocol
 
 Code path: `BlueStore::queue_transactions()`,
-`BlueStore::TransContext::state_t` (`src/os/bluestore/BlueStore.h`).
+`BlueStore::TransContext::state_t` ([`src/os/bluestore/BlueStore.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h)).
 
 One `queue_transactions()` call folds its entire batch of ObjectStore
 transactions into a single `TransContext`, which becomes a single RocksDB
@@ -853,9 +853,9 @@ and the `L` records inside the batch defer raw block writes (§7.2).
 
 ## 7.2 Deferred records — `L`
 
-Source: `src/os/bluestore/bluestore_types.h`
+Source: [`src/os/bluestore/bluestore_types.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h)
 (`bluestore_deferred_transaction_t`, `bluestore_deferred_op_t`); key
-builder `get_deferred_key()` (`src/os/bluestore/BlueStore.cc`).
+builder `get_deferred_key()` ([`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc)).
 
 Small overwrites of allocated space (≤ `bluestore_prefer_deferred_size`)
 cannot be written in place before commit (torn-write risk). The data
@@ -886,7 +886,7 @@ unchanged.
 
 ## 8.1 Bitmap freelist — `B` / `b`
 
-Source: `src/os/bluestore/BitmapFreelistManager.{h,cc}`
+Source: [`src/os/bluestore/BitmapFreelistManager.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BitmapFreelistManager.h) / [`.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BitmapFreelistManager.cc)
 (`BitmapFreelistManager`, `XorMergeOperator`).
 
 Geometry parameters: `size` (device bytes), `blocks`, `bytes_per_block`
@@ -928,7 +928,7 @@ blocks 0–1 allocated = the 8 KiB `SUPER_RESERVED` area, matching mkfs
 
 ## 8.2 NCB mode — allocation file (`freelist_type = "null"`)
 
-Source: `src/os/bluestore/BlueStore.cc` (NCB section:
+Source: [`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc) (NCB section:
 `allocator_image_header`, `allocator_image_trailer`, `ALLOCATOR_NCB_DIR`,
 `ALLOCATOR_NCB_FILE`); mode selection in `BlueStore::_open_fm()`.
 
@@ -1098,28 +1098,28 @@ document describes (ref_map parity, csum sizes, shard bounds, omap flags).
 
 | Area | File | Symbols |
 |---|---|---|
-| Encoding primitives | `src/include/denc.h` | `denc_varint`, `denc_signed_varint`, `denc_varint_lowz`, `denc_lba`, `DENC_START` |
-| Classic encoding | `src/include/encoding.h` | `ENCODE_START`, `encode`/`decode` |
-| Basic types | `src/include/utime.h`, `src/include/uuid.h` | `utime_t`, `uuid_d` |
-| Key int encoding | `src/os/bluestore/kv.h` | `_key_encode_u64`, `_key_encode_u32` |
-| Label, reserved offsets | `src/os/bluestore/bluestore_common.h` | `BDEV_LABEL_BLOCK_SIZE`, `BLUEFS_SUPER_POSITION`, `SUPER_RESERVED`, `Int64ArrayMergeOperator` |
-| Label struct | `src/os/bluestore/bluestore_types.h/.cc` | `bluestore_bdev_label_t` |
-| Label I/O, replicas | `src/os/bluestore/BlueStore.cc` | `_write_bdev_label`, `_read_bdev_label`, `bdev_label_positions` |
-| BlueFS types | `src/os/bluestore/bluefs_types.h/.cc` | `bluefs_super_t`, `bluefs_fnode_t`, `bluefs_fnode_delta_t`, `bluefs_extent_t`, `bluefs_transaction_t`, `bluefs_layout_t`, `bluefs_node_encoding` |
-| BlueFS engine | `src/os/bluestore/BlueFS.cc/.h` | `_replay`, `_open_super`, `_write_super`, `_compact_log_async_LD_LNF_D`, `File::envelope_t` |
-| RocksDB glue | `src/os/bluestore/BlueRocksEnv.cc` | `BlueRocksEnv` |
-| CF sharding | `src/common/options/global.yaml.in` | `bluestore_rocksdb_cfs`, `bluefs_wal_envelope_mode`, `bluestore_allocation_from_file`, `bluestore_onode_segment_size` |
-| KV prefixes, keys | `src/os/bluestore/BlueStore.cc` | `PREFIX_*`, `get_object_key`, `append_escaped`, `get_extent_shard_key`, `is_extent_shard_key`, `get_deferred_key`, `Onode::calc_omap_key` |
-| Hash reversal | `src/common/hobject.h` | `hobject_t::_reverse_bits` |
-| Onode/blob/extents | `src/os/bluestore/bluestore_types.h` | `bluestore_onode_t`, `bluestore_blob_t`, `bluestore_pextent_t`, `bluestore_blob_use_tracker_t`, `bluestore_shared_blob_t`, `bluestore_extent_ref_map_t`, `bluestore_compression_header_t`, `bluestore_cnode_t` |
-| O-value assembly | `src/os/bluestore/BlueStore.cc` | `_record_onode`, `Onode::decode_raw` |
-| Extent map codec | `src/os/bluestore/BlueStore.cc` | `ExtentMap::encode_some`, `ExtentDecoder::decode_some`, `encode_spanning_blobs`, `decode_spanning_blobs`, `BLOBID_FLAG_*` |
-| Blob wrapper | `src/os/bluestore/BlueStore.h` | `BlueStore::Blob::encode/decode` |
-| Checksums | `src/common/Checksummer.h` | `Checksummer::CSumType`, `get_csum_value_size` |
-| Compression | `src/compressor/Compressor.h` | `Compressor::COMP_ALG_*` |
-| Transactions | `src/os/bluestore/BlueStore.h/.cc` | `TransContext::state_t`, `queue_transactions` |
-| Deferred/WAL | `src/os/bluestore/bluestore_types.h`, `BlueStore.cc` | `bluestore_deferred_transaction_t`, `bluestore_deferred_op_t`, `_deferred_replay`, `_eliminate_outdated_deferred` |
-| Statfs | `src/os/bluestore/BlueStore.h` | `volatile_statfs` |
-| Freelist | `src/os/bluestore/BitmapFreelistManager.cc/.h` | `BitmapFreelistManager`, `XorMergeOperator` |
-| NCB allocator file | `src/os/bluestore/BlueStore.cc` | `_open_fm`, `allocator_image_header`, `allocator_image_trailer`, `ALLOCATOR_NCB_*`, `read_allocation_from_drive_on_startup` |
-| Mount sequence | `src/os/bluestore/BlueStore.cc` | `_open_super_meta`, `_open_fm`, `_deferred_replay` |
+| Encoding primitives | [`src/include/denc.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/include/denc.h) | `denc_varint`, `denc_signed_varint`, `denc_varint_lowz`, `denc_lba`, `DENC_START` |
+| Classic encoding | [`src/include/encoding.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/include/encoding.h) | `ENCODE_START`, `encode`/`decode` |
+| Basic types | [`src/include/utime.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/include/utime.h), [`src/include/uuid.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/include/uuid.h) | `utime_t`, `uuid_d` |
+| Key int encoding | [`src/os/kv.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/kv.h) | `_key_encode_u64`, `_key_encode_u32` |
+| Label, reserved offsets | [`src/os/bluestore/bluestore_common.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_common.h) | `BDEV_LABEL_BLOCK_SIZE`, `BLUEFS_SUPER_POSITION`, `SUPER_RESERVED`, `Int64ArrayMergeOperator` |
+| Label struct | [`src/os/bluestore/bluestore_types.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h) / [`.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.cc) | `bluestore_bdev_label_t` |
+| Label I/O, replicas | [`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc) | `_write_bdev_label`, `_read_bdev_label`, `bdev_label_positions` |
+| BlueFS types | [`src/os/bluestore/bluefs_types.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluefs_types.h) / [`.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluefs_types.cc) | `bluefs_super_t`, `bluefs_fnode_t`, `bluefs_fnode_delta_t`, `bluefs_extent_t`, `bluefs_transaction_t`, `bluefs_layout_t`, `bluefs_node_encoding` |
+| BlueFS engine | [`src/os/bluestore/BlueFS.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.cc) / [`.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.h) | `_replay`, `_open_super`, `_write_super`, `_compact_log_async_LD_LNF_D`, `File::envelope_t` |
+| RocksDB glue | [`src/os/bluestore/BlueRocksEnv.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueRocksEnv.cc) | `BlueRocksEnv` |
+| CF sharding | [`src/common/options/global.yaml.in`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in) | `bluestore_rocksdb_cfs`, `bluefs_wal_envelope_mode`, `bluestore_allocation_from_file`, `bluestore_onode_segment_size` |
+| KV prefixes, keys | [`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc) | `PREFIX_*`, `get_object_key`, `append_escaped`, `get_extent_shard_key`, `is_extent_shard_key`, `get_deferred_key`, `Onode::calc_omap_key` |
+| Hash reversal | [`src/common/hobject.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/hobject.h) | `hobject_t::_reverse_bits` |
+| Onode/blob/extents | [`src/os/bluestore/bluestore_types.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h) | `bluestore_onode_t`, `bluestore_blob_t`, `bluestore_pextent_t`, `bluestore_blob_use_tracker_t`, `bluestore_shared_blob_t`, `bluestore_extent_ref_map_t`, `bluestore_compression_header_t`, `bluestore_cnode_t` |
+| O-value assembly | [`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc) | `_record_onode`, `Onode::decode_raw` |
+| Extent map codec | [`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc) | `ExtentMap::encode_some`, `ExtentDecoder::decode_some`, `encode_spanning_blobs`, `decode_spanning_blobs`, `BLOBID_FLAG_*` |
+| Blob wrapper | [`src/os/bluestore/BlueStore.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h) | `BlueStore::Blob::encode/decode` |
+| Checksums | [`src/common/Checksummer.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/Checksummer.h) | `Checksummer::CSumType`, `get_csum_value_size` |
+| Compression | [`src/compressor/Compressor.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/compressor/Compressor.h) | `Compressor::COMP_ALG_*` |
+| Transactions | [`src/os/bluestore/BlueStore.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h) / [`.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc) | `TransContext::state_t`, `queue_transactions` |
+| Deferred/WAL | [`src/os/bluestore/bluestore_types.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h), [`BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc) | `bluestore_deferred_transaction_t`, `bluestore_deferred_op_t`, `_deferred_replay`, `_eliminate_outdated_deferred` |
+| Statfs | [`src/os/bluestore/BlueStore.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h) | `volatile_statfs` |
+| Freelist | [`src/os/bluestore/BitmapFreelistManager.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BitmapFreelistManager.cc) / [`.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BitmapFreelistManager.h) | `BitmapFreelistManager`, `XorMergeOperator` |
+| NCB allocator file | [`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc) | `_open_fm`, `allocator_image_header`, `allocator_image_trailer`, `ALLOCATOR_NCB_*`, `read_allocation_from_drive_on_startup` |
+| Mount sequence | [`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc) | `_open_super_meta`, `_open_fm`, `_deferred_replay` |
