@@ -557,7 +557,8 @@ Source: [`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.
 
 Full onode key (including the `'o'`) + `BE u32 shard_logical_offset` +
 `'x'`. The trailing byte discriminates onode vs shard keys without decoding;
-shards of an object sort immediately after its onode.
+shards of an object sort immediately after its onode. Captured example:
+§5.4.2.
 
 ## 4.6 `M`/`P`/`m`/`p` — omap keys
 
@@ -736,7 +737,7 @@ Because the onode value is read before anything else about the object,
 table before any shard is loaded; shard references then resolve by id
 (§5.3, `BLOBID_FLAG_SPANNING`, id in bits 4+) regardless of which shards
 are faulted in. An unsharded onode has no shard boundaries and always
-encodes `count = 0` — the `02 00` pair in the §5.4 specimen.
+encodes `count = 0` — the `02 00` pair in the §5.4.1 specimen.
 
 The reference tracker is persisted only in this section. A shard-local
 blob's reference accounting is rebuilt at decode time from the extents of
@@ -799,7 +800,9 @@ indexed by extent position (`consume_blobid()`). Example: extents 0,1,2
 using blobs A,A,B → blob B is inlined at extent 2 with `blobid_field`
 bits 4+ = 0; a later extent reusing B encodes `k = 3`.
 
-## 5.4 Captured specimen
+## 5.4 Captured specimens
+
+### 5.4.1 Inline form: 16 KiB object
 
 16 KiB object, one user xattr, one omap key. Value = 414 bytes total =
 onode 378 B + spanning section 2 B + inline map (4 + 30) B. The 378-byte
@@ -843,6 +846,110 @@ The 30 inline bytes, annotated (§5.3 + §6.3 layouts; cross-checked against
 40 eb ac d6  50 50 d5 39  28 54 1d ab  e6 86 a1 ca
                 4 x le32 crc32c, one per 4 KiB chunk
 ```
+
+### 5.4.2 Sharded form: 150 discontiguous 4 KiB writes
+
+Created with 150 strided single-block writes, each becoming its own blob:
+
+```
+$ for i in $(seq 0 149); do
+    rados -p p1 put sharded /root/4k --offset $((i * 65536))
+  done                                  # object size 9768960
+```
+
+Sharding triggers when the encoded inline map exceeds
+`bluestore_extent_map_shard_max_size` (default 1200 bytes); the reshard
+then cuts shards sized toward `bluestore_extent_map_shard_target_size`
+(500 bytes) using a per-extent size estimate; separately, non-trailing
+shards that fall below `bluestore_extent_map_shard_min_size` (150) become
+merge candidates
+([`src/common/options/global.yaml.in`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in)).
+150 extents at ~16 B each is far past the threshold; the result is one
+onode record plus five shard records (`ceph-kvstore-tool ... list O`,
+shared ghobject prefix abbreviated):
+
+```
+O  <ghobject key>'o'                          onode, 382 B
+O  <ghobject key>'o' 00 00 00 00 'x'          shard 0: logical 0x0,      530 B
+O  <ghobject key>'o' 00 21 00 00 'x'          shard 1: logical 0x210000, 532 B
+O  <ghobject key>'o' 00 42 00 00 'x'          shard 2: logical 0x420000, 532 B
+O  <ghobject key>'o' 00 63 00 00 'x'          shard 3: logical 0x630000, 532 B
+O  <ghobject key>'o' 00 84 00 00 'x'          shard 4: logical 0x840000, 292 B
+```
+
+The observed cut points fall every 33 extents (530–532 encoded bytes,
+slightly above target); the BE u32 in each key is the shard's logical
+start (0x210000 = 33 × 64 KiB stride).
+
+The 382-byte onode value now ends without an inline-map section — its
+tail bytes:
+
+```
+05 00 00 00            extent_map_shards: le32 count = 5
+00           92 04     shard_info[0]: offset varint 0x0,      bytes varint 530
+80 80 84 01  94 04     shard_info[1]: offset 0x210000, bytes 532
+80 80 88 02  94 04     shard_info[2]: offset 0x420000, bytes 532
+80 80 8c 03  94 04     shard_info[3]: offset 0x630000, bytes 532
+80 80 90 04  a4 02     shard_info[4]: offset 0x840000, bytes 292
+00 00 00               expected_object_size/write_size/hint: varint 0 x3
+00 00 00 00            zone_offset_refs: 0
+02 00                  spanning blobs: v=2, count=0   -- nothing follows
+```
+
+Three contrasts with the inline form:
+
+* the onode value ends at the spanning-blob section — there is no third
+  section;
+* a shard value is the bare §5.3 payload with no le32 length prefix: the
+  writer stores the raw `encode_some()` output, and the reader asserts
+  the KV value length equals `shard_info.bytes`;
+* the spanning count is 0 even though the map is sharded: every blob here
+  is 4 KiB referenced by a single extent, so no blob crosses a cut
+  (§5.2).
+
+Shard 0's 530-byte value is a 2-byte header plus 33 records of exactly
+16 bytes:
+
+```
+02              struct_v 2
+21              n = 33 extents
+-- extent 0 --
+03              blobid: CONTIGUOUS|ZEROOFFSET, inline blob follows
+07              length = 4096          (varint_lowz)
+01 48 20 03 00  blob: 1 pextent, lba word 0x00032048 -> device offset 419577856
+07              pextent length = 4096
+04 04 0c 04     flags CSUM; csum_type crc32c; chunk order 12; csum len 4
+6c 6d f5 90     crc32c of the 4 KiB chunk
+-- extent 1 --
+06              blobid: ZEROOFFSET|SAMELENGTH (length omitted)
+3f              gap = 61440 (60 KiB)   (varint_lowz; the 64 KiB stride
+01 4a 20 03 00                          minus the 4 KiB write)
+07 04 04 0c 04
+6c 6d f5 90
+-- extent 2 --
+06 3f           blobid + gap as above
+01 4c 20 03 00  lba word 0x0003204c -> device offset 419586048 (+4096)
+07 04 04 0c 04
+6c 6d f5 90
+-- extent 3 --
+06 3f
+01 4e 20 03 00  lba word 0x0003204e -> device offset 419590144 (+4096)
+07 04 04 0c 04
+6c 6d f5 90
+-- ... 29 more records of the same shape --
+```
+
+Every write carried the same 4 KiB payload, so all 150 blobs share one
+crc32c (`0x90f56d6c`) and the records repeat byte-for-byte except for the
+advancing lba words — which step by exactly 4096: the 150 logically
+64 KiB-strided writes were allocated physically contiguous. Shards 1–3 encode 532 bytes against shard 0's 530:
+the encoder's logical position starts at 0 within each shard, so shard
+0's first record opens `03 07` (CONTIGUOUS, length) while a later shard's
+first record opens with blobid `02`, a 2-byte `varint_lowz` gap carrying
+its absolute logical offset (0x630000 → `c3 31`), and the length byte —
+SAMELENGTH cannot apply to a shard's first record. 18 bytes against 16:
+exactly the observed +2, and the same accounting reproduces the last
+shard's 292 (2 + 18 + 17 × 16).
 
 # 6. Blob Structures
 
@@ -1220,7 +1327,7 @@ $ ceph-kvstore-tool bluestore-kv dev/osd0 get O '%7f%80...o' out /tmp/onode.bin
 `bluestore-kv` mode mounts BlueFS and opens the embedded RocksDB, so all
 §4 prefixes are visible. Keys are printed %xx-escaped and are accepted back
 in the same form by `get`. The §4.2 census was produced with
-`list | cut -f1 | sort | uniq -c`; the §5.4 hexdump is `hexdump -C` of the
+`list | cut -f1 | sort | uniq -c`; the §5.4.1 hexdump is `hexdump -C` of the
 `get ... out` file.
 
 ## 10.4 `ceph-dencoder`
@@ -1248,7 +1355,7 @@ $ ceph-objectstore-tool --data-path dev/osd0 --no-mon-config --pgid 1.4 specimen
 `--no-mon-config` is required offline (the tool otherwise blocks fetching
 the mon config). `dump` prints the fully decoded onode — §5/§6 in JSON
 (`"nid": 1156`, extent at 420151296, `csum_type: 4`, 4 crc32c values) —
-and is the reference against which the §5.4 byte annotation was verified.
+and is the reference against which the §5.4.1 byte annotation was verified.
 
 ## 10.6 `ceph-bluestore-tool free-dump`
 
