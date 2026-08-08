@@ -708,21 +708,60 @@ the captured OSD confirms.
 ## 5.2 Spanning-blob section
 
 Code path: `BlueStore::ExtentMap::encode_spanning_blobs()` /
-`ExtentDecoder::decode_spanning_blobs()` ([`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc)).
+`ExtentDecoder::decode_spanning_blobs()`, promotion in
+`ExtentMap::encode_some()` / `reshard()`
+([`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc)).
 
-A blob referenced by extents in more than one shard cannot be encoded
-locally in either shard; it is promoted to a spanning blob, held in the
-onode value, and referenced from shards by id:
+Sharding the extent map (§4.5, §5.3) imposes an independence rule: every
+shard value must be decodable on its own. Blob definitions are therefore
+encoded inline in the shard that references them — which is impossible for
+a blob whose extents cross a shard boundary, since two shards would
+reference one definition. Such a blob is promoted to a spanning blob: its
+definition moves out of the shards and into the onode value, as section 2
+of the §5 layout:
 
 ```
 u8 struct_v = 2
 varint count
-count x { varint blob_id, blob (§6.3, with use tracker) }
+count x {
+  varint blob_id                    per-onode id, stable across reloads
+  bluestore_blob_t (§6.2)
+  [ le64 sbid ]                     if FLAG_SHARED (§6.3)
+  use tracker (§6.4)                always present here
+}
 ```
 
-Spanning blobs carry their reference tracker (§6.4) explicitly because no
-single shard sees all extents referencing them; non-spanning blobs rebuild
-the tracker at decode time from the extents of their own shard.
+Because the onode value is read before anything else about the object,
+`Onode::decode_raw()` decodes this section eagerly into the spanning-blob
+table before any shard is loaded; shard references then resolve by id
+(§5.3, `BLOBID_FLAG_SPANNING`, id in bits 4+) regardless of which shards
+are faulted in. An unsharded onode has no shard boundaries and always
+encodes `count = 0` — the `02 00` pair in the §5.4 specimen.
+
+The reference tracker is persisted only in this section. A shard-local
+blob's reference accounting is rebuilt at decode time from the extents of
+its own shard, which are all present by definition; a spanning blob's
+referencing extents may lie in unloaded shards, so releasing space on
+partial deallocation would otherwise require faulting in every shard.
+
+Lifecycle:
+
+* promotion — `encode_some()` detects a blob escaping the range being
+  encoded (`blob_escapes_range()`) and calls `request_reshard()`; the
+  reshard pass assigns spanning ids to boundary-crossing blobs and re-cuts
+  shard boundaries;
+* demotion — when overwrites confine a blob to one shard, it is dropped
+  from the spanning table (`id = -1`) and re-encoded inline at the next
+  reshard;
+* prevention — v3 onode segmentation (§5.1, `segment_size` > 0) forbids
+  blobs from crossing segment boundaries, which by construction keeps
+  every blob within one shard; with the default `segment_size = 0` the
+  spanning machinery above is in effect.
+
+Spanning blobs are decoded on every onode load and re-encoded on every
+onode update, independent of whether the I/O touches their extents; the
+`l_bluestore_spanning_blobs` perf counter tracks the population for this
+reason.
 
 ## 5.3 Extent-map encoding
 
@@ -1205,7 +1244,7 @@ document describes (ref_map parity, csum sizes, shard bounds, omap flags).
 | Collections | [`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc) | `get_coll_range`, `_open_collections`, `_split_collection`, `_merge_collection` |
 | Onode/blob/extents | [`src/os/bluestore/bluestore_types.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h) | `bluestore_onode_t`, `bluestore_blob_t`, `bluestore_pextent_t`, `bluestore_blob_use_tracker_t`, `bluestore_shared_blob_t`, `bluestore_extent_ref_map_t`, `bluestore_compression_header_t`, `bluestore_cnode_t` |
 | O-value assembly | [`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc) | `_record_onode`, `Onode::decode_raw` |
-| Extent map codec | [`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc) | `ExtentMap::encode_some`, `ExtentDecoder::decode_some`, `encode_spanning_blobs`, `decode_spanning_blobs`, `BLOBID_FLAG_*` |
+| Extent map codec | [`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc) | `ExtentMap::encode_some`, `ExtentDecoder::decode_some`, `encode_spanning_blobs`, `decode_spanning_blobs`, `ExtentMap::reshard`, `request_reshard`, `BLOBID_FLAG_*` |
 | Blob wrapper | [`src/os/bluestore/BlueStore.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h) | `BlueStore::Blob::encode/decode` |
 | Checksums | [`src/common/Checksummer.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/Checksummer.h) | `Checksummer::CSumType`, `get_csum_value_size` |
 | Compression | [`src/compressor/Compressor.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/compressor/Compressor.h) | `Compressor::COMP_ALG_*` |
