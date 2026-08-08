@@ -403,8 +403,18 @@ recovery on top of §3.
 
 ## 4.1 Column families
 
-At mkfs, prefixes are split into RocksDB column families per
-`bluestore_rocksdb_cfs` ([`src/common/options/global.yaml.in`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in)), default:
+A RocksDB column family (CF) is an independent keyspace inside one
+database. Each CF owns a private LSM tree — its own memtables, SST files,
+and options (block cache, write-buffer sizes, compaction style, merge
+operators) — while all CFs share the write-ahead log, MANIFEST, and
+background thread pools. The shared WAL is what preserves the §7.1 commit
+contract: one `WriteBatch` spanning several CFs commits atomically. A WAL
+segment becomes deletable only after every CF holding data in it has
+flushed, so per-CF flush tuning also bounds WAL retention.
+
+At mkfs, `bluestore_rocksdb_cfs`
+([`src/common/options/global.yaml.in`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in))
+assigns prefixes to CFs; default:
 
 ```
 m(3) p(3,0-12) O(3,0-13)=block_cache={type=binned_lru}
@@ -423,9 +433,40 @@ Resulting layout:
 | `P` | `P` | 1 | — | merge buffers |
 | default | all others | 1 | — | |
 
-The hash ranges are chosen so all keys of one object (`O`, 13 = shard byte +
-pool + hash) or one PG (`p`, 12 = pool + hash) land in the same shard.
-Physical placement only; key formats are unaffected.
+The definition serves three purposes:
+
+* isolation — high-churn prefixes compact without rewriting unrelated
+  data; unlisted prefixes share the default CF;
+* per-CF tuning — `L` and `P` accumulate up to 32 memtables before
+  flushing (`min_write_buffer_number_to_merge`), so a deferred record
+  (§7.2) written by one commit and deleted shortly after by another
+  normally annihilates in memory and never reaches an SST; PG-log
+  append-and-trim in `P` behaves the same way; `O` reads go through a
+  `binned_lru` block cache;
+* sharding — `O`, `m`, `p` are each split across 3 CFs by a hash of the
+  leading key bytes, yielding smaller LSM trees that flush and compact in
+  parallel.
+
+The hash ranges are chosen so all keys of one object (`O`, 13 = shard byte
++ pool + hash, §4.4) or one PG (`p`, 12 = pool + hash, §4.6) land in the
+same shard; range scans such as object listing or PG removal never
+straddle CFs.
+
+The active definition is persisted at mkfs as the BlueFS file
+`sharding/def` and parsed at every open by
+`RocksDBStore::parse_sharding_def()`
+([`src/kv/RocksDBStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/RocksDBStore.cc));
+changing `bluestore_rocksdb_cfs` has no effect on an existing OSD. Shard
+CFs are named `O-0`, `O-1`, ...; CF membership of each SST file in `db/`
+is recorded in the RocksDB MANIFEST. Per-prefix merge operators (§4.8,
+§8.1) are registered against the CF holding the prefix. The layout is
+inspected and converted offline with `ceph-bluestore-tool show-sharding`
+and `reshard`
+([`src/os/bluestore/bluestore_tool.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_tool.cc));
+`reshard` physically moves keys between CFs.
+
+Column families are physical placement only; key formats (§4.2–§4.8) are
+unaffected.
 
 ## 4.2 Prefix table
 
@@ -1109,6 +1150,8 @@ document describes (ref_map parity, csum sizes, shard bounds, omap flags).
 | BlueFS engine | [`src/os/bluestore/BlueFS.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.cc) / [`.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.h) | `_replay`, `_open_super`, `_write_super`, `_compact_log_async_LD_LNF_D`, `File::envelope_t` |
 | RocksDB glue | [`src/os/bluestore/BlueRocksEnv.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueRocksEnv.cc) | `BlueRocksEnv` |
 | CF sharding | [`src/common/options/global.yaml.in`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in) | `bluestore_rocksdb_cfs`, `bluefs_wal_envelope_mode`, `bluestore_allocation_from_file`, `bluestore_onode_segment_size` |
+| CF store, sharding/def | [`src/kv/RocksDBStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/RocksDBStore.cc) | `RocksDBStore::parse_sharding_def`, `sharding_def_file` |
+| Reshard tooling | [`src/os/bluestore/bluestore_tool.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_tool.cc) | `show-sharding`, `reshard` |
 | KV prefixes, keys | [`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc) | `PREFIX_*`, `get_object_key`, `append_escaped`, `get_extent_shard_key`, `is_extent_shard_key`, `get_deferred_key`, `Onode::calc_omap_key` |
 | Hash reversal | [`src/common/hobject.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/hobject.h) | `hobject_t::_reverse_bits` |
 | Onode/blob/extents | [`src/os/bluestore/bluestore_types.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h) | `bluestore_onode_t`, `bluestore_blob_t`, `bluestore_pextent_t`, `bluestore_blob_use_tracker_t`, `bluestore_shared_blob_t`, `bluestore_extent_ref_map_t`, `bluestore_compression_header_t`, `bluestore_cnode_t` |
