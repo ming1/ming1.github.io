@@ -1059,20 +1059,61 @@ blocks 0–1 allocated = the 8 KiB `SUPER_RESERVED` area, matching mkfs
 Source: [`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc) (NCB section:
 `allocator_image_header`, `allocator_image_trailer`, `ALLOCATOR_NCB_DIR`,
 `ALLOCATOR_NCB_FILE`); mode selection in `BlueStore::_open_fm()`.
+Introduced by commit `272160ab5e4` ("Remove Allocations from RocksDB");
+first released in v17 (Quincy), default-on since introduction.
 
-When `S.freelist_type` = `null`, the bitmap is not maintained; the
-authoritative allocation map is written at clean shutdown ("destage") to
-the BlueFS file `ALLOCATOR_NCB_DIR/ALLOCATOR_NCB_FILE`. Mode selection
-requires all four of:
+Rationale. In bitmap mode, every commit that allocates or frees space
+carries `b`-key XOR operands in its WriteBatch: allocation bookkeeping is
+persisted on the client-write critical path, then paid again through
+WAL, flush, and compaction. The free list, however, is derived state —
+fully reconstructible from the union of every onode's blob extents
+(§5–§6) and BlueFS's own extents (§3). NCB (the introducing commit's
+phrasing: allocation information committed "into RocksDB
+(column-family B)" — hence the name) stops persisting it at runtime
+altogether: the allocator lives in memory, is destaged once at clean
+shutdown to the BlueFS file `ALLOCATOR_NCB_DIR/ALLOCATOR_NCB_FILE`, and
+is rebuilt from onodes after a crash. The commit reports a 25% IOPS
+increase with reduced latency for small random writes.
+
+Cost shift per event:
+
+| Event | bitmap mode | NCB mode |
+|---|---|---|
+| every allocating/freeing commit | `b` merge operands in the WriteBatch | nothing persisted |
+| clean shutdown | nothing | one sequential destage of the image |
+| mount after clean shutdown | scan `b` prefix | sequential read of the image |
+| mount after crash | scan `b` prefix | rebuild from all onodes + BlueFS extents |
+
+When `S.freelist_type` = `null`, the bitmap is not maintained. Mode
+selection requires all four of:
 
 ```
 !is_db_rotational()  &&  !read_only  &&  db_avail  &&
 cct->_conf->bluestore_allocation_from_file      (default: true)
 ```
 
-The `!read_only` term means offline tools never switch a store to NCB; the
-rotational term keeps HDD-backed (and file-backed test) OSDs in bitmap
-mode — the captured OSD is one such.
+The rotational term bounds the crash-recovery cost: the rebuild reads
+every onode on the OSD, acceptable on flash but a long OSD-down window on
+HDDs, which therefore stay in bitmap mode — as do file-backed test
+devices, the captured OSD among them. The `!read_only` term means offline
+tools never switch a store to NCB. Since the option defaults to true, a
+production OSD with a non-rotational DB device runs NCB without any
+configuration; commit `bfd4e18eaad` ("Multithreaded allocation
+recovery", in the v21 line) parallelizes the crash rebuild.
+
+Placement. The image is a standalone BlueFS file rather than RocksDB
+content, a reserved raw region, or journal payload:
+
+| Alternative | Rejected because |
+|---|---|
+| RocksDB value(s) | the image needs no transactional, lookup, or merge property, yet would pay WAL double-write and later compaction of a large blob; it would also re-insert allocation state into the pipeline NCB exists to evacuate |
+| reserved raw region | image size is unbounded — 16 B per free extent, fragmentation-dependent — and cannot be sized at mkfs |
+| BlueFS journal / superblock | the journal is replayed at every mount and rewritten at every compaction (§3.4); the superblock is a single 4 KiB block (§3.1) |
+| standalone BlueFS file | growable extents plus atomic, journaled create/invalidate — the same pattern as `sharding/def` (§4.1) |
+
+BlueFS guarantees the file's extents, not its contents; self-validation
+(signature, serial, pad checks, per-buffer and header/trailer crc32c) is
+supplied by the image format below.
 
 File format:
 
