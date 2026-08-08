@@ -3,3 +3,4 @@ note.txt
 .virthualenv
 sftp-config.json
 *~
+*.swp
