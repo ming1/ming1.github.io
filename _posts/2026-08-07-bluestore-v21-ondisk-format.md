@@ -978,116 +978,148 @@ SAMELENGTH cannot apply to a shard's first record. 18 bytes against 16:
 exactly the observed +2, and the same accounting reproduces the last
 shard's 292 (2 + 18 + 17 × 16).
 
-### 5.4.3 Spanning blobs: cloned object with 8 KiB-stride overwrites
+### 5.4.3 Spanning blobs: 256 KiB cloned object, 8 KiB-stride overwrites
 
-A blob crossing a shard cut is not promoted automatically. During reshard,
+A blob crossing a shard cut is not promoted automatically. During reshard
 a crossing blob is **split** whenever `can_split()` and
-`can_split_at(blob_offset)` both hold, and only an unsplittable blob
-becomes spanning
-([`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc),
-reshard → `split_blob()`). Since `can_split()` excludes only
-`FLAG_SHARED`, `FLAG_COMPRESSED` and `FLAG_HAS_UNUSED` blobs (§6.2), an
-ordinary mutable blob is always split — in the §5.4.2 object every cut
-that landed mid-blob produced a fresh blob with `blob_offset` 0 in the
-next shard, and its spanning count stayed 0.
+`can_split_at(blob_offset)` both hold; only an unsplittable blob becomes
+spanning ([`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc),
+reshard → `split_blob()`). `can_split()` excludes exactly `FLAG_SHARED`,
+`FLAG_COMPRESSED` and `FLAG_HAS_UNUSED` blobs (§6.2), so an ordinary
+mutable blob is always split instead — which is why the §5.4.2 object,
+built from mutable blobs, reports a spanning count of 0 even though it has
+five shards.
 
-This specimen therefore uses clone-shared blobs: a 2 MiB object, a pool
-snapshot, then 256 overwrites that both fragment the extent map and mark
-every touched blob `FLAG_SHARED`:
+This specimen uses clone-shared blobs. A 256 KiB object is written, a pool
+snapshot taken, then 32 overwrites at 8 KiB stride both fragment the
+extent map past the sharding threshold and mark the touched blobs
+`FLAG_SHARED`:
 
 ```
-$ rados -p p1 put snapspan /root/2m_rand      # 2 MiB -> 64 KiB blobs
-$ rados -p p1 mksnap snap1                     # next write clones
-$ for w in $(seq 0 31); do for j in $(seq 0 7); do
-    rados -p p1 put snapspan /root/4k --offset $((w * 65536 + j * 8192))
+$ rados -p p1 put sp256 /root/obj_256               # 256 KiB -> 64 KiB blobs
+$ rados -p p1 mksnap snap2                           # next write clones
+$ for w in 0 1 2 3; do for j in $(seq 0 7); do
+    rados -p p1 put sp256 /root/4k --offset $((w * 65536 + j * 8192))
   done; done
 ```
 
-Head object (`snap` = `CEPH_NOSNAP`; the clone sorts first under the lower
-snap id, §4.4):
+The head object (`snap` = `CEPH_NOSNAP`; the clone sorts first under its
+lower snap id, §4.4) occupies five records in total:
 
-| | value |
-|---|---|
-| onode record | 7634 B = 6 B frame + 4597 B onode struct + 3031 B spanning section |
-| onode fields | nid 5139, size 2097152, flags 0x00, 20 `shard_info` entries |
-| shard records | 20 (shard[0] 0x0/563 B, shard[1] 0x1c000/552 B, … shard[19] 0x1fc000/52 B) |
-| spanning blobs | 13 |
-| `X` records | 32 |
+| Record | Key | Value |
+|---|---|---|
+| onode | `<ghobject>'o'` | 1166 B |
+| shard 0 | `<ghobject>'o' 00 00 00 00 'x'` | 494 B |
+| shard 1 | `<ghobject>'o' 00 01 50 00 'x'` | 583 B |
+| shard 2 | `<ghobject>'o' 00 03 00 00 'x'` | 423 B |
+| shared blob | `X` + BE u64 61442 | 56 B |
 
-The onode struct is large only because of the OSD-layer `snapset` attr
-(4187 B of the 4597 — its clone_overlap tracks all 256 fragments); the
-`_` attr is 267 B and BlueStore's own fields are the ones listed above.
+Onode value, 1166 B = 6 B frame + 925 B onode struct + 235 B spanning
+section, with no third section (the map is sharded):
 
-Spanning section (§5.2), first entry annotated; the 3031 bytes are
-2 + 13 × 233, every entry being the same size here:
+```
+02 01 9d 03 00 00   DENC: struct_v 2, compat 1, payload 0x39d (925)
+                    nid 6161, size 262144, flags 0x00
+                    attrs: "_" 264 B, "snapset" 603 B  (OSD payloads)
+03 00 00 00         extent_map_shards: le32 count = 3
+00        ee 03     shard_info[0]: offset 0x0,     bytes 494
+80 a0 05  c7 04     shard_info[1]: offset 0x15000, bytes 583
+80 80 0c  a7 03     shard_info[2]: offset 0x30000, bytes 423
+00 00 00            expected_object_size/write_size/hint: varint 0 x3
+00 00 00 00         zone_offset_refs: 0
+```
+
+The two xattrs are 867 of the 925 bytes; BlueStore's own onode fields are
+the remaining ~58.
+
+Spanning section — one entry, and 235 = 2 + 233:
 
 ```
 02              struct_v = 2
-0d              count = 13
--- entry 0, 233 B --
+01              count = 1
+-- entry, 233 B --
 00              varint blob_id = 0
-10              PExtentVector count = 16          (varint, §6.1)
-ff ff ff ff  ff ff ff ff ff 01   07     pextent[0]: lba INVALID_OFFSET
-                                        (hole), length 4096
-a8 03 00 00                      07     pextent[1]: lba 0x1d4000, length 4096
-ff ff ff ff  ff ff ff ff ff 01   07     pextent[2]: hole
-ac 03 00 00                      07     pextent[3]: lba 0x1d6000
--- 12 more pextents, alternating hole / real --
+10              PExtentVector count = 16                  (varint, §6.1)
+ff ff ff ff ff ff ff ff ff 01  07   pextent[0]: lba INVALID_OFFSET
+                                    (hole, 10 B), length 4096
+39 01 00 00                    07   pextent[1]: lba 0x4e0000, length 4096
+-- 7 more hole/real pairs, real ones stepping 0x2000 to 0x4ee000 --
+14              flags = 0x14 = FLAG_SHARED | FLAG_CSUM
+04 0c 40        csum_type crc32c (4), chunk order 12, 64 B of checksums
+<64 B>          16 x le32 crc32c, one per 4 KiB of the 64 KiB blob
+02 f0 00 00 00 00 00 00     le64 sbid = 61442               (§6.3)
+80 20  10       use tracker: au_size 4096, num_au 16        (§6.4)
+00  80 20  00  80 20 ...    16 varints: 0, 4096, 0, 4096, …
 ```
 
-The remaining fields of the entry decode as: `flags` = 0x14
-(`FLAG_SHARED` | `FLAG_CSUM`), csum crc32c with chunk order 12 and 64 B
-of checksums (16 × 4 KiB = the full 64 KiB blob), `sbid` = 51202, and a
-use tracker with `au_size` 4096 and `num_au` 16 (§6.4 — persisted here
-because the blob is spanning). The eight surviving pextents step by
-8 KiB from 0x1d4000: the blob's original allocation was contiguous, and
-the overwrites punched out every other 4 KiB block. Blob ids are not
-dense — 0, 10, 11, 20 among the 13 — since they are assigned only to
-blobs that survive as spanning.
+The entry length reconciles exactly:
 
-Shard 17 (542 B, 24 extents: 4 inline blobs, 15 back-references, 5
-spanning references) shows both reference forms interleaved:
+| Part | Bytes |
+|---|---|
+| blob_id + pextent count | 2 |
+| 8 holes × 11 B + 8 real × 5 B | 128 |
+| flags | 1 |
+| csum header (3) + 64 B array | 67 |
+| sbid | 8 |
+| use tracker (`80 20 10` + 8 × 1 B + 8 × 2 B) | 27 |
+| **total** | **233** |
+
+The blob's original 64 KiB allocation was contiguous; the overwrites
+released every other 4 KiB block, leaving eight real pextents at 8 KiB
+stride interleaved with eight holes. The tracker mirrors this: alternating
+0 and 4096 referenced bytes per allocation unit. Both are persisted only
+because the blob is spanning (§5.2).
+
+Why this blob spans: it covers logical [0x10000, 0x20000), and the shard 1
+cut at 0x15000 falls inside that range, so its eight surviving fragments
+are referenced from two different shards — two in shard 0, six in
+shard 1. `BLOBID_FLAG_SPANNING` (bit 3) is set and bits 4+ carry the id
+(§5.3):
 
 ```
-02 18           struct_v 2, n = 24
-02 a3 0e 07     extent 0: gap 0x1c8000 (absolute, shard-local pos starts
-                at 0), length 4096, inline blob follows
-07 56 09 00 00 07 ...   inline blob: 7 pextents, first lba 0x4ab000
+shard 0 (21 extents; 3 inline blobs, 16 back-references, 2 spanning refs)
+  [17] logical 0x11000  blob_off 0x1000   0d 07
+  [19] logical 0x13000  blob_off 0x3000   0d 0f
+        0x0d = CONTIGUOUS|SAMELENGTH|SPANNING, id = 0x0d >> 4 = 0;
+        the single following byte is the blob_offset (varint_lowz)
 
-decoded records:
-  [0] logical 0x1c8000  blob_off 0x0     inline blob (7 pextents)
-  [1] logical 0x1c9000  blob_off 0x9000  SPANNING id=20
-  [2] logical 0x1ca000  blob_off 0x2000  backref k=1 (extent 0)
-  [3] logical 0x1cb000  blob_off 0xb000  SPANNING id=20
-  [4] logical 0x1cc000  blob_off 0x4000  backref k=1 (extent 0)
-  [5] logical 0x1cd000  blob_off 0xd000  SPANNING id=20
+shard 1 (27 extents; 3 inline blobs, 18 back-references, 6 spanning refs)
+  [ 0] logical 0x15000  blob_off 0x5000   08 57 17 07
+        0x08 = SPANNING only: gap 0x15000 (absolute — a shard's decode
+        position starts at 0), blob_offset 0x5000, length 0x1000
+  [ 2] logical 0x17000  blob_off 0x7000   0d 1f
+  [ 4] logical 0x19000  blob_off 0x9000   0d 27
+  [ 6] logical 0x1b000  blob_off 0xb000   0d 2f
+  [ 8] logical 0x1d000  blob_off 0xd000   0d 37
+  [10] logical 0x1f000  blob_off 0xf000   0d 3f
+
+shard 2 (16 extents): no spanning references
 ```
 
-Records [1], [3], [5] carry `BLOBID_FLAG_SPANNING` with the id in bits
-4+ (§5.3) and resolve against the onode's spanning table; their
-`blob_offset` advances by 0x2000 through the shared blob, while the
-interleaved records back-reference a blob defined locally in this shard.
-The shared blob is referenced from more than one shard, which is exactly
-why it could not stay local.
+A contiguous, same-length spanning reference costs two bytes. Sharing
+alone does not promote a blob: shard 0 and shard 2 each define
+`FLAG_SHARED` blobs inline (flags 0x14) that stay local because all their
+extents fall within one shard.
 
-The `X` record for `sbid` 51202 (§6.5), key `BE u64` 0x000000000000c802:
+The `X` record for `sbid` 61442 (§6.5), key `BE u64` 0x000000000000f002:
 
 ```
 01 01 32 00 00 00   DENC_START(1,1), payload 50 B
 10                  ref_map: 16 entries
-cf 0e  07  01       offset 0x1d3000 (absolute varint_lowz), length 4096, refs 1
+ff 26  07  01       offset 0x4df000 (absolute varint_lowz), length 4096, refs 1
 07  07  02          offset delta 4096, length 4096, refs 2
 07  07  01          delta 4096, length 4096, refs 1
-...                 refs alternate 1, 2 for all 16 entries
+...                 refs alternate 1, 2 through all 16 entries
 ```
 
-`ceph-dencoder type bluestore_shared_blob_t` decodes it as offsets
-1912832, 1916928, 1921024 … with `refs` 1, 2, 1 …, and reports
-`"sbid": 0` because the value carries only the ref_map — the id lives in
-the key. The alternation is the clone relationship made visible: blocks
-still referenced by both head and clone hold 2 references, blocks the
-head overwrote hold 1 (the clone alone). Sixteen 4 KiB entries cover the
-original 64 KiB blob.
+`ceph-dencoder type bluestore_shared_blob_t` decodes offsets 5107712,
+5111808, … with `refs` 1, 2, 1 …, and reports `"sbid": 0` because the
+value carries only the ref_map — the id lives in the key. The alternation
+is the clone relationship: blocks both head and clone reference hold two
+references, blocks the head overwrote hold one (the clone alone). Sixteen
+4 KiB entries cover the original 64 KiB blob, and the head's first real
+pextent (0x4e0000) is the second entry — the first block, 0x4df000, is
+the hole at the front of the head's blob.
 
 # 6. Blob Structures
 
