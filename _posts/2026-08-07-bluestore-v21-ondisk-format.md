@@ -939,10 +939,31 @@ Shard 0's 530-byte value is a 2-byte header plus 33 records of exactly
 -- ... 29 more records of the same shape --
 ```
 
+Extents 0 and 1 map identical 4 KiB writes yet encode differently,
+because the §5.3 flag byte describes the extent relative to the
+decoder's running state (`pos`, `prev_len`), not the extent itself:
+
+| | extent 0 (`03 07`) | extent 1 (`06 3f`) |
+|---|---|---|
+| state before record | `pos` = 0, `prev_len` = 0 | `pos` = 4096, `prev_len` = 4096 |
+| CONTIGUOUS | set: offset 0 == `pos` → no gap field | clear: offset 65536 ≠ `pos` → gap `3f` (61440, the hole the stride left) |
+| SAMELENGTH | clear: 4096 ≠ `prev_len` → length `07` emitted | set: 4096 == `prev_len` → length omitted |
+| ZEROOFFSET | set → `blob_offset` omitted | set → omitted |
+
+The first record gets contiguity for free (`pos` starts at 0) but must
+spell out its length; the second inherits the length but must spell out
+the gap — one field trades for the other, which is why both records
+encode to exactly 16 bytes. From extent 1 onward the relative situation
+repeats (same gap, same length), so the remaining records are
+byte-for-byte copies of extent 1.
+
 Every write carried the same 4 KiB payload, so all 150 blobs share one
 crc32c (`0x90f56d6c`) and the records repeat byte-for-byte except for the
 advancing lba words — which step by exactly 4096: the 150 logically
-64 KiB-strided writes were allocated physically contiguous. Shards 1–3 encode 532 bytes against shard 0's 530:
+64 KiB-strided writes were allocated physically contiguous.
+
+The same state dependence sets the shard sizes: shards 1–3 encode 532
+bytes against shard 0's 530 because
 the encoder's logical position starts at 0 within each shard, so shard
 0's first record opens `03 07` (CONTIGUOUS, length) while a later shard's
 first record opens with blobid `02`, a 2-byte `varint_lowz` gap carrying
