@@ -592,10 +592,58 @@ contiguous range scan.
 ## 4.7 `C` — collections
 
 Source: [`src/os/bluestore/bluestore_types.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h) (`bluestore_cnode_t`).
+Code path: `get_coll_range()`, `_open_collections()`,
+`_split_collection()`, `_merge_collection()`
+([`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc)).
 
-Key: ASCII `<pgid>_head` (e.g. `1.4_head`). Value: `DENC_START(1,1)` +
-le32 `bits` = number of significant PG-hash bits; used with the key's pgid
-to bound-check which objects belong to the collection.
+A collection is ObjectStore's grouping unit: one PG, plus the per-OSD
+`meta` collection holding bookkeeping objects (OSD superblock, PG
+metadata). Key: the ASCII rendering of the `spg_t` plus the literal
+`_head` (EC shards include the shard id: `1.4s2_head`); the meta
+collection's key is `meta`.
+
+Value — the collection's entire persistent state:
+
+```
+01 01 04 00 00 00   DENC_START(1,1), payload len 4
+03 00 00 00         le32 bits = significant low PG-hash bits
+```
+
+Membership is computed, not stored; no per-collection object list exists.
+An object belongs to PG collection `<pool>.<ps>` iff
+`hash & ((1 << bits) - 1) == ps`. Because `O` keys embed
+`_reverse_bits(hash)` (§4.4), this predicate is equivalent to a contiguous
+key range, derived by `get_coll_range()`:
+
+```
+start = shard | pool | _reverse_bits(ps)
+end   = shard | pool | _reverse_bits(ps) + (1 << (32 - bits))
+```
+
+Collection listing, scrub/backfill enumeration, and PG deletion are range
+scans over [start, end). Each PG collection additionally owns a temp
+region for in-flight recovery objects: the same range math with
+pool = `-2 - pool`, a separate negative-pool key region cleared by range
+at PG activation.
+
+`bits` is stored per collection rather than derived from the pool because
+`pg_num` need not be a power of two: at `pg_num` = 12, some PGs are
+defined by 3 hash bits and others by 4.
+
+Split and merge move no objects. `_split_collection()` writes the child's
+`C` record and sets both records to `bits + 1`; the parent's key range
+bisects, and the upper half now belongs to the child.
+`_merge_collection()` is the inverse (`bits - 1`). fsck validates the
+predicate in reverse: every onode's hash must fall inside its collection's
+declared range.
+
+Captured (`ceph-kvstore-tool`): the reference OSD's 10 `C` keys are
+`1.0_head`–`1.7_head` (pool 1, `pg_num` 8, bits 3), `2.0_head` (the
+`.mgr` pool), and `meta`.
+
+Collections are loaded before any onode access at mount
+(`_open_collections()`, §9): key interpretation and membership checks
+require the cnode.
 
 ## 4.8 `T` — statfs
 
@@ -1154,6 +1202,7 @@ document describes (ref_map parity, csum sizes, shard bounds, omap flags).
 | Reshard tooling | [`src/os/bluestore/bluestore_tool.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_tool.cc) | `show-sharding`, `reshard` |
 | KV prefixes, keys | [`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc) | `PREFIX_*`, `get_object_key`, `append_escaped`, `get_extent_shard_key`, `is_extent_shard_key`, `get_deferred_key`, `Onode::calc_omap_key` |
 | Hash reversal | [`src/common/hobject.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/hobject.h) | `hobject_t::_reverse_bits` |
+| Collections | [`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc) | `get_coll_range`, `_open_collections`, `_split_collection`, `_merge_collection` |
 | Onode/blob/extents | [`src/os/bluestore/bluestore_types.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h) | `bluestore_onode_t`, `bluestore_blob_t`, `bluestore_pextent_t`, `bluestore_blob_use_tracker_t`, `bluestore_shared_blob_t`, `bluestore_extent_ref_map_t`, `bluestore_compression_header_t`, `bluestore_cnode_t` |
 | O-value assembly | [`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc) | `_record_onode`, `Onode::decode_raw` |
 | Extent map codec | [`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc) | `ExtentMap::encode_some`, `ExtentDecoder::decode_some`, `encode_spanning_blobs`, `decode_spanning_blobs`, `BLOBID_FLAG_*` |
