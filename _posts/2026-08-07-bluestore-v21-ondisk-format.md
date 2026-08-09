@@ -862,8 +862,8 @@ Lifecycle:
 
 * promotion — `encode_some()` detects a blob escaping the range being
   encoded (`blob_escapes_range()`) and calls `request_reshard()`; the
-  reshard pass assigns spanning ids to boundary-crossing blobs and re-cuts
-  shard boundaries;
+  reshard pass re-cuts shard boundaries and then, for each blob that still
+  crosses one, either splits it or promotes it (below);
 * demotion — when overwrites confine a blob to one shard, it is dropped
   from the spanning table (`id = -1`) and re-encoded inline at the next
   reshard;
@@ -871,6 +871,22 @@ Lifecycle:
   blobs from crossing segment boundaries, which by construction keeps
   every blob within one shard; with the default `segment_size = 0` the
   spanning machinery above is in effect.
+
+Crossing a shard boundary is necessary but not sufficient for promotion.
+During reshard a crossing blob is **split** when `Blob::can_split()` and
+`Blob::can_split_at(blob_offset)` both hold, and promoted to spanning
+(`_make_spanning()`) only when either test fails
+([`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc)).
+Each test has two halves
+([`src/os/bluestore/BlueStore.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h)):
+
+| Test | blob half | use-tracker half |
+|---|---|---|
+| `can_split()` | not `FLAG_SHARED`, `FLAG_COMPRESSED` or `FLAG_HAS_UNUSED` (§5.2) | tracker is per-AU (`num_au > 0`, §5.4) |
+| `can_split_at()` | no checksums, or offset is csum-chunk aligned | offset is AU-aligned and within the tracker |
+
+An ordinary mutable blob therefore splits and never appears here; §6.4.3
+captures both outcomes at one boundary.
 
 Spanning blobs are decoded on every onode load and re-encoded on every
 onode update, independent of whether the I/O touches their extents; the
@@ -1117,28 +1133,13 @@ extents.
 
 ### 6.4.3 Spanning blobs: 256 KiB cloned object, 8 KiB-stride overwrites
 
-A blob crossing a shard cut is not promoted automatically. During reshard
-a crossing blob is **split** when `Blob::can_split()` and
-`Blob::can_split_at(blob_offset)` both hold, and promoted to spanning
-(`_make_spanning()`) only when either test fails
-([`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc)).
-Each test has two halves
-([`src/os/bluestore/BlueStore.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h)):
+This specimen captures a populated spanning section: one blob promoted
+because it is referenced from two shards and cannot be split. Promotion
+requires an unsplittable blob (§6.2), so the object is cloned — a clone
+marks blobs `FLAG_SHARED`, the cheapest way to produce one.
 
-| Test | blob half | use-tracker half |
-|---|---|---|
-| `can_split()` | not `FLAG_SHARED`, `FLAG_COMPRESSED` or `FLAG_HAS_UNUSED` (§5.2) | tracker is per-AU (`num_au > 0`, §5.4) |
-| `can_split_at()` | no checksums, or offset is csum-chunk aligned | offset is AU-aligned and within the tracker |
-
-Both outcomes occur at the same cut in this specimen. The head's own
-mutable blob for window 1 is split at 0x15000 into the two halves visible
-in the shards — shard 0's record [16] holds 5 pextents (3 real: blocks
-16, 18, 20) and shard 1's record [1] holds 10 (5 real: blocks 22–30) —
-while the clone-shared blob covering the same window fails the first test
-and is promoted instead.
-
-This specimen uses clone-shared blobs. A 256 KiB object is written and a
-pool snapshot taken. The first of the 32 overwrites that follow triggers
+A 256 KiB object is written and a pool snapshot taken. The first of the
+32 overwrites that follow triggers
 the clone of the whole object, which converts all four of its 64 KiB
 blobs to `FLAG_SHARED` (`_do_clone_range()` → `dup_esb()` →
 `make_blob_shared()`; `dup_esb` is the default path since
@@ -1152,6 +1153,58 @@ $ for w in 0 1 2 3; do for j in $(seq 0 7); do
     rados -p p1 put sp256 /root/4k --offset $((w * 65536 + j * 8192))
   done; done
 ```
+
+Which of the four shared blobs ends up promoted is decided by where the
+shard cuts fall. The script overwrites 4 KiB at every 8 KiB boundary, so
+across the whole object the head owns every even 4 KiB block and the
+clone-shared blobs retain every odd one. Each 64 KiB window has its own
+shared blob, but the shard cuts — the logical offsets 0x15000 and
+0x30000, which are blocks 21 and 48 — fall differently: only the cut at
+block 21 lands inside a window:
+
+```
+          0       8       16      24      32      40      48      56     63
+          |-------|-------|-------|-------|-------|-------|-------|-------
+ owner    HSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHS
+ window   [-- window 0 --][-- window 1 --][-- window 2 --][-- window 3 --]
+ head     [--- head 0 ---][h1a][-- h1b --][--- head 2 ---][--- head 3 ---]
+ shared   [---- 61441 ---][---- 61442 ---][---- 61443 ---][---- 61444 ---]
+ shard    [----- shard 0 -----][-------- shard 1 --------][--- shard 2 --]
+                               ^                          ^
+                          cut 0x15000                cut 0x30000
+                          (block 21)                 (block 48)
+                          shard 0 | 1                shard 1 | 2
+
+ H = 4 KiB overwritten by the head; a window's eight H blocks share one
+     head blob (head 0, head 2, head 3 — and h1a/h1b, see below)
+ S = 4 KiB still referenced from that window's clone-shared blob, named
+     here by its sbid
+```
+
+| Window | Blocks | sbid | S fragments | Shards holding them | Result |
+|---|---|---|---|---|---|
+| 0 | 0–15 | 61441 | 8 (odd blocks 1–15) | shard 0 | inline, local |
+| 1 | 16–31 | 61442 | 8 (odd blocks 17–31) | shards 0 **and** 1 | **spanning** |
+| 2 | 32–47 | 61443 | 8 (odd blocks 33–47) | shard 1 | inline, local |
+| 3 | 48–63 | 61444 | 8 (odd blocks 49–63) | shard 2 | inline, local |
+
+Window 1's blob is referenced from two shards, so it cannot be encoded
+locally in either; being `FLAG_SHARED` it also cannot be split, so it is
+promoted. The other three blobs are equally shared but sit wholly inside
+one shard, so they stay inline. The cut at block 48 promotes nothing
+because it coincides with a window boundary, though it still resets the
+encoder: shard 2's first record can use neither CONTIGUOUS nor
+SAMELENGTH.
+
+`BLOBID_FLAG_SPANNING` (bit 3) is set in the referring records and bits
+4+ carry the id (§6.3).
+
+Both outcomes of the §6.2 rule are visible at this one cut. The head's
+own mutable blob for window 1 passes both split tests and is cut in two —
+shard 0's record `[16]` holds 5 pextents (3 real: blocks 16, 18, 20) and
+shard 1's record `[1]` holds 10 (5 real: blocks 22–30), the two halves of
+what was one blob. The shared blob covering the same window fails
+`can_split()` and is promoted instead.
 
 The head object (`snap` = `CEPH_NOSNAP`; the clone sorts first under its
 lower snap id, §4.4) is described by eight records — four under `O`, plus
@@ -1233,50 +1286,6 @@ stride interleaved with eight holes. The tracker mirrors this: alternating
 0 and 4096 referenced bytes per allocation unit. Both are persisted only
 because the blob is spanning (§6.2).
 
-Why this blob spans: the script overwrites 4 KiB at every 8 KiB boundary,
-so across the whole object the head owns every even 4 KiB block and the
-clone-shared blobs retain every odd one. Each 64 KiB window has its own
-shared blob, but the shard cuts — the logical offsets 0x15000 and
-0x30000, which are blocks 21 and 48 — fall differently: only the cut at
-block 21 lands inside a window:
-
-```
-          0       8       16      24      32      40      48      56     63
-          |-------|-------|-------|-------|-------|-------|-------|-------
- owner    HSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHSHS
- window   [-- window 0 --][-- window 1 --][-- window 2 --][-- window 3 --]
- head     [--- head 0 ---][h1a][-- h1b --][--- head 2 ---][--- head 3 ---]
- shared   [---- 61441 ---][---- 61442 ---][---- 61443 ---][---- 61444 ---]
- shard    [----- shard 0 -----][-------- shard 1 --------][--- shard 2 --]
-                               ^                          ^
-                          cut 0x15000                cut 0x30000
-                          (block 21)                 (block 48)
-                          shard 0 | 1                shard 1 | 2
-
- H = 4 KiB overwritten by the head; a window's eight H blocks share one
-     head blob (head 0, head 2, head 3 — and h1a/h1b, see below)
- S = 4 KiB still referenced from that window's clone-shared blob, named
-     here by its sbid
-```
-
-| Window | Blocks | sbid | S fragments | Shards holding them | Result |
-|---|---|---|---|---|---|
-| 0 | 0–15 | 61441 | 8 (odd blocks 1–15) | shard 0 | inline, local |
-| 1 | 16–31 | 61442 | 8 (odd blocks 17–31) | shards 0 **and** 1 | **spanning** |
-| 2 | 32–47 | 61443 | 8 (odd blocks 33–47) | shard 1 | inline, local |
-| 3 | 48–63 | 61444 | 8 (odd blocks 49–63) | shard 2 | inline, local |
-
-Window 1's blob is referenced from two shards, so it cannot be encoded
-locally in either; being `FLAG_SHARED` it also cannot be split, so it is
-promoted. The other three blobs are equally shared but sit wholly inside
-one shard, so they stay inline. The cut at block 48 promotes nothing
-because it coincides with a window boundary, though it still resets the
-encoder: shard 2's first record can use neither CONTIGUOUS nor
-SAMELENGTH.
-
-`BLOBID_FLAG_SPANNING` (bit 3) is set in the referring records and bits
-4+ carry the id (§6.3).
-
 Each shard resolves its extents three ways — blobs defined inline,
 back-references within the shard, and spanning references into the onode
 table:
@@ -1330,6 +1339,7 @@ references, blocks the head overwrote hold one (the clone alone). Sixteen
 4 KiB entries cover the original 64 KiB blob, and the head's first real
 pextent (0x4e0000) is the second entry — the first block, 0x4df000, is
 the hole at the front of the head's blob.
+
 
 # 7. Transactions and Deferred Writes
 
