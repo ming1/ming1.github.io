@@ -1381,11 +1381,6 @@ position starts at 0), blob_offset 0x5000 and length 0x1000. Block
 numbers convert to the logical offsets of §6.3 as block × 4096, so
 `[17]` at block 17 is logical 0x11000.
 
-A contiguous, same-length spanning reference costs two bytes. The skipped
-indices are the head's own 4 KiB writes: through window 1 the records
-alternate between a spanning reference and the head blob — inline where
-that blob first appears in the shard, a back-reference thereafter.
-
 The `X` record for `sbid` 61442 (§5.5), key `BE u64` 0x000000000000f002:
 
 ```
