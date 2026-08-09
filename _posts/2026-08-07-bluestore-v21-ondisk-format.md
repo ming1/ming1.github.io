@@ -1492,6 +1492,61 @@ pextent (0x4e0000) is the second entry — the first block, 0x4df000, is
 the hole at the front of the head's blob.
 
 
+### 6.4.4 Walking the mapping for an I/O
+
+The specimens above show the structures at rest. Serving a request means
+traversing them in a fixed order, and every value below is taken from the
+§6.4.3 capture.
+
+Read of 4 KiB at logical 0x1b000:
+
+```
+1. key        build the O key from the ghobject (§4.4), read the onode record
+2. onode      decode bluestore_onode_t (§6.1)      -> shard_info[]
+              decode the spanning section (§6.2)   -> id 0 = blob, 16 pextents,
+                                                      csum order 12
+3. select     shard_info {(0x0,494), (0x15000,583), (0x30000,423)}
+              0x15000 <= 0x1b000 < 0x30000         -> shard 1 only
+              read key <onode>'o' 00 01 50 00 'x'  -> 583 B
+4. decode     replay records from pos = 0, prev_len = 0 (§6.3) until one
+              covers the target                    -> record [6] = 0d 2f
+5. resolve    0x0d has SPANNING set, id 0x0d >> 4 = 0
+              -> the blob from step 2, not an inline or back-referenced one
+6. offset     the record carries blob_off 0xb000
+7. pextent    0xb000 / 4096 = 11 -> pextent[11] = 0x4ea000, real
+              (INVALID_OFFSET here would mean never written: return zeros)
+8. verify     chunk 0xb000 >> 12 = 11 -> crc32c 0xcfae3298
+
+   => read 4 KiB at device offset 0x4ea000, check it against 0xcfae3298
+```
+
+Two properties of the format show up in that descent. Steps 3 and 4 read
+one shard record of 583 bytes rather than the whole 1.4 KiB map — the
+demand paging sharding exists for. Step 5 resolves without touching
+shard 0, even though the same blob is referenced there, because the
+definition was promoted into the onode that step 2 already decoded; a
+back-reference at that point would have been resolvable only within
+shard 1.
+
+A write descends identically to find the affected extents, then differs
+in what it rewrites:
+
+* the target blob decides the update. A mutable, unshared blob can be
+  overwritten in place, deferred or direct (§7.2); a shared or compressed
+  one cannot, so the write allocates new space, the extent map is
+  repointed, and the old range is released through the transaction's
+  `released` set or a refcount put (§5.5, §7.2);
+* only shards whose logical ranges changed are re-encoded and written.
+  That is the point of the split: a 4 KiB write to this object rewrites
+  one shard record, not the whole extent map;
+* the onode record is always rewritten, and with it the entire spanning
+  section — so a spanning blob is re-encoded even by a write that never
+  touches its extents (§6.2);
+* if a rewritten shard crosses the size thresholds of §6.4.2, reshard
+  re-cuts boundaries and may split or promote blobs, changing which of
+  the three reference forms later records use.
+
+
 # 7. Transactions and Deferred Writes
 
 ## 7.1 Commit protocol
