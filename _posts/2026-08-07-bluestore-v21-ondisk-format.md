@@ -1514,11 +1514,21 @@ Read of 4 KiB at logical 0x1b000:
               -> the blob from step 2, not an inline or back-referenced one
 6. offset     the record carries blob_off 0xb000
 7. pextent    0xb000 / 4096 = 11 -> pextent[11] = 0x4ea000, real
-              (INVALID_OFFSET here would mean never written: return zeros)
 8. verify     chunk 0xb000 >> 12 = 11 -> crc32c 0xcfae3298
 
    => read 4 KiB at device offset 0x4ea000, check it against 0xcfae3298
 ```
+
+Step 7 lands on a real pextent by construction. The entry's eight holes
+are at the even blob offsets, and those logical ranges are no longer
+mapped to this blob at all — the head's own extents cover them (§6.4.3),
+so no live reference resolves onto a hole. `INVALID_OFFSET` marks space
+the blob does not map, here because the overwrites released it while the
+clone kept its reference; the write path checks `is_allocated()` before
+reusing a range for exactly this reason, and fsck flags an extent that
+points at one. Space that is allocated but never written is a different
+thing, carried by `FLAG_HAS_UNUSED` (§5.2) and read as zeros without
+touching the device.
 
 Two properties of the format show up in that descent. Steps 3 and 4 read
 one shard record of 583 bytes rather than the whole 1.4 KiB map — the
