@@ -1211,9 +1211,6 @@ one `X` record per shared blob:
 | shard 2 | `<ghobject>'o' 00 03 00 00 'x'` | 423 B |
 | shared blobs | `X` + BE u64 `00 00 00 00 00 00 f0 01` … `f0 04` | 56 B each |
 
-The four sbids 61441–61444 are one per 64 KiB window, assigned in order
-by the clone; 61442 is the promoted one.
-
 Onode value, 1166 B = 6 B frame + 925 B onode struct + 235 B spanning
 section, with no third section (the map is sharded):
 
@@ -1276,9 +1273,9 @@ c7 9f bd 81 6b bb a6 5c ce e8 fc 5b 5c 52 4b 47 crc32c, chunks 12-15
 00 80 20 00 80 20                AU 12-15 referenced: 0, 4096, 0, 4096
 ```
 
-The fields sum to the entry's 233 bytes: 1 + 1 + 128 pextents + 1 + 67
-csum + 8 sbid + 27 tracker — checksums and pextents alone are 84% of it,
-which is why a spanning blob is expensive to carry in the onode (§6.2).
+Per field that is 1 + 1 + 128 pextents + 1 + 67 csum + 8 sbid + 27
+tracker; checksums and pextents alone are 84% of the entry, which is why
+a spanning blob is expensive to carry in the onode (§6.2).
 
 Three things the full listing shows that a summary hides:
 
@@ -1303,17 +1300,16 @@ Each shard resolves its extents three ways — blobs defined inline,
 back-references within the shard, and spanning references into the onode
 table:
 
-| Shard | Extents | inline blobs | back-references | spanning refs |
-|---|---|---|---|---|
-| 0 | 21 | 3 | 16 | 2 |
-| 1 | 27 | 3 | 18 | 6 |
-| 2 | 16 | 2 | 14 | 0 |
+| Shard | inline blobs | back-references | spanning refs |
+|---|---|---|---|
+| 0 | 3 | 16 | 2 |
+| 1 | 3 | 18 | 6 |
+| 2 | 2 | 14 | 0 |
 
-Decoding the three shards record by record shows why only one of the four
-shared blobs needed promoting. Windows 0, 2 and 3 lie wholly inside a
-shard, so their shared blobs are defined inline there and every later
-block that uses them costs a two-byte back-reference; window 1 straddles
-the cut, so neither shard can hold its definition:
+Decoding the three shards record by record puts the two encodings side by
+side: a shared blob that fits inside one shard is defined inline there and
+reached by two-byte back-references, while window 1's is reached by
+spanning references from both shards:
 
 ```
 shard 0, 494 B, 21 records, blocks 0-20
@@ -1354,19 +1350,13 @@ shard 2, 423 B, 16 records, blocks 48-63
   ...  blocks 52-63 alternate the same way, no spanning record anywhere
 ```
 
-Shard 2 is the control case in full: one window, one head blob, one
-shared blob, fourteen two-byte back-references and not a single spanning
-record — what every shard would look like if no cut fell inside a window.
-Its leading record also carries the absolute gap of §6.4.2, `c3 01` =
-0x30000.
+Shard 2 is the control case: one window, no cut inside it, so no spanning
+record. Its leading record also carries the absolute gap of §6.4.2,
+`c3 01` = 0x30000.
 
-The walk also settles two questions about the unpromoted blobs. The shared blobs of the
-three unpromoted windows (`05 07 10 ff ff …` at shard 0 `[1]`, shard 1
-`[12]` and shard 2 `[1]`) are as `FLAG_SHARED` as the promoted one and
-still sit inline, because all their extents fall in one shard. And
-back-references grow with the index of the record they point at, from
-`15 0b` through `95 02 0b` to `c5 01 0b`, while a spanning reference
-stays two bytes whatever the shard.
+One encoding detail the walk adds: back-references grow with the index of
+the record they point at, from `15 0b` through `95 02 0b` to `c5 01 0b`,
+while a spanning reference stays two bytes whatever the shard.
 
 Only one of the object's nine blobs has an id. `Blob::is_spanning()` is
 `id >= 0` ([`src/os/bluestore/BlueStore.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h)),
@@ -1386,14 +1376,12 @@ named by position instead:
 | shard 2 | `[0]` | window 3 head | position |
 | shard 2 | `[1]` | window 3 shared, sbid 61444 | position |
 
-Nine rather than eight because the cut turned window 1's head blob into
-two. Position means the back-reference form of §6.3 — bits 4+ hold
-1 + the index of the record that inlined the blob — and those indices are
+Position means the back-reference form of §6.3 — bits 4+ hold 1 + the
+index of the record that inlined the blob — and those indices are
 **shard-local**: shard 0's `[1]` and shard 1's `[1]` are different blobs,
-and neither shard can name the other's. That is the whole reason
-promotion exists. A blob referenced from two shards cannot be named
-positionally by either, so it is given the one thing shard-local blobs
-lack: an id in a namespace belonging to the onode.
+and neither shard can name the other's. A blob referenced from two shards
+therefore cannot be named positionally at all, which is what an id is
+for.
 
 Three naming schemes therefore meet in this object, and window 1's blob
 carries all of them at once — `sbid` 61442, the cluster-wide id keying
