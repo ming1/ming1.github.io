@@ -934,13 +934,37 @@ Each test has two halves
 | `can_split()` | not `FLAG_SHARED`, `FLAG_COMPRESSED` or `FLAG_HAS_UNUSED` (§5.2) | tracker is per-AU (`num_au > 0`, §5.4) |
 | `can_split_at()` | no checksums, or offset is csum-chunk aligned | offset is AU-aligned and within the tracker |
 
+The three excluded flags are not an arbitrary list: each marks blob-wide
+state that cannot be divided at an arbitrary offset. A shared blob's
+refcounts live in one `X` record under one sbid, which other objects also
+reference (§5.5); a compressed blob's payload is a single compressed
+unit; the `unused` field is one bitmap over the whole blob. The alignment
+test is the same idea applied to the side tables that can be divided —
+a cut is only legal where the checksum array and the use tracker can be
+cut too. **A blob is splittable exactly when all of its side tables are,
+and promotion is what happens when they are not.**
+
 An ordinary mutable blob therefore splits and never appears here; §6.4.3
 captures both outcomes at one boundary.
 
-Spanning blobs are decoded on every onode load and re-encoded on every
-onode update, independent of whether the I/O touches their extents; the
-`l_bluestore_spanning_blobs` perf counter tracks the population for this
-reason.
+Promotion inverts the property sharding was introduced to buy. A shard is
+loaded only when a request touches its range, but the spanning section
+rides in the onode value, so a spanning blob is decoded on every onode
+load and re-encoded on every onode update whether or not the I/O touches
+its extents. It also costs a persisted use tracker, and an id namespace
+that no other blob needs. BlueStore treats a growing population as a
+pathology rather than a cost: `l_bluestore_spanning_blobs` counts them,
+and `bluestore_debug_too_many_blobs_threshold` (24576) dumps the offending
+onode for diagnosis
+([`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc),
+`_make_spanning`).
+
+Hence the v21 direction recorded under prevention above: rather than make
+spanning blobs cheaper, segmentation removes the case. Declaring
+boundaries that blobs may not cross means reshard cuts only on those
+lines, so no blob can straddle a cut and this machinery never engages.
+The specimens in §6.4 run with the default `segment_size = 0`, which is
+why they still exercise it.
 
 ## 6.3 Extent-map encoding
 
