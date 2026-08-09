@@ -740,6 +740,9 @@ if au_size != 0:
 
 Source: [`src/os/bluestore/bluestore_types.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h) (`bluestore_shared_blob_t`,
 `bluestore_extent_ref_map_t`).
+Code path: `Collection::make_blob_shared()`, `_assign_blobid()`,
+`_txc_write_nodes()`, `open_shared_blob()`
+([`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc)).
 
 Created when a blob is cloned; refcounts on physical ranges. The blob
 itself stays in the onode — only the ref_map is shared, keyed by sbid
@@ -755,6 +758,33 @@ each record body:  varint_lowz length, varint refs
 When a put drops the last reference of a range, the released extents land
 in the owning transaction's `released` set (§7.2). Captured example:
 §6.4.3.
+
+The sbid is a per-OSD counter, not a per-object one. `_assign_blobid()` is
+`++blobid_last` with no disk access; durability comes from the `blobid_max`
+super key (§4.3), which the commit path pushes forward by
+`bluestore_blobid_prealloc` (10K) once half a batch is consumed, so the
+reservation is persisted long before the ids are handed out. At mount
+`blobid_last` resumes from `blobid_max`, so ids below the stored ceiling
+are spent whether or not they were ever issued, and no sbid is reused.
+
+Records are written by `_txc_write_nodes()`, in the same `WriteBatch` as
+the onode and shard changes that caused them, so refcounts cannot diverge
+from the extent maps referencing them:
+
+| Event | Effect on the `X` record |
+|---|---|
+| clone | `make_blob_shared()` sets `FLAG_SHARED`, clears `FLAG_HAS_UNUSED`, takes a ref on every valid pextent; the record is created |
+| refcount change | the whole ref_map is re-encoded and `set` again — this prefix has no merge operator, unlike `b` (§8.1) and `T` (§4.8) |
+| last ref dropped | `persistent->empty()`, so the record is `rmkey`'d |
+
+Rewriting in full is what makes a fragmented shared blob expensive: the
+§6.4.3 record is 56 bytes for 16 entries, and changing one block's
+refcount rewrites all 56. The record is read on demand rather than at
+mount — `open_shared_blob()` fetches it when a `FLAG_SHARED` blob is first
+touched, using the sbid decoded from the blob itself (§5.3), so the id
+travels in the metadata while the refcounts stay out of line. Only fsck
+scans the whole prefix, looking for stray records that no onode references
+and for referenced sbids that have none.
 
 ## 5.6 Compression header
 
