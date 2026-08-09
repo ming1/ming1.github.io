@@ -479,7 +479,7 @@ object).
 | `S` | PREFIX_SUPER | ASCII field name | per-field (§4.3) | 7 |
 | `T` | PREFIX_STAT | BE u64 pool id (or `bluestore_statfs`) | 5 × le64 (§4.8) | 3 |
 | `C` | PREFIX_COLL | ASCII coll name, e.g. `1.4_head` | `bluestore_cnode_t` (§4.7) | 10 |
-| `O` | PREFIX_OBJ | ghobject key (§4.4) | onode (§5) / extent shard (§5.3) | 32 |
+| `O` | PREFIX_OBJ | ghobject key (§4.4) | onode (§6) / extent shard (§6.3) | 32 |
 | `M` | PREFIX_OMAP | BE u64 nid + sep + name (§4.6) | omap value | 0 |
 | `P` | PREFIX_PGMETA_OMAP | BE u64 nid + sep + name (§4.6) | omap value (PG meta; opaque here) | 91 |
 | `m` | PREFIX_PERPOOL_OMAP | BE u64 pool + nid + sep + name (§4.6) | omap value | 0 |
@@ -487,7 +487,7 @@ object).
 | `L` | PREFIX_DEFERRED | BE u64 seq | `bluestore_deferred_transaction_t` (§7.2) | 0 |
 | `B` | PREFIX_ALLOC | ASCII `size`, `blocks`, `bytes_per_block`, `blocks_per_key` | le64 (§8.1, legacy geometry copy) | 4 |
 | `b` | PREFIX_ALLOC_BITMAP | BE u64 region offset | region bitmap (§8.1) | 802 |
-| `X` | PREFIX_SHARED_BLOB | BE u64 sbid | `bluestore_shared_blob_t` (§6.5) | 0 |
+| `X` | PREFIX_SHARED_BLOB | BE u64 sbid | `bluestore_shared_blob_t` (§5.5) | 0 |
 
 ## 4.3 `S` — superblock fields
 
@@ -558,7 +558,7 @@ Source: [`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.
 Full onode key (including the `'o'`) + `BE u32 shard_logical_offset` +
 `'x'`. The trailing byte discriminates onode vs shard keys without decoding;
 shards of an object sort immediately after its onode. Captured example:
-§5.4.2.
+§6.4.2.
 
 ## 4.6 `M`/`P`/`m`/`p` — omap keys
 
@@ -566,7 +566,7 @@ Source: [`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.
 (`BlueStore::Onode::calc_omap_key()`, `calc_omap_header()`,
 `calc_omap_tail()`).
 
-The prefix an object uses is fixed by `bluestore_onode_t::flags` (§5.1) at
+The prefix an object uses is fixed by `bluestore_onode_t::flags` (§6.1) at
 first omap write:
 
 | Onode flags | Prefix | Key layout |
@@ -658,7 +658,118 @@ legacy key `bluestore_statfs`. Value: 5 signed le64 counters:
 Updates are RocksDB merges (element-wise add), so commits never
 read-modify-write the counters.
 
-# 5. Object Metadata (`O` value)
+# 5. Blob Structures
+
+A blob is the unit that binds logical object data to physical device
+extents: it carries the pextents, the checksums covering them, and the
+flags that decide how it may be shared, compressed or split. Blobs are
+not addressable on their own — every one is embedded in, or referenced
+from, an object's extent map (§6.3), and the shared-blob refcount map
+(§5.5) is the only piece with a key of its own. They are specified first
+because every extent-map record in §6 contains or points at one, and the
+captured byte streams there cannot be decoded without this section.
+
+## 5.1 `bluestore_pextent_t`
+
+Source: [`src/os/bluestore/bluestore_types.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h) (`bluestore_pextent_t`), bare
+denc.
+
+`lba offset` + `varint_lowz length (u32)`. `offset == ~0ull`
+(`INVALID_OFFSET`) marks an unallocated (punched) run inside a blob.
+`PExtentVector` uses a varint element count (custom
+`denc_traits<PExtentVector>`), unlike default containers.
+
+## 5.2 `bluestore_blob_t`
+
+Source: [`src/os/bluestore/bluestore_types.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h) (`bluestore_blob_t`), bare
+denc; struct_v (2) inherited from the containing §6.2/§6.3 section.
+
+| Field | Type | Present when |
+|---|---|---|
+| `extents` | PExtentVector | always |
+| `flags` | varint | always |
+| `logical_length` | varint_lowz | FLAG_COMPRESSED (else = sum of extents) |
+| `compressed_length` | varint_lowz | FLAG_COMPRESSED |
+| `csum_type` | u8 | FLAG_CSUM |
+| `csum_chunk_order` | u8 | FLAG_CSUM; chunk = `1 << order` bytes |
+| `csum_data` | varint len + raw | FLAG_CSUM; array of per-chunk checksums |
+| `unused` | le16 bitmap | FLAG_HAS_UNUSED; 1 bit per 1/16 blob: never written |
+
+Flags: `0x01` LEGACY_MUTABLE, `0x02` COMPRESSED, `0x04` CSUM,
+`0x08` HAS_UNUSED, `0x10` SHARED.
+
+Checksum types ([`src/common/Checksummer.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/Checksummer.h), `Checksummer::CSumType`; note
+NONE = 1, not 0):
+
+| Value | Type | Element width (B) |
+|---|---|---|
+| 1 | none | 0 |
+| 2 | xxhash32 | 4 |
+| 3 | xxhash64 | 8 |
+| 4 | crc32c | 4 |
+| 5 | crc32c_16 | 2 |
+| 6 | crc32c_8 | 1 |
+
+## 5.3 Blob wrapper
+
+Source: [`src/os/bluestore/BlueStore.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h) (`BlueStore::Blob::encode/decode`).
+
+```
+bluestore_blob_t                 (§5.2)
+[ le64 sbid ]                    if FLAG_SHARED: key into X prefix (§5.5)
+[ use tracker (§5.4) ]           spanning blobs only (include_ref_map)
+```
+
+## 5.4 Use tracker — `bluestore_blob_use_tracker_t`
+
+Source: [`src/os/bluestore/bluestore_types.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h)
+(`bluestore_blob_use_tracker_t`).
+
+Per-allocation-unit referenced-byte counts for spanning blobs; decides when
+a partially overwritten blob's space can be released.
+
+```
+varint au_size                   0 = tracker empty, nothing follows
+if au_size != 0:
+  varint num_au
+  if num_au == 0:  varint total_bytes        single-region blob
+  else:            num_au x varint bytes     referenced bytes per AU
+```
+
+## 5.5 Shared blobs — `X` value, `bluestore_shared_blob_t`
+
+Source: [`src/os/bluestore/bluestore_types.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h) (`bluestore_shared_blob_t`,
+`bluestore_extent_ref_map_t`).
+
+Created when a blob is cloned; refcounts on physical ranges. The blob
+itself stays in the onode — only the ref_map is shared, keyed by sbid
+(BE u64 in the key, §4.2). Value: `DENC_START(1,1)` + ref_map:
+
+```
+varint count
+first record:      varint_lowz offset (absolute)
+subsequent:        varint_lowz offset-delta from previous
+each record body:  varint_lowz length, varint refs
+```
+
+When a put drops the last reference of a range, the released extents land
+in the owning transaction's `released` set (§7.2). Captured example:
+§6.4.3.
+
+## 5.6 Compression header
+
+Source: [`src/os/bluestore/bluestore_types.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h)
+(`bluestore_compression_header_t`); algorithm ids
+[`src/compressor/Compressor.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/compressor/Compressor.h) (`Compressor::COMP_ALG_*`).
+
+Compressed blob payload = header + compressed bytes. Header:
+`DENC_START(2,1)`, u8 algorithm (0 none, 1 snappy, 2 zlib, 3 zstd, 4 lz4,
+5 brotli), le32 `length` (uncompressed), and since v2 an optional le32
+`compressor_message` encoded as u8 presence flag + le32 when present
+(zstd/lz4 window hints). Checksums in the blob cover the compressed bytes,
+so scrub verifies without decompressing.
+
+# 6. Object Metadata (`O` value)
 
 An `O` value is three concatenated sections.
 Code path: writer `BlueStore::_record_onode()`, reader
@@ -667,16 +778,16 @@ Code path: writer `BlueStore::_record_onode()`, reader
 ```
 +-------------------------------+------------------------+---------------------------------+
 | bluestore_onode_t             | spanning-blob section  | inline extent map               |
-| DENC v2/v3, 6 B header (§5.1) | (§5.2)                 | only if extent_map_shards       |
-|                               |                        | empty: le32 len + §5.3 payload  |
+| DENC v2/v3, 6 B header (§6.1) | (§6.2)                 | only if extent_map_shards       |
+|                               |                        | empty: le32 len + §6.3 payload  |
 +-------------------------------+------------------------+---------------------------------+
 ```
 
 When `extent_map_shards` is non-empty the third section is absent and the
-extent map lives in separate shard values under the §4.5 keys, one §5.3
+extent map lives in separate shard values under the §4.5 keys, one §6.3
 payload per shard.
 
-## 5.1 `bluestore_onode_t`
+## 6.1 `bluestore_onode_t`
 
 Source: [`src/os/bluestore/bluestore_types.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h) (`bluestore_onode_t`,
 `_denc_friend`). Frame: `DENC_START`, struct_v 2 or 3, compat 1.
@@ -706,40 +817,40 @@ it as v2. With the default `bluestore_onode_segment_size = 0` the encoder
 emits struct_v 2 (`_record_onode()` passes `FLAG_DEBUG_FORCE_V2`), which
 the captured OSD confirms.
 
-## 5.2 Spanning-blob section
+## 6.2 Spanning-blob section
 
 Code path: `BlueStore::ExtentMap::encode_spanning_blobs()` /
 `ExtentDecoder::decode_spanning_blobs()`, promotion in
 `ExtentMap::encode_some()` / `reshard()`
 ([`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc)).
 
-Sharding the extent map (§4.5, §5.3) imposes an independence rule: every
+Sharding the extent map (§4.5, §6.3) imposes an independence rule: every
 shard value must be decodable on its own. Blob definitions are therefore
 encoded inline in the shard that references them — which is impossible for
 a blob whose extents cross a shard boundary, since two shards would
 reference one definition. Such a blob is promoted to a spanning blob: its
 definition moves out of the shards and into the onode value, as section 2
-of the §5 layout:
+of the §6 layout:
 
 ```
 u8 struct_v = 2
 varint count
 count x {
   varint blob_id                    per-onode id, stable across reloads
-  bluestore_blob_t (§6.2)
-  [ le64 sbid ]                     if FLAG_SHARED (§6.3)
-  use tracker (§6.4)                always present here
+  bluestore_blob_t (§5.2)
+  [ le64 sbid ]                     if FLAG_SHARED (§5.3)
+  use tracker (§5.4)                always present here
 }
 ```
 
 Because the onode value is read before anything else about the object,
 `Onode::decode_raw()` decodes this section eagerly into the spanning-blob
 table before any shard is loaded; shard references then resolve by id
-(§5.3, `BLOBID_FLAG_SPANNING`, id in bits 4+) regardless of which shards
+(§6.3, `BLOBID_FLAG_SPANNING`, id in bits 4+) regardless of which shards
 are faulted in. An unsharded onode has no shard boundaries and always
-encodes `count = 0` — the `02 00` pair in the §5.4.1 specimen. A
+encodes `count = 0` — the `02 00` pair in the §6.4.1 specimen. A
 populated spanning section, and the split-versus-promote rule that
-governs it, is captured in §5.4.3.
+governs it, is captured in §6.4.3.
 
 The reference tracker is persisted only in this section. A shard-local
 blob's reference accounting is rebuilt at decode time from the extents of
@@ -756,7 +867,7 @@ Lifecycle:
 * demotion — when overwrites confine a blob to one shard, it is dropped
   from the spanning table (`id = -1`) and re-encoded inline at the next
   reshard;
-* prevention — v3 onode segmentation (§5.1, `segment_size` > 0) forbids
+* prevention — v3 onode segmentation (§6.1, `segment_size` > 0) forbids
   blobs from crossing segment boundaries, which by construction keeps
   every blob within one shard; with the default `segment_size = 0` the
   spanning machinery above is in effect.
@@ -766,7 +877,7 @@ onode update, independent of whether the I/O touches their extents; the
 `l_bluestore_spanning_blobs` perf counter tracks the population for this
 reason.
 
-## 5.3 Extent-map encoding
+## 6.3 Extent-map encoding
 
 Code path: `BlueStore::ExtentMap::encode_some()` /
 `ExtentDecoder::decode_some()` ([`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc),
@@ -780,7 +891,7 @@ n x extent record:
   [ varint_lowz gap ]          if !CONTIGUOUS: logical gap since prev end
   [ varint_lowz blob_offset ]  if !ZEROOFFSET
   [ varint_lowz length ]       if !SAMELENGTH
-  [ inline blob (§6.3) ]       if blobid_field >> 4 == 0 and !SPANNING
+  [ inline blob (§5.3) ]       if blobid_field >> 4 == 0 and !SPANNING
 ```
 
 `blobid_field` bit assignments:
@@ -789,7 +900,7 @@ n x extent record:
 bit 0  BLOBID_FLAG_CONTIGUOUS   extent starts at prev extent's logical end
 bit 1  BLOBID_FLAG_ZEROOFFSET   blob_offset == 0
 bit 2  BLOBID_FLAG_SAMELENGTH   length == previous extent's length
-bit 3  BLOBID_FLAG_SPANNING     bits 4+ hold a spanning-blob id (§5.2)
+bit 3  BLOBID_FLAG_SPANNING     bits 4+ hold a spanning-blob id (§6.2)
 bits 4+                         0 = inline blob definition follows;
                                 k > 0 = back-reference: k = 1 + index of the
                                 EXTENT at which the blob was first inlined
@@ -802,9 +913,9 @@ indexed by extent position (`consume_blobid()`). Example: extents 0,1,2
 using blobs A,A,B → blob B is inlined at extent 2 with `blobid_field`
 bits 4+ = 0; a later extent reusing B encodes `k = 3`.
 
-## 5.4 Captured specimens
+## 6.4 Captured specimens
 
-### 5.4.1 Inline form: 16 KiB object
+### 6.4.1 Inline form: 16 KiB object
 
 16 KiB object, one user xattr, one omap key. Value = 414 bytes total =
 onode 378 B + spanning section 2 B + inline map (4 + 30) B. The 378-byte
@@ -829,7 +940,7 @@ data at end of buffer, offset 378").
 1e 00 00 00            inline extent map: 30 bytes
 ```
 
-The 30 inline bytes, annotated (§5.3 + §6.3 layouts; cross-checked against
+The 30 inline bytes, annotated (§6.3 + §5.3 layouts; cross-checked against
 `ceph-objectstore-tool ... dump`):
 
 ```
@@ -849,7 +960,7 @@ The 30 inline bytes, annotated (§5.3 + §6.3 layouts; cross-checked against
                 4 x le32 crc32c, one per 4 KiB chunk
 ```
 
-### 5.4.2 Sharded form: 75 discontiguous 4 KiB writes
+### 6.4.2 Sharded form: 75 discontiguous 4 KiB writes
 
 Created with 75 strided single-block writes, each becoming its own blob:
 
@@ -879,7 +990,7 @@ O  <ghobject key>'o' 00 3e 00 00 'x'          shard 2: logical 0x3e0000, 212 B
 ```
 
 Each shard record's key is the full onode key plus the shard's logical
-start offset as a BE u32 plus `'x'` (§4.5); its value is the bare §5.3
+start offset as a BE u32 plus `'x'` (§4.5); its value is the bare §6.3
 payload encoding the extents of [its offset, the next shard's offset).
 The observed cut points fall every 31 extents (498–500 encoded bytes,
 just under the 500-byte target); 0x1f0000 = 31 × the 64 KiB stride:
@@ -917,13 +1028,13 @@ bytes:
 
 Against the inline form:
 
-| | inline (§5.4.1) | sharded (§5.4.2) |
+| | inline (§6.4.1) | sharded (§6.4.2) |
 |---|---|---|
 | records per object | 1 | 4: onode + 3 shards |
 | extent map stored in | section 3 of the `O` value | separate `'x'` records (§4.5) |
 | map length prefix | le32 before the payload | none — the length is `shard_info.bytes`, which the reader asserts against the KV value length |
 | `extent_map_shards` | empty | 3 entries |
-| spanning section | `02 00`, empty | `02 00`, still empty — every blob is one 4 KiB extent, so none crosses a cut (§5.4.3 shows one that does) |
+| spanning section | `02 00`, empty | `02 00`, still empty — every blob is one 4 KiB extent, so none crosses a cut (§6.4.3 shows one that does) |
 
 Shard 0's 498-byte value is a 2-byte header plus 31 records of exactly
 16 bytes:
@@ -953,7 +1064,7 @@ Shard 0's 498-byte value is a 2-byte header plus 31 records of exactly
 ```
 
 Extents 0 and 1 map identical 4 KiB writes yet encode differently,
-because the §5.3 flag byte describes the extent relative to the
+because the §6.3 flag byte describes the extent relative to the
 decoder's running state (`pos`, `prev_len`), not the extent itself:
 
 | | extent 0 (`03 07`) | extent 1 (`06 3f`) |
@@ -998,7 +1109,7 @@ shard 2  02 83 1f 07 + 14 B inline blob    gap 83 1f = 0x3e0000
 500 = 2 + 18 + 30 × 16, 212 = 2 + 18 + 12 × 16, over 31 + 31 + 13 = 75
 extents.
 
-### 5.4.3 Spanning blobs: 256 KiB cloned object, 8 KiB-stride overwrites
+### 6.4.3 Spanning blobs: 256 KiB cloned object, 8 KiB-stride overwrites
 
 A blob crossing a shard cut is not promoted automatically. During reshard
 a crossing blob is **split** when `Blob::can_split()` and
@@ -1010,7 +1121,7 @@ Each test has two halves
 
 | Test | blob half | use-tracker half |
 |---|---|---|
-| `can_split()` | not `FLAG_SHARED`, `FLAG_COMPRESSED` or `FLAG_HAS_UNUSED` (§6.2) | tracker is per-AU (`num_au > 0`, §6.4) |
+| `can_split()` | not `FLAG_SHARED`, `FLAG_COMPRESSED` or `FLAG_HAS_UNUSED` (§5.2) | tracker is per-AU (`num_au > 0`, §5.4) |
 | `can_split_at()` | no checksums, or offset is csum-chunk aligned | offset is AU-aligned and within the tracker |
 
 Both outcomes occur at the same cut in this specimen. The head's own
@@ -1084,7 +1195,7 @@ Spanning section — one entry, and 235 = 2 + 233:
 01              count = 1
 -- entry, 233 B --
 00              varint blob_id = 0
-10              PExtentVector count = 16                  (varint, §6.1)
+10              PExtentVector count = 16                  (varint, §5.1)
 ff ff ff ff ff ff ff ff ff 01  07   pextent[0]: lba INVALID_OFFSET
                                     (hole, 10 B), length 4096
 39 01 00 00                    07   pextent[1]: lba 0x4e0000, length 4096
@@ -1092,8 +1203,8 @@ ff ff ff ff ff ff ff ff ff 01  07   pextent[0]: lba INVALID_OFFSET
 14              flags = 0x14 = FLAG_SHARED | FLAG_CSUM
 04 0c 40        csum_type crc32c (4), chunk order 12, 64 B of checksums
 <64 B>          16 x le32 crc32c, one per 4 KiB of the 64 KiB blob
-02 f0 00 00 00 00 00 00     le64 sbid = 61442               (§6.3)
-80 20  10       use tracker: au_size 4096, num_au 16        (§6.4)
+02 f0 00 00 00 00 00 00     le64 sbid = 61442               (§5.3)
+80 20  10       use tracker: au_size 4096, num_au 16        (§5.4)
 00  80 20  00  80 20 ...    16 varints: 0, 4096, 0, 4096, …
 ```
 
@@ -1114,7 +1225,7 @@ The blob's original 64 KiB allocation was contiguous; the overwrites
 released every other 4 KiB block, leaving eight real pextents at 8 KiB
 stride interleaved with eight holes. The tracker mirrors this: alternating
 0 and 4096 referenced bytes per allocation unit. Both are persisted only
-because the blob is spanning (§5.2).
+because the blob is spanning (§6.2).
 
 Why this blob spans: the script overwrites 4 KiB at every 8 KiB boundary,
 so across the whole object the head owns every even 4 KiB block and the
@@ -1156,7 +1267,7 @@ encoder: shard 2's first record can use neither CONTIGUOUS nor
 SAMELENGTH.
 
 `BLOBID_FLAG_SPANNING` (bit 3) is set in the referring records and bits
-4+ carry the id (§5.3).
+4+ carry the id (§6.3).
 
 Each shard resolves its extents three ways — blobs defined inline,
 back-references within the shard, and spanning references into the onode
@@ -1192,7 +1303,7 @@ indices are the head's own 4 KiB writes: through window 1 the records
 alternate between a spanning reference and the head blob — inline where
 that blob first appears in the shard, a back-reference thereafter.
 
-The `X` record for `sbid` 61442 (§6.5), key `BE u64` 0x000000000000f002:
+The `X` record for `sbid` 61442 (§5.5), key `BE u64` 0x000000000000f002:
 
 ```
 01 01 32 00 00 00   DENC_START(1,1), payload 50 B
@@ -1211,108 +1322,6 @@ references, blocks the head overwrote hold one (the clone alone). Sixteen
 4 KiB entries cover the original 64 KiB blob, and the head's first real
 pextent (0x4e0000) is the second entry — the first block, 0x4df000, is
 the hole at the front of the head's blob.
-
-# 6. Blob Structures
-
-## 6.1 `bluestore_pextent_t`
-
-Source: [`src/os/bluestore/bluestore_types.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h) (`bluestore_pextent_t`), bare
-denc.
-
-`lba offset` + `varint_lowz length (u32)`. `offset == ~0ull`
-(`INVALID_OFFSET`) marks an unallocated (punched) run inside a blob.
-`PExtentVector` uses a varint element count (custom
-`denc_traits<PExtentVector>`), unlike default containers.
-
-## 6.2 `bluestore_blob_t`
-
-Source: [`src/os/bluestore/bluestore_types.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h) (`bluestore_blob_t`), bare
-denc; struct_v (2) inherited from the containing §5.2/§5.3 section.
-
-| Field | Type | Present when |
-|---|---|---|
-| `extents` | PExtentVector | always |
-| `flags` | varint | always |
-| `logical_length` | varint_lowz | FLAG_COMPRESSED (else = sum of extents) |
-| `compressed_length` | varint_lowz | FLAG_COMPRESSED |
-| `csum_type` | u8 | FLAG_CSUM |
-| `csum_chunk_order` | u8 | FLAG_CSUM; chunk = `1 << order` bytes |
-| `csum_data` | varint len + raw | FLAG_CSUM; array of per-chunk checksums |
-| `unused` | le16 bitmap | FLAG_HAS_UNUSED; 1 bit per 1/16 blob: never written |
-
-Flags: `0x01` LEGACY_MUTABLE, `0x02` COMPRESSED, `0x04` CSUM,
-`0x08` HAS_UNUSED, `0x10` SHARED.
-
-Checksum types ([`src/common/Checksummer.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/Checksummer.h), `Checksummer::CSumType`; note
-NONE = 1, not 0):
-
-| Value | Type | Element width (B) |
-|---|---|---|
-| 1 | none | 0 |
-| 2 | xxhash32 | 4 |
-| 3 | xxhash64 | 8 |
-| 4 | crc32c | 4 |
-| 5 | crc32c_16 | 2 |
-| 6 | crc32c_8 | 1 |
-
-## 6.3 Blob wrapper
-
-Source: [`src/os/bluestore/BlueStore.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h) (`BlueStore::Blob::encode/decode`).
-
-```
-bluestore_blob_t                 (§6.2)
-[ le64 sbid ]                    if FLAG_SHARED: key into X prefix (§6.5)
-[ use tracker (§6.4) ]           spanning blobs only (include_ref_map)
-```
-
-## 6.4 Use tracker — `bluestore_blob_use_tracker_t`
-
-Source: [`src/os/bluestore/bluestore_types.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h)
-(`bluestore_blob_use_tracker_t`).
-
-Per-allocation-unit referenced-byte counts for spanning blobs; decides when
-a partially overwritten blob's space can be released.
-
-```
-varint au_size                   0 = tracker empty, nothing follows
-if au_size != 0:
-  varint num_au
-  if num_au == 0:  varint total_bytes        single-region blob
-  else:            num_au x varint bytes     referenced bytes per AU
-```
-
-## 6.5 Shared blobs — `X` value, `bluestore_shared_blob_t`
-
-Source: [`src/os/bluestore/bluestore_types.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h) (`bluestore_shared_blob_t`,
-`bluestore_extent_ref_map_t`).
-
-Created when a blob is cloned; refcounts on physical ranges. The blob
-itself stays in the onode — only the ref_map is shared, keyed by sbid
-(BE u64 in the key, §4.2). Value: `DENC_START(1,1)` + ref_map:
-
-```
-varint count
-first record:      varint_lowz offset (absolute)
-subsequent:        varint_lowz offset-delta from previous
-each record body:  varint_lowz length, varint refs
-```
-
-When a put drops the last reference of a range, the released extents land
-in the owning transaction's `released` set (§7.2). Captured example:
-§5.4.3.
-
-## 6.6 Compression header
-
-Source: [`src/os/bluestore/bluestore_types.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h)
-(`bluestore_compression_header_t`); algorithm ids
-[`src/compressor/Compressor.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/compressor/Compressor.h) (`Compressor::COMP_ALG_*`).
-
-Compressed blob payload = header + compressed bytes. Header:
-`DENC_START(2,1)`, u8 algorithm (0 none, 1 snappy, 2 zlib, 3 zstd, 4 lz4,
-5 brotli), le32 `length` (uncompressed), and since v2 an optional le32
-`compressor_message` encoded as u8 presence flag + le32 when present
-(zstd/lz4 window hints). Checksums in the blob cover the compressed bytes,
-so scrub verifies without decompressing.
 
 # 7. Transactions and Deferred Writes
 
@@ -1364,7 +1373,7 @@ bluestore_deferred_transaction_t   DENC_START(1,1)
   le64 seq
   le32 op count, each op:          bluestore_deferred_op_t, DENC_START(1,1)
     u8 op                          1 = OP_WRITE (sole opcode)
-    PExtentVector extents          destination disk runs (§6.1)
+    PExtentVector extents          destination disk runs (§5.1)
     bufferlist data                le32 len + payload; len = sum of extents
   interval_set released            le32 count + { le64 offset, le64 length };
                                    extents freed only after the deferred
@@ -1436,7 +1445,7 @@ carries `b`-key XOR operands in its WriteBatch: allocation bookkeeping is
 persisted on the client-write critical path, then paid again through
 WAL, flush, and compaction. The free list, however, is derived state —
 fully reconstructible from the union of every onode's blob extents
-(§5–§6) and BlueFS's own extents (§3). NCB (the introducing commit's
+(§6–§5) and BlueFS's own extents (§3). NCB (the introducing commit's
 phrasing: allocation information committed "into RocksDB
 (column-family B)" — hence the name) stops persisting it at runtime
 altogether: the allocator lives in memory, is destaged once at clean
@@ -1589,7 +1598,7 @@ $ ceph-kvstore-tool bluestore-kv dev/osd0 get O '%7f%80...o' out /tmp/onode.bin
 `bluestore-kv` mode mounts BlueFS and opens the embedded RocksDB, so all
 §4 prefixes are visible. Keys are printed %xx-escaped and are accepted back
 in the same form by `get`. The §4.2 census was produced with
-`list | cut -f1 | sort | uniq -c`; the §5.4.1 hexdump is `hexdump -C` of the
+`list | cut -f1 | sort | uniq -c`; the §6.4.1 hexdump is `hexdump -C` of the
 `get ... out` file.
 
 ## 10.4 `ceph-dencoder`
@@ -1600,7 +1609,7 @@ error: stray data at end of buffer, offset 378
 ```
 
 The error is expected and diagnostic: an `O` value is onode + extent-map
-sections (§5), and dencoder stops at the end of `bluestore_onode_t` — the
+sections (§6), and dencoder stops at the end of `bluestore_onode_t` — the
 onode proper is 378 of 414 bytes. Types with self-contained values
 (`bluestore_cnode_t`, `bluefs_super_t`,
 `bluestore_deferred_transaction_t`, ...) decode cleanly the same way.
@@ -1615,9 +1624,9 @@ $ ceph-objectstore-tool --data-path dev/osd0 --no-mon-config --pgid 1.4 specimen
 ```
 
 `--no-mon-config` is required offline (the tool otherwise blocks fetching
-the mon config). `dump` prints the fully decoded onode — §5/§6 in JSON
+the mon config). `dump` prints the fully decoded onode — §6/§5 in JSON
 (`"nid": 1156`, extent at 420151296, `csum_type: 4`, 4 crc32c values) —
-and is the reference against which the §5.4.1 byte annotation was verified.
+and is the reference against which the §6.4.1 byte annotation was verified.
 
 ## 10.6 `ceph-bluestore-tool free-dump`
 
