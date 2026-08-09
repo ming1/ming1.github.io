@@ -1181,26 +1181,23 @@ block 21 lands inside a window:
      here by its sbid
 ```
 
-| Window | Blocks | sbid | S fragments | Shards holding them | Result |
-|---|---|---|---|---|---|
-| 0 | 0–15 | 61441 | 8 (odd blocks 1–15) | shard 0 | inline, local |
-| 1 | 16–31 | 61442 | 8 (odd blocks 17–31) | shards 0 **and** 1 | **spanning** |
-| 2 | 32–47 | 61443 | 8 (odd blocks 33–47) | shard 1 | inline, local |
-| 3 | 48–63 | 61444 | 8 (odd blocks 49–63) | shard 2 | inline, local |
+| Window | Blocks | sbid | Shards holding its 8 S blocks | Result |
+|---|---|---|---|---|
+| 0 | 0–15 | 61441 | shard 0 | inline, local |
+| 1 | 16–31 | 61442 | shards 0 **and** 1 | **spanning** |
+| 2 | 32–47 | 61443 | shard 1 | inline, local |
+| 3 | 48–63 | 61444 | shard 2 | inline, local |
 
-Window 1's blob is referenced from two shards, so it cannot be encoded
-locally in either; being `FLAG_SHARED` it also cannot be split, so it is
-promoted. The other three blobs are equally shared but sit wholly inside
-one shard, so they stay inline. The cut at block 48 promotes nothing because it coincides with a window
-boundary — though it still resets the encoder state, giving shard 2 the
-18-byte leading record of §6.4.2.
-
-Both outcomes of the §6.2 rule are visible at this one cut. The head's
-own mutable blob for window 1 passes both split tests and is cut in two —
+Both outcomes of the §6.2 rule meet at the block-21 cut. Window 1's
+shared blob is referenced from both shards and fails `can_split()`, so it
+cannot be encoded locally in either and is promoted. The head's own blob
+for the same window passes both split tests and is cut in two instead —
 shard 0's record `[16]` holds 5 pextents (3 real: blocks 16, 18, 20) and
 shard 1's record `[1]` holds 10 (5 real: blocks 22–30), the two halves of
-what was one blob. The shared blob covering the same window fails
-`can_split()` and is promoted instead.
+what was one blob. The other three shared blobs sit wholly inside one
+shard and stay inline; the cut at block 48 promotes nothing because it
+coincides with a window boundary, though it still resets the encoder,
+giving shard 2 the 18-byte leading record of §6.4.2.
 
 The head object (`snap` = `CEPH_NOSNAP`; the clone sorts first under its
 lower snap id, §4.4) is described by eight records — four under `O`, plus
@@ -1375,24 +1372,14 @@ with the index of the record they point at, from `15 0b` through
 `95 02 0b` to `c5 01 0b`, while a spanning reference stays two bytes
 whatever the shard, since its id is per-onode rather than per-shard.
 
-The eight references to blob id 0, with their complete record bytes:
-
-| Shard | Record | logical | blob_offset | Bytes |
-|---|---|---|---|---|
-| 0 | `[17]` | 0x11000 | 0x1000 | `0d 07` |
-| 0 | `[19]` | 0x13000 | 0x3000 | `0d 0f` |
-| 1 | `[0]` | 0x15000 | 0x5000 | `08 57 17 07` |
-| 1 | `[2]` | 0x17000 | 0x7000 | `0d 1f` |
-| 1 | `[4]` | 0x19000 | 0x9000 | `0d 27` |
-| 1 | `[6]` | 0x1b000 | 0xb000 | `0d 2f` |
-| 1 | `[8]` | 0x1d000 | 0xd000 | `0d 37` |
-| 1 | `[10]` | 0x1f000 | 0xf000 | `0d 3f` |
-
+The eight spanning records in that listing decode from two flag bytes.
 `0x0d` = CONTIGUOUS | SAMELENGTH | SPANNING with id `0x0d >> 4` = 0, so a
-single `varint_lowz` blob_offset byte completes the record. Shard 1's
-first record instead carries `0x08` — SPANNING alone — and therefore
-spells out gap 0x15000 (absolute, since a shard's decode position starts
-at 0), blob_offset 0x5000 and length 0x1000.
+single `varint_lowz` blob_offset byte completes the record — two bytes in
+all. Shard 1's first record instead carries `0x08`, SPANNING alone, and
+therefore spells out gap 0x15000 (absolute, since a shard's decode
+position starts at 0), blob_offset 0x5000 and length 0x1000. Block
+numbers convert to the logical offsets of §6.3 as block × 4096, so
+`[17]` at block 17 is logical 0x11000.
 
 A contiguous, same-length spanning reference costs two bytes. The skipped
 indices are the head's own 4 KiB writes: through window 1 the records
