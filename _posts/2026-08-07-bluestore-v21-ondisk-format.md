@@ -720,6 +720,19 @@ bluestore_blob_t                 (§5.2)
 [ use tracker (§5.4) ]           spanning blobs only (include_ref_map)
 ```
 
+This wrapper, not `bluestore_blob_t` alone, is what an extent-map shard
+inlines (§6.3) and what the spanning section carries (§6.2). The `sbid`
+is the pointer from an object's own metadata to state it shares with
+another object: once a clone exists, whether an extent may be freed can
+no longer be answered from one object's blob, and the sbid is the key
+of the `X` record holding the answer. It cannot be derived — sharing is
+assigned from a counter at clone time (§5.5) — so it is stored, but only
+under `FLAG_SHARED`, since most blobs are never cloned. It is stored once
+per definition, never on a reference: the eight records referring to
+§6.4.3's spanning blob carry two bytes each and no sbid between them.
+Note it is a fixed le64 rather than a varint, so it costs 8 bytes where
+3 would do.
+
 ## 5.4 Use tracker — `bluestore_blob_use_tracker_t`
 
 Source: [`src/os/bluestore/bluestore_types.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h)
@@ -873,10 +886,9 @@ of the §6 layout:
 u8 struct_v = 2
 varint count
 count x {
-  varint blob_id                    per-onode id, stable across reloads
-  bluestore_blob_t (§5.2)
-  [ le64 sbid ]                     if FLAG_SHARED (§5.3)
-  use tracker (§5.4)                always present here
+  varint blob_id       per-onode id, stable across reloads
+  blob wrapper (§5.3)  with the use tracker present — this is the
+                       include_ref_map case
 }
 ```
 
