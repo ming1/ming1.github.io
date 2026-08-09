@@ -1314,6 +1314,67 @@ table:
 | 1 | 27 | 3 | 18 | 6 |
 | 2 | 16 | 2 | 14 | 0 |
 
+Decoding the three shards record by record shows why only one of the four
+shared blobs needed promoting. Windows 0, 2 and 3 lie wholly inside a
+shard, so their shared blobs are defined inline there and every later
+block that uses them costs a two-byte back-reference; window 1 straddles
+the cut, so neither shard can hold its definition:
+
+```
+shard 0, 494 B, 21 records, blocks 0-20
+  [ 0] blk  0  03 07 0f e6 0b 00 00 …  inline  head blob         15 pextents
+  [ 1] blk  1  05 07 10 ff ff ff ff …  inline  shared blob 61441 16 pextents
+  [ 2] blk  2  15 0b                   backref -> [0]  head
+  [ 3] blk  3  25 0f                   backref -> [1]  shared 61441
+  ...  blocks 4-15 alternate the same way, all two-byte back-references
+  [16] blk 16  07 05 f6 0b 00 00 07 …  inline  head blob h1a      5 pextents
+  [17] blk 17  0d 07                   SPANNING id=0  blob_off 0x1000
+  [18] blk 18  95 02 0b                backref -> [16] head
+  [19] blk 19  0d 0f                   SPANNING id=0  blob_off 0x3000
+  [20] blk 20  95 02 13                backref -> [16] head
+
+shard 1, 583 B, 27 records, blocks 21-47
+  [ 0] blk 21  08 57 17 07             SPANNING id=0  blob_off 0x5000
+  [ 1] blk 22  05 07 0a ff ff ff ff …  inline  head blob h1b     10 pextents
+  [ 2] blk 23  0d 1f                   SPANNING id=0  blob_off 0x7000
+  [ 3] blk 24  25 0f                   backref -> [1]  head
+  [ 4] blk 25  0d 27                   SPANNING id=0  blob_off 0x9000
+  [ 5] blk 26  25 17                   backref -> [1]  head
+  [ 6] blk 27  0d 2f                   SPANNING id=0  blob_off 0xb000
+  [ 7] blk 28  25 1f                   backref -> [1]  head
+  [ 8] blk 29  0d 37                   SPANNING id=0  blob_off 0xd000
+  [ 9] blk 30  25 27                   backref -> [1]  head
+  [10] blk 31  0d 3f                   SPANNING id=0  blob_off 0xf000
+  [11] blk 32  07 0f 06 0c 00 00 07 …  inline  head blob         15 pextents
+  [12] blk 33  05 07 10 ff ff ff ff …  inline  shared blob 61443 16 pextents
+  [13] blk 34  c5 01 0b                backref -> [11] head
+  [14] blk 35  d5 01 0f                backref -> [12] shared 61443
+  ...  blocks 36-47 alternate the same way
+
+shard 2, 423 B, 16 records, blocks 48-63
+  [ 0] blk 48  02 c3 01 07 0f 16 0c …  inline  head blob         15 pextents
+  [ 1] blk 49  05 07 10 ff ff ff ff …  inline  shared blob 61444 16 pextents
+  [ 2] blk 50  15 0b                   backref -> [0]  head
+  [ 3] blk 51  25 0f                   backref -> [1]  shared 61444
+  ...  blocks 52-63 alternate the same way, no spanning record anywhere
+```
+
+Shard 2 is the control case in full: one window, one head blob, one
+shared blob, fourteen two-byte back-references and not a single spanning
+record — what every shard would look like if no cut fell inside a window.
+Its leading record also carries the absolute gap of §6.4.2, `c3 01` =
+0x30000.
+
+Three further things are legible in those bytes. The shared blobs of the
+three unpromoted windows (`05 07 10 ff ff …` at shard 0 `[1]`, shard 1
+`[12]` and shard 2 `[1]`) are as `FLAG_SHARED` as the promoted one and
+still sit inline, because all their extents fall in one shard. The head's window-1 blob appears as two inline
+definitions — `[16]` in shard 0 with 5 pextents and `[1]` in shard 1 with
+10 — the two halves of the blob the cut split. And back-references grow
+with the index of the record they point at, from `15 0b` through
+`95 02 0b` to `c5 01 0b`, while a spanning reference stays two bytes
+whatever the shard, since its id is per-onode rather than per-shard.
+
 The eight references to blob id 0, with their complete record bytes:
 
 | Shard | Record | logical | blob_offset | Bytes |
