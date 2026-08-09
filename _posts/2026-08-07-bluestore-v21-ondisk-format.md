@@ -992,8 +992,14 @@ O  <ghobject key>'o' 00 3e 00 00 'x'          shard 2: logical 0x3e0000, 212 B
 Each shard record's key is the full onode key plus the shard's logical
 start offset as a BE u32 plus `'x'` (§4.5); its value is the bare §6.3
 payload encoding the extents of [its offset, the next shard's offset).
-The observed cut points fall every 31 extents (498–500 encoded bytes,
-just under the 500-byte target); 0x1f0000 = 31 × the 64 KiB stride:
+A shard boundary is referred to below as a *cut*: the logical offset at
+which reshard divided the extent map, so extents below it encode into one
+shard record and extents at or above it into the next. A cut is therefore
+the same value in three places — `shard_info[n].offset` in the onode, the
+BE u32 in that shard's key, and the absolute gap opening that shard's
+first record. The observed cuts fall every 31 extents (498–500 encoded
+bytes, just under the 500-byte target); 0x1f0000 = 31 × the 64 KiB
+stride:
 
 ```
  object logical space (size 0x4a1000)
@@ -1230,8 +1236,9 @@ because the blob is spanning (§6.2).
 Why this blob spans: the script overwrites 4 KiB at every 8 KiB boundary,
 so across the whole object the head owns every even 4 KiB block and the
 clone-shared blobs retain every odd one. Each 64 KiB window has its own
-shared blob, but the shard cuts fall at blocks 21 and 48 — and only the
-cut at block 21 lands inside a window:
+shared blob, but the shard cuts — the logical offsets 0x15000 and
+0x30000, which are blocks 21 and 48 — fall differently: only the cut at
+block 21 lands inside a window:
 
 ```
           0       8       16      24      32      40      48      56     63
@@ -1244,6 +1251,7 @@ cut at block 21 lands inside a window:
                                ^                          ^
                           cut 0x15000                cut 0x30000
                           (block 21)                 (block 48)
+                          shard 0 | 1                shard 1 | 2
 
  H = 4 KiB overwritten by the head; a window's eight H blocks share one
      head blob (head 0, head 2, head 3 — and h1a/h1b, see below)
