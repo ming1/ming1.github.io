@@ -1394,17 +1394,17 @@ so a blob has an id precisely because it was promoted — `_make_spanning()`
 is the only thing that assigns one. Every other blob keeps id −1 and is
 named by position instead:
 
-| Where | Record | Blob | Named by |
-|---|---|---|---|
-| onode spanning section | — | window 1 shared, sbid 61442 | **id 0** |
-| shard 0 | `[0]` | window 0 head | position |
-| shard 0 | `[1]` | window 0 shared, sbid 61441 | position |
-| shard 0 | `[16]` | window 1 head, left half | position |
-| shard 1 | `[1]` | window 1 head, right half | position |
-| shard 1 | `[11]` | window 2 head | position |
-| shard 1 | `[12]` | window 2 shared, sbid 61443 | position |
-| shard 2 | `[0]` | window 3 head | position |
-| shard 2 | `[1]` | window 3 shared, sbid 61444 | position |
+| Blob | Definition stored in | Referenced as |
+|---|---|---|
+| window 1 shared, sbid 61442 | onode spanning section (§6.2) | **spanning id 0** |
+| window 0 head | shard 0, record `[0]` | back-reference to `[0]` |
+| window 0 shared, sbid 61441 | shard 0, record `[1]` | back-reference to `[1]` |
+| window 1 head, left half | shard 0, record `[16]` | back-reference to `[16]` |
+| window 1 head, right half | shard 1, record `[1]` | back-reference to `[1]` |
+| window 2 head | shard 1, record `[11]` | back-reference to `[11]` |
+| window 2 shared, sbid 61443 | shard 1, record `[12]` | back-reference to `[12]` |
+| window 3 head | shard 2, record `[0]` | back-reference to `[0]` |
+| window 3 shared, sbid 61444 | shard 2, record `[1]` | back-reference to `[1]` |
 
 Position means the back-reference form of §6.3 — bits 4+ hold 1 + the
 index of the record that inlined the blob — and those indices are
