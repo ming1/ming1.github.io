@@ -1362,15 +1362,46 @@ record — what every shard would look like if no cut fell inside a window.
 Its leading record also carries the absolute gap of §6.4.2, `c3 01` =
 0x30000.
 
-Three further things are legible in those bytes. The shared blobs of the
+Two further things are legible in those bytes. The shared blobs of the
 three unpromoted windows (`05 07 10 ff ff …` at shard 0 `[1]`, shard 1
 `[12]` and shard 2 `[1]`) are as `FLAG_SHARED` as the promoted one and
-still sit inline, because all their extents fall in one shard. The head's window-1 blob appears as two inline
-definitions — `[16]` in shard 0 with 5 pextents and `[1]` in shard 1 with
-10 — the two halves of the blob the cut split. And back-references grow
-with the index of the record they point at, from `15 0b` through
-`95 02 0b` to `c5 01 0b`, while a spanning reference stays two bytes
-whatever the shard, since its id is per-onode rather than per-shard.
+still sit inline, because all their extents fall in one shard. And
+back-references grow with the index of the record they point at, from
+`15 0b` through `95 02 0b` to `c5 01 0b`, while a spanning reference
+stays two bytes whatever the shard.
+
+Only one of the object's nine blobs has an id. `Blob::is_spanning()` is
+`id >= 0` ([`src/os/bluestore/BlueStore.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h)),
+so a blob has an id precisely because it was promoted — `_make_spanning()`
+is the only thing that assigns one. Every other blob keeps id −1 and is
+named by position instead:
+
+| Where | Record | Blob | Named by |
+|---|---|---|---|
+| onode spanning section | — | window 1 shared, sbid 61442 | **id 0** |
+| shard 0 | `[0]` | window 0 head | position |
+| shard 0 | `[1]` | window 0 shared, sbid 61441 | position |
+| shard 0 | `[16]` | window 1 head, left half | position |
+| shard 1 | `[1]` | window 1 head, right half | position |
+| shard 1 | `[11]` | window 2 head | position |
+| shard 1 | `[12]` | window 2 shared, sbid 61443 | position |
+| shard 2 | `[0]` | window 3 head | position |
+| shard 2 | `[1]` | window 3 shared, sbid 61444 | position |
+
+Nine rather than eight because the cut turned window 1's head blob into
+two. Position means the back-reference form of §6.3 — bits 4+ hold
+1 + the index of the record that inlined the blob — and those indices are
+**shard-local**: shard 0's `[1]` and shard 1's `[1]` are different blobs,
+and neither shard can name the other's. That is the whole reason
+promotion exists. A blob referenced from two shards cannot be named
+positionally by either, so it is given the one thing shard-local blobs
+lack: an id in a namespace belonging to the onode.
+
+Three naming schemes therefore meet in this object, and window 1's blob
+carries all of them at once — `sbid` 61442, the cluster-wide id keying
+its `X` record and counted by `blobid_max` (§4.3); spanning id 0, a small
+per-onode integer; and no record index at all, since its definition sits
+in no shard.
 
 The eight spanning records in that listing decode from two flag bytes.
 `0x0d` = CONTIGUOUS | SAMELENGTH | SPANNING with id `0x0d >> 4` = 0, so a
