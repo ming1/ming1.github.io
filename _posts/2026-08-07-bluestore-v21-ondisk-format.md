@@ -1549,9 +1549,12 @@ in what it rewrites:
 * only shards whose logical ranges changed are re-encoded and written.
   That is the point of the split: a 4 KiB write to this object rewrites
   one shard record, not the whole extent map;
-* the onode record is always rewritten, and with it the entire spanning
-  section — so a spanning blob is re-encoded even by a write that never
-  touches its extents (§6.2);
+* the onode record is rewritten, and with it the entire spanning section —
+  so a spanning blob is re-encoded even by a data write that never touches
+  its extents (§6.2). Every data write does this: `_do_write()` ends in
+  `txc->write_onode()`. Omap updates are the exception — `_omap_setkeys()`
+  and friends call `note_modified_object()` instead, whose comment is
+  "onode itself isn't written", so they touch only the omap keys of §4.6;
 * if a rewritten shard crosses the size thresholds of §6.4.2, reshard
   re-cuts boundaries and may split or promote blobs, changing which of
   the three reference forms later records use.
