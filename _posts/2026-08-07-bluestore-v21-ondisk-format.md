@@ -1241,29 +1241,62 @@ a le32 value length per attr), and 30 of BlueStore's own fields — nid 2,
 size 3, flags 1, the 17 shard_info bytes shown above, three hint varints,
 and the zone_offset_refs count.
 
-Spanning section — one entry, and 235 = 2 + 233:
+Spanning section, decoded in full — every one of the 235 bytes, with
+235 = 2 header + 233 entry:
 
 ```
-02              struct_v = 2
-01              count = 1
+02 01                            section header: struct_v 2, count = 1
 -- entry, 233 B --
-00              varint blob_id = 0
-10              PExtentVector count = 16                  (varint, §5.1)
-ff ff ff ff ff ff ff ff ff 01  07   pextent[0]: lba INVALID_OFFSET
-                                    (hole, 10 B), length 4096
-39 01 00 00                    07   pextent[1]: lba 0x4e0000, length 4096
--- 7 more hole/real pairs, real ones stepping 0x2000 to 0x4ee000 --
-14              flags = 0x14 = FLAG_SHARED | FLAG_CSUM
-04 0c 40        csum_type crc32c (4), chunk order 12, 64 B of checksums
-<64 B>          16 x le32 crc32c, one per 4 KiB of the 64 KiB blob
-02 f0 00 00 00 00 00 00     le64 sbid = 61442               (§5.3)
-80 20  10       use tracker: au_size 4096, num_au 16        (§5.4)
-00  80 20  00  80 20 ...    16 varints: 0, 4096, 0, 4096, …
+00                               blob_id = 0
+10                               PExtentVector count = 16
+ff ff ff ff ff ff ff ff ff 01 07 pextent[ 0] hole, length 4096
+39 01 00 00 07                   pextent[ 1] lba 0x4e0000, length 4096
+ff ff ff ff ff ff ff ff ff 01 07 pextent[ 2] hole, length 4096
+c4 09 00 00 07                   pextent[ 3] lba 0x4e2000, length 4096
+ff ff ff ff ff ff ff ff ff 01 07 pextent[ 4] hole, length 4096
+c8 09 00 00 07                   pextent[ 5] lba 0x4e4000, length 4096
+ff ff ff ff ff ff ff ff ff 01 07 pextent[ 6] hole, length 4096
+cc 09 00 00 07                   pextent[ 7] lba 0x4e6000, length 4096
+ff ff ff ff ff ff ff ff ff 01 07 pextent[ 8] hole, length 4096
+d0 09 00 00 07                   pextent[ 9] lba 0x4e8000, length 4096
+ff ff ff ff ff ff ff ff ff 01 07 pextent[10] hole, length 4096
+d4 09 00 00 07                   pextent[11] lba 0x4ea000, length 4096
+ff ff ff ff ff ff ff ff ff 01 07 pextent[12] hole, length 4096
+d8 09 00 00 07                   pextent[13] lba 0x4ec000, length 4096
+ff ff ff ff ff ff ff ff ff 01 07 pextent[14] hole, length 4096
+dc 09 00 00 07                   pextent[15] lba 0x4ee000, length 4096
+14                               flags = 0x14 = FLAG_SHARED | FLAG_CSUM
+04 0c 40                         csum_type crc32c, chunk order 12, 64 B follow
+19 e2 4b 9a fa 2b c2 6b 0f d6 15 90 b5 0b d3 f2 crc32c, chunks   0- 3
+8e a0 df 7a a3 aa a2 c6 ec 19 8e cd 70 47 18 5d crc32c, chunks   4- 7
+03 6e fa 2b f6 77 48 cf 51 ea b4 ef 98 32 ae cf crc32c, chunks   8-11
+c7 9f bd 81 6b bb a6 5c ce e8 fc 5b 5c 52 4b 47 crc32c, chunks 12-15
+02 f0 00 00 00 00 00 00          le64 sbid = 61442
+80 20 10                         use tracker: au_size 4096, num_au 16
+00 80 20 00 80 20                AU  0- 3 referenced: 0, 4096, 0, 4096
+00 80 20 00 80 20                AU  4- 7 referenced: 0, 4096, 0, 4096
+00 80 20 00 80 20                AU  8-11 referenced: 0, 4096, 0, 4096
+00 80 20 00 80 20                AU 12-15 referenced: 0, 4096, 0, 4096
 ```
 
 The fields sum to the entry's 233 bytes: 1 + 1 + 128 pextents + 1 + 67
 csum + 8 sbid + 27 tracker — checksums and pextents alone are 84% of it,
 which is why a spanning blob is expensive to carry in the onode (§6.2).
+
+Three things the full listing shows that a summary hides:
+
+* **holes cost more than data.** `INVALID_OFFSET` is the worst case for
+  `denc_lba` (§1) — no low zero bits to strip, so it needs the 4-byte word
+  plus six continuation bytes, 11 B against 5 B for a real extent. The
+  eight holes take 88 of the 128 pextent bytes.
+* **the first extent encodes differently from the other seven.** 0x4e0000
+  has 17 low zero bits so it takes `denc_lba`'s 16-bit-alignment case
+  (`39 01 00 00`, low bits `1`), while 0x4e2000–0x4ee000 have 13 and take
+  the 12-bit case (low bits `0` or `4`). Same width, different class.
+* **checksums cover the holes too.** All 16 chunks of the original 64 KiB
+  are still checksummed although the head references only eight: the clone
+  still reads the other eight through this same blob, so the array cannot
+  be pruned.
 
 The pextent pattern records the object's history: the blob's 64 KiB was
 allocated contiguously, and the overwrites released every other 4 KiB
