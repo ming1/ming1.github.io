@@ -838,6 +838,13 @@ Source: [`src/os/bluestore/bluestore_types.h`](https://github.com/ceph/ceph/blob
 `shard_info` = { varint `offset` (logical start), varint `bytes` (encoded
 shard length) } — the demand-paging index for `ExtentMap::fault_range()`.
 
+The struct ends with the `DENC_FINISH` of its own frame, and nothing
+above is a blob: the spanning-blob section (§6.2) and the inline extent
+map (§6.3) are separate structures concatenated after it in the same `O`
+value, decoded by separate calls in `Onode::decode_raw()`. That is why
+`ceph-dencoder type bluestore_onode_t` stops at the frame boundary and
+reports the rest as stray data (§6.4.1).
+
 Version policy (paraphrasing the header comment): objects are written v3
 with `segment_size` initialized from `bluestore_onode_segment_size` when
 segmentation is enabled; objects created by older code decode with
@@ -1305,7 +1312,7 @@ c7 9f bd 81 6b bb a6 5c ce e8 fc 5b 5c 52 4b 47 crc32c, chunks 12-15
 
 Per field that is 1 + 1 + 128 pextents + 1 + 67 csum + 8 sbid + 27
 tracker; checksums and pextents alone are 84% of the entry, which is why
-a spanning blob is expensive to carry in the onode (§6.2).
+a spanning blob is expensive to carry in the onode record (§6.2).
 
 Three things the full listing shows that a summary hides:
 
@@ -1327,8 +1334,8 @@ contiguously, and the overwrites released every other block. The tracker
 records the same pattern in referenced bytes per allocation unit.
 
 Each shard resolves its extents three ways — blobs defined inline,
-back-references within the shard, and spanning references into the onode
-table:
+back-references within the shard, and spanning references into the
+onode record's spanning table:
 
 | Shard | inline blobs | back-references | spanning refs |
 |---|---|---|---|
