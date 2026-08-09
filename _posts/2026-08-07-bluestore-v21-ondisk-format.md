@@ -1191,13 +1191,9 @@ block 21 lands inside a window:
 Window 1's blob is referenced from two shards, so it cannot be encoded
 locally in either; being `FLAG_SHARED` it also cannot be split, so it is
 promoted. The other three blobs are equally shared but sit wholly inside
-one shard, so they stay inline. The cut at block 48 promotes nothing
-because it coincides with a window boundary, though it still resets the
-encoder: shard 2's first record can use neither CONTIGUOUS nor
-SAMELENGTH.
-
-`BLOBID_FLAG_SPANNING` (bit 3) is set in the referring records and bits
-4+ carry the id (§6.3).
+one shard, so they stay inline. The cut at block 48 promotes nothing because it coincides with a window
+boundary — though it still resets the encoder state, giving shard 2 the
+18-byte leading record of §6.4.2.
 
 Both outcomes of the §6.2 rule are visible at this one cut. The head's
 own mutable blob for window 1 passes both split tests and is cut in two —
@@ -1218,10 +1214,8 @@ one `X` record per shared blob:
 | shard 2 | `<ghobject>'o' 00 03 00 00 'x'` | 423 B |
 | shared blobs | `X` + BE u64 `00 00 00 00 00 00 f0 01` … `f0 04` | 56 B each |
 
-The four sbids 61441–61444 are one per 64 KiB window, assigned in order by
-the clone. Only 61442 belongs to the spanning blob; the other three are
-equally shared but keep all their extents inside a single shard, so
-sharing alone does not promote a blob — crossing a cut does.
+The four sbids 61441–61444 are one per 64 KiB window, assigned in order
+by the clone; 61442 is the promoted one.
 
 Onode value, 1166 B = 6 B frame + 925 B onode struct + 235 B spanning
 section, with no third section (the map is sharded):
@@ -1267,24 +1261,15 @@ ff ff ff ff ff ff ff ff ff 01  07   pextent[0]: lba INVALID_OFFSET
 00  80 20  00  80 20 ...    16 varints: 0, 4096, 0, 4096, …
 ```
 
-The entry length reconciles exactly:
+The fields sum to the entry's 233 bytes: 1 + 1 + 128 pextents + 1 + 67
+csum + 8 sbid + 27 tracker — checksums and pextents alone are 84% of it,
+which is why a spanning blob is expensive to carry in the onode (§6.2).
 
-```
- +------+------+--------------------+-------+------------+--------+-----------+
- | id   | cnt  | 16 pextents        | flags | csum       | sbid   | tracker   |
- | 00   | 10   | 8 holes x 11 B     |  14   | 04 0c 40   | le64   | 80 20 10  |
- |      |      | 8 real  x  5 B     |       | + 64 B     |        | + 8x1 B   |
- |      |      |                    |       |            |        | + 8x2 B   |
- +------+------+--------------------+-------+------------+--------+-----------+
-    1 B    1 B         128 B           1 B      67 B        8 B       27 B
-                                                            total = 233 B
-```
-
-The blob's original 64 KiB allocation was contiguous; the overwrites
-released every other 4 KiB block, leaving eight real pextents at 8 KiB
-stride interleaved with eight holes. The tracker mirrors this: alternating
-0 and 4096 referenced bytes per allocation unit. Both are persisted only
-because the blob is spanning (§6.2).
+The pextent pattern records the object's history: the blob's 64 KiB was
+allocated contiguously, and the overwrites released every other 4 KiB
+block, so eight real extents at 8 KiB stride alternate with eight holes.
+The tracker's alternating 0 and 4096 says the same thing in referenced
+bytes per allocation unit.
 
 Each shard resolves its extents three ways — blobs defined inline,
 back-references within the shard, and spanning references into the onode
