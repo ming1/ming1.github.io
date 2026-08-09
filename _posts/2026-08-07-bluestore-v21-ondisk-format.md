@@ -1295,11 +1295,9 @@ Three things the full listing shows that a summary hides:
   still reads the other eight through this same blob, so the array cannot
   be pruned.
 
-The pextent pattern records the object's history: the blob's 64 KiB was
-allocated contiguously, and the overwrites released every other 4 KiB
-block, so eight real extents at 8 KiB stride alternate with eight holes.
-The tracker's alternating 0 and 4096 says the same thing in referenced
-bytes per allocation unit.
+The alternation is the object's history: the blob's 64 KiB was allocated
+contiguously, and the overwrites released every other block. The tracker
+records the same pattern in referenced bytes per allocation unit.
 
 Each shard resolves its extents three ways — blobs defined inline,
 back-references within the shard, and spanning references into the onode
@@ -1362,7 +1360,7 @@ record — what every shard would look like if no cut fell inside a window.
 Its leading record also carries the absolute gap of §6.4.2, `c3 01` =
 0x30000.
 
-Two further things are legible in those bytes. The shared blobs of the
+The walk also settles two questions about the unpromoted blobs. The shared blobs of the
 three unpromoted windows (`05 07 10 ff ff …` at shard 0 `[1]`, shard 1
 `[12]` and shard 2 `[1]`) are as `FLAG_SHARED` as the promoted one and
 still sit inline, because all their extents fall in one shard. And
