@@ -561,7 +561,7 @@ script's banner line before starting the workload:
 |---|---|---|
 | [`wstats.bt`]({{ site.baseurl }}/code/ceph/wstats.bt) | statistics over a period | which events, how many, how large |
 | [`wtrace.bt`]({{ site.baseurl }}/code/ceph/wtrace.bt) | event log for a single IO | what happened, in order, on which thread |
-| [`wlat.bt`]({{ site.baseurl }}/code/ceph/wlat.bt) | latency per transaction | where the milliseconds went |
+| [`wlat.bt`]({{ site.baseurl }}/code/ceph/wlat.bt) | per-stage latency histograms | where the milliseconds went |
 
 ## 2.1 Probe points
 
@@ -744,7 +744,7 @@ lines.
 ## 2.4 Latency mode — wlat.bt
 
 ```bash
-bpftrace wlat.bt bin/ceph-osd   # one line per write as it commits; Ctrl-C for histogram
+bpftrace wlat.bt bin/ceph-osd   # silent while tracing; Ctrl-C prints the report
 ```
 
 Stage boundaries are the txc state machine of §1.6.2, followed per
@@ -755,31 +755,34 @@ queue_transactions entry ──prep──► first _txc_state_proc ──data_io
 _txc_finish_io ──kv_commit──► _txc_committed_kv (= client reply)
 ```
 
-Direct and deferred writes in one run (deferred enabled mid-run via
-`bluestore_prefer_deferred_size 32768`):
+The script emits nothing per event — every txc is aggregated at
+`_txc_committed_kv` and Ctrl-C prints one histogram per stage plus the
+client-visible total. Two direct and two deferred writes in one run
+(deferred enabled mid-run via `bluestore_prefer_deferred_size 32768`):
 
 ```
-txc            clientlat = prep + data_io + kv_commit [us]
-0x55674621a700    14347 = 255 + 2773 + 11318     <- direct
-0x556745979180    12932 = 210 + 1790 + 10929     <- direct
-0x5567469e1500     6707 = 364 +    9 +  6331     <- deferred
-0x556746186a80     7593 = 222 +    7 +  7362     <- deferred
+4 txcs, avg [us]: prep 278 + data_io 1178 + kv_commit 11282
 
-4 txcs, avg [us]: prep 262 + data_io 1144 + kv_commit 8998
-
-@client_us: [4K, 8K) 2   [8K, 16K) 2
+@prep_us:       [128, 256) 1   [256, 512) 3
+@data_io_us:    [4, 8) 2       [2K, 4K) 2       <- deferred | direct
+@kv_commit_us:  [8K, 16K) 4
+@client_us:     [8K, 16K) 4
 ```
 
-The breakdown answers §1's latency question in one line per IO: prep (CPU —
-allocation, checksum, encoding) is ~250 µs; everything else is the two
-fdatasync barriers inside kv_commit. Deferred halves the client latency by
-dropping the data barrier — its `data_io` shows a few microseconds, not
-zero, because `_txc_state_proc` falls through and calls `_txc_finish_io`
-inline when no data aio exists
+The mixed run is legible in exactly one place: `@data_io_us` is bimodal.
+Direct writes pay the device — milliseconds of data aio plus its barrier;
+deferred writes show 4–8 µs — not zero, because `_txc_state_proc` falls
+through and calls `_txc_finish_io` inline when no data aio exists
 ([`BlueStore.cc:14735`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L14735));
-those µs are queue overhead, not device wait.
+those µs are queue overhead, not device wait. Every other stage is
+mode-blind: prep (CPU — allocation, checksum, encoding) is a few hundred
+µs either way, and kv_commit is the fdatasync barriers of §1.6.1. Note
+what the log2 buckets do to the deferred saving: dropping a ~2 ms data
+barrier inside an [8K, 16K) kv-dominated total does not move `@client_us`
+to a different bucket — the averages line, not the histogram, is where a
+delta that size shows up.
 
-Two reporting subtleties the script encodes: the per-txc line prints at
+Two reporting subtleties the script encodes: each txc is recorded at
 `_txc_committed_kv`, not `_txc_finish`, because that is where the client
 reply fires — and because a deferred txc's `_txc_finish` lags until the
 next kv cycle retires its replay, which is background cost, not client

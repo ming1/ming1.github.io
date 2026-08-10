@@ -4,9 +4,12 @@
  *
  * Usage:  bpftrace wlat.bt <path-to-ceph-osd>
  *         e.g.  bpftrace wlat.bt /root/git/ceph/ceph/build/bin/ceph-osd
- *         Wait for the header line (wildcard probes take ~10 s to attach),
+ *         Wait for the banner line (wildcard probes take ~10 s to attach),
  *         run write workload, Ctrl-C.
- * Prints one line per transaction as it completes, plus histograms at exit.
+ * Silent while tracing; Ctrl-C prints one latency histogram per stage
+ * (prep, data_io, kv_commit) plus the client-visible total and an
+ * average line.  A mixed direct/deferred run shows up as a bimodal
+ * data_io histogram: milliseconds for direct, microseconds for deferred.
  *
  * Stage boundaries (all take TransContext* so one txc is followed through):
  *
@@ -16,7 +19,7 @@
  *   _txc_committed_kv(txc)          t3  kv_wait+commit: flush + rocksdb fsync
  *
  * Client-visible latency ends at t3 (kv committed fires the commit callback),
- * so each txc is reported there.  A deferred write shows data_io of a few
+ * so each txc is recorded there.  A deferred write shows data_io of a few
  * microseconds, not milliseconds: with no data aio pending, _txc_state_proc
  * falls through PREPARE -> AIO_WAIT inline and calls _txc_finish_io itself
  * (BlueStore.cc:14735), so the stage measures queue overhead, not the
@@ -24,7 +27,7 @@
  */
 
 BEGIN
-{ printf("%-14s %8s = %s\n", "txc", "clientlat", "prep + data_io + kv_commit [us]"); }
+{ printf("tracing bluestore write latency... Ctrl-C for report\n"); }
 
 /* stage prepare starts when the transaction enters BlueStore */
 /* BlueStore::queue_transactions */
@@ -49,20 +52,21 @@ uprobe:$1:_ZN9BlueStore*_txc_finish_ioE*
 { @dio[arg1] = (nsecs - @last[arg1]) / 1000; @last[arg1] = nsecs; }
 
 /* kv durable -> commit callback -> client reply.  This is the end of the
- * client-visible latency, so report here.  (A deferred txc's _txc_finish
+ * client-visible latency, so record here.  (A deferred txc's _txc_finish
  * can lag until the next kv cycle -- background replay, not client cost.) */
 /* BlueStore::_txc_committed_kv */
 uprobe:$1:_ZN9BlueStore*_txc_committed_kvE*
 /@last[arg1]/
 {
-  printf("%-14p %8lld = %lld + %lld + %lld\n", arg1,
-         (nsecs - @birth[arg1]) / 1000,
-         @prep[arg1], @dio[arg1], (nsecs - @last[arg1]) / 1000);
-  @client_us = hist((nsecs - @birth[arg1]) / 1000);
+  $kvc = (nsecs - @last[arg1]) / 1000;
+  @prep_us      = hist(@prep[arg1]);
+  @data_io_us   = hist(@dio[arg1]);
+  @kv_commit_us = hist($kvc);
+  @client_us    = hist((nsecs - @birth[arg1]) / 1000);
   @n++;
   @sum_prep += @prep[arg1];
   @sum_dio  += @dio[arg1];
-  @sum_kvc  += (nsecs - @last[arg1]) / 1000;
+  @sum_kvc  += $kvc;
   delete(@birth[arg1]); delete(@prep[arg1]);
   delete(@dio[arg1]);   delete(@last[arg1]);
 }
@@ -76,5 +80,10 @@ END
            $n, @sum_prep / $n, @sum_dio / $n, @sum_kvc / $n);
   }
   clear(@n); clear(@sum_prep); clear(@sum_dio); clear(@sum_kvc);
-  printf("\nclient-visible latency (queue_transactions -> kv committed), us:\n");
+  /* print in pipeline order, then clear so exit does not re-print them
+   * (client_us last: queue_transactions -> kv committed, us) */
+  print(@prep_us);      clear(@prep_us);
+  print(@data_io_us);   clear(@data_io_us);
+  print(@kv_commit_us); clear(@kv_commit_us);
+  print(@client_us);    clear(@client_us);
 }
