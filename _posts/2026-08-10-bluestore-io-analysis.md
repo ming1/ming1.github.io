@@ -1012,10 +1012,12 @@ not match this post's, write twice and read the second trace.
 
 # 4. Function reference
 
-The six functions doing the heavy lifting above, in the order a write
+The functions doing the heavy lifting above, in the order a write
 meets them: plan (`_do_write_big` / `_do_write_small`) → execute
 (`_do_alloc_write`) → encode (`_txc_write_nodes`) → drive
-(`_txc_state_proc`) → commit (`submit_transaction_sync`). Bare `:NNNN`
+(`_txc_state_proc`) → commit (`submit_transaction_sync`) → and the two
+thread loops that own the tail, `_kv_sync_thread` and
+`_kv_finalize_thread`. Bare `:NNNN`
 line numbers are
 [`BlueStore.cc` at the v21.3.0 tag](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc)
 (§4.6 is `RocksDBStore.cc`); each heading links its definition.
@@ -1049,6 +1051,7 @@ head/tail fill: when the existing blob's checksum chunk is wider than
 the write's alignment, `_do_write_big_apply_deferred` *reads* the
 missing bytes from the device (`_do_read`, `:17026`, `:17043`).
 Allocation and the data writes happen later, in §4.3.
+
 **Locks:** none of its own; the OSD's PG lock and the per-collection
 sequencer already serialize writers on this onode.
 
@@ -1080,6 +1083,7 @@ queued right here (`:16699`) — the small path both reads and writes,
 so "plan" is only mostly true for it. The RMW rewrite never becomes a
 direct aio: it always rides the kv transaction as a deferred op, even
 on the SSD defaults of §1.1 where deferred writes are otherwise off.
+
 **Locks:** none of its own (same serialization as §4.1).
 
 ## 4.3 _do_alloc_write — allocate, checksum, start the IO
@@ -1112,6 +1116,7 @@ aios for one blob.
 
 **IOs:** queues the data writes on the txc's IOContext; nothing is
 submitted yet (`_txc_aio_submit` does that, §3.3 line #8). No reads.
+
 **Locks:** the allocator's internal mutex (inside `allocate`) and a
 buffer-cache shard lock (inside `_buffer_cache_write`); nothing held
 across the function.
@@ -1134,6 +1139,7 @@ for each shared blob (clone bookkeeping)
 
 **IOs:** none — memory into the in-memory transaction; the bytes reach
 disk in §4.6.
+
 **Locks:** none.
 
 ## 4.5 _txc_state_proc — drive the txc through its states
@@ -1155,6 +1161,7 @@ STATE_FINISHING    :14739  → _txc_finish, txc retired         bstore_kv_final
 
 **IOs:** starts them all, does none itself: the data `io_submit`
 (PREPARE) and the deferred replay (KV_DONE).
+
 **Locks:** `kv_lock` while queueing and waking the kv thread
 (`:14704`); IO_DONE requires the sequencer's `qlock` (asserted
 `:14672`; taken by its caller `_txc_finish_io`, `:14763`);
@@ -1195,6 +1202,66 @@ unprobed between trace lines #10 and #11.)
 **IOs:** the 4 KiB WAL append and the flush behind it (§3.5), via
 BlueFS — the flushed bytes include the async-appended batches. SST
 files are written later by compaction, off the write path.
+
 **Locks:** RocksDB's internal writer mutex — concurrent committers form
 a write group whose leader writes the WAL once; nothing on the Ceph
 side.
+
+## 4.7 _kv_sync_thread — the kv committer (thread bstore_kv_sync)
+
+[`BlueStore.cc:15290`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15290)
+— the thread body behind the `bstore_kv_sync` lane of §3.2; no
+parameters, runs for the OSD's lifetime. Everything §3.5 traced is one
+iteration of this loop:
+
+```
+while (true)                                        :15290
+  kv_queue empty → kv_cond.wait()                   :15326  ← switch #2
+  swap the whole queue → kv_committing              :15340
+  drop kv_lock                                      :15350
+  batch has completed data aios?
+    └► bdev->flush()             barrier #1         :15359-15385
+  per txc: db->submit_transaction(txc->t)  ASYNC    :15429  (§4.6)
+  build synct: id bumps + deferred cleanup          :15399,:15448
+  db->submit_transaction_sync(synct)  barrier #2    :15463
+  hand the batch to the finalize thread,
+  kv_finalize_cond.notify_one()                     :15497-15517
+```
+
+**IOs:** both barriers of §3.5 — the data-device fdatasync and the WAL
+append + fsync behind the sync commit. This is the only thread that
+pays them.
+
+**Locks:** `kv_lock` around sleeping and grabbing the queue (`:15294`),
+*dropped* before the barriers (`:15350`) so submitters never wait on a
+flush — after the swap the batch is private to this thread.
+
+## 4.8 _kv_finalize_thread — the finisher (thread bstore_kv_final)
+
+[`BlueStore.cc:15564`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15564)
+— the thread body behind `bstore_kv_final` (the thread is named after
+the role; the function is `_kv_finalize_thread`). No parameters. It
+exists so completion callbacks never run on — and never delay — the
+committing thread:
+
+```
+while (true)                                        :15564
+  nothing to do → kv_finalize_cond.wait()           :15582  ← switch #3
+  swap in committed txcs + stable deferred batches  :15585,:15586
+  per committed txc: _txc_state_proc                :15596
+    KV_SUBMITTED → _txc_committed_kv → callbacks,
+                   osd_op_reply(ondisk) leaves        (#16)
+    KV_DONE      → deferred txn? _deferred_queue
+    FINISHING    → _txc_finish, txc retired           (#17)
+  per stable deferred batch: _txc_state_proc
+    DEFERRED_CLEANUP → FINISHING → retire
+  maybe kick the replay: deferred_try_submit()      :15614
+```
+
+**IOs:** none of its own; it can *start* the deferred replay
+(`deferred_try_submit`, `:15614`), whose aios then belong to the data
+device path.
+
+**Locks:** `kv_finalize_lock` around the sleep and the swaps; the txc
+steps take the sequencer's `qlock` inside `_txc_committed_kv`
+(`:14957`) and `_txc_finish` (`:15006`).
