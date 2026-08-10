@@ -882,10 +882,12 @@ prepared, nothing is durable yet:
 #1  queue_transactions           :15980  OSD hands BlueStore the transaction
     └► _txc_add_transaction      :16098  walk the op list, in order:
 #2     ├► OP_WRITE → _write :18085 → _do_write :17851    "off=0x0 len=0x4000"
-#3     │  └► _do_write_big       :17077  16 KiB = whole 4 KiB units
-       │     └► _do_alloc_write  :17290  allocate ONE contiguous 16 KiB
-       │        │                        extent, checksum 4× crc32c
-#4     │        └► KernelDevice::aio_write (KernelDevice.cc:1143)
+#3     │  ├► _do_write_data → _do_write_big :17077
+       │  │                              plan only: 16 KiB = whole 4 KiB
+       │  │                              units, one blob, no allocation yet
+       │  └► _do_alloc_write     :17290  allocate ONE contiguous 16 KiB
+       │     │                           extent, checksum 4× crc32c
+#4     │     └► KernelDevice::aio_write (KernelDevice.cc:1143)
        │                                 "off=0x73000 len=0x4000" — queued
        │                                 on the txc, NOT yet submitted
        └► OP_OMAP_SETKEYS → _omap_setkeys :18521
