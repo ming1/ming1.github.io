@@ -832,36 +832,38 @@ runs only when the arrow wakes it. The whole trace on one map — every
 `#N` is a trace line, every switch is a thread change:
 
 ```
- tp_osd_tp             bstore_aio           bstore_kv_sync       bstore_kv_final
- (PG worker)           (aio reaper,         (kv committer,       (finisher, waits
-     │                  waits in             waits in             in kv_finalize_
-     │                  io_getevents)        kv_cond.wait)        cond.wait)
- #1  queue_transactions
- #2  └► _do_write
- #3     └► _do_write_big
- #4        └► aio_write          data IO queued, not sent yet
- #5,6  set(P) ×2                 pg log + info — in memory
- #7    set(O)                    onode — in memory
- #8  _txc_aio_submit
-     │
-     │ switch #1 ── io_submit ═► NVMe writes 16 KiB ═► io_getevents returns
-     ▼
- back to pool          #9  _txc_finish_io — txc is IO_DONE
-                           │
-                           │ switch #2 ── kv_queue.push + kv_cond.notify_one
-                           ▼
-                                            #10  flush(data bdev)     barrier #1
-                                            #11  submit_transaction_sync
-                                            #12  └► BlueFS::fsync
-                                            #13     ├► aio_write — WAL, 4 KiB
-                                            #14     └► flush(bluefs bdev)
-                                            #15  done — durable        barrier #2 ↑
-                                                 │
-                                                 │ switch #3 ── kv_finalize_cond
-                                                 ▼              .notify_one
-                                                                #16  _txc_committed_kv
-                                                                     → client reply
-                                                                #17  _txc_finish
+ tp_osd_tp                 bstore_aio              bstore_kv_sync             bstore_kv_final
+ (PG worker)               (aio reaper)            (kv committer)             (finisher)
+     │                     waits in                waits in                   waits in
+     │                     io_getevents            kv_cond.wait()             kv_finalize_cond.wait()
+     │                         ⋮                        ⋮                          ⋮
+ #1  queue_transactions        ⋮                        ⋮                          ⋮
+ #2  └► _do_write              ⋮                        ⋮                          ⋮
+ #3     └► _do_write_big       ⋮                        ⋮                          ⋮
+ #4        └► aio_write        ⋮                        ⋮                          ⋮
+ #5,6  set(P) ×2               ⋮                        ⋮                          ⋮
+ #7    set(O)                  ⋮                        ⋮                          ⋮
+ #8  _txc_aio_submit           ⋮                        ⋮                          ⋮
+     │                         ⋮                        ⋮                          ⋮
+     │ switch #1: io_submit(2) → NVMe writes 16 KiB     ⋮                          ⋮
+     └───────────────────► io_getevents returns         ⋮                          ⋮
+ (back to pool)                │                        ⋮                          ⋮
+                           #9  _txc_finish_io           ⋮                          ⋮
+                               │                        ⋮                          ⋮
+                               │ switch #2: kv_queue.push + kv_cond.notify_one     ⋮
+                               └──────────────────► wake                           ⋮
+                                                   #10  flush(data bdev)           ⋮
+                                                   #11  submit_transaction_sync    ⋮
+                                                   #12  └► BlueFS::fsync           ⋮
+                                                   #13     ├► aio_write (WAL)      ⋮
+                                                   #14     └► flush(bluefs bdev)   ⋮
+                                                   #15  done — durable             ⋮
+                                                        │                          ⋮
+                                                        │ switch #3: kv_finalize_cond.notify_one
+                                                        └────────────────────► wake
+                                                                              #16  _txc_committed_kv
+                                                                                   → client reply
+                                                                              #17  _txc_finish
 ```
 
 The rest of this section zooms into each lane with the code locations;
