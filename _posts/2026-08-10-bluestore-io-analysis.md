@@ -788,4 +788,99 @@ reply fires — and because a deferred txc's `_txc_finish` lags until the
 next kv cycle retires its replay, which is background cost, not client
 latency.
 
+# 3. Case study: one 16 KiB write
+
+Everything so far traced a 4 KiB write — one min_alloc unit, one
+checksum, the smallest direct write there is. This section reruns the
+§2.3 recipe with a 16 KiB object on a freshly rebuilt lab (§1.1
+commands; `p1` lands as pool 2 this time, so pg ids read `2.x`). Four
+min_alloc units are enough to answer three questions the 4 KiB write
+cannot: does BlueStore split the IO, how does the metadata grow, and
+which stages actually charge for the extra 12 KiB.
+
+```bash
+head -c 16384 /dev/urandom > /root/16k
+rados -p p1 put o48 /root/16k        # traced exactly as in §2.3
+```
+
+Steady-state trace (second write into this pg — the first one stages
+more, see §3.1):
+
+```
+        us     tid  thread           function                               event
+         3   33376  tp_osd_tp        BlueStore::queue_transactions          transaction arrives
+        75   33376  tp_osd_tp        BlueStore::_do_write                   off=0x0 len=0x4000
+        79   33376  tp_osd_tp        BlueStore::_do_write_big               whole min_alloc units
+       129   33376  tp_osd_tp        KernelDevice::aio_write                bdev=0x..864a00 off=0x73000 len=0x4000
+       145   33376  tp_osd_tp        RocksDBTransactionImpl::set            P keylen=40 val=187B
+       160   33376  tp_osd_tp        RocksDBTransactionImpl::set            P keylen=18 val=194B
+       171   33376  tp_osd_tp        RocksDBTransactionImpl::set            O keylen=36 val=384B
+       202   33376  tp_osd_tp        BlueStore::_txc_aio_submit             txc 0x..ff0a80
+      3617   32972  bstore_aio       BlueStore::_txc_finish_io              txc 0x..ff0a80 data aio done
+      9701   33341  bstore_kv_sync   KernelDevice::flush                    fdatasync bdev=0x..864a00 6022 us
+      9815   33341  bstore_kv_sync   RocksDBStore::submit_transaction_sync  start
+      9831   33341  bstore_kv_sync   BlueFS::fsync                          WAL file
+      9840   33341  bstore_kv_sync   KernelDevice::aio_write                bdev=0x..865900 off=0xfeb000 len=0x1000
+     17480   33341  bstore_kv_sync   KernelDevice::flush                    fdatasync bdev=0x..865900 5434 us
+     17508   33341  bstore_kv_sync   RocksDBStore::submit_transaction_sync  done (7694 us)
+     17578   33342  bstore_kv_final  BlueStore::_txc_committed_kv           txc 0x..ff0a80 -> client reply
+     17593   33342  bstore_kv_final  BlueStore::_txc_finish                 txc 0x..ff0a80
+```
+
+Against a 4 KiB write traced the same way on the same cluster minutes
+earlier (`rados -p p1 put x199 /root/4k`, also steady-state):
+
+| | 4 KiB | 16 KiB | reading |
+|---|---|---|---|
+| `_do_write` | `len=0x1000` | `len=0x4000` | both whole min_alloc units → `_do_write_big` |
+| data `aio_write` | one, `len=0x1000` | one, `len=0x4000` | no splitting — one extent, one IO |
+| onode `O` value | 372 B | 384 B | +12 B = three more crc32c values |
+| pgmeta `P` records | 40/188 B, 18/194 B | 40/187 B, 18/194 B | same two records either way |
+| WAL `aio_write` | `len=0x1000` | `len=0x1000` | commit cost is size-independent |
+| data aio done | +3 026 µs | +3 617 µs | the only size-sensitive stage |
+| two fdatasyncs | 6 320 + 5 151 µs | 6 022 + 5 434 µs | identical — this is the bill |
+| client reply | +16 752 µs | +17 578 µs | 4× the data, ~5 % more latency |
+
+Four things the pair of traces settles:
+
+- **A 16 KiB write is one device IO.** `_do_write_big` thinks in
+  min_alloc units but does not slice IOs to them: the allocator returned
+  one contiguous 16 KiB extent and it went to disk as a single
+  `aio_write len=0x4000`. A write is not cut until it crosses a blob
+  boundary (`bluestore_max_blob_size_ssd`, 64 KiB — §1.1). The two
+  16 KiB objects of this session landed exactly adjacent, at 0x6f000
+  and 0x73000.
+
+- **Metadata scales at 4 B per 4 KiB.** The onode value grows 372 B →
+  384 B: one crc32c per csum chunk, nothing else. The pgmeta records do
+  not change at all — the PG log entry does not care how big the write
+  was.
+
+- **The commit path never sees the payload.** On the direct path the
+  data goes to its own extent via aio and RocksDB gets only metadata,
+  so the WAL append is `len=0x1000` for both sizes and the kv commit
+  does the same two fdatasync barriers over the same bytes. Nothing in
+  the bottom half of the trace knows the write got 4× bigger.
+
+- **You pay for barriers, not bytes.** The extra 12 KiB bought ~600 µs
+  of data aio and nothing else; both writes spend ~11.5 of their
+  ~17 ms in the two fdatasyncs. At this scale IO size is nearly free
+  and sync frequency is everything — which is the same conclusion
+  §2.4's histograms reach from the deferred side.
+
+## 3.1 The first write into a PG
+
+The very first write into each pg staged three `P` records, not two:
+
+```
+P keylen=40 val=189B
+P keylen=15 val=4B
+P keylen=14 val=1021B
+```
+
+A 4 B flag and a ~1 KiB pg-info blob are written once per PG and never
+again; from the second write on, the pgmeta settles into the two-record
+steady state above. If you trace a fresh pool and your byte counts do
+not match this post's, write twice and read the second trace.
+
 <!-- analysis sections follow -->
