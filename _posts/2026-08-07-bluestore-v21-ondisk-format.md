@@ -163,7 +163,7 @@ Code path: `BlueStore::_write_bdev_label()` / `_read_bdev_label()`
 
 The `meta` map on the main device carries what older releases kept as small
 files in the OSD data directory, plus the authoritative freelist geometry
-(§8.1).
+(§9.1).
 
 Captured (`ceph-bluestore-tool show-label`):
 
@@ -407,7 +407,7 @@ A RocksDB column family (CF) is an independent keyspace inside one
 database. Each CF owns a private LSM tree — its own memtables, SST files,
 and options (block cache, write-buffer sizes, compaction style, merge
 operators) — while all CFs share the write-ahead log, MANIFEST, and
-background thread pools. The shared WAL is what preserves the §7.1 commit
+background thread pools. The shared WAL is what preserves the §8.1 commit
 contract: one `WriteBatch` spanning several CFs commits atomically. A WAL
 segment becomes deletable only after every CF holding data in it has
 flushed, so per-CF flush tuning also bounds WAL retention.
@@ -439,7 +439,7 @@ The definition serves three purposes:
   data; unlisted prefixes share the default CF;
 * per-CF tuning — `L` and `P` accumulate up to 32 memtables before
   flushing (`min_write_buffer_number_to_merge`), so a deferred record
-  (§7.2) written by one commit and deleted shortly after by another
+  (§8.2) written by one commit and deleted shortly after by another
   normally annihilates in memory and never reaches an SST; PG-log
   append-and-trim in `P` behaves the same way; `O` reads go through a
   `binned_lru` block cache;
@@ -459,7 +459,7 @@ The active definition is persisted at mkfs as the BlueFS file
 changing `bluestore_rocksdb_cfs` has no effect on an existing OSD. Shard
 CFs are named `O-0`, `O-1`, ...; CF membership of each SST file in `db/`
 is recorded in the RocksDB MANIFEST. Per-prefix merge operators (§4.8,
-§8.1) are registered against the CF holding the prefix. The layout is
+§9.1) are registered against the CF holding the prefix. The layout is
 inspected and converted offline with `ceph-bluestore-tool show-sharding`
 and `reshard`
 ([`src/os/bluestore/bluestore_tool.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_tool.cc));
@@ -484,9 +484,9 @@ object).
 | `P` | PREFIX_PGMETA_OMAP | BE u64 nid + sep + name (§4.6) | omap value (PG meta; opaque here) | 91 |
 | `m` | PREFIX_PERPOOL_OMAP | BE u64 pool + nid + sep + name (§4.6) | omap value | 0 |
 | `p` | PREFIX_PERPG_OMAP | BE u64 pool + BE u32 hash + nid + sep + name (§4.6) | omap value | 5 |
-| `L` | PREFIX_DEFERRED | BE u64 seq | `bluestore_deferred_transaction_t` (§7.2) | 0 |
-| `B` | PREFIX_ALLOC | ASCII `size`, `blocks`, `bytes_per_block`, `blocks_per_key` | le64 (§8.1, legacy geometry copy) | 4 |
-| `b` | PREFIX_ALLOC_BITMAP | BE u64 region offset | region bitmap (§8.1) | 802 |
+| `L` | PREFIX_DEFERRED | BE u64 seq | `bluestore_deferred_transaction_t` (§8.2) | 0 |
+| `B` | PREFIX_ALLOC | ASCII `size`, `blocks`, `bytes_per_block`, `blocks_per_key` | le64 (§9.1, legacy geometry copy) | 4 |
+| `b` | PREFIX_ALLOC_BITMAP | BE u64 region offset | region bitmap (§9.1) | 802 |
 | `X` | PREFIX_SHARED_BLOB | BE u64 sbid | `bluestore_shared_blob_t` (§5.5) | 0 |
 
 ## 4.3 `S` — superblock fields
@@ -501,7 +501,7 @@ Code path: `BlueStore::_open_super_meta()` and mkfs
 | `min_alloc_size` | le64 | `00 10 00 ..` (4096) | immutable after mkfs; decoding b-bitmaps and blob geometry depends on it |
 | `ondisk_format` | le32 | `04 00 00 00` | current format epoch (4) |
 | `min_compat_ondisk_format` | le32 | `03 00 00 00` | oldest code allowed to mount |
-| `freelist_type` | ASCII | `bitmap` | `bitmap` or `null` (NCB, §8.2) |
+| `freelist_type` | ASCII | `bitmap` | `bitmap` or `null` (NCB, §9.2) |
 | `per_pool_omap` | ASCII | `2` | omap key generation: absent = legacy, `1` = per-pool, `2` = per-PG |
 
 `nid_max`/`blobid_max` are batched reservations: ids below the stored max
@@ -558,7 +558,7 @@ Source: [`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.
 Full onode key (including the `'o'`) + `BE u32 shard_logical_offset` +
 `'x'`. The trailing byte discriminates onode vs shard keys without decoding;
 shards of an object sort immediately after its onode. Captured example:
-§6.4.2.
+§7.2.
 
 ## 4.6 `M`/`P`/`m`/`p` — omap keys
 
@@ -643,7 +643,7 @@ Captured (`ceph-kvstore-tool`): the reference OSD's 10 `C` keys are
 `.mgr` pool), and `meta`.
 
 Collections are loaded before any onode access at mount
-(`_open_collections()`, §9): key interpretation and membership checks
+(`_open_collections()`, §10): key interpretation and membership checks
 require the cnode.
 
 ## 4.8 `T` — statfs
@@ -729,7 +729,7 @@ of the `X` record holding the answer. It cannot be derived — sharing is
 assigned from a counter at clone time (§5.5) — so it is stored, but only
 under `FLAG_SHARED`, since most blobs are never cloned. It is stored once
 per definition, never on a reference: the eight records referring to
-§6.4.3's spanning blob carry two bytes each and no sbid between them.
+§7.3's spanning blob carry two bytes each and no sbid between them.
 Note it is a fixed le64 rather than a varint, so it costs 8 bytes where
 3 would do.
 
@@ -769,8 +769,8 @@ each record body:  varint_lowz length, varint refs
 ```
 
 When a put drops the last reference of a range, the released extents land
-in the owning transaction's `released` set (§7.2). Captured example:
-§6.4.3.
+in the owning transaction's `released` set (§8.2). Captured example:
+§7.3.
 
 The sbid is a per-OSD counter, not a per-object one. `_assign_blobid()` is
 `++blobid_last` with no disk access; durability comes from the `blobid_max`
@@ -787,11 +787,11 @@ from the extent maps referencing them:
 | Event | Effect on the `X` record |
 |---|---|
 | clone | `make_blob_shared()` sets `FLAG_SHARED`, clears `FLAG_HAS_UNUSED`, takes a ref on every valid pextent; the record is created |
-| refcount change | the whole ref_map is re-encoded and `set` again — this prefix has no merge operator, unlike `b` (§8.1) and `T` (§4.8) |
+| refcount change | the whole ref_map is re-encoded and `set` again — this prefix has no merge operator, unlike `b` (§9.1) and `T` (§4.8) |
 | last ref dropped | `persistent->empty()`, so the record is `rmkey`'d |
 
 Rewriting in full is what makes a fragmented shared blob expensive: the
-§6.4.3 record is 56 bytes for 16 entries, and changing one block's
+§7.3 record is 56 bytes for 16 entries, and changing one block's
 refcount rewrites all 56. The record is read on demand rather than at
 mount — `open_shared_blob()` fetches it when a `FLAG_SHARED` blob is first
 touched, using the sbid decoded from the blob itself (§5.3), so the id
@@ -856,7 +856,7 @@ above is a blob: the spanning-blob section (§6.2) and the inline extent
 map (§6.3) are separate structures concatenated after it in the same `O`
 value, decoded by separate calls in `Onode::decode_raw()`. That is why
 `ceph-dencoder type bluestore_onode_t` stops at the frame boundary and
-reports the rest as stray data (§6.4.1).
+reports the rest as stray data (§7.1).
 
 Version policy (paraphrasing the header comment): objects are written v3
 with `segment_size` initialized from `bluestore_onode_segment_size` when
@@ -897,9 +897,9 @@ Because the onode value is read before anything else about the object,
 table before any shard is loaded; shard references then resolve by id
 (§6.3, `BLOBID_FLAG_SPANNING`, id in bits 4+) regardless of which shards
 are faulted in. An unsharded onode has no shard boundaries and always
-encodes `count = 0` — the `02 00` pair in the §6.4.1 specimen. A
+encodes `count = 0` — the `02 00` pair in the §7.1 specimen. A
 populated spanning section, and the split-versus-promote rule that
-governs it, is captured in §6.4.3.
+governs it, is captured in §7.3.
 
 The reference tracker is persisted only in this section. A shard-local
 blob's reference accounting is rebuilt at decode time from the extents of
@@ -944,7 +944,7 @@ a cut is only legal where the checksum array and the use tracker can be
 cut too. **A blob is splittable exactly when all of its side tables are,
 and promotion is what happens when they are not.**
 
-An ordinary mutable blob therefore splits and never appears here; §6.4.3
+An ordinary mutable blob therefore splits and never appears here; §7.3
 captures both outcomes at one boundary.
 
 Promotion inverts the property sharding was introduced to buy. A shard is
@@ -963,7 +963,7 @@ Hence the v21 direction recorded under prevention above: rather than make
 spanning blobs cheaper, segmentation removes the case. Declaring
 boundaries that blobs may not cross means reshard cuts only on those
 lines, so no blob can straddle a cut and this machinery never engages.
-The specimens in §6.4 run with the default `segment_size = 0`, which is
+The specimens in §7 run with the default `segment_size = 0`, which is
 why they still exercise it.
 
 ## 6.3 Extent-map encoding
@@ -1002,13 +1002,20 @@ indexed by extent position (`consume_blobid()`). Example: extents 0,1,2
 using blobs A,A,B → blob B is inlined at extent 2 with `blobid_field`
 bits 4+ = 0; a later extent reusing B encodes `k = 3`.
 
-## 6.4 Captured specimens
+# 7. Captured Specimens
 
-### 6.4.1 Inline form: 16 KiB object
+The formats of sections 4–6 are now exercised on real bytes: three
+specimens dumped from the lab OSD with the tools of §11, each the
+smallest object that forces one encoding regime — inline, sharded,
+spanning — followed by a walk of how the decoded map resolves a read
+or write. Every hexdump is a verbatim capture; the recipe that built
+each object heads its subsection.
+
+## 7.1 Inline form: 16 KiB object
 
 16 KiB object, one user xattr, one omap key. Value = 414 bytes total =
 onode 378 B + spanning section 2 B + inline map (4 + 30) B. The 378-byte
-onode length is independently visible in §10.4's dencoder output ("stray
+onode length is independently visible in §11.4's dencoder output ("stray
 data at end of buffer, offset 378").
 
 ```
@@ -1049,7 +1056,7 @@ The 30 inline bytes, annotated (§6.3 + §5.3 layouts; cross-checked against
                 4 x le32 crc32c, one per 4 KiB chunk
 ```
 
-### 6.4.2 Sharded form: 75 discontiguous 4 KiB writes
+## 7.2 Sharded form: 75 discontiguous 4 KiB writes
 
 Created with 75 strided single-block writes, each becoming its own blob:
 
@@ -1123,13 +1130,13 @@ bytes:
 
 Against the inline form:
 
-| | inline (§6.4.1) | sharded (§6.4.2) |
+| | inline (§7.1) | sharded (§7.2) |
 |---|---|---|
 | records per object | 1 | 4: onode + 3 shards |
 | extent map stored in | section 3 of the `O` value | separate `'x'` records (§4.5) |
 | map length prefix | le32 before the payload | none — the length is `shard_info.bytes`, which the reader asserts against the KV value length |
 | `extent_map_shards` | empty | 3 entries |
-| spanning section | `02 00`, empty | `02 00`, still empty — every blob is one 4 KiB extent, so none crosses a cut (§6.4.3 shows one that does) |
+| spanning section | `02 00`, empty | `02 00`, still empty — every blob is one 4 KiB extent, so none crosses a cut (§7.3 shows one that does) |
 
 Shard 0's 498-byte value is a 2-byte header plus 31 records of exactly
 16 bytes:
@@ -1204,7 +1211,7 @@ shard 2  02 83 1f 07 + 14 B inline blob    gap 83 1f = 0x3e0000
 500 = 2 + 18 + 30 × 16, 212 = 2 + 18 + 12 × 16, over 31 + 31 + 13 = 75
 extents.
 
-### 6.4.3 Spanning blobs: 256 KiB cloned object, 8 KiB-stride overwrites
+## 7.3 Spanning blobs: 256 KiB cloned object, 8 KiB-stride overwrites
 
 This specimen captures a populated spanning section: one blob promoted
 because it is referenced from two shards and cannot be split. Promotion
@@ -1270,7 +1277,7 @@ shard 1's record `[1]` holds 10 (5 real: blocks 22–30), the two halves of
 what was one blob. The other three shared blobs sit wholly inside one
 shard and stay inline; the cut at block 48 promotes nothing because it
 coincides with a window boundary, though it still resets the encoder,
-giving shard 2 the 18-byte leading record of §6.4.2.
+giving shard 2 the 18-byte leading record of §7.2.
 
 The head object (`snap` = `CEPH_NOSNAP`; the clone sorts first under its
 lower snap id, §4.4) is described by eight records — four under `O`, plus
@@ -1424,7 +1431,7 @@ shard 2, 423 B, 16 records, blocks 48-63
 ```
 
 Shard 2 is the control case: one window, no cut inside it, so no spanning
-record. Its leading record also carries the absolute gap of §6.4.2,
+record. Its leading record also carries the absolute gap of §7.2,
 `c3 01` = 0x30000.
 
 One encoding detail the walk adds: back-references grow with the index of
@@ -1492,11 +1499,11 @@ pextent (0x4e0000) is the second entry — the first block, 0x4df000, is
 the hole at the front of the head's blob.
 
 
-### 6.4.4 Walking the mapping for an I/O
+## 7.4 Walking the mapping for an I/O
 
 The specimens above show the structures at rest. Serving a request means
 traversing them in a fixed order, and every value below is taken from the
-§6.4.3 capture.
+§7.3 capture.
 
 Read of 4 KiB at logical 0x1b000:
 
@@ -1521,7 +1528,7 @@ Read of 4 KiB at logical 0x1b000:
 
 Step 7 lands on a real pextent by construction. The entry's eight holes
 are at the even blob offsets, and those logical ranges are no longer
-mapped to this blob at all — the head's own extents cover them (§6.4.3),
+mapped to this blob at all — the head's own extents cover them (§7.3),
 so no live reference resolves onto a hole. `INVALID_OFFSET` marks space
 the blob does not map, here because the overwrites released it while the
 clone kept its reference; the write path checks `is_allocated()` before
@@ -1542,10 +1549,10 @@ A write descends identically to find the affected extents, then differs
 in what it rewrites:
 
 * the target blob decides the update. A mutable, unshared blob can be
-  overwritten in place, deferred or direct (§7.2); a shared or compressed
+  overwritten in place, deferred or direct (§8.2); a shared or compressed
   one cannot, so the write allocates new space, the extent map is
   repointed, and the old range is released through the transaction's
-  `released` set or a refcount put (§5.5, §7.2);
+  `released` set or a refcount put (§5.5, §8.2);
 * only shards whose logical ranges changed are re-encoded and written.
   That is the point of the split: a 4 KiB write to this object rewrites
   one shard record, not the whole extent map;
@@ -1560,14 +1567,14 @@ in what it rewrites:
   `rados setomapval` produced `_setattrs`, `_omap_setkeys` and
   `_record_onode` against the same object, so the onode was rewritten
   after all;
-* if a rewritten shard crosses the size thresholds of §6.4.2, reshard
+* if a rewritten shard crosses the size thresholds of §7.2, reshard
   re-cuts boundaries and may split or promote blobs, changing which of
   the three reference forms later records use.
 
 
-# 7. Transactions and Deferred Writes
+# 8. Transactions and Deferred Writes
 
-## 7.1 Commit protocol
+## 8.1 Commit protocol
 
 Code path: `BlueStore::queue_transactions()`,
 `BlueStore::TransContext::state_t` ([`src/os/bluestore/BlueStore.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h)).
@@ -1581,7 +1588,7 @@ has no other commit record.
 
 Durability therefore nests three logs: the BlueFS journal (§3.3) makes the
 RocksDB WAL file findable, the RocksDB WAL makes the WriteBatch durable,
-and the `L` records inside the batch defer raw block writes (§7.2).
+and the `L` records inside the batch defer raw block writes (§8.2).
 
 `state_t` values: `prepare`, `aio_wait`, `io_done`, `kv_queued`,
 `kv_submitted`, `kv_done`, `deferred_queued`, `deferred_cleanup`,
@@ -1599,7 +1606,7 @@ and the `L` records inside the batch defer raw block writes (§7.2).
  (**) a later WriteBatch deletes the L key
 ```
 
-## 7.2 Deferred records — `L`
+## 8.2 Deferred records — `L`
 
 Source: [`src/os/bluestore/bluestore_types.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h)
 (`bluestore_deferred_transaction_t`, `bluestore_deferred_op_t`); key
@@ -1630,9 +1637,9 @@ into space BlueFS has since claimed would corrupt the DB. Surviving ops are
 re-executed; re-execution is idempotent because the payload bytes are
 unchanged.
 
-# 8. Free Space Persistence
+# 9. Free Space Persistence
 
-## 8.1 Bitmap freelist — `B` / `b`
+## 9.1 Bitmap freelist — `B` / `b`
 
 Source: [`src/os/bluestore/BitmapFreelistManager.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BitmapFreelistManager.h) / [`.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BitmapFreelistManager.cc)
 (`BitmapFreelistManager`, `XorMergeOperator`).
@@ -1674,7 +1681,7 @@ blocks 0–1 allocated = the 8 KiB `SUPER_RESERVED` area, matching mkfs
 (`fm->allocate(BDEV_FIRST_LABEL_POSITION, reserved, t)` in
 `BlueStore::_open_fm()`).
 
-## 8.2 NCB mode — allocation file (`freelist_type = "null"`)
+## 9.2 NCB mode — allocation file (`freelist_type = "null"`)
 
 Source: [`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc) (NCB section:
 `allocator_image_header`, `allocator_image_trailer`, `ALLOCATOR_NCB_DIR`,
@@ -1769,7 +1776,7 @@ opened for write) the allocation map is reconstructed by scanning every
 onode's blob extents plus BlueFS's own extents
 (`read_allocation_from_drive_on_startup()`), then destaged again.
 
-# 9. Recovery-Relevant State: Mount Sequence
+# 10. Recovery-Relevant State: Mount Sequence
 
 ```
 [1] read bdev label(s) @0 (+replicas)     crc32c, osd_uuid match      (§2.3)
@@ -1784,9 +1791,9 @@ onode's blob extents plus BlueFS's own extents
         |                                 nid_max, blobid_max,
         |                                 min_alloc_size,
         |                                 freelist_type, per_pool_omap(§4.3)
-[6] freelist/allocator init               b-bitmap scan (§8.1), or NCB
-        |                                 file / full recovery scan   (§8.2)
-[7] _deferred_replay                      L records -> raw writes     (§7.2)
+[6] freelist/allocator init               b-bitmap scan (§9.1), or NCB
+        |                                 file / full recovery scan   (§9.2)
+[7] _deferred_replay                      L records -> raw writes     (§8.2)
         |
       READY (collections from C, onodes demand-paged from O)
 ```
@@ -1800,13 +1807,13 @@ complete BlueStore image consists of:
 * the RocksDB content within those files;
 * the object-data extents referenced by onodes.
 
-# 10. Inspection Tooling
+# 11. Inspection Tooling
 
 All commands below were executed against the captured OSD
 (built tree, `build/dev/osd0`, OSD stopped). These are offline tools; the
 store must not be in use by a running OSD.
 
-## 10.1 `ceph-bluestore-tool show-label`
+## 11.1 `ceph-bluestore-tool show-label`
 
 ```
 $ ceph-bluestore-tool show-label --path dev/osd0
@@ -1816,7 +1823,7 @@ Decodes the §2.3 label for every device of the OSD; `--dev <file>` inspects
 a single device file instead. Key fields: `osd_uuid` (must match across
 devices of one OSD), `size`, `meta`.
 
-## 10.2 `ceph-bluestore-tool bluefs-bdev-sizes` / `bluefs-log-dump`
+## 11.2 `ceph-bluestore-tool bluefs-bdev-sizes` / `bluefs-log-dump`
 
 ```
 $ ceph-bluestore-tool bluefs-bdev-sizes --path dev/osd0
@@ -1830,7 +1837,7 @@ noop mode and prints every transaction (excerpt in §3.5) — each line shows
 the journal offset, `txn(seq, len, crc)` and decoded ops, exposing
 fnode/extent evolution and envelope-mode flags.
 
-## 10.3 `ceph-kvstore-tool bluestore-kv`
+## 11.3 `ceph-kvstore-tool bluestore-kv`
 
 ```
 $ ceph-kvstore-tool bluestore-kv dev/osd0 list            # prefix \t escaped-key
@@ -1840,10 +1847,10 @@ $ ceph-kvstore-tool bluestore-kv dev/osd0 get O '%7f%80...o' out /tmp/onode.bin
 `bluestore-kv` mode mounts BlueFS and opens the embedded RocksDB, so all
 §4 prefixes are visible. Keys are printed %xx-escaped and are accepted back
 in the same form by `get`. The §4.2 census was produced with
-`list | cut -f1 | sort | uniq -c`; the §6.4.1 hexdump is `hexdump -C` of the
+`list | cut -f1 | sort | uniq -c`; the §7.1 hexdump is `hexdump -C` of the
 `get ... out` file.
 
-## 10.4 `ceph-dencoder`
+## 11.4 `ceph-dencoder`
 
 ```
 $ ceph-dencoder type bluestore_onode_t import /tmp/onode.bin decode dump_json
@@ -1856,7 +1863,7 @@ onode proper is 378 of 414 bytes. Types with self-contained values
 (`bluestore_cnode_t`, `bluefs_super_t`,
 `bluestore_deferred_transaction_t`, ...) decode cleanly the same way.
 
-## 10.5 `ceph-objectstore-tool`
+## 11.5 `ceph-objectstore-tool`
 
 ```
 $ ceph-objectstore-tool --data-path dev/osd0 --no-mon-config --op list specimen
@@ -1868,9 +1875,9 @@ $ ceph-objectstore-tool --data-path dev/osd0 --no-mon-config --pgid 1.4 specimen
 `--no-mon-config` is required offline (the tool otherwise blocks fetching
 the mon config). `dump` prints the fully decoded onode — §6/§5 in JSON
 (`"nid": 1156`, extent at 420151296, `csum_type: 4`, 4 crc32c values) —
-and is the reference against which the §6.4.1 byte annotation was verified.
+and is the reference against which the §7.1 byte annotation was verified.
 
-## 10.6 `ceph-bluestore-tool free-dump`
+## 11.6 `ceph-bluestore-tool free-dump`
 
 ```
 $ ceph-bluestore-tool free-dump --path dev/osd0
@@ -1878,12 +1885,12 @@ $ ceph-bluestore-tool free-dump --path dev/osd0
   "extents": [ { "offset": "0x2000", "length": "0x19003000" }, ... ] }
 ```
 
-Prints the allocator's free-extent view built from §8 state; the first free
+Prints the allocator's free-extent view built from §9 state; the first free
 extent begins at 0x2000, immediately after `SUPER_RESERVED`. `free-score`
 summarizes fragmentation; `fsck`/`repair` validate the invariants this
 document describes (ref_map parity, csum sizes, shard bounds, omap flags).
 
-# 11. Source Index
+# 12. Source Index
 
 | Area | File | Symbols |
 |---|---|---|
