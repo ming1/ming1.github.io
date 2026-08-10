@@ -790,13 +790,12 @@ latency.
 
 # 3. Case study: one 16 KiB write
 
-Everything so far traced a 4 KiB write — one min_alloc unit, one
-checksum, the smallest direct write there is. This section reruns the
-§2.3 recipe with a 16 KiB object on a freshly rebuilt lab (§1.1
-commands; `p1` lands as pool 2 this time, so pg ids read `2.x`). Four
-min_alloc units are enough to answer three questions the 4 KiB write
-cannot: does BlueStore split the IO, how does the metadata grow, and
-which stages actually charge for the extra 12 KiB.
+This section takes one 16 KiB write on a freshly rebuilt lab (§1.1
+commands; `p1` lands as pool 2 this time, so pg ids read `2.x`) and
+walks its wtrace line by line: which function printed each line, where
+it lives in the code, what it does — and, every time the `thread`
+column changes, what made the next thread run. Bare `:NNNN` line
+numbers are `BlueStore.cc` in the lab tree (`cc6b5e2da077` = v21.3.0).
 
 ```bash
 head -c 16384 /dev/urandom > /root/16k
@@ -827,46 +826,115 @@ more, see §3.2):
      17593   33342  bstore_kv_final  BlueStore::_txc_finish                 txc 0x..ff0a80
 ```
 
-Against a 4 KiB write traced the same way on the same cluster minutes
-earlier (`rados -p p1 put x199 /root/4k`, also steady-state):
+The trace crosses four threads. Three switches, three different
+triggers — one hardware, two condvar wakeups:
 
-| | 4 KiB | 16 KiB | reading |
-|---|---|---|---|
-| `_do_write` | `len=0x1000` | `len=0x4000` | both whole min_alloc units → `_do_write_big` |
-| data `aio_write` | one, `len=0x1000` | one, `len=0x4000` | no splitting — one extent, one IO |
-| onode `O` value | 372 B | 384 B | +12 B = three more crc32c values |
-| pgmeta `P` records | 40/188 B, 18/194 B | 40/187 B, 18/194 B | same two records either way |
-| WAL `aio_write` | `len=0x1000` | `len=0x1000` | commit cost is size-independent |
-| data aio done | +3 026 µs | +3 617 µs | the only size-sensitive stage |
-| two fdatasyncs | 6 320 + 5 151 µs | 6 022 + 5 434 µs | identical — this is the bill |
-| client reply | +16 752 µs | +17 578 µs | 4× the data, ~5 % more latency |
+```
+ tp_osd_tp          plan the write, stage all metadata,      +3 .. +202 us
+ (PG worker)        queue the 16 KiB data IO
+      │
+      │  switch #1: io_submit(2) — then the NVMe does the work
+      ▼
+ bstore_aio         device finished; mark txc IO_DONE            +3 617 us
+ (aio reaper)
+      │
+      │  switch #2: kv_cond.notify_one()          (§3.1 diagram)
+      ▼
+ bstore_kv_sync     barrier #1, commit metadata,        +9 701 .. +17 508 us
+ (kv committer)     barrier #2
+      │
+      │  switch #3: kv_finalize_cond.notify_one()   :15497-15517
+      ▼
+ bstore_kv_final    callbacks → client reply, retire txc        +17 578 us
+ (finisher)
+```
 
-Four things the pair of traces settles:
+**Lines 1–8, `tp_osd_tp` — everything is prepared, nothing is durable.**
+One PG worker runs the whole top half synchronously, as a call tree:
 
-- **A 16 KiB write is one device IO.** `_do_write_big` thinks in
-  min_alloc units but does not slice IOs to them: the allocator returned
-  one contiguous 16 KiB extent and it went to disk as a single
-  `aio_write len=0x4000`. A write is not cut until it crosses a blob
-  boundary (`bluestore_max_blob_size_ssd`, 64 KiB — §1.1). The two
-  16 KiB objects of this session landed exactly adjacent, at 0x6f000
-  and 0x73000.
+```
+queue_transactions            :15980   OSD hands BlueStore the transaction
+└► _txc_add_transaction       :16098   walk the op list, in order:
+   ├► OP_WRITE → _write :18109 → _do_write :17875     "off=0x0 len=0x4000"
+   │  └► _do_write_big        :17089   16 KiB = whole 4 KiB units
+   │     └► _do_alloc_write   :17308   allocate ONE contiguous 16 KiB
+   │        │                          extent, checksum 4× crc32c
+   │        └► KernelDevice::aio_write (KernelDevice.cc:1143)
+   │                                   "off=0x73000 len=0x4000" — queued
+   │                                   on the txc, NOT yet submitted
+   └► OP_OMAP_SETKEYS → _omap_setkeys :18545
+      └► set(P, ...) ×2                pg log entry + pg info, staged
+                                       in the in-memory rocksdb txn
+└► _txc_write_nodes           :14789
+   └► set(O, ...)                      onode: extent map + 4 checksums
+└► _txc_state_proc            :14634   state PREPARE → AIO_WAIT
+   └► _txc_aio_submit         :16091   io_submit(2): NOW the data IO
+                                       leaves for the device
+```
 
-- **Metadata scales at 4 B per 4 KiB.** The onode value grows 372 B →
-  384 B: one crc32c per csum chunk, nothing else. The pgmeta records do
-  not change at all — the PG log entry does not care how big the write
-  was.
+Everything above is CPU and memory: the `P`/`O` `set()` calls
+(`RocksDBStore.cc:1709,1723`) only append to an in-memory RocksDB
+transaction, and even `aio_write` only *queues* the IO. The single
+`io_submit` at the end is the first thing that touches hardware — one
+16 KiB IO for the whole write, because the allocator returned one
+contiguous extent and nothing splits below the 64 KiB blob boundary
+(`bluestore_max_blob_size_ssd`, §1.1).
 
-- **The commit path never sees the payload.** On the direct path the
-  data goes to its own extent via aio and RocksDB gets only metadata,
-  so the WAL append is `len=0x1000` for both sizes and the kv commit
-  does the same two fdatasync barriers over the same bytes. Nothing in
-  the bottom half of the trace knows the write got 4× bigger.
+**Switch #1 — nobody wakes anybody; the hardware does.** `tp_osd_tp`
+returns to its pool after `io_submit`. The `bstore_aio` thread is
+`KernelDevice::_aio_thread` (`KernelDevice.cc:673`), which sits in
+`io_getevents(2)` all day; when the NVMe completes the 16 KiB write,
+`io_getevents` returns and the thread runs. The 3.4 ms gap between
++202 and +3 617 is the device (plus reaping).
 
-- **You pay for barriers, not bytes.** The extra 12 KiB bought ~600 µs
-  of data aio and nothing else; both writes spend ~11.5 of their
-  ~17 ms in the two fdatasyncs. At this scale IO size is nearly free
-  and sync frequency is everything — which is the same conclusion
-  §2.4's histograms reach from the deferred side.
+**Line 9, `bstore_aio` — one job: pass the baton.**
+
+```
+io_getevents returns
+└► aio_cb                     :5802    completion callback
+   └► _txc_state_proc → _txc_finish_io :14753   "data aio done"
+      txc state → IO_DONE
+      kv_queue.push_back + kv_cond.notify_one   :14703-14710
+```
+
+That notify is **switch #2** — the wakeup drawn in §3.1's diagram.
+
+**Lines 10–15, `bstore_kv_sync` — make it durable.** The two flush
+lines and the RocksDB commit are §3.1's subject; in trace order:
+
+```
+flush(data bdev)     6022 us           barrier #1: the 16 KiB at 0x73000
+                                       must be on media BEFORE the onode
+                                       that points at it commits
+submit_transaction_sync (RocksDBStore.cc:1668)
+└► BlueFS::fsync (WAL file)  (BlueFS.cc:4428)
+   ├► aio_write, len=0x1000            the WAL block: ALL metadata of
+   │                                   this write — two P + one O —
+   │                                   in one 4 KiB append
+   └► flush(bluefs bdev)   5434 us     barrier #2: the commit point,
+                                       now the write is crash-safe
+```
+
+(The flush lines print from the *return* probe: barrier #1 actually
+started at ~+3.7 ms, immediately after the wakeup.) Note the WAL block
+is 4 KiB no matter how big the data was — on the direct path the
+payload never enters RocksDB. When the commit returns, the kv thread
+moves the batch to `kv_committing_to_finalize` and rings
+`kv_finalize_cond` (`:15497-15517`) — **switch #3**, same
+sleep/notify pattern as switch #2, different condvar.
+
+**Lines 16–17, `bstore_kv_final` — tell the client.**
+
+```
+_kv_finalize_thread           :15564   woken by switch #3
+├► _txc_committed_kv          :14952   run the commit callbacks →
+│                                      osd_op_reply(... ondisk) leaves
+└► _txc_finish                :14989   retire the txc, free throttle
+```
+
+The client's `put` returns somewhere between these two lines — at
++17.6 ms, of which ~11.5 ms was the two barriers and ~3.4 ms the data
+IO. Everything else in the trace cost microseconds.
 
 ## 3.1 Where the two fdatasyncs come from
 
