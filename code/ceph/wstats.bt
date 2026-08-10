@@ -2,7 +2,11 @@
 /*
  * wstats.bt -- BlueStore write-path statistics over a period.
  *
- * Usage:  bpftrace wstats.bt     (start) ... run workload ... Ctrl-C (stop+report)
+ * Usage:  bpftrace wstats.bt <path-to-ceph-osd>
+ *         e.g.  bpftrace wstats.bt /root/git/ceph/ceph/build/bin/ceph-osd
+ *         ... run workload ... Ctrl-C (stop+report)
+ *         The binary path is the positional parameter $1 in every probe;
+ *         omitting it fails at parse time with "uprobe should have a target".
  *         Wildcard probes take ~10 s to attach against the big binary --
  *         wait for the "tracing..." banner before starting the workload.
  *
@@ -33,44 +37,44 @@ BEGIN { printf("tracing bluestore write path... Ctrl-C to stop\n"); }
 /* ---- OSD -> BlueStore ------------------------------------------------ */
 
 /* BlueStore::queue_transactions(CollectionHandle&, vector<Transaction>&, ...) */
-uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN9BlueStore*queue_transactionsE*
+uprobe:$1:_ZN9BlueStore*queue_transactionsE*
 { @a_txc_submitted = count(); }
 
 /* BlueStore::_do_write(txc, coll, onode, offset, length, bl, flags) */
-uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN9BlueStore*_do_writeE*
+uprobe:$1:_ZN9BlueStore*_do_writeE*
 { @b_object_writes = count(); @b_object_write_bytes = sum(arg5); }
 
 /* ---- RocksDB staging: which keys get written ------------------------- */
 
 /* RocksDBStore::RocksDBTransactionImpl::set(prefix, key: string, bl) */
-uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN12RocksDBStore*3setE*S8_RK*
+uprobe:$1:_ZN12RocksDBStore*3setE*S8_RK*
 { @c_kv_set[str(*(uint64*)arg1)] = count();
   @c_kv_set_bytes[str(*(uint64*)arg1)] = sum(*(uint32*)(arg3+24)); }
 
 /* RocksDBStore::RocksDBTransactionImpl::set(prefix, key: char*+len, bl) */
-uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN12RocksDBStore*3setE*PKcmRK*
+uprobe:$1:_ZN12RocksDBStore*3setE*PKcmRK*
 { @c_kv_set[str(*(uint64*)arg1)] = count();
   @c_kv_set_bytes[str(*(uint64*)arg1)] = sum(*(uint32*)(arg4+24)); }
 
 /* RocksDBStore::RocksDBTransactionImpl::rmkey -- matches both overloads;
  * prefix is arg1 in each, so one probe covers them */
-uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN12RocksDBStore*5rmkeyE*
+uprobe:$1:_ZN12RocksDBStore*5rmkeyE*
 { @c_kv_rmkey[str(*(uint64*)arg1)] = count(); }
 
 /* RocksDBStore::RocksDBTransactionImpl::merge(prefix, key, bl) */
-uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN12RocksDBStore*5mergeE*
+uprobe:$1:_ZN12RocksDBStore*5mergeE*
 { @c_kv_merge[str(*(uint64*)arg1)] = count(); }
 
 /* ---- RocksDB commit -------------------------------------------------- */
 
 /* RocksDBStore::submit_transaction (async, deferred-cleanup etc.) */
-uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN12RocksDBStore*submit_transactionE*
+uprobe:$1:_ZN12RocksDBStore*submit_transactionE*
 { @d_kv_commit_async = count(); }
 
 /* RocksDBStore::submit_transaction_sync (the kv_sync_thread commit) */
-uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN12RocksDBStore*submit_transaction_syncE*
+uprobe:$1:_ZN12RocksDBStore*submit_transaction_syncE*
 { @d_kv_commit_sync = count(); @ts_kv[tid] = nsecs; }
-uretprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN12RocksDBStore*submit_transaction_syncE*
+uretprobe:$1:_ZN12RocksDBStore*submit_transaction_syncE*
 /@ts_kv[tid]/
 { @d_kv_commit_us = hist((nsecs - @ts_kv[tid]) / 1000); delete(@ts_kv[tid]); }
 
@@ -78,13 +82,13 @@ uretprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN12RocksDBStore*submit_transa
 
 /* KernelDevice::aio_write(off, bl, ioc, buffered, hint) -- keyed by the
  * issuing thread, which identifies the writer (data vs WAL vs deferred) */
-uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN12KernelDevice*aio_writeE*
+uprobe:$1:_ZN12KernelDevice*aio_writeE*
 { @e_disk_writes[comm] = count(); @e_disk_write_bytes[comm] = sum(*(uint32*)(arg2+24)); }
 
 /* KernelDevice::flush() == fdatasync barrier */
-uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN12KernelDevice*flushE*
+uprobe:$1:_ZN12KernelDevice*flushE*
 { @ts_fl[tid] = nsecs; }
-uretprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN12KernelDevice*flushE*
+uretprobe:$1:_ZN12KernelDevice*flushE*
 /@ts_fl[tid]/
 { @f_disk_flush = count(); @f_disk_flush_us = hist((nsecs - @ts_fl[tid]) / 1000);
   delete(@ts_fl[tid]); }
@@ -92,9 +96,9 @@ uretprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN12KernelDevice*flushE*
 /* ---- BlueFS (RocksDB's filesystem) ----------------------------------- */
 
 /* BlueFS::fsync(FileWriter*) -- WAL file durability */
-uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN6BlueFS5fsyncE*
+uprobe:$1:_ZN6BlueFS5fsyncE*
 { @ts_bf[tid] = nsecs; }
-uretprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN6BlueFS5fsyncE*
+uretprobe:$1:_ZN6BlueFS5fsyncE*
 /@ts_bf[tid]/
 { @g_bluefs_fsync = count(); @g_bluefs_fsync_us = hist((nsecs - @ts_bf[tid]) / 1000);
   delete(@ts_bf[tid]); }
@@ -102,7 +106,7 @@ uretprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN6BlueFS5fsyncE*
 /* ---- deferred replay ------------------------------------------------- */
 
 /* BlueStore::_deferred_submit_unlock(OpSequencer*) -- background data write */
-uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN9BlueStore*_deferred_submit_unlockE*
+uprobe:$1:_ZN9BlueStore*_deferred_submit_unlockE*
 { @h_deferred_batches = count(); }
 
 END { clear(@ts_kv); clear(@ts_fl); clear(@ts_bf); }

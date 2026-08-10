@@ -2,8 +2,10 @@
 /*
  * wlat.bt -- per-layer latency breakdown of BlueStore write transactions.
  *
- * Usage:  bpftrace wlat.bt    wait for the header line (wildcard probes
- *         take ~10 s to attach), run write workload, Ctrl-C.
+ * Usage:  bpftrace wlat.bt <path-to-ceph-osd>
+ *         e.g.  bpftrace wlat.bt /root/git/ceph/ceph/build/bin/ceph-osd
+ *         Wait for the header line (wildcard probes take ~10 s to attach),
+ *         run write workload, Ctrl-C.
  * Prints one line per transaction as it completes, plus histograms at exit.
  *
  * Stage boundaries (all take TransContext* so one txc is followed through):
@@ -25,11 +27,11 @@ BEGIN
 { printf("%-14s %8s = %s\n", "txc", "clientlat", "prep + data_io + kv_commit [us]"); }
 
 /* stage prepare starts when the transaction enters BlueStore */
-uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN9BlueStore*queue_transactionsE*
+uprobe:$1:_ZN9BlueStore*queue_transactionsE*
 { @qt[tid] = nsecs; }
 
 /* first _txc_state_proc on the same thread = this txc leaving prepare */
-uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN9BlueStore*_txc_state_procE*
+uprobe:$1:_ZN9BlueStore*_txc_state_procE*
 /@qt[tid] && !@birth[arg1]/
 {
   @birth[arg1] = @qt[tid];
@@ -39,14 +41,14 @@ uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN9BlueStore*_txc_state_procE*
 }
 
 /* data aio completed (fires inline within ~us for deferred/no-aio txcs) */
-uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN9BlueStore*_txc_finish_ioE*
+uprobe:$1:_ZN9BlueStore*_txc_finish_ioE*
 /@last[arg1]/
 { @dio[arg1] = (nsecs - @last[arg1]) / 1000; @last[arg1] = nsecs; }
 
 /* kv durable -> commit callback -> client reply.  This is the end of the
  * client-visible latency, so report here.  (A deferred txc's _txc_finish
  * can lag until the next kv cycle -- background replay, not client cost.) */
-uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN9BlueStore*_txc_committed_kvE*
+uprobe:$1:_ZN9BlueStore*_txc_committed_kvE*
 /@last[arg1]/
 {
   printf("%-14p %8lld = %lld + %lld + %lld\n", arg1,

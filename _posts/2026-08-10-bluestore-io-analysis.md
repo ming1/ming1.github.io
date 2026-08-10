@@ -603,15 +603,16 @@ headers:
   data/size at +0/+8) come from `gdb -batch -ex "ptype /o ..."` on the
   binary's own debug info, not from guessing.
 
-The binary path is hard-coded inside each probe
-(`/root/git/ceph/ceph/build/bin/ceph-osd`) — edit it for a different build
-tree. Rebuilding the binary is fine (symbols re-resolve at attach); moving
-it is not.
+The binary path is not hard-coded: every probe uses bpftrace's positional
+parameter `$1`, so the path to `ceph-osd` is passed on the command line
+(`bpftrace wstats.bt bin/ceph-osd` — relative paths work). Omitting it
+fails at parse time with "uprobe should have a target". Rebuilding the
+binary is fine — symbols re-resolve at attach.
 
 ## 2.2 Statistics mode — wstats.bt
 
 ```bash
-bpftrace wstats.bt          # start
+bpftrace wstats.bt bin/ceph-osd          # start
 # ... run any workload: rados bench, fio, a loop of puts ...
 # Ctrl-C                    # stop + print summary
 ```
@@ -648,14 +649,14 @@ the thread *is* the writer's identity: `tp_osd_tp` = object data,
 
 ```bash
 # terminal 1                        # terminal 2
-bpftrace wtrace.bt                  rados -p p1 put obj /root/4k
+bpftrace wtrace.bt bin/ceph-osd     rados -p p1 put obj /root/4k
 # events stream; Ctrl-C when done
 ```
 
 or in one terminal:
 
 ```bash
-bpftrace wtrace.bt > /tmp/trace.txt 2>&1 &
+bpftrace wtrace.bt bin/ceph-osd > /tmp/trace.txt 2>&1 &
 until grep -q pthread /tmp/trace.txt; do sleep 1; done   # wait for attach
 rados -p p1 put obj /root/4k
 sleep 2; kill -INT %1; cat /tmp/trace.txt
@@ -704,7 +705,7 @@ column.
 ## 2.4 Latency mode — wlat.bt
 
 ```bash
-bpftrace wlat.bt            # one line per write as it commits; Ctrl-C for histogram
+bpftrace wlat.bt bin/ceph-osd   # one line per write as it commits; Ctrl-C for histogram
 ```
 
 Stage boundaries are the txc state machine of §1.6.2, followed per
