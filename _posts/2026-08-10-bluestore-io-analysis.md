@@ -803,7 +803,7 @@ rados -p p1 put o48 /root/16k        # traced exactly as in §2.3
 ```
 
 Steady-state trace (second write into this pg — the first one stages
-more, see §3.2). The `#` column is added here so the analysis below
+more, see §3.1). The `#` column is added here so the analysis below
 can refer to lines; the script does not print it:
 
 ```
@@ -866,8 +866,8 @@ runs only when the arrow wakes it. The whole trace on one map — every
                                                                               #17  _txc_finish
 ```
 
-The rest of this section zooms into each lane with the code locations;
-§3.1 explains the two barriers and the switch-#2 wakeup in depth.
+The rest of this section zooms into each lane with the code
+locations.
 
 **Lines 1–8, `tp_osd_tp` — everything is prepared, nothing is durable.**
 One PG worker runs the whole top half synchronously, as a call tree:
@@ -917,28 +917,54 @@ returns to its pool after `io_submit`. The `bstore_aio` thread is
           kv_queue.push_back + kv_cond.notify_one   :14703-14710
 ```
 
-That notify is **switch #2** on the map — §3.1 explains the wakeup in
-depth.
+That notify is **switch #2** on the map: the kv thread was asleep in
+`kv_cond.wait()` inside `_kv_sync_thread`'s loop (`:15326`). A txc
+with **no data aio** (deferred, or pure metadata) skips this lane
+entirely — `_txc_state_proc` falls through PREPARE → IO_DONE inline on
+the submitting `tp_osd_tp` thread, which then does the push + notify
+itself.
 
-**Lines 10–15, `bstore_kv_sync` — make it durable.** The two flush
-lines and the RocksDB commit are §3.1's subject; in trace order:
+**Lines 10–15, `bstore_kv_sync` — make it durable.** In trace order:
 
 ```
-#10 flush(data bdev)    6022 us          barrier #1 — why: §3.1
+#10 flush(data bdev)    6022 us          barrier #1: data before metadata
 #11 submit_transaction_sync start        (RocksDBStore.cc:1668)
 #12 └► BlueFS::fsync (WAL file)          (BlueFS.cc:4428)
 #13    ├► aio_write, len=0x1000          the WAL block: two P + one O
-#14    └► flush(bluefs bdev)  5434 us    barrier #2, the commit point — §3.1
+#14    └► flush(bluefs bdev)  5434 us    barrier #2: the commit point
 #15 submit_transaction_sync returns      done (7694 us)
 ```
 
-(The flush lines print from the *return* probe: barrier #1 actually
-started at ~+3.7 ms, immediately after the wakeup.) The WAL block is
-4 KiB no matter how big the data was — on the direct path the payload
-never enters RocksDB. When the commit returns, the kv thread moves the
-batch to `kv_committing_to_finalize` and rings `kv_finalize_cond`
-(`:15497-15517`) — **switch #3**, same sleep/notify pattern as
-switch #2, different condvar.
+**Why barrier #1:** #9 only means the drive *accepted* the 16 KiB — it
+may still sit in the volatile write cache, while the transaction about
+to commit contains the onode whose extent map and checksums point at
+that extent. Commit the metadata first, lose power, and replay
+resurrects an onode referencing never-written data. So
+`_kv_sync_thread` flushes the data device before submitting whenever
+the batch has completed data aios (`force_flush`, `:15364-15385`).
+
+**Why barrier #2:** `submit_transaction_sync` commits with
+`sync = true` (`RocksDBStore.cc:1673`), and the WAL file lives on
+BlueFS — that sync is what produces #13 and #14. Both flushes are
+`::fdatasync(2)` on the raw block-device fd
+(`blk/kernel/KernelDevice.cc:504,535`), which the kernel turns into an
+NVMe Flush draining the drive's volatile cache: ~5–6 ms each,
+sequential on one thread — the ~11.5 ms floor under every trace in
+this post. The WAL block is 4 KiB no matter how big the data was; on
+the direct path the payload never enters RocksDB. (The flush lines
+print from the *return* probe: barrier #1 actually started at
+~+3.7 ms, immediately after the wakeup.)
+
+The barrier pair is paid **per kv batch, not per write** — mid-cycle
+txcs are swept up by `kv_committing.swap(kv_queue)` (`:15340`), so
+throughput scales with queue depth while single-IO latency does not.
+And a deferred write (§2.4) is exactly the trick of moving the data
+*into* the WAL record: barrier #1 leaves the client path, and the
+replay that later writes the data does not even wake the kv thread
+(`_deferred_aio_finish`, `:15838`). When the commit returns, the kv
+thread moves the batch to `kv_committing_to_finalize` and rings
+`kv_finalize_cond` (`:15497-15517`) — **switch #3**, same sleep/notify
+pattern as switch #2, different condvar.
 
 **Lines 16–17, `bstore_kv_final` — tell the client.**
 
@@ -949,80 +975,13 @@ switch #2, different condvar.
 #17 └► _txc_finish               :14989  retire the txc, free throttle
 ```
 
-The client's `put` returns somewhere between these two lines — at
-+17.6 ms, of which ~11.5 ms was the two barriers and ~3.4 ms the data
-IO. Everything else in the trace cost microseconds.
+The write became durable the moment #14's flush returned; #16 is the
+consequence — the onode, pgmeta and pg-log records are on media, so
+the commit callbacks run and the client's `ondisk` reply leaves. The
+`put` returns at +17.6 ms, of which ~11.5 ms was the two barriers and
+~3.4 ms the data IO. Everything else in the trace cost microseconds.
 
-## 3.1 Where the two fdatasyncs come from
-
-Both barriers are issued from the same `bstore_kv_sync` thread, but
-they guard different invariants.
-
-**Who wakes the thread.** `bstore_kv_sync` sleeps in `kv_cond.wait()`
-inside `_kv_sync_thread`'s loop while `kv_queue` is empty (`:15326`);
-line #9's push + notify — switch #2 — is what wakes it. A txc with
-**no data aio** (deferred, or pure metadata) skips the `bstore_aio`
-lane entirely: `_txc_state_proc` falls through PREPARE → IO_DONE
-inline on the submitting `tp_osd_tp` thread, which then does the
-push + notify itself.
-
-**#1, data device — ordering: data before the metadata that points at
-it.** The 16 KiB data aio completed back at +3 617 µs, but aio
-completion only means the drive *accepted* the write — it may still sit
-in the device's volatile cache. The transaction about to commit
-contains the onode whose extent map and checksums point at that extent;
-if the metadata became durable first and power failed, replay would
-produce an onode referencing never-written data, and every read of it
-would fail checksum. So
-[`_kv_sync_thread`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15290)
-flushes the data device before submitting the batch whenever the batch
-contains completed data aios:
-
-```
-BlueStore::_kv_sync_thread                       BlueStore.cc:15290
-  force_flush = aios || !deferred_done.empty()             :15364-15378
-  bdev->flush()                                            :15385
-    KernelDevice::flush -> ::fdatasync(fd)       blk/kernel/KernelDevice.cc:504,535
-```
-
-**#2, BlueFS device — the commit point.** `submit_transaction_sync`
-commits with `sync = true`, so RocksDB appends the transaction to its
-WAL file and syncs it. The WAL lives on BlueFS, which turns that sync
-into the `len=0x1000` append seen in the trace plus a flush of the
-BlueFS device:
-
-```
-RocksDBStore::submit_transaction_sync            kv/RocksDBStore.cc:1668
-  woptions.sync = true                                     :1673
-  rocksdb WAL append + WritableFile::Sync()
-    BlueRocksWritableFile::Sync                  os/bluestore/BlueRocksEnv.cc:233
-      BlueFS::fsync(WAL FileWriter)              os/bluestore/BlueFS.cc:4428
-        KernelDevice::aio_write                  (the 0x1000 WAL block)
-        KernelDevice::flush -> ::fdatasync(fd)
-```
-
-The onode, pgmeta and pg-log records are durable exactly when that WAL
-block is on media — which is why the next two trace lines are
-`_txc_committed_kv` and the client's `ondisk` reply.
-
-In both cases `::fdatasync(2)` on the raw block-device fd becomes a
-kernel preflush (`REQ_PREFLUSH`), i.e. an NVMe Flush draining the
-drive's volatile write cache — ~5–6 ms each on this device, sequential
-on one thread: the ~11.5 ms floor under every trace in this post. Two
-consequences. The pair is paid **per kv batch, not per write**: a busy
-kv thread is never re-notified (`kv_sync_in_progress` guards the
-notify), and txcs queued mid-cycle are grabbed wholesale by
-`kv_committing.swap(kv_queue)` (`:15340`) on the next iteration — which
-is why throughput scales with queue depth while single-IO latency does
-not. And deferred writes (§2.4) are exactly the trick of moving the
-data *into* the WAL record: with no completed data aio in the batch,
-#1 leaves the client path, and the data's own flush rides a later
-cycle's background replay — whose completion does not even wake the
-thread (`_deferred_aio_finish`, `:15838`: "it will catch us on the
-next commit anyway"), so retiring deferred data never buys its own
-barrier pair.
-
-## 3.2 The first write into a PG
+## 3.1 The first write into a PG
 
 The very first write into each pg staged three `P` records, not two:
 
