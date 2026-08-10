@@ -873,6 +873,27 @@ Four things the pair of traces settles:
 Both barriers are issued from the same `bstore_kv_sync` thread, but
 they guard different invariants.
 
+**Who wakes the thread.** `bstore_kv_sync` spends its life in
+`_kv_sync_thread`'s loop, asleep in `kv_cond.wait()` while `kv_queue`
+is empty (`BlueStore.cc:15326`). The handoff is the tail of
+`_txc_state_proc`'s `STATE_IO_DONE` stage: push the txc onto
+`kv_queue`, then `kv_cond.notify_one()` — only if the thread is
+actually idle (`!kv_sync_in_progress`, `:14703-14710`). Who executes
+that stage depends on the write. For a direct write it is the
+**bstore_aio** thread: the device's aio completion callback (`aio_cb`,
+`:5802`) re-enters `_txc_state_proc`, which runs `_txc_finish_io`
+(`:14668`) and falls through to `IO_DONE` — so the `_txc_finish_io`
+line at +3 617 µs in the trace *is* the wakeup. A txc with no data aio
+(deferred, or pure metadata) takes the same fall-through inline on the
+submitting `tp_osd_tp` thread, which then does the notify itself. Two
+refinements are visible in the code: a busy kv thread is never
+re-notified — txcs queued mid-cycle are grabbed wholesale by
+`kv_committing.swap(kv_queue)` on the next iteration (`:15340`), which
+is exactly where the batching comes from; and `_deferred_aio_finish`
+(`:15838`) deliberately does *not* wake the thread when a background
+replay completes — "it will catch us on the next commit anyway" — so
+retiring deferred data never buys its own barrier pair.
+
 **#1, data device — ordering: data before the metadata that points at
 it.** The 16 KiB data aio completed back at +3 617 µs, but aio
 completion only means the drive *accepted* the write — it may still sit
