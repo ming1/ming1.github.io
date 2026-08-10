@@ -804,7 +804,7 @@ rados -p p1 put o48 /root/16k        # traced exactly as in §2.3
 ```
 
 Steady-state trace (second write into this pg — the first one stages
-more, see §3.1):
+more, see §3.2):
 
 ```
         us     tid  thread           function                               event
@@ -868,7 +868,63 @@ Four things the pair of traces settles:
   and sync frequency is everything — which is the same conclusion
   §2.4's histograms reach from the deferred side.
 
-## 3.1 The first write into a PG
+## 3.1 Where the two fdatasyncs come from
+
+Both barriers are issued from the same `bstore_kv_sync` thread, but
+they guard different invariants.
+
+**#1, data device — ordering: data before the metadata that points at
+it.** The 16 KiB data aio completed back at +3 617 µs, but aio
+completion only means the drive *accepted* the write — it may still sit
+in the device's volatile cache. The transaction about to commit
+contains the onode whose extent map and checksums point at that extent;
+if the metadata became durable first and power failed, replay would
+produce an onode referencing never-written data, and every read of it
+would fail checksum. So
+[`_kv_sync_thread`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15290)
+flushes the data device before submitting the batch whenever the batch
+contains completed data aios:
+
+```
+BlueStore::_kv_sync_thread                       BlueStore.cc:15290
+  force_flush = aios || !deferred_done.empty()             :15364-15378
+  bdev->flush()                                            :15385
+    KernelDevice::flush -> ::fdatasync(fd)       blk/kernel/KernelDevice.cc:504,535
+```
+
+**#2, BlueFS device — the commit point.** `submit_transaction_sync`
+commits with `sync = true`, so RocksDB appends the transaction to its
+WAL file and syncs it. The WAL lives on BlueFS, which turns that sync
+into the `len=0x1000` append seen in the trace plus a flush of the
+BlueFS device:
+
+```
+RocksDBStore::submit_transaction_sync            kv/RocksDBStore.cc:1668
+  woptions.sync = true                                     :1673
+  rocksdb WAL append + WritableFile::Sync()
+    BlueRocksWritableFile::Sync                  os/bluestore/BlueRocksEnv.cc:233
+      BlueFS::fsync(WAL FileWriter)              os/bluestore/BlueFS.cc:4428
+        KernelDevice::aio_write                  (the 0x1000 WAL block)
+        KernelDevice::flush -> ::fdatasync(fd)
+```
+
+The onode, pgmeta and pg-log records are durable exactly when that WAL
+block is on media — which is why the next two trace lines are
+`_txc_committed_kv` and the client's `ondisk` reply.
+
+In both cases `::fdatasync(2)` on the raw block-device fd becomes a
+kernel preflush (`REQ_PREFLUSH`), i.e. an NVMe Flush draining the
+drive's volatile write cache — ~5–6 ms each on this device, sequential
+on one thread: the ~11.5 ms floor under every trace in this post. Two
+consequences. The pair is paid **per kv batch, not per write** —
+`_kv_sync_thread` commits every txc that arrived during the previous
+cycle behind one pair of barriers, which is why throughput scales with
+queue depth while single-IO latency does not. And deferred writes
+(§2.4) are exactly the trick of moving the data *into* the WAL record:
+with no completed data aio in the batch, #1 leaves the client path, and
+the data's own flush is paid by a later cycle's background replay.
+
+## 3.2 The first write into a PG
 
 The very first write into each pg staged three `P` records, not two:
 
