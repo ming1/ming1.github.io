@@ -1034,6 +1034,8 @@ loop over the span in ≤ target_blob_size (64 KiB) chunks
    ├─ deferring pays? (chunk ≤ 2 × prefer_deferred_size)    :17111
    │    └► carve head/tail, stage them as deferred writes
    │       _do_write_big_apply_deferred                     :17014
+   │         may _do_read head/tail chunk fill              :17026,:17043
+   │                                              ← device READs
    ├─ a neighbour blob can absorb the chunk?
    │    scan ± one blob length, can_reuse_blob              :17195,:17220
    │    └► extend that blob
@@ -1041,8 +1043,12 @@ loop over the span in ≤ target_blob_size (64 KiB) chunks
         └► wctx->write(chunk) — plan recorded, nothing done :17268
 ```
 
-**IOs:** none — everything lands in `wctx` (deferred payloads go into
-the kv transaction); allocation and device IO happen later, in §4.3.
+**IOs:** none on the common path — the plan lands in `wctx`, deferred
+payloads in the kv transaction. The exception is the deferred branch's
+head/tail fill: when the existing blob's checksum chunk is wider than
+the write's alignment, `_do_write_big_apply_deferred` *reads* the
+missing bytes from the device (`_do_read`, `:17026`, `:17043`).
+Allocation and the data writes happen later, in §4.3.
 **Locks:** none of its own; the OSD's PG lock and the per-collection
 sequencer already serialize writers on this onode.
 
@@ -1059,16 +1065,21 @@ sub-4-KiB write
    ├─ fits in never-written space of an existing mutable blob?  :16669
    │    ├─ small (< prefer_deferred_size) → stage OP_WRITE
    │    │  payload in the kv txn                                :16683
-   │    └─ else → direct write into the blob's free space
+   │    └─ else → bdev->aio_write into the blob's free
+   │       space, queued on txc->ioc right here                 :16699
    ├─ overlaps written chunks → read-modify-write:
    │    _do_read head :16741 / tail :16755        ← device READs
-   │    merge old + new bytes, rewrite the chunk
+   │    merge old + new bytes, stage the rewritten chunk as a
+   │    deferred OP_WRITE — always, even with deferred off      :16774
    └─ nothing reusable → new blob
         └► wctx->write                                          :16943
 ```
 
-**IOs:** possibly device *reads* for the head/tail fill — the only
-reads in the whole write path. The writes themselves are only planned.
+**IOs:** the head/tail `_do_read`s, and possibly a direct `aio_write`
+queued right here (`:16699`) — the small path both reads and writes,
+so "plan" is only mostly true for it. The RMW rewrite never becomes a
+direct aio: it always rides the kv transaction as a deferred op, even
+on the SSD defaults of §1.1 where deferred writes are otherwise off.
 **Locks:** none of its own (same serialization as §4.1).
 
 ## 4.3 _do_alloc_write — allocate, checksum, start the IO
@@ -1083,17 +1094,24 @@ wctx->writes (the plan)
    ├─ optional: compress each blob                          :17322
    ├─ ONE allocator call for the plan's total need
    │    alloc->allocate                                     :17409
+   ├─ defer or not, decided ONCE for the whole plan:
+   │    data_size of ALL blobs < prefer_deferred_size?      :17308,:17552
    └─ per blob:
         checksum   dblob.calc_csum  (crc32c per 4 KiB)      :17522
         cache      _buffer_cache_write                      :17547
-        small? (data < prefer_deferred_size)
-          ├─ yes → OP_WRITE payload into the kv txn         :17557
-          └─ no  → bdev->aio_write, queued on txc->ioc      :17571
+        deferred plan → OP_WRITE payload into the kv txn    :17557
+        direct plan   → bdev->aio_write per PHYSICAL
+                        extent of the blob (map_bl)         :17571
 ```
 
-**IOs:** queues the data write — one aio per new blob — on the txc's
-IOContext; nothing is submitted yet (`_txc_aio_submit` does that, §3.3
-line #8). No reads.
+The two fine points the diagram flags: the defer decision compares the
+*plan's total* against `prefer_deferred_size` — two 32 KiB blobs with
+a 64 KiB threshold go direct, not deferred — and a direct blob emits
+one aio per physical extent, so a fragmented allocation queues several
+aios for one blob.
+
+**IOs:** queues the data writes on the txc's IOContext; nothing is
+submitted yet (`_txc_aio_submit` does that, §3.3 line #8). No reads.
 **Locks:** the allocator's internal mutex (inside `allocate`) and a
 buffer-cache shard lock (inside `_buffer_cache_write`); nothing held
 across the function.
@@ -1145,26 +1163,38 @@ STATE_FINISHING    :14739  → _txc_finish, txc retired         bstore_kv_final
 ## 4.6 submit_transaction_sync — make the transaction durable
 
 [`RocksDBStore.cc:1668`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/RocksDBStore.cc#L1668)
-— takes the `KeyValueDB::Transaction` (a wrapped `rocksdb::WriteBatch`
-holding every `set`/`rmkey` the kv batch staged). This is the kv-sync
-thread's per-batch commit — §3's lines #11/#15.
+— takes a `KeyValueDB::Transaction` (a wrapped `rocksdb::WriteBatch`)
+and commits it with `sync = true`. The surprise is *which* transaction:
+in the kv cycle the client records do **not** travel in this call.
 
 ```
-submit_transaction_sync              RocksDBStore.cc:1668
-  woptions.sync = !disableWAL                :1673   (sync = true)
-  └► submit_common                           :1607
-       └► db->Write(woptions, batch)         :1624
-            append batch to the WAL file     → #13 (BlueFS)
-            insert keys into the memtable    (memory only)
-            sync → fsync the WAL file        → #12/#14, barrier #2
+one kv cycle (bstore_kv_sync, §3.5)
+   │
+   ├─ per txc: db->submit_transaction(txc->t)  — ASYNC     BlueStore.cc:15429
+   │    the two P + one O records: appended to the WAL       (via :14919)
+   │    buffer + memtable, NO fsync
+   └─ once:   db->submit_transaction_sync(synct)           BlueStore.cc:15463
+        synct = nid/blobid-max bumps                       :15399,:15406
+                + deferred-cleanup rmkeys                  :15448-15456
+        woptions.sync = !disableWAL                        RocksDBStore.cc:1673
+        └► submit_common → db->Write                       :1607,:1624
+             sync=true → fsync the WAL file  → #12/#14, barrier #2
 ```
 
-The async twin `submit_transaction` (`:1654`, `sync = false`) is the
-same call without the fsync — used for the optional early submit and
-deferred cleanup, never for the client-visible commit.
+The sync call's own batch (`synct`) is nearly empty — its job is the
+*blocking WAL fsync*, which makes everything appended before it durable
+at once, including the async batches carrying this write's `P`/`O`
+records. That is why the single 4 KiB WAL block flushed at #13 contains
+the client records even though the async twin (`:1654`) submitted them:
+the WAL is one sequential file, and one fsync covers all of it. §2.2's
+wstats sample shows the pairing directly — 10 puts produced
+`@d_kv_commit_sync: 10` *and* `@d_kv_commit_async: 10`, one of each per
+cycle. (wtrace probes only the sync call; the async submits sit
+unprobed between trace lines #10 and #11.)
 
 **IOs:** the 4 KiB WAL append and the flush behind it (§3.5), via
-BlueFS. SST files are written later by compaction, off the write path.
+BlueFS — the flushed bytes include the async-appended batches. SST
+files are written later by compaction, off the write path.
 **Locks:** RocksDB's internal writer mutex — concurrent committers form
 a write group whose leader writes the WAL once; nothing on the Ceph
 side.
