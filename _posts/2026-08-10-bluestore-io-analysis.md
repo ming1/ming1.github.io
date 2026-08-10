@@ -875,24 +875,53 @@ they guard different invariants.
 
 **Who wakes the thread.** `bstore_kv_sync` spends its life in
 `_kv_sync_thread`'s loop, asleep in `kv_cond.wait()` while `kv_queue`
-is empty (`BlueStore.cc:15326`). The handoff is the tail of
-`_txc_state_proc`'s `STATE_IO_DONE` stage: push the txc onto
-`kv_queue`, then `kv_cond.notify_one()` — only if the thread is
-actually idle (`!kv_sync_in_progress`, `:14703-14710`). Who executes
-that stage depends on the write. For a direct write it is the
-**bstore_aio** thread: the device's aio completion callback (`aio_cb`,
-`:5802`) re-enters `_txc_state_proc`, which runs `_txc_finish_io`
-(`:14668`) and falls through to `IO_DONE` — so the `_txc_finish_io`
-line at +3 617 µs in the trace *is* the wakeup. A txc with no data aio
-(deferred, or pure metadata) takes the same fall-through inline on the
-submitting `tp_osd_tp` thread, which then does the notify itself. Two
-refinements are visible in the code: a busy kv thread is never
-re-notified — txcs queued mid-cycle are grabbed wholesale by
-`kv_committing.swap(kv_queue)` on the next iteration (`:15340`), which
-is exactly where the batching comes from; and `_deferred_aio_finish`
-(`:15838`) deliberately does *not* wake the thread when a background
-replay completes — "it will catch us on the next commit anyway" — so
-retiring deferred data never buys its own barrier pair.
+is empty. For a direct write the waker is the **bstore_aio** thread, at
+the moment the data aio completes (line numbers are `BlueStore.cc`):
+
+```
+ tp_osd_tp                bstore_aio              bstore_kv_sync
+ (submitter)              (aio reaper)            (_kv_sync_thread)
+     │                        │                       │
+ queue_transactions           │                  kv_queue empty:
+ _txc_state_proc              │                  kv_cond.wait()   :15326
+   │ PREPARE:                 │                       ⋮
+   │   stage kv records       │                       ⋮  asleep
+   │   aio_write(data) ════► NVMe                     ⋮
+   └─ txc parked; thread      │                       ⋮
+      returns to the pool     │ data IO completes     ⋮
+                              ▼                       ⋮
+                          aio_cb           :5802      ⋮
+                          _txc_state_proc             ⋮
+                          _txc_finish_io   :14668     ⋮
+                          IO_DONE:                    ⋮
+                            kv_queue.push_back        ⋮
+                            kv_cond.notify_one() ──► wake   :14703-14710
+                                                      │
+                                                      ▼
+                                       kv_committing.swap(kv_queue)  :15340
+                                       flush(data bdev)       ← barrier #1
+                                       submit_transaction_sync
+                                         WAL append + fsync   ← barrier #2
+                                                      │
+                                       hand off to bstore_kv_final:
+                                       _txc_committed_kv → client reply
+```
+
+So the `_txc_finish_io` line at +3 617 µs in the trace *is* the wakeup
+— its tail falls through to `IO_DONE`, pushes the txc onto `kv_queue`
+and notifies. A txc with **no data aio** (deferred, or pure metadata)
+never visits the middle lane: `_txc_state_proc` falls through
+PREPARE → IO_DONE inline on the submitting `tp_osd_tp` thread, which
+does the push + notify itself.
+
+Two refinements are visible in the code: a busy kv thread is never
+re-notified (`kv_sync_in_progress` guards the notify) — txcs queued
+mid-cycle are grabbed wholesale by the `swap` on the next iteration,
+which is exactly where kv batching comes from; and
+`_deferred_aio_finish` (`:15838`) deliberately does *not* wake the
+thread when a background replay completes — "it will catch us on the
+next commit anyway" — so retiring deferred data never buys its own
+barrier pair.
 
 **#1, data device — ordering: data before the metadata that points at
 it.** The 16 KiB data aio completed back at +3 617 µs, but aio
