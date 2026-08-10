@@ -1550,11 +1550,16 @@ in what it rewrites:
   That is the point of the split: a 4 KiB write to this object rewrites
   one shard record, not the whole extent map;
 * the onode record is rewritten, and with it the entire spanning section —
-  so a spanning blob is re-encoded even by a data write that never touches
-  its extents (§6.2). Every data write does this: `_do_write()` ends in
-  `txc->write_onode()`. Omap updates are the exception — `_omap_setkeys()`
-  and friends call `note_modified_object()` instead, whose comment is
-  "onode itself isn't written", so they touch only the omap keys of §4.6;
+  so a spanning blob is re-encoded even by a write that never touches its
+  extents (§6.2). `_do_write()` ends in `txc->write_onode()`, and only
+  the ObjectStore's omap operations avoid it: `_omap_setkeys()` and
+  friends call `note_modified_object()`, whose comment is "onode itself
+  isn't written". That exemption rarely survives a client request,
+  though — an OSD omap write also updates `object_info_t`, which is a
+  setattr. Traced at `debug_bluestore 20`, a single
+  `rados setomapval` produced `_setattrs`, `_omap_setkeys` and
+  `_record_onode` against the same object, so the onode was rewritten
+  after all;
 * if a rewritten shard crosses the size thresholds of §6.4.2, reshard
   re-cuts boundaries and may split or promote blobs, changing which of
   the three reference forms later records use.
