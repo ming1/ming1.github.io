@@ -803,27 +803,28 @@ rados -p p1 put o48 /root/16k        # traced exactly as in §2.3
 ```
 
 Steady-state trace (second write into this pg — the first one stages
-more, see §3.2):
+more, see §3.2). The `#` column is added here so the analysis below
+can refer to lines; the script does not print it:
 
 ```
-        us     tid  thread           function                               event
-         3   33376  tp_osd_tp        BlueStore::queue_transactions          transaction arrives
-        75   33376  tp_osd_tp        BlueStore::_do_write                   off=0x0 len=0x4000
-        79   33376  tp_osd_tp        BlueStore::_do_write_big               whole min_alloc units
-       129   33376  tp_osd_tp        KernelDevice::aio_write                bdev=0x..864a00 off=0x73000 len=0x4000
-       145   33376  tp_osd_tp        RocksDBTransactionImpl::set            P keylen=40 val=187B
-       160   33376  tp_osd_tp        RocksDBTransactionImpl::set            P keylen=18 val=194B
-       171   33376  tp_osd_tp        RocksDBTransactionImpl::set            O keylen=36 val=384B
-       202   33376  tp_osd_tp        BlueStore::_txc_aio_submit             txc 0x..ff0a80
-      3617   32972  bstore_aio       BlueStore::_txc_finish_io              txc 0x..ff0a80 data aio done
-      9701   33341  bstore_kv_sync   KernelDevice::flush                    fdatasync bdev=0x..864a00 6022 us
-      9815   33341  bstore_kv_sync   RocksDBStore::submit_transaction_sync  start
-      9831   33341  bstore_kv_sync   BlueFS::fsync                          WAL file
-      9840   33341  bstore_kv_sync   KernelDevice::aio_write                bdev=0x..865900 off=0xfeb000 len=0x1000
-     17480   33341  bstore_kv_sync   KernelDevice::flush                    fdatasync bdev=0x..865900 5434 us
-     17508   33341  bstore_kv_sync   RocksDBStore::submit_transaction_sync  done (7694 us)
-     17578   33342  bstore_kv_final  BlueStore::_txc_committed_kv           txc 0x..ff0a80 -> client reply
-     17593   33342  bstore_kv_final  BlueStore::_txc_finish                 txc 0x..ff0a80
+ #         us     tid  thread           function                               event
+ 1          3   33376  tp_osd_tp        BlueStore::queue_transactions          transaction arrives
+ 2         75   33376  tp_osd_tp        BlueStore::_do_write                   off=0x0 len=0x4000
+ 3         79   33376  tp_osd_tp        BlueStore::_do_write_big               whole min_alloc units
+ 4        129   33376  tp_osd_tp        KernelDevice::aio_write                bdev=0x..864a00 off=0x73000 len=0x4000
+ 5        145   33376  tp_osd_tp        RocksDBTransactionImpl::set            P keylen=40 val=187B
+ 6        160   33376  tp_osd_tp        RocksDBTransactionImpl::set            P keylen=18 val=194B
+ 7        171   33376  tp_osd_tp        RocksDBTransactionImpl::set            O keylen=36 val=384B
+ 8        202   33376  tp_osd_tp        BlueStore::_txc_aio_submit             txc 0x..ff0a80
+ 9       3617   32972  bstore_aio       BlueStore::_txc_finish_io              txc 0x..ff0a80 data aio done
+10       9701   33341  bstore_kv_sync   KernelDevice::flush                    fdatasync bdev=0x..864a00 6022 us
+11       9815   33341  bstore_kv_sync   RocksDBStore::submit_transaction_sync  start
+12       9831   33341  bstore_kv_sync   BlueFS::fsync                          WAL file
+13       9840   33341  bstore_kv_sync   KernelDevice::aio_write                bdev=0x..865900 off=0xfeb000 len=0x1000
+14      17480   33341  bstore_kv_sync   KernelDevice::flush                    fdatasync bdev=0x..865900 5434 us
+15      17508   33341  bstore_kv_sync   RocksDBStore::submit_transaction_sync  done (7694 us)
+16      17578   33342  bstore_kv_final  BlueStore::_txc_committed_kv           txc 0x..ff0a80 -> client reply
+17      17593   33342  bstore_kv_final  BlueStore::_txc_finish                 txc 0x..ff0a80
 ```
 
 The trace crosses four threads. Three switches, three different
@@ -853,23 +854,23 @@ triggers — one hardware, two condvar wakeups:
 One PG worker runs the whole top half synchronously, as a call tree:
 
 ```
-queue_transactions            :15980   OSD hands BlueStore the transaction
-└► _txc_add_transaction       :16098   walk the op list, in order:
-   ├► OP_WRITE → _write :18109 → _do_write :17875     "off=0x0 len=0x4000"
-   │  └► _do_write_big        :17089   16 KiB = whole 4 KiB units
-   │     └► _do_alloc_write   :17308   allocate ONE contiguous 16 KiB
-   │        │                          extent, checksum 4× crc32c
-   │        └► KernelDevice::aio_write (KernelDevice.cc:1143)
-   │                                   "off=0x73000 len=0x4000" — queued
-   │                                   on the txc, NOT yet submitted
-   └► OP_OMAP_SETKEYS → _omap_setkeys :18545
-      └► set(P, ...) ×2                pg log entry + pg info, staged
-                                       in the in-memory rocksdb txn
-└► _txc_write_nodes           :14789
-   └► set(O, ...)                      onode: extent map + 4 checksums
-└► _txc_state_proc            :14634   state PREPARE → AIO_WAIT
-   └► _txc_aio_submit         :16091   io_submit(2): NOW the data IO
-                                       leaves for the device
+#1  queue_transactions           :15980  OSD hands BlueStore the transaction
+    └► _txc_add_transaction      :16098  walk the op list, in order:
+#2     ├► OP_WRITE → _write :18109 → _do_write :17875    "off=0x0 len=0x4000"
+#3     │  └► _do_write_big       :17089  16 KiB = whole 4 KiB units
+       │     └► _do_alloc_write  :17308  allocate ONE contiguous 16 KiB
+       │        │                        extent, checksum 4× crc32c
+#4     │        └► KernelDevice::aio_write (KernelDevice.cc:1143)
+       │                                 "off=0x73000 len=0x4000" — queued
+       │                                 on the txc, NOT yet submitted
+       └► OP_OMAP_SETKEYS → _omap_setkeys :18545
+#5,6      └► set(P, ...) ×2              pg log entry + pg info, staged
+                                         in the in-memory rocksdb txn
+    └► _txc_write_nodes          :14789
+#7     └► set(O, ...)                    onode: extent map + 4 checksums
+    └► _txc_state_proc           :14634  state PREPARE → AIO_WAIT
+#8     └► _txc_aio_submit        :16091  io_submit(2): NOW the data IO
+                                         leaves for the device
 ```
 
 Everything above is CPU and memory: the `P`/`O` `set()` calls
@@ -890,11 +891,11 @@ returns to its pool after `io_submit`. The `bstore_aio` thread is
 **Line 9, `bstore_aio` — one job: pass the baton.**
 
 ```
-io_getevents returns
-└► aio_cb                     :5802    completion callback
-   └► _txc_state_proc → _txc_finish_io :14753   "data aio done"
-      txc state → IO_DONE
-      kv_queue.push_back + kv_cond.notify_one   :14703-14710
+    io_getevents returns
+    └► aio_cb                    :5802   completion callback
+#9     └► _txc_state_proc → _txc_finish_io :14753   "data aio done"
+          txc state → IO_DONE
+          kv_queue.push_back + kv_cond.notify_one   :14703-14710
 ```
 
 That notify is **switch #2** — the wakeup drawn in §3.1's diagram.
@@ -903,16 +904,17 @@ That notify is **switch #2** — the wakeup drawn in §3.1's diagram.
 lines and the RocksDB commit are §3.1's subject; in trace order:
 
 ```
-flush(data bdev)     6022 us           barrier #1: the 16 KiB at 0x73000
-                                       must be on media BEFORE the onode
-                                       that points at it commits
-submit_transaction_sync (RocksDBStore.cc:1668)
-└► BlueFS::fsync (WAL file)  (BlueFS.cc:4428)
-   ├► aio_write, len=0x1000            the WAL block: ALL metadata of
-   │                                   this write — two P + one O —
-   │                                   in one 4 KiB append
-   └► flush(bluefs bdev)   5434 us     barrier #2: the commit point,
-                                       now the write is crash-safe
+#10 flush(data bdev)    6022 us          barrier #1: the 16 KiB at 0x73000
+                                         must be on media BEFORE the onode
+                                         that points at it commits
+#11 submit_transaction_sync start (RocksDBStore.cc:1668)
+#12 └► BlueFS::fsync (WAL file)  (BlueFS.cc:4428)
+#13    ├► aio_write, len=0x1000          the WAL block: ALL metadata of
+       │                                 this write — two P + one O —
+       │                                 in one 4 KiB append
+#14    └► flush(bluefs bdev)  5434 us    barrier #2: the commit point,
+                                         now the write is crash-safe
+#15 submit_transaction_sync returns      done (7694 us)
 ```
 
 (The flush lines print from the *return* probe: barrier #1 actually
@@ -926,10 +928,10 @@ sleep/notify pattern as switch #2, different condvar.
 **Lines 16–17, `bstore_kv_final` — tell the client.**
 
 ```
-_kv_finalize_thread           :15564   woken by switch #3
-├► _txc_committed_kv          :14952   run the commit callbacks →
-│                                      osd_op_reply(... ondisk) leaves
-└► _txc_finish                :14989   retire the txc, free throttle
+    _kv_finalize_thread          :15564  woken by switch #3
+#16 ├► _txc_committed_kv         :14952  run the commit callbacks →
+    │                                    osd_op_reply(... ondisk) leaves
+#17 └► _txc_finish               :14989  retire the txc, free throttle
 ```
 
 The client's `put` returns somewhere between these two lines — at
