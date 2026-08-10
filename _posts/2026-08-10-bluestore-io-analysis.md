@@ -827,28 +827,45 @@ can refer to lines; the script does not print it:
 17      17593   33342  bstore_kv_final  BlueStore::_txc_finish                 txc 0x..ff0a80
 ```
 
-The trace crosses four threads. Three switches, three different
-triggers — one hardware, two condvar wakeups:
+The trace crosses four threads; the right three start asleep and each
+runs only when the arrow wakes it. The whole trace on one map — every
+`#N` is a trace line, every switch is a thread change:
 
 ```
- tp_osd_tp          plan the write, stage all metadata,      +3 .. +202 us
- (PG worker)        queue the 16 KiB data IO
-      │
-      │  switch #1: io_submit(2) — then the NVMe does the work
-      ▼
- bstore_aio         device finished; mark txc IO_DONE            +3 617 us
- (aio reaper)
-      │
-      │  switch #2: kv_cond.notify_one()          (§3.1 diagram)
-      ▼
- bstore_kv_sync     barrier #1, commit metadata,        +9 701 .. +17 508 us
- (kv committer)     barrier #2
-      │
-      │  switch #3: kv_finalize_cond.notify_one()   :15497-15517
-      ▼
- bstore_kv_final    callbacks → client reply, retire txc        +17 578 us
- (finisher)
+ tp_osd_tp             bstore_aio           bstore_kv_sync       bstore_kv_final
+ (PG worker)           (aio reaper,         (kv committer,       (finisher, waits
+     │                  waits in             waits in             in kv_finalize_
+     │                  io_getevents)        kv_cond.wait)        cond.wait)
+ #1  queue_transactions
+ #2  └► _do_write
+ #3     └► _do_write_big
+ #4        └► aio_write          data IO queued, not sent yet
+ #5,6  set(P) ×2                 pg log + info — in memory
+ #7    set(O)                    onode — in memory
+ #8  _txc_aio_submit
+     │
+     │ switch #1 ── io_submit ═► NVMe writes 16 KiB ═► io_getevents returns
+     ▼
+ back to pool          #9  _txc_finish_io — txc is IO_DONE
+                           │
+                           │ switch #2 ── kv_queue.push + kv_cond.notify_one
+                           ▼
+                                            #10  flush(data bdev)     barrier #1
+                                            #11  submit_transaction_sync
+                                            #12  └► BlueFS::fsync
+                                            #13     ├► aio_write — WAL, 4 KiB
+                                            #14     └► flush(bluefs bdev)
+                                            #15  done — durable        barrier #2 ↑
+                                                 │
+                                                 │ switch #3 ── kv_finalize_cond
+                                                 ▼              .notify_one
+                                                                #16  _txc_committed_kv
+                                                                     → client reply
+                                                                #17  _txc_finish
 ```
+
+The rest of this section zooms into each lane with the code locations;
+§3.1 explains the two barriers and the switch-#2 wakeup in depth.
 
 **Lines 1–8, `tp_osd_tp` — everything is prepared, nothing is durable.**
 One PG worker runs the whole top half synchronously, as a call tree:
@@ -898,7 +915,8 @@ returns to its pool after `io_submit`. The `bstore_aio` thread is
           kv_queue.push_back + kv_cond.notify_one   :14703-14710
 ```
 
-That notify is **switch #2** — the wakeup drawn in §3.1's diagram.
+That notify is **switch #2** on the map — §3.1 explains the wakeup in
+depth.
 
 **Lines 10–15, `bstore_kv_sync` — make it durable.** The two flush
 lines and the RocksDB commit are §3.1's subject; in trace order:
@@ -945,49 +963,19 @@ they guard different invariants.
 
 **Who wakes the thread.** `bstore_kv_sync` spends its life in
 `_kv_sync_thread`'s loop, asleep in `kv_cond.wait()` while `kv_queue`
-is empty. For a direct write the waker is the **bstore_aio** thread, at
-the moment the data aio completes (line numbers are `BlueStore.cc`):
-
-```
- tp_osd_tp                bstore_aio              bstore_kv_sync
- (submitter)              (aio reaper)            (_kv_sync_thread)
-     │                        │                       │
- queue_transactions           │                  kv_queue empty:
- _txc_state_proc              │                  kv_cond.wait()   :15326
-   │ PREPARE:                 │                       ⋮
-   │   stage kv records       │                       ⋮  asleep
-   │   aio_write(data) ════► NVMe                     ⋮
-   └─ txc parked; thread      │                       ⋮
-      returns to the pool     │ data IO completes     ⋮
-                              ▼                       ⋮
-                          aio_cb           :5802      ⋮
-                          _txc_state_proc             ⋮
-                          _txc_finish_io   :14668     ⋮
-                          IO_DONE:                    ⋮
-                            kv_queue.push_back        ⋮
-                            kv_cond.notify_one() ──► wake   :14703-14710
-                                                      │
-                                                      ▼
-                                       kv_committing.swap(kv_queue)  :15340
-                                       flush(data bdev)       ← barrier #1
-                                       submit_transaction_sync
-                                         WAL append + fsync   ← barrier #2
-                                                      │
-                                       hand off to bstore_kv_final:
-                                       _txc_committed_kv → client reply
-```
-
-So the `_txc_finish_io` line at +3 617 µs in the trace *is* the wakeup
-— its tail falls through to `IO_DONE`, pushes the txc onto `kv_queue`
-and notifies. A txc with **no data aio** (deferred, or pure metadata)
-never visits the middle lane: `_txc_state_proc` falls through
-PREPARE → IO_DONE inline on the submitting `tp_osd_tp` thread, which
-does the push + notify itself.
+is empty (`:15326`). Switch #2 on the §3 map is the only thing that
+wakes it: the tail of `_txc_state_proc`'s `IO_DONE` stage pushes the
+txc onto `kv_queue` and calls `kv_cond.notify_one()` (`:14703-14710`).
+For a direct write that runs on the `bstore_aio` thread — trace line
+#9 *is* the wakeup. A txc with **no data aio** (deferred, or pure
+metadata) falls through PREPARE → IO_DONE inline on the submitting
+`tp_osd_tp` thread, which then does the push + notify itself.
 
 Two refinements are visible in the code: a busy kv thread is never
 re-notified (`kv_sync_in_progress` guards the notify) — txcs queued
-mid-cycle are grabbed wholesale by the `swap` on the next iteration,
-which is exactly where kv batching comes from; and
+mid-cycle are grabbed wholesale by `kv_committing.swap(kv_queue)`
+(`:15340`) on the next iteration, which is exactly where kv batching
+comes from; and
 `_deferred_aio_finish` (`:15838`) deliberately does *not* wake the
 thread when a background replay completes — "it will catch us on the
 next commit anyway" — so retiring deferred data never buys its own
