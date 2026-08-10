@@ -45,10 +45,11 @@ There are no tests or linters configured.
 
 - `.gitignore` excludes `*~`, but the working tree is full of stray backup files (`*.md~`, `:w`, single-letter files like `2`/`3`, dumps like `ll`, `test.log`) and binary artifacts (`fast26-pan.pdf`, `favicon.ico` duplicated at root). **Do not `git add -A`** — stage explicitly. Most of these are untracked clutter, not in-progress work.
 - `_site/`, `.sass-cache/`, and `.jekyll-cache/` are build output; never commit changes inside them.
-- Two remotes: `github` (public, `git@github.com:ming1/ming1.github.io.git`) and `origin` (a private bare mirror at `/kvm/git/ming1.github.io.git/`). Publishing requires pushing to both, which is what `./update` does.
+- Two remotes: `origin` and `github`. Publishing requires pushing to both, which is what `./update` does.
 
 ## writing style
 
+- Prefer diagrams (ASCII, in fenced code blocks) over prose for structure, flow, and call paths; keep the words in and around a diagram trimmed to the minimum.
 - Make it concise and information-dense.
 - Remove repetition and unnecessary explanations.
 - Replace long sentences with clear, direct statements.
