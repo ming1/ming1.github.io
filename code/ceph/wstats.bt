@@ -1,0 +1,99 @@
+#!/usr/bin/env bpftrace
+/*
+ * wstats.bt -- BlueStore write-path statistics over a period.
+ *
+ * Usage:  bpftrace wstats.bt     (start) ... run workload ... Ctrl-C (stop+report)
+ *
+ * Counts every event involved in handling rados write IO:
+ *   - transactions entering BlueStore
+ *   - RocksDB key set/rmkey per prefix (O=onode, P=pgmeta-omap, L=deferred, ...)
+ *   - RocksDB transaction commits (+ sync-commit latency)
+ *   - block-device writes, keyed by the thread that issued them:
+ *       tp_osd_tp      = object data (direct write path)
+ *       bstore_kv_sync = RocksDB WAL via BlueFS
+ *       finisher/other = deferred data replay
+ *   - device flushes (fdatasync) and BlueFS fsyncs, with latency
+ *
+ * Probes are uprobes on the unstripped dev binary; each mangled symbol is
+ * annotated with its demangled C++ name.  bufferlist length lives at
+ * offset 24 (gdb: ptype /o ceph::buffer::v15_2_0::list -> _len).
+ */
+
+BEGIN { printf("tracing bluestore write path... Ctrl-C to stop\n"); }
+
+/* ---- OSD -> BlueStore ------------------------------------------------ */
+
+/* BlueStore::queue_transactions(CollectionHandle&, vector<Transaction>&, ...) */
+uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN9BlueStore18queue_transactionsERN5boost13intrusive_ptrIN11ObjectStore14CollectionImplEEERSt6vectorIN4ceph2os11TransactionESaIS9_EENS1_I9TrackedOpEEPN10ThreadPool8TPHandleE
+{ @a_txc_submitted = count(); }
+
+/* BlueStore::_do_write(txc, coll, onode, offset, length, bl, flags) */
+uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN9BlueStore9_do_writeEPNS_12TransContextERN5boost13intrusive_ptrINS_10CollectionEEERNS3_INS_5OnodeEEEmmRN4ceph6buffer7v15_2_04listEj
+{ @b_object_writes = count(); @b_object_write_bytes = sum(arg5); }
+
+/* ---- RocksDB staging: which keys get written ------------------------- */
+
+/* RocksDBStore::RocksDBTransactionImpl::set(prefix, key: string, bl) */
+uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN12RocksDBStore22RocksDBTransactionImpl3setERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEES8_RKN4ceph6buffer7v15_2_04listE
+{ @c_kv_set[str(*(uint64*)arg1)] = count();
+  @c_kv_set_bytes[str(*(uint64*)arg1)] = sum(*(uint32*)(arg3+24)); }
+
+/* RocksDBStore::RocksDBTransactionImpl::set(prefix, key: char*+len, bl) */
+uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN12RocksDBStore22RocksDBTransactionImpl3setERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEEPKcmRKN4ceph6buffer7v15_2_04listE
+{ @c_kv_set[str(*(uint64*)arg1)] = count();
+  @c_kv_set_bytes[str(*(uint64*)arg1)] = sum(*(uint32*)(arg4+24)); }
+
+/* RocksDBStore::RocksDBTransactionImpl::rmkey -- string / char*+len */
+uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN12RocksDBStore22RocksDBTransactionImpl5rmkeyERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEES8_,
+uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN12RocksDBStore22RocksDBTransactionImpl5rmkeyERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEEPKcm
+{ @c_kv_rmkey[str(*(uint64*)arg1)] = count(); }
+
+/* RocksDBStore::RocksDBTransactionImpl::merge(prefix, key, bl) */
+uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN12RocksDBStore22RocksDBTransactionImpl5mergeERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEES8_RKN4ceph6buffer7v15_2_04listE
+{ @c_kv_merge[str(*(uint64*)arg1)] = count(); }
+
+/* ---- RocksDB commit -------------------------------------------------- */
+
+/* RocksDBStore::submit_transaction (async, deferred-cleanup etc.) */
+uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN12RocksDBStore18submit_transactionESt10shared_ptrIN10KeyValueDB15TransactionImplEE
+{ @d_kv_commit_async = count(); }
+
+/* RocksDBStore::submit_transaction_sync (the kv_sync_thread commit) */
+uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN12RocksDBStore23submit_transaction_syncESt10shared_ptrIN10KeyValueDB15TransactionImplEE
+{ @d_kv_commit_sync = count(); @ts_kv[tid] = nsecs; }
+uretprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN12RocksDBStore23submit_transaction_syncESt10shared_ptrIN10KeyValueDB15TransactionImplEE
+/@ts_kv[tid]/
+{ @d_kv_commit_us = hist((nsecs - @ts_kv[tid]) / 1000); delete(@ts_kv[tid]); }
+
+/* ---- block device ---------------------------------------------------- */
+
+/* KernelDevice::aio_write(off, bl, ioc, buffered, hint) -- keyed by the
+ * issuing thread, which identifies the writer (data vs WAL vs deferred) */
+uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN12KernelDevice9aio_writeEmRN4ceph6buffer7v15_2_04listEP9IOContextbi
+{ @e_disk_writes[comm] = count(); @e_disk_write_bytes[comm] = sum(*(uint32*)(arg2+24)); }
+
+/* KernelDevice::flush() == fdatasync barrier */
+uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN12KernelDevice5flushEv
+{ @ts_fl[tid] = nsecs; }
+uretprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN12KernelDevice5flushEv
+/@ts_fl[tid]/
+{ @f_disk_flush = count(); @f_disk_flush_us = hist((nsecs - @ts_fl[tid]) / 1000);
+  delete(@ts_fl[tid]); }
+
+/* ---- BlueFS (RocksDB's filesystem) ----------------------------------- */
+
+/* BlueFS::fsync(FileWriter*) -- WAL file durability */
+uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN6BlueFS5fsyncEPNS_10FileWriterE
+{ @ts_bf[tid] = nsecs; }
+uretprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN6BlueFS5fsyncEPNS_10FileWriterE
+/@ts_bf[tid]/
+{ @g_bluefs_fsync = count(); @g_bluefs_fsync_us = hist((nsecs - @ts_bf[tid]) / 1000);
+  delete(@ts_bf[tid]); }
+
+/* ---- deferred replay ------------------------------------------------- */
+
+/* BlueStore::_deferred_submit_unlock(OpSequencer*) -- background data write */
+uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN9BlueStore23_deferred_submit_unlockEPNS_11OpSequencerE
+{ @h_deferred_batches = count(); }
+
+END { clear(@ts_kv); clear(@ts_fl); clear(@ts_bf); }

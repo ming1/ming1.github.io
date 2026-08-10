@@ -1,0 +1,67 @@
+#!/usr/bin/env bpftrace
+/*
+ * wlat.bt -- per-layer latency breakdown of BlueStore write transactions.
+ *
+ * Usage:  bpftrace wlat.bt    ... run write workload ... Ctrl-C.
+ * Prints one line per transaction as it completes, plus histograms at exit.
+ *
+ * Stage boundaries (all take TransContext* so one txc is followed through):
+ *
+ *   queue_transactions entry        t0  prepare: decode ops, allocate,
+ *   first _txc_state_proc(txc)      t1    checksum, stage kv -- CPU only
+ *   _txc_finish_io(txc)             t2  data_io: aio_write to NVMe
+ *   _txc_committed_kv(txc)          t3  kv_wait+commit: flush + rocksdb fsync
+ *
+ * Client-visible latency ends at t3 (kv committed fires the commit callback),
+ * so each txc is reported there.  A deferred write shows data_io of a few
+ * microseconds, not milliseconds: with no data aio pending, _txc_state_proc
+ * falls through PREPARE -> AIO_WAIT inline and calls _txc_finish_io itself
+ * (BlueStore.cc:14735), so the stage measures queue overhead, not the
+ * device.  The data rides inside the kv commit and hits disk after the reply.
+ */
+
+BEGIN
+{ printf("%-14s %8s = %s\n", "txc", "clientlat", "prep + data_io + kv_commit [us]"); }
+
+/* stage prepare starts when the transaction enters BlueStore */
+uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN9BlueStore18queue_transactionsERN5boost13intrusive_ptrIN11ObjectStore14CollectionImplEEERSt6vectorIN4ceph2os11TransactionESaIS9_EENS1_I9TrackedOpEEPN10ThreadPool8TPHandleE
+{ @qt[tid] = nsecs; }
+
+/* first _txc_state_proc on the same thread = this txc leaving prepare */
+uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN9BlueStore15_txc_state_procEPNS_12TransContextE
+/@qt[tid] && !@birth[arg1]/
+{
+  @birth[arg1] = @qt[tid];
+  @prep[arg1]  = (nsecs - @qt[tid]) / 1000;
+  @last[arg1]  = nsecs;
+  delete(@qt[tid]);
+}
+
+/* data aio completed (fires inline within ~us for deferred/no-aio txcs) */
+uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN9BlueStore14_txc_finish_ioEPNS_12TransContextE
+/@last[arg1]/
+{ @dio[arg1] = (nsecs - @last[arg1]) / 1000; @last[arg1] = nsecs; }
+
+/* kv durable -> commit callback -> client reply.  This is the end of the
+ * client-visible latency, so report here.  (A deferred txc's _txc_finish
+ * can lag until the next kv cycle -- background replay, not client cost.) */
+uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN9BlueStore17_txc_committed_kvEPNS_12TransContextE
+/@last[arg1]/
+{
+  printf("%-14p %8lld = %lld + %lld + %lld\n", arg1,
+         (nsecs - @birth[arg1]) / 1000,
+         @prep[arg1], @dio[arg1], (nsecs - @last[arg1]) / 1000);
+  @client_us = hist((nsecs - @birth[arg1]) / 1000);
+  @sum_prep  = sum(@prep[arg1]);
+  @sum_dio   = sum(@dio[arg1]);
+  @sum_kvc   = sum((nsecs - @last[arg1]) / 1000);
+  @n         = count();
+  delete(@birth[arg1]); delete(@prep[arg1]);
+  delete(@dio[arg1]);   delete(@last[arg1]);
+}
+
+END
+{
+  clear(@qt); clear(@birth); clear(@prep); clear(@dio); clear(@last);
+  printf("\nclient-visible latency (queue_transactions -> kv committed), us:\n");
+}
