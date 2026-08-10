@@ -797,13 +797,15 @@ it lives in the code, what it does — and, every time the `thread`
 column changes, what made the next thread run. Bare `:NNNN` line
 numbers are `BlueStore.cc` in the lab tree (`cc6b5e2da077` = v21.3.0).
 
+## 3.1 The workload and the trace
+
 ```bash
 head -c 16384 /dev/urandom > /root/16k
 rados -p p1 put o48 /root/16k        # traced exactly as in §2.3
 ```
 
 Steady-state trace (second write into this pg — the first one stages
-more, see §3.1). The `#` column is added here so the analysis below
+more, see §3.7). The `#` column is added here so the analysis below
 can refer to lines; the script does not print it:
 
 ```
@@ -826,6 +828,8 @@ can refer to lines; the script does not print it:
 16      17578   33342  bstore_kv_final  BlueStore::_txc_committed_kv           txc 0x..ff0a80 -> client reply
 17      17593   33342  bstore_kv_final  BlueStore::_txc_finish                 txc 0x..ff0a80
 ```
+
+## 3.2 The map — four threads, three switches
 
 The trace crosses four threads; the right three start asleep and each
 runs only when the arrow wakes it. The whole trace on one map — every
@@ -869,8 +873,10 @@ runs only when the arrow wakes it. The whole trace on one map — every
 The rest of this section zooms into each lane with the code
 locations.
 
-**Lines 1–8, `tp_osd_tp` — everything is prepared, nothing is durable.**
-One PG worker runs the whole top half synchronously, as a call tree:
+## 3.3 Lines 1–8, tp_osd_tp — prepare everything
+
+One PG worker runs the whole top half synchronously — everything is
+prepared, nothing is durable yet:
 
 ```
 #1  queue_transactions           :15980  OSD hands BlueStore the transaction
@@ -907,7 +913,7 @@ returns to its pool after `io_submit`. The `bstore_aio` thread is
 `io_getevents` returns and the thread runs. The 3.4 ms gap between
 +202 and +3 617 is the device (plus reaping).
 
-**Line 9, `bstore_aio` — one job: pass the baton.**
+## 3.4 Line 9, bstore_aio — pass the baton
 
 ```
     io_getevents returns
@@ -924,7 +930,9 @@ entirely — `_txc_state_proc` falls through PREPARE → IO_DONE inline on
 the submitting `tp_osd_tp` thread, which then does the push + notify
 itself.
 
-**Lines 10–15, `bstore_kv_sync` — make it durable.** In trace order:
+## 3.5 Lines 10–15, bstore_kv_sync — make it durable
+
+In trace order:
 
 ```
 #10 flush(data bdev)    6022 us          barrier #1: data before metadata
@@ -966,7 +974,7 @@ thread moves the batch to `kv_committing_to_finalize` and rings
 `kv_finalize_cond` (`:15497-15517`) — **switch #3**, same sleep/notify
 pattern as switch #2, different condvar.
 
-**Lines 16–17, `bstore_kv_final` — tell the client.**
+## 3.6 Lines 16–17, bstore_kv_final — tell the client
 
 ```
     _kv_finalize_thread          :15564  woken by switch #3
@@ -981,7 +989,7 @@ the commit callbacks run and the client's `ondisk` reply leaves. The
 `put` returns at +17.6 ms, of which ~11.5 ms was the two barriers and
 ~3.4 ms the data IO. Everything else in the trace cost microseconds.
 
-## 3.1 The first write into a PG
+## 3.7 The first write into a PG
 
 The very first write into each pg staged three `P` records, not two:
 
