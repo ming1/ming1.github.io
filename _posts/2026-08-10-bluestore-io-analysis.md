@@ -547,7 +547,9 @@ KernelDevice    io_submit(IOCB_CMD_PWRITEV) + fdatasync
 
 Everything §1 extracted from `debug_*` logs can be captured with three small
 bpftrace scripts instead — no debug levels, no restart, no 400 KB of log per
-write. They attach to the live OSD in ~2 s and detach on Ctrl-C:
+write. They attach to the live OSD and detach on Ctrl-C. Attach takes ~10 s
+(wildcard resolution against a 160k-symbol binary), so wait for each
+script's banner line before starting the workload:
 
 | Script | Mode | Answers |
 |---|---|---|
@@ -574,8 +576,27 @@ boundaries §1 walked:
 Three implementation details make the scripts work, all documented in their
 headers:
 
-* uprobes attach by **mangled** symbol name — resolve them once with
-  `nm bin/ceph-osd`;
+* C++ symbols are mangled, but full mangled names are unreadable, so the
+  probes use **anchored wildcard patterns**:
+
+  ```
+  uprobe:.../ceph-osd:_ZN9BlueStore*_txc_finishE*
+  ```
+
+  The anchoring is what makes this safe. A naive `*BlueStore*_txc_finish*`
+  also matches `__ceph_assert_fail` instantiations and — worse —
+  `std::_Function_handler` helper stubs for lambdas defined inside the
+  function, which run on every call with different arguments. The
+  `_ZN<len><Class>` prefix pins the class (those helper symbols start
+  `_ZN4ceph`/`_ZNSt`, so they cannot match) and the trailing `E*` pins the
+  end of the method name (so `_txc_finishE*` cannot catch
+  `_txc_finish_io`). Before trusting any new pattern, verify what it
+  matches:
+
+  ```bash
+  bpftrace -l 'uprobe:bin/ceph-osd:_ZN9BlueStore*_txc_finishE*'   # expect exactly 1
+  ```
+
 * every `_txc_*` function takes `TransContext*` as its first parameter
   (arg1 — arg0 is `this`), which is a free per-IO correlation key;
 * the two struct offsets peeked at (`bufferlist::_len` at +24, `std::string`
@@ -635,6 +656,7 @@ or in one terminal:
 
 ```bash
 bpftrace wtrace.bt > /tmp/trace.txt 2>&1 &
+until grep -q pthread /tmp/trace.txt; do sleep 1; done   # wait for attach
 rados -p p1 put obj /root/4k
 sleep 2; kill -INT %1; cat /tmp/trace.txt
 ```

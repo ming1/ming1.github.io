@@ -2,7 +2,8 @@
 /*
  * wtrace.bt -- detailed event log for a single rados write IO.
  *
- * Usage:  bpftrace wtrace.bt      then issue ONE write, e.g.
+ * Usage:  bpftrace wtrace.bt      wait for the column-header line
+ *         (wildcard probes take ~10 s to attach), then issue ONE write:
  *         rados -p p1 put obj /root/4k        and Ctrl-C.
  *
  * Prints every event in chronological order.  Columns:
@@ -24,7 +25,7 @@ BEGIN
   @t0 = (uint64)0; }
 
 /* ---- OSD -> BlueStore: transaction arrives --------------------------- */
-uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN9BlueStore18queue_transactionsERN5boost13intrusive_ptrIN11ObjectStore14CollectionImplEEERSt6vectorIN4ceph2os11TransactionESaIS9_EENS1_I9TrackedOpEEPN10ThreadPool8TPHandleE
+uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN9BlueStore*queue_transactionsE*
 {
   if (@t0 == 0) { @t0 = nsecs; }
   printf("%10lld %7d %12lx  %-16s BlueStore::queue_transactions\n", (nsecs-@t0)/1000, tid, curtask->thread.fsbase, comm);
@@ -32,62 +33,62 @@ uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN9BlueStore18queue_transactionsE
 
 /* ---- object write, and the big/small split --------------------------- */
 /* BlueStore::_do_write(txc, c, o, offset=arg4, length=arg5, bl, flags)   */
-uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN9BlueStore9_do_writeEPNS_12TransContextERN5boost13intrusive_ptrINS_10CollectionEEERNS3_INS_5OnodeEEEmmRN4ceph6buffer7v15_2_04listEj
+uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN9BlueStore*_do_writeE*
 /@t0/
 { printf("%10lld %7d %12lx  %-16s   _do_write off=0x%lx len=0x%lx\n",
          (nsecs-@t0)/1000, tid, curtask->thread.fsbase, comm, arg4, arg5); }
 
-uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN9BlueStore13_do_write_bigEPNS_12TransContextERN5boost13intrusive_ptrINS_10CollectionEEERNS3_INS_5OnodeEEEmmRN4ceph6buffer7v15_2_04list8iteratorEPNS_12WriteContextE
+uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN9BlueStore*_do_write_bigE*
 /@t0/
 { printf("%10lld %7d %12lx  %-16s   _do_write_big (whole min_alloc units)\n", (nsecs-@t0)/1000, tid, curtask->thread.fsbase, comm); }
 
-uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN9BlueStore15_do_write_smallEPNS_12TransContextERN5boost13intrusive_ptrINS_10CollectionEEERNS3_INS_5OnodeEEEmmRN4ceph6buffer7v15_2_04list8iteratorEPNS_12WriteContextE
+uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN9BlueStore*_do_write_smallE*
 /@t0/
 { printf("%10lld %7d %12lx  %-16s   _do_write_small (sub-alloc, may RMW/defer)\n", (nsecs-@t0)/1000, tid, curtask->thread.fsbase, comm); }
 
 /* ---- RocksDB staging ------------------------------------------------- */
 /* set(prefix, key: string, bl): keylen at key+8, vallen at bl+24 */
-uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN12RocksDBStore22RocksDBTransactionImpl3setERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEES8_RKN4ceph6buffer7v15_2_04listE
+uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN12RocksDBStore*3setE*S8_RK*
 /@t0/
 { printf("%10lld %7d %12lx  %-16s   kv set    %s keylen=%lld val=%dB\n", (nsecs-@t0)/1000, tid, curtask->thread.fsbase, comm,
          str(*(uint64*)arg1), *(uint64*)(arg2+8), *(uint32*)(arg3+24)); }
 
 /* set(prefix, key: char* + len, bl) -- the onode 'O' record uses this one */
-uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN12RocksDBStore22RocksDBTransactionImpl3setERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEEPKcmRKN4ceph6buffer7v15_2_04listE
+uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN12RocksDBStore*3setE*PKcmRK*
 /@t0/
 { printf("%10lld %7d %12lx  %-16s   kv set    %s keylen=%lld val=%dB\n", (nsecs-@t0)/1000, tid, curtask->thread.fsbase, comm,
          str(*(uint64*)arg1), arg3, *(uint32*)(arg4+24)); }
 
-uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN12RocksDBStore22RocksDBTransactionImpl5rmkeyERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEES8_,
-uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN12RocksDBStore22RocksDBTransactionImpl5rmkeyERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEEPKcm
+/* both rmkey overloads; prefix is arg1 in each */
+uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN12RocksDBStore*5rmkeyE*
 /@t0/
 { printf("%10lld %7d %12lx  %-16s   kv rmkey  %s\n", (nsecs-@t0)/1000, tid, curtask->thread.fsbase, comm, str(*(uint64*)arg1)); }
 
 /* ---- transaction state machine (per-txc pointer) --------------------- */
-uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN9BlueStore15_txc_aio_submitEPNS_12TransContextE
+uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN9BlueStore*_txc_aio_submitE*
 /@t0/
 { printf("%10lld %7d %12lx  %-16s   txc %p submit data aio\n", (nsecs-@t0)/1000, tid, curtask->thread.fsbase, comm, arg1); }
 
 /* for a deferred txc this fires within ~us of submit, on the same thread:
  * no data aio exists, _txc_state_proc falls through and calls it inline */
-uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN9BlueStore14_txc_finish_ioEPNS_12TransContextE
+uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN9BlueStore*_txc_finish_ioE*
 /@t0/
 { printf("%10lld %7d %12lx  %-16s   txc %p data aio done\n", (nsecs-@t0)/1000, tid, curtask->thread.fsbase, comm, arg1); }
 
-uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN9BlueStore17_txc_committed_kvEPNS_12TransContextE
+uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN9BlueStore*_txc_committed_kvE*
 /@t0/
 { printf("%10lld %7d %12lx  %-16s   txc %p kv committed -> client reply\n", (nsecs-@t0)/1000, tid, curtask->thread.fsbase, comm, arg1); }
 
-uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN9BlueStore11_txc_finishEPNS_12TransContextE
+uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN9BlueStore*_txc_finishE*
 /@t0/
 { printf("%10lld %7d %12lx  %-16s   txc %p finish\n", (nsecs-@t0)/1000, tid, curtask->thread.fsbase, comm, arg1); }
 
 /* ---- RocksDB commit -------------------------------------------------- */
-uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN12RocksDBStore23submit_transaction_syncESt10shared_ptrIN10KeyValueDB15TransactionImplEE
+uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN12RocksDBStore*submit_transaction_syncE*
 /@t0/
 { @ts_kv[tid] = nsecs;
   printf("%10lld %7d %12lx  %-16s   rocksdb commit (sync) start\n", (nsecs-@t0)/1000, tid, curtask->thread.fsbase, comm); }
-uretprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN12RocksDBStore23submit_transaction_syncESt10shared_ptrIN10KeyValueDB15TransactionImplEE
+uretprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN12RocksDBStore*submit_transaction_syncE*
 /@ts_kv[tid]/
 { printf("%10lld %7d %12lx  %-16s   rocksdb commit done (%lld us)\n",
          (nsecs-@t0)/1000, tid, curtask->thread.fsbase, comm, (nsecs-@ts_kv[tid])/1000); delete(@ts_kv[tid]); }
@@ -95,27 +96,27 @@ uretprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN12RocksDBStore23submit_trans
 /* ---- block device ---------------------------------------------------- */
 /* KernelDevice::aio_write(off=arg1, bl=arg2, ...); bdev=arg0 -- two
  * instances share the NVMe: BlueStore data vs BlueFS (RocksDB files) */
-uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN12KernelDevice9aio_writeEmRN4ceph6buffer7v15_2_04listEP9IOContextbi
+uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN12KernelDevice*aio_writeE*
 /@t0/
 { printf("%10lld %7d %12lx  %-16s   DISK aio_write bdev=%p off=0x%lx len=0x%x\n",
          (nsecs-@t0)/1000, tid, curtask->thread.fsbase, comm, arg0, arg1, *(uint32*)(arg2+24)); }
 
-uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN12KernelDevice5flushEv
+uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN12KernelDevice*flushE*
 /@t0/
 { @ts_fl[tid] = nsecs; @fl_dev[tid] = arg0; }
-uretprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN12KernelDevice5flushEv
+uretprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN12KernelDevice*flushE*
 /@ts_fl[tid]/
 { printf("%10lld %7d %12lx  %-16s   DISK flush (fdatasync) bdev=%p %lld us\n",
          (nsecs-@t0)/1000, tid, curtask->thread.fsbase, comm, @fl_dev[tid], (nsecs-@ts_fl[tid])/1000);
   delete(@ts_fl[tid]); delete(@fl_dev[tid]); }
 
 /* BlueFS::fsync(FileWriter*) */
-uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN6BlueFS5fsyncEPNS_10FileWriterE
+uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN6BlueFS5fsyncE*
 /@t0/
 { printf("%10lld %7d %12lx  %-16s   bluefs fsync (WAL file)\n", (nsecs-@t0)/1000, tid, curtask->thread.fsbase, comm); }
 
 /* ---- deferred replay ------------------------------------------------- */
-uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN9BlueStore23_deferred_submit_unlockEPNS_11OpSequencerE
+uprobe:/root/git/ceph/ceph/build/bin/ceph-osd:_ZN9BlueStore*_deferred_submit_unlockE*
 /@t0/
 { printf("%10lld %7d %12lx  %-16s   deferred data submit (background)\n", (nsecs-@t0)/1000, tid, curtask->thread.fsbase, comm); }
 
