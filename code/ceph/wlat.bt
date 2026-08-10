@@ -27,10 +27,12 @@ BEGIN
 { printf("%-14s %8s = %s\n", "txc", "clientlat", "prep + data_io + kv_commit [us]"); }
 
 /* stage prepare starts when the transaction enters BlueStore */
+/* BlueStore::queue_transactions */
 uprobe:$1:_ZN9BlueStore*queue_transactionsE*
 { @qt[tid] = nsecs; }
 
 /* first _txc_state_proc on the same thread = this txc leaving prepare */
+/* BlueStore::_txc_state_proc */
 uprobe:$1:_ZN9BlueStore*_txc_state_procE*
 /@qt[tid] && !@birth[arg1]/
 {
@@ -41,6 +43,7 @@ uprobe:$1:_ZN9BlueStore*_txc_state_procE*
 }
 
 /* data aio completed (fires inline within ~us for deferred/no-aio txcs) */
+/* BlueStore::_txc_finish_io */
 uprobe:$1:_ZN9BlueStore*_txc_finish_ioE*
 /@last[arg1]/
 { @dio[arg1] = (nsecs - @last[arg1]) / 1000; @last[arg1] = nsecs; }
@@ -48,6 +51,7 @@ uprobe:$1:_ZN9BlueStore*_txc_finish_ioE*
 /* kv durable -> commit callback -> client reply.  This is the end of the
  * client-visible latency, so report here.  (A deferred txc's _txc_finish
  * can lag until the next kv cycle -- background replay, not client cost.) */
+/* BlueStore::_txc_committed_kv */
 uprobe:$1:_ZN9BlueStore*_txc_committed_kvE*
 /@last[arg1]/
 {

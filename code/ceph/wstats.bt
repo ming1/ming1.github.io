@@ -56,8 +56,8 @@ uprobe:$1:_ZN12RocksDBStore*3setE*PKcmRK*
 { @c_kv_set[str(*(uint64*)arg1)] = count();
   @c_kv_set_bytes[str(*(uint64*)arg1)] = sum(*(uint32*)(arg4+24)); }
 
-/* RocksDBStore::RocksDBTransactionImpl::rmkey -- matches both overloads;
- * prefix is arg1 in each, so one probe covers them */
+/* matches both overloads; prefix is arg1 in each, so one probe covers both */
+/* RocksDBStore::RocksDBTransactionImpl::rmkey */
 uprobe:$1:_ZN12RocksDBStore*5rmkeyE*
 { @c_kv_rmkey[str(*(uint64*)arg1)] = count(); }
 
@@ -74,20 +74,23 @@ uprobe:$1:_ZN12RocksDBStore*submit_transactionE*
 /* RocksDBStore::submit_transaction_sync (the kv_sync_thread commit) */
 uprobe:$1:_ZN12RocksDBStore*submit_transaction_syncE*
 { @d_kv_commit_sync = count(); @ts_kv[tid] = nsecs; }
+/* RocksDBStore::submit_transaction_sync (return) */
 uretprobe:$1:_ZN12RocksDBStore*submit_transaction_syncE*
 /@ts_kv[tid]/
 { @d_kv_commit_us = hist((nsecs - @ts_kv[tid]) / 1000); delete(@ts_kv[tid]); }
 
 /* ---- block device ---------------------------------------------------- */
 
-/* KernelDevice::aio_write(off, bl, ioc, buffered, hint) -- keyed by the
- * issuing thread, which identifies the writer (data vs WAL vs deferred) */
+/* args (off, bl, ioc, buffered, hint); keyed by the issuing thread,
+ * which identifies the writer (data vs WAL vs deferred) */
+/* KernelDevice::aio_write */
 uprobe:$1:_ZN12KernelDevice*aio_writeE*
 { @e_disk_writes[comm] = count(); @e_disk_write_bytes[comm] = sum(*(uint32*)(arg2+24)); }
 
 /* KernelDevice::flush() == fdatasync barrier */
 uprobe:$1:_ZN12KernelDevice*flushE*
 { @ts_fl[tid] = nsecs; }
+/* KernelDevice::flush (return) */
 uretprobe:$1:_ZN12KernelDevice*flushE*
 /@ts_fl[tid]/
 { @f_disk_flush = count(); @f_disk_flush_us = hist((nsecs - @ts_fl[tid]) / 1000);
@@ -98,6 +101,7 @@ uretprobe:$1:_ZN12KernelDevice*flushE*
 /* BlueFS::fsync(FileWriter*) -- WAL file durability */
 uprobe:$1:_ZN6BlueFS5fsyncE*
 { @ts_bf[tid] = nsecs; }
+/* BlueFS::fsync (return) */
 uretprobe:$1:_ZN6BlueFS5fsyncE*
 /@ts_bf[tid]/
 { @g_bluefs_fsync = count(); @g_bluefs_fsync_us = hist((nsecs - @ts_bf[tid]) / 1000);

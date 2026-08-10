@@ -4,122 +4,191 @@
  *
  * Usage:  bpftrace wtrace.bt <path-to-ceph-osd>
  *         e.g.  bpftrace wtrace.bt /root/git/ceph/ceph/build/bin/ceph-osd
+ *
+ *         With per-event userspace stacks (note the "--": bpftrace's own
+ *         option parser would otherwise eat --stack):
+ *         bpftrace wtrace.bt -- /root/git/ceph/ceph/build/bin/ceph-osd --stack
+ *
  *         Wait for the column-header line (wildcard probes take ~10 s to
  *         attach), then issue ONE write:
  *         rados -p p1 put obj /root/4k        and Ctrl-C.
  *
  * Prints every event in chronological order.  Columns:
- *   us       microseconds since the first queue_transactions seen (the
- *            clock zero is that first event, so lines read "+N us into IO")
- *   tid      kernel thread id -- matches strace/ps -L/top -H
- *   pthread  pthread_self() in hex (= FS base) -- matches the thread id
- *            column of the Ceph OSD log, so lines can be joined with
- *            debug_bluestore output
- *   thread   OSD thread name (this IS the pipeline stage:
- *            tp_osd_tp -> bstore_aio -> bstore_kv_sync -> bstore_kv_final)
- *   event    layer boundary crossed
+ *   us        microseconds since the first queue_transactions seen (the
+ *             clock zero is that first event, so lines read "+N us into IO")
+ *   tid       kernel thread id -- matches strace/ps -L/top -H
+ *   thread    OSD thread name (this IS the pipeline stage:
+ *             tp_osd_tp -> bstore_aio -> bstore_kv_sync -> bstore_kv_final)
+ *   function  the probed function (class::method)
+ *   event     what happened, with arguments
+ *
+ * --stack prints the userspace call stack under each entry-probe event
+ * (uretprobes are skipped: their stack shows the return trampoline, not
+ * the caller).  Top frames resolve and demangle; deeper frames may print
+ * as raw addresses where the build lacks frame pointers.
+ *
+ * To join lines with the Ceph OSD log's 7f... thread column, add a
+ * "%12lx" field printing curtask->thread.fsbase -- on x86-64 glibc the
+ * FS base equals pthread_self(), which is what the log prints.
  *
  * The clock starts at the first transaction, so run it on a quiet cluster.
  */
 
 BEGIN
-{ printf("%10s %7s %12s  %-16s %s\n", "us", "tid", "pthread", "thread", "event");
-  @t0 = (uint64)0; }
+{
+  printf("%10s %7s  %-16s %-38s %s\n", "us", "tid", "thread", "function", "event");
+  @t0 = (uint64)0;
+  @stk = str($2) == "--stack" ? 1 : 0;
+}
 
 /* ---- OSD -> BlueStore: transaction arrives --------------------------- */
+/* BlueStore::queue_transactions */
 uprobe:$1:_ZN9BlueStore*queue_transactionsE*
 {
   if (@t0 == 0) { @t0 = nsecs; }
-  printf("%10lld %7d %12lx  %-16s BlueStore::queue_transactions\n", (nsecs-@t0)/1000, tid, curtask->thread.fsbase, comm);
+  printf("%10lld %7d  %-16s %-38s transaction arrives\n",
+         (nsecs-@t0)/1000, tid, comm, "BlueStore::queue_transactions");
+  if (@stk) { printf("%s\n", ustack); }
 }
 
 /* ---- object write, and the big/small split --------------------------- */
 /* BlueStore::_do_write(txc, c, o, offset=arg4, length=arg5, bl, flags)   */
 uprobe:$1:_ZN9BlueStore*_do_writeE*
 /@t0/
-{ printf("%10lld %7d %12lx  %-16s   _do_write off=0x%lx len=0x%lx\n",
-         (nsecs-@t0)/1000, tid, curtask->thread.fsbase, comm, arg4, arg5); }
+{ printf("%10lld %7d  %-16s %-38s off=0x%lx len=0x%lx\n",
+         (nsecs-@t0)/1000, tid, comm, "BlueStore::_do_write", arg4, arg5);
+  if (@stk) { printf("%s\n", ustack); } }
 
+/* BlueStore::_do_write_big */
 uprobe:$1:_ZN9BlueStore*_do_write_bigE*
 /@t0/
-{ printf("%10lld %7d %12lx  %-16s   _do_write_big (whole min_alloc units)\n", (nsecs-@t0)/1000, tid, curtask->thread.fsbase, comm); }
+{ printf("%10lld %7d  %-16s %-38s whole min_alloc units\n",
+         (nsecs-@t0)/1000, tid, comm, "BlueStore::_do_write_big");
+  if (@stk) { printf("%s\n", ustack); } }
 
+/* BlueStore::_do_write_small */
 uprobe:$1:_ZN9BlueStore*_do_write_smallE*
 /@t0/
-{ printf("%10lld %7d %12lx  %-16s   _do_write_small (sub-alloc, may RMW/defer)\n", (nsecs-@t0)/1000, tid, curtask->thread.fsbase, comm); }
+{ printf("%10lld %7d  %-16s %-38s sub-alloc, may RMW/defer\n",
+         (nsecs-@t0)/1000, tid, comm, "BlueStore::_do_write_small");
+  if (@stk) { printf("%s\n", ustack); } }
 
 /* ---- RocksDB staging ------------------------------------------------- */
 /* set(prefix, key: string, bl): keylen at key+8, vallen at bl+24 */
+/* RocksDBStore::RocksDBTransactionImpl::set */
 uprobe:$1:_ZN12RocksDBStore*3setE*S8_RK*
 /@t0/
-{ printf("%10lld %7d %12lx  %-16s   kv set    %s keylen=%lld val=%dB\n", (nsecs-@t0)/1000, tid, curtask->thread.fsbase, comm,
-         str(*(uint64*)arg1), *(uint64*)(arg2+8), *(uint32*)(arg3+24)); }
+{ printf("%10lld %7d  %-16s %-38s %s keylen=%lld val=%dB\n",
+         (nsecs-@t0)/1000, tid, comm, "RocksDBTransactionImpl::set",
+         str(*(uint64*)arg1), *(uint64*)(arg2+8), *(uint32*)(arg3+24));
+  if (@stk) { printf("%s\n", ustack); } }
 
 /* set(prefix, key: char* + len, bl) -- the onode 'O' record uses this one */
+/* RocksDBStore::RocksDBTransactionImpl::set */
 uprobe:$1:_ZN12RocksDBStore*3setE*PKcmRK*
 /@t0/
-{ printf("%10lld %7d %12lx  %-16s   kv set    %s keylen=%lld val=%dB\n", (nsecs-@t0)/1000, tid, curtask->thread.fsbase, comm,
-         str(*(uint64*)arg1), arg3, *(uint32*)(arg4+24)); }
+{ printf("%10lld %7d  %-16s %-38s %s keylen=%lld val=%dB\n",
+         (nsecs-@t0)/1000, tid, comm, "RocksDBTransactionImpl::set",
+         str(*(uint64*)arg1), arg3, *(uint32*)(arg4+24));
+  if (@stk) { printf("%s\n", ustack); } }
 
 /* both rmkey overloads; prefix is arg1 in each */
+/* RocksDBStore::RocksDBTransactionImpl::rmkey */
 uprobe:$1:_ZN12RocksDBStore*5rmkeyE*
 /@t0/
-{ printf("%10lld %7d %12lx  %-16s   kv rmkey  %s\n", (nsecs-@t0)/1000, tid, curtask->thread.fsbase, comm, str(*(uint64*)arg1)); }
+{ printf("%10lld %7d  %-16s %-38s %s\n",
+         (nsecs-@t0)/1000, tid, comm, "RocksDBTransactionImpl::rmkey",
+         str(*(uint64*)arg1));
+  if (@stk) { printf("%s\n", ustack); } }
 
 /* ---- transaction state machine (per-txc pointer) --------------------- */
+/* BlueStore::_txc_aio_submit */
 uprobe:$1:_ZN9BlueStore*_txc_aio_submitE*
 /@t0/
-{ printf("%10lld %7d %12lx  %-16s   txc %p submit data aio\n", (nsecs-@t0)/1000, tid, curtask->thread.fsbase, comm, arg1); }
+{ printf("%10lld %7d  %-16s %-38s txc %p\n",
+         (nsecs-@t0)/1000, tid, comm, "BlueStore::_txc_aio_submit", arg1);
+  if (@stk) { printf("%s\n", ustack); } }
 
 /* for a deferred txc this fires within ~us of submit, on the same thread:
  * no data aio exists, _txc_state_proc falls through and calls it inline */
+/* BlueStore::_txc_finish_io */
 uprobe:$1:_ZN9BlueStore*_txc_finish_ioE*
 /@t0/
-{ printf("%10lld %7d %12lx  %-16s   txc %p data aio done\n", (nsecs-@t0)/1000, tid, curtask->thread.fsbase, comm, arg1); }
+{ printf("%10lld %7d  %-16s %-38s txc %p data aio done\n",
+         (nsecs-@t0)/1000, tid, comm, "BlueStore::_txc_finish_io", arg1);
+  if (@stk) { printf("%s\n", ustack); } }
 
+/* BlueStore::_txc_committed_kv */
 uprobe:$1:_ZN9BlueStore*_txc_committed_kvE*
 /@t0/
-{ printf("%10lld %7d %12lx  %-16s   txc %p kv committed -> client reply\n", (nsecs-@t0)/1000, tid, curtask->thread.fsbase, comm, arg1); }
+{ printf("%10lld %7d  %-16s %-38s txc %p -> client reply\n",
+         (nsecs-@t0)/1000, tid, comm, "BlueStore::_txc_committed_kv", arg1);
+  if (@stk) { printf("%s\n", ustack); } }
 
+/* BlueStore::_txc_finish */
 uprobe:$1:_ZN9BlueStore*_txc_finishE*
 /@t0/
-{ printf("%10lld %7d %12lx  %-16s   txc %p finish\n", (nsecs-@t0)/1000, tid, curtask->thread.fsbase, comm, arg1); }
+{ printf("%10lld %7d  %-16s %-38s txc %p\n",
+         (nsecs-@t0)/1000, tid, comm, "BlueStore::_txc_finish", arg1);
+  if (@stk) { printf("%s\n", ustack); } }
 
 /* ---- RocksDB commit -------------------------------------------------- */
+/* RocksDBStore::submit_transaction_sync */
 uprobe:$1:_ZN12RocksDBStore*submit_transaction_syncE*
 /@t0/
 { @ts_kv[tid] = nsecs;
-  printf("%10lld %7d %12lx  %-16s   rocksdb commit (sync) start\n", (nsecs-@t0)/1000, tid, curtask->thread.fsbase, comm); }
+  printf("%10lld %7d  %-16s %-38s start\n",
+         (nsecs-@t0)/1000, tid, comm, "RocksDBStore::submit_transaction_sync");
+  if (@stk) { printf("%s\n", ustack); } }
+/* RocksDBStore::submit_transaction_sync (return) */
 uretprobe:$1:_ZN12RocksDBStore*submit_transaction_syncE*
 /@ts_kv[tid]/
-{ printf("%10lld %7d %12lx  %-16s   rocksdb commit done (%lld us)\n",
-         (nsecs-@t0)/1000, tid, curtask->thread.fsbase, comm, (nsecs-@ts_kv[tid])/1000); delete(@ts_kv[tid]); }
+{ printf("%10lld %7d  %-16s %-38s done (%lld us)\n",
+         (nsecs-@t0)/1000, tid, comm, "RocksDBStore::submit_transaction_sync",
+         (nsecs-@ts_kv[tid])/1000); delete(@ts_kv[tid]); }
 
 /* ---- block device ---------------------------------------------------- */
-/* KernelDevice::aio_write(off=arg1, bl=arg2, ...); bdev=arg0 -- two
- * instances share the NVMe: BlueStore data vs BlueFS (RocksDB files) */
+/* off=arg1, bl=arg2, bdev=arg0 -- two KernelDevice instances share the
+ * NVMe: BlueStore data vs BlueFS (RocksDB files) */
+/* KernelDevice::aio_write */
 uprobe:$1:_ZN12KernelDevice*aio_writeE*
 /@t0/
-{ printf("%10lld %7d %12lx  %-16s   DISK aio_write bdev=%p off=0x%lx len=0x%x\n",
-         (nsecs-@t0)/1000, tid, curtask->thread.fsbase, comm, arg0, arg1, *(uint32*)(arg2+24)); }
+{ printf("%10lld %7d  %-16s %-38s bdev=%p off=0x%lx len=0x%x\n",
+         (nsecs-@t0)/1000, tid, comm, "KernelDevice::aio_write",
+         arg0, arg1, *(uint32*)(arg2+24));
+  if (@stk) { printf("%s\n", ustack); } }
 
+/* KernelDevice::flush -- normally silent at entry (the return probe
+ * reports); in stack mode print an "enter" line so the stack has a header */
 uprobe:$1:_ZN12KernelDevice*flushE*
 /@t0/
-{ @ts_fl[tid] = nsecs; @fl_dev[tid] = arg0; }
+{ @ts_fl[tid] = nsecs; @fl_dev[tid] = arg0;
+  if (@stk) {
+    printf("%10lld %7d  %-16s %-38s enter\n",
+           (nsecs-@t0)/1000, tid, comm, "KernelDevice::flush");
+    printf("%s\n", ustack);
+  } }
+/* KernelDevice::flush (return) */
 uretprobe:$1:_ZN12KernelDevice*flushE*
 /@ts_fl[tid]/
-{ printf("%10lld %7d %12lx  %-16s   DISK flush (fdatasync) bdev=%p %lld us\n",
-         (nsecs-@t0)/1000, tid, curtask->thread.fsbase, comm, @fl_dev[tid], (nsecs-@ts_fl[tid])/1000);
+{ printf("%10lld %7d  %-16s %-38s fdatasync bdev=%p %lld us\n",
+         (nsecs-@t0)/1000, tid, comm, "KernelDevice::flush",
+         @fl_dev[tid], (nsecs-@ts_fl[tid])/1000);
   delete(@ts_fl[tid]); delete(@fl_dev[tid]); }
 
 /* BlueFS::fsync(FileWriter*) */
 uprobe:$1:_ZN6BlueFS5fsyncE*
 /@t0/
-{ printf("%10lld %7d %12lx  %-16s   bluefs fsync (WAL file)\n", (nsecs-@t0)/1000, tid, curtask->thread.fsbase, comm); }
+{ printf("%10lld %7d  %-16s %-38s WAL file\n",
+         (nsecs-@t0)/1000, tid, comm, "BlueFS::fsync");
+  if (@stk) { printf("%s\n", ustack); } }
 
 /* ---- deferred replay ------------------------------------------------- */
+/* BlueStore::_deferred_submit_unlock */
 uprobe:$1:_ZN9BlueStore*_deferred_submit_unlockE*
 /@t0/
-{ printf("%10lld %7d %12lx  %-16s   deferred data submit (background)\n", (nsecs-@t0)/1000, tid, curtask->thread.fsbase, comm); }
+{ printf("%10lld %7d  %-16s %-38s background data replay\n",
+         (nsecs-@t0)/1000, tid, comm, "BlueStore::_deferred_submit_unlock");
+  if (@stk) { printf("%s\n", ustack); } }
 
-END { clear(@ts_kv); clear(@ts_fl); clear(@fl_dev); clear(@t0); }
+END { clear(@ts_kv); clear(@ts_fl); clear(@fl_dev); clear(@t0); clear(@stk); }

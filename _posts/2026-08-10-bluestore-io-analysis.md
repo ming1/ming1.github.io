@@ -666,24 +666,24 @@ The clock zeroes at the first `queue_transactions` seen, so start the script
 before the write and keep the cluster otherwise quiet. One 4 KiB put:
 
 ```
-        us     tid      pthread  thread           event
-         2   20880 7f2ef27c66c0  tp_osd_tp        BlueStore::queue_transactions
-        89   20880 7f2ef27c66c0  tp_osd_tp          _do_write off=0x0 len=0x1000
-        95   20880 7f2ef27c66c0  tp_osd_tp          _do_write_big (whole min_alloc units)
-       193   20880 7f2ef27c66c0  tp_osd_tp          DISK aio_write bdev=0x..784a00 off=0xc1000 len=0x1000
-       218   20880 7f2ef27c66c0  tp_osd_tp          kv set    P keylen=40 val=188B
-       239   20880 7f2ef27c66c0  tp_osd_tp          kv set    P keylen=18 val=194B
-       258   20880 7f2ef27c66c0  tp_osd_tp          kv set    O keylen=37 val=372B
-       309   20880 7f2ef27c66c0  tp_osd_tp          txc 0x..02700 submit data aio
-      3273   20479 7f2f06fef6c0  bstore_aio         txc 0x..02700 data aio done
-      9955   20848 7f2efffe16c0  bstore_kv_sync     DISK flush (fdatasync) bdev=0x..784a00 6160 us
-     10129   20848 7f2efffe16c0  bstore_kv_sync     rocksdb commit (sync) start
-     10145   20848 7f2efffe16c0  bstore_kv_sync     bluefs fsync (WAL file)
-     10187   20848 7f2efffe16c0  bstore_kv_sync     DISK aio_write bdev=0x..785900 off=0xfce000 len=0x1000
-     17061   20848 7f2efffe16c0  bstore_kv_sync     DISK flush (fdatasync) bdev=0x..785900 5366 us
-     17144   20848 7f2efffe16c0  bstore_kv_sync     rocksdb commit done (7016 us)
-     17187   20849 7f2f007e26c0  bstore_kv_final    txc 0x..02700 kv committed -> client reply
-     17204   20849 7f2f007e26c0  bstore_kv_final    txc 0x..02700 finish
+        us     tid  thread           function                               event
+         1   20884  tp_osd_tp        BlueStore::queue_transactions          transaction arrives
+        87   20884  tp_osd_tp        BlueStore::_do_write                   off=0x0 len=0x1000
+        92   20884  tp_osd_tp        BlueStore::_do_write_big               whole min_alloc units
+       149   20884  tp_osd_tp        KernelDevice::aio_write                bdev=0x..784a00 off=0x1f0000 len=0x1000
+       167   20884  tp_osd_tp        RocksDBTransactionImpl::set            P keylen=40 val=187B
+       184   20884  tp_osd_tp        RocksDBTransactionImpl::set            P keylen=18 val=194B
+       198   20884  tp_osd_tp        RocksDBTransactionImpl::set            O keylen=36 val=371B
+       236   20884  tp_osd_tp        BlueStore::_txc_aio_submit             txc 0x..f6380
+      2119   20479  bstore_aio       BlueStore::_txc_finish_io              txc 0x..f6380 data aio done
+      6978   20848  bstore_kv_sync   KernelDevice::flush                    fdatasync bdev=0x..784a00 4800 us
+      7162   20848  bstore_kv_sync   RocksDBStore::submit_transaction_sync  start
+      7186   20848  bstore_kv_sync   BlueFS::fsync                          WAL file
+      7199   20848  bstore_kv_sync   KernelDevice::aio_write                bdev=0x..785900 off=0xfd5000 len=0x1000
+     14190   20848  bstore_kv_sync   KernelDevice::flush                    fdatasync bdev=0x..785900 5608 us
+     14230   20848  bstore_kv_sync   RocksDBStore::submit_transaction_sync  done (7069 us)
+     14268   20849  bstore_kv_final  BlueStore::_txc_committed_kv           txc 0x..f6380 -> client reply
+     14285   20849  bstore_kv_final  BlueStore::_txc_finish                 txc 0x..f6380
 ```
 
 Columns:
@@ -692,15 +692,42 @@ Columns:
 |---|---|
 | `us` | microseconds since the first `queue_transactions` — relative, not wall-clock |
 | `tid` | kernel thread id; matches `strace`, `ps -L`, `top -H` |
-| `pthread` | `pthread_self()` in hex — **matches the thread column of the OSD log** |
 | `thread` | OSD thread name; the four names are the four pipeline stages of §1.6.2 |
+| `function` | the probed function (`class::method`) |
+| `event` | what happened, with arguments |
 
-The `pthread` column is read from `curtask->thread.fsbase`: on x86-64 glibc
-a `pthread_t` is the address of the thread's control block, the same address
-the kernel keeps in the FS base register. Verified by running wtrace and
-`debug_bdev=20` together — the same `aio_write` shows `7f2efffe16c0` in both
-outputs, so wtrace lines join with `debug_bluestore` log lines on that
-column.
+**Call stacks.** `--stack` prints the userspace stack under each
+entry-probe event — pass it after a `--`, or bpftrace's own option parser
+eats it:
+
+```bash
+bpftrace wtrace.bt -- bin/ceph-osd --stack
+```
+
+```
+         1   20884  tp_osd_tp        BlueStore::queue_transactions     transaction arrives
+        BlueStore::queue_transactions(...)+0
+        PrimaryLogPG::issue_repop(PrimaryLogPG::RepGather*, ...)+1004
+        PrimaryLogPG::execute_ctx(PrimaryLogPG::OpContext*)+4947
+       113   20884  tp_osd_tp        BlueStore::_do_write              off=0x0 len=0x1000
+        BlueStore::_do_write(BlueStore::TransContext*, ...)+0
+        BlueStore::_write(BlueStore::TransContext*, ...)+714
+```
+
+Frames come out demangled, which answers "who called this layer" without
+adding probes upstream. Two limits: uretprobes are skipped (their stack
+shows the return trampoline, not the caller), and depth varies per call
+site — the build lacks frame pointers in optimized code, so some sites
+resolve one to three frames before degrading to raw addresses.
+
+One column worth knowing about even though it isn't printed: the OSD log's
+`7f...` thread ids are `pthread_self()` values, and bpftrace can produce the
+same value from `curtask->thread.fsbase` (on x86-64 glibc a `pthread_t` is
+the thread control block address, which the kernel keeps in the FS base
+register — verified against `debug_bdev=20` output, where the same
+`aio_write` shows the identical id in both traces). Add a `%12lx` field
+printing it if you need to join wtrace lines with `debug_bluestore` log
+lines.
 
 ## 2.4 Latency mode — wlat.bt
 
