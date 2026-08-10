@@ -543,4 +543,182 @@ KernelDevice    io_submit(IOCB_CMD_PWRITEV) + fdatasync
 /dev/nvme0n1
 ```
 
+# 2. Tracing with bpftrace
+
+Everything §1 extracted from `debug_*` logs can be captured with three small
+bpftrace scripts instead — no debug levels, no restart, no 400 KB of log per
+write. They attach to the live OSD in ~2 s and detach on Ctrl-C:
+
+| Script | Mode | Answers |
+|---|---|---|
+| [`wstats.bt`]({{ site.baseurl }}/code/ceph/wstats.bt) | statistics over a period | which events, how many, how large |
+| [`wtrace.bt`]({{ site.baseurl }}/code/ceph/wtrace.bt) | event log for a single IO | what happened, in order, on which thread |
+| [`wlat.bt`]({{ site.baseurl }}/code/ceph/wlat.bt) | latency per transaction | where the milliseconds went |
+
+## 2.1 Probe points
+
+No kernel tracepoints exist for any of this, so all probes are **uprobes on
+layer-boundary functions** of the (unstripped) `ceph-osd` binary — the same
+boundaries §1 walked:
+
+| Probed function | Layer boundary |
+|---|---|
+| `BlueStore::queue_transactions` | OSD → BlueStore (§1.5) |
+| `BlueStore::_do_write` / `_big` / `_small` | write planning (§1.6.1) |
+| `RocksDBTransactionImpl::set` / `rmkey` | BlueStore → RocksDB staging, with prefix + sizes (§1.6.4) |
+| `RocksDBStore::submit_transaction_sync` | the kv_sync commit (§1.6.1) |
+| `BlueFS::fsync` | RocksDB → BlueFS (§1.7) |
+| `KernelDevice::aio_write` / `flush` | → NVMe (§1.8) |
+| `BlueStore::_txc_{state_proc,finish_io,committed_kv,finish}` | txc state machine (§1.6.2) |
+
+Three implementation details make the scripts work, all documented in their
+headers:
+
+* uprobes attach by **mangled** symbol name — resolve them once with
+  `nm bin/ceph-osd`;
+* every `_txc_*` function takes `TransContext*` as its first parameter
+  (arg1 — arg0 is `this`), which is a free per-IO correlation key;
+* the two struct offsets peeked at (`bufferlist::_len` at +24, `std::string`
+  data/size at +0/+8) come from `gdb -batch -ex "ptype /o ..."` on the
+  binary's own debug info, not from guessing.
+
+The binary path is hard-coded inside each probe
+(`/root/git/ceph/ceph/build/bin/ceph-osd`) — edit it for a different build
+tree. Rebuilding the binary is fine (symbols re-resolve at attach); moving
+it is not.
+
+## 2.2 Statistics mode — wstats.bt
+
+```bash
+bpftrace wstats.bt          # start
+# ... run any workload: rados bench, fio, a loop of puts ...
+# Ctrl-C                    # stop + print summary
+```
+
+Output for exactly 10 × 4 KiB `rados put` (validation run — every number
+checks against §1):
+
+```
+@a_txc_submitted: 10
+@b_object_writes: 10          @b_object_write_bytes: 40960
+
+@c_kv_set[O]: 10              @c_kv_set_bytes[O]: 3741
+@c_kv_set[P]: 20              @c_kv_set_bytes[P]: 3841
+
+@d_kv_commit_sync: 10         @d_kv_commit_async: 10
+@d_kv_commit_us: [4K, 8K) 8  [8K, 16K) 2
+
+@e_disk_writes[tp_osd_tp]: 10       @e_disk_write_bytes[tp_osd_tp]: 40960
+@e_disk_writes[bstore_kv_sync]: 10  @e_disk_write_bytes[bstore_kv_sync]: 49152
+
+@f_disk_flush: 20             @f_disk_flush_us: [4K, 8K) 18  [8K, 16K) 2
+@g_bluefs_fsync: 10
+@h_deferred_batches: 0
+```
+
+Read it back against §1.6: 10 writes → 10 onode records (`O`), 20 pgmeta
+records (`P` — two per write), 10 sync commits, and per write one data
+`aio_write` from `tp_osd_tp` + one WAL `aio_write` from `bstore_kv_sync` +
+two fdatasyncs. Disk writes are keyed by the issuing thread's name because
+the thread *is* the writer's identity: `tp_osd_tp` = object data,
+`bstore_kv_sync` = RocksDB WAL, anything else = deferred replay.
+
+## 2.3 Single-IO mode — wtrace.bt
+
+```bash
+# terminal 1                        # terminal 2
+bpftrace wtrace.bt                  rados -p p1 put obj /root/4k
+# events stream; Ctrl-C when done
+```
+
+or in one terminal:
+
+```bash
+bpftrace wtrace.bt > /tmp/trace.txt 2>&1 &
+rados -p p1 put obj /root/4k
+sleep 2; kill -INT %1; cat /tmp/trace.txt
+```
+
+The clock zeroes at the first `queue_transactions` seen, so start the script
+before the write and keep the cluster otherwise quiet. One 4 KiB put:
+
+```
+        us     tid      pthread  thread           event
+         2   20880 7f2ef27c66c0  tp_osd_tp        BlueStore::queue_transactions
+        89   20880 7f2ef27c66c0  tp_osd_tp          _do_write off=0x0 len=0x1000
+        95   20880 7f2ef27c66c0  tp_osd_tp          _do_write_big (whole min_alloc units)
+       193   20880 7f2ef27c66c0  tp_osd_tp          DISK aio_write bdev=0x..784a00 off=0xc1000 len=0x1000
+       218   20880 7f2ef27c66c0  tp_osd_tp          kv set    P keylen=40 val=188B
+       239   20880 7f2ef27c66c0  tp_osd_tp          kv set    P keylen=18 val=194B
+       258   20880 7f2ef27c66c0  tp_osd_tp          kv set    O keylen=37 val=372B
+       309   20880 7f2ef27c66c0  tp_osd_tp          txc 0x..02700 submit data aio
+      3273   20479 7f2f06fef6c0  bstore_aio         txc 0x..02700 data aio done
+      9955   20848 7f2efffe16c0  bstore_kv_sync     DISK flush (fdatasync) bdev=0x..784a00 6160 us
+     10129   20848 7f2efffe16c0  bstore_kv_sync     rocksdb commit (sync) start
+     10145   20848 7f2efffe16c0  bstore_kv_sync     bluefs fsync (WAL file)
+     10187   20848 7f2efffe16c0  bstore_kv_sync     DISK aio_write bdev=0x..785900 off=0xfce000 len=0x1000
+     17061   20848 7f2efffe16c0  bstore_kv_sync     DISK flush (fdatasync) bdev=0x..785900 5366 us
+     17144   20848 7f2efffe16c0  bstore_kv_sync     rocksdb commit done (7016 us)
+     17187   20849 7f2f007e26c0  bstore_kv_final    txc 0x..02700 kv committed -> client reply
+     17204   20849 7f2f007e26c0  bstore_kv_final    txc 0x..02700 finish
+```
+
+Columns:
+
+| Column | Meaning |
+|---|---|
+| `us` | microseconds since the first `queue_transactions` — relative, not wall-clock |
+| `tid` | kernel thread id; matches `strace`, `ps -L`, `top -H` |
+| `pthread` | `pthread_self()` in hex — **matches the thread column of the OSD log** |
+| `thread` | OSD thread name; the four names are the four pipeline stages of §1.6.2 |
+
+The `pthread` column is read from `curtask->thread.fsbase`: on x86-64 glibc
+a `pthread_t` is the address of the thread's control block, the same address
+the kernel keeps in the FS base register. Verified by running wtrace and
+`debug_bdev=20` together — the same `aio_write` shows `7f2efffe16c0` in both
+outputs, so wtrace lines join with `debug_bluestore` log lines on that
+column.
+
+## 2.4 Latency mode — wlat.bt
+
+```bash
+bpftrace wlat.bt            # one line per write as it commits; Ctrl-C for histogram
+```
+
+Stage boundaries are the txc state machine of §1.6.2, followed per
+transaction via its `TransContext*`:
+
+```
+queue_transactions entry ──prep──► first _txc_state_proc ──data_io──►
+_txc_finish_io ──kv_commit──► _txc_committed_kv (= client reply)
+```
+
+Direct and deferred writes in one run (deferred enabled mid-run via
+`bluestore_prefer_deferred_size 32768`):
+
+```
+txc            clientlat = prep + data_io + kv_commit [us]
+0x56134af08380    13392 = 286 + 1907 + 11198     <- direct
+0x56134af0b500    15420 = 228 + 2258 + 12932     <- direct
+0x56134af00a80     9651 = 285 +    6 +  9357     <- deferred
+0x56134af0aa80     7425 = 183 +    3 +  7238     <- deferred
+
+@client_us: [4K, 8K) 2   [8K, 16K) 4
+```
+
+The breakdown answers §1's latency question in one line per IO: prep (CPU —
+allocation, checksum, encoding) is ~200 µs; everything else is the two
+fdatasync barriers inside kv_commit. Deferred halves the client latency by
+dropping the data barrier — its `data_io` shows a few microseconds, not
+zero, because `_txc_state_proc` falls through and calls `_txc_finish_io`
+inline when no data aio exists
+([`BlueStore.cc:14735`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L14735));
+those µs are queue overhead, not device wait.
+
+Two reporting subtleties the script encodes: the per-txc line prints at
+`_txc_committed_kv`, not `_txc_finish`, because that is where the client
+reply fires — and because a deferred txc's `_txc_finish` lags until the
+next kv cycle retires its replay, which is background cost, not client
+latency.
+
 <!-- analysis sections follow -->
