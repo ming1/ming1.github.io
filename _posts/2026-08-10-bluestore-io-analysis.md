@@ -1010,4 +1010,161 @@ again (a new osdmap epoch, an interval change); on a quiet pool that is
 effectively once. If you trace a fresh pool and your byte counts do
 not match this post's, write twice and read the second trace.
 
-<!-- analysis sections follow -->
+# 4. Function reference
+
+The six functions doing the heavy lifting above, in the order a write
+meets them: plan (`_do_write_big` / `_do_write_small`) → execute
+(`_do_alloc_write`) → encode (`_txc_write_nodes`) → drive
+(`_txc_state_proc`) → commit (`submit_transaction_sync`). Bare `:NNNN`
+line numbers are
+[`BlueStore.cc` at the v21.3.0 tag](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc)
+(§4.6 is `RocksDBStore.cc`); each heading links its definition.
+
+## 4.1 _do_write_big — plan the aligned part
+
+[`BlueStore.cc:17077`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L17077)
+— takes the txc, collection `c`, onode `o`, the logical
+`offset~length`, the payload iterator `blp`, and the `WriteContext
+*wctx` it appends its plan to. Called by `_do_write_data` (`:17648`)
+for the whole-min_alloc-units span of the write.
+
+```
+loop over the span in ≤ target_blob_size (64 KiB) chunks
+   │
+   ├─ deferring pays? (chunk ≤ 2 × prefer_deferred_size)    :17111
+   │    └► carve head/tail, stage them as deferred writes
+   │       _do_write_big_apply_deferred                     :17014
+   ├─ a neighbour blob can absorb the chunk?
+   │    scan ± one blob length, can_reuse_blob              :17195,:17220
+   │    └► extend that blob
+   └─ else: new blob
+        └► wctx->write(chunk) — plan recorded, nothing done :17268
+```
+
+**IOs:** none — everything lands in `wctx` (deferred payloads go into
+the kv transaction); allocation and device IO happen later, in §4.3.
+**Locks:** none of its own; the OSD's PG lock and the per-collection
+sequencer already serialize writers on this onode.
+
+## 4.2 _do_write_small — plan the unaligned part
+
+[`BlueStore.cc:16566`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L16566)
+— same parameters; handles the sub-min_alloc span
+(`length < min_alloc_size` is asserted). This is where
+read-modify-write lives — three exits:
+
+```
+sub-4-KiB write
+   │
+   ├─ fits in never-written space of an existing mutable blob?  :16669
+   │    ├─ small (< prefer_deferred_size) → stage OP_WRITE
+   │    │  payload in the kv txn                                :16683
+   │    └─ else → direct write into the blob's free space
+   ├─ overlaps written chunks → read-modify-write:
+   │    _do_read head :16741 / tail :16755        ← device READs
+   │    merge old + new bytes, rewrite the chunk
+   └─ nothing reusable → new blob
+        └► wctx->write                                          :16943
+```
+
+**IOs:** possibly device *reads* for the head/tail fill — the only
+reads in the whole write path. The writes themselves are only planned.
+**Locks:** none of its own (same serialization as §4.1).
+
+## 4.3 _do_alloc_write — allocate, checksum, start the IO
+
+[`BlueStore.cc:17290`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L17290)
+— takes the txc, collection, onode and the filled `wctx`; executes the
+plan.
+
+```
+wctx->writes (the plan)
+   │
+   ├─ optional: compress each blob                          :17322
+   ├─ ONE allocator call for the plan's total need
+   │    alloc->allocate                                     :17409
+   └─ per blob:
+        checksum   dblob.calc_csum  (crc32c per 4 KiB)      :17522
+        cache      _buffer_cache_write                      :17547
+        small? (data < prefer_deferred_size)
+          ├─ yes → OP_WRITE payload into the kv txn         :17557
+          └─ no  → bdev->aio_write, queued on txc->ioc      :17571
+```
+
+**IOs:** queues the data write — one aio per new blob — on the txc's
+IOContext; nothing is submitted yet (`_txc_aio_submit` does that, §3.3
+line #8). No reads.
+**Locks:** the allocator's internal mutex (inside `allocate`) and a
+buffer-cache shard lock (inside `_buffer_cache_write`); nothing held
+across the function.
+
+## 4.4 _txc_write_nodes — metadata into the transaction
+
+[`BlueStore.cc:14789`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L14789)
+— takes the txc and the kv transaction `t`; runs at the end of
+`queue_transactions`, after every op is planned.
+
+```
+for each dirty onode
+   └► _record_onode                                         :19618
+        encode onode + extent-map shards
+        t->set(PREFIX_OBJ, ...)          ← the O record of §3
+      o->flushing_count++               (flush() waits on it)
+for each shared blob (clone bookkeeping)
+   └► t->set / rmkey(PREFIX_SHARED_BLOB)                    :14822
+```
+
+**IOs:** none — memory into the in-memory transaction; the bytes reach
+disk in §4.6.
+**Locks:** none.
+
+## 4.5 _txc_state_proc — drive the txc through its states
+
+[`BlueStore.cc:14634`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L14634)
+— takes only the txc. Every thread that touches a txc calls this one
+function; the switch decides what happens next, falling through where
+no wait is needed. The thread running each state is §3.2's map:
+
+```
+STATE_PREPARE      :14641  pending aios? → _txc_aio_submit    tp_osd_tp
+STATE_AIO_WAIT     :14656  → _txc_finish_io                   bstore_aio
+STATE_IO_DONE      :14671  → KV_QUEUED: push kv_queue,
+                           wake kv thread (switch #2)         bstore_aio
+STATE_KV_SUBMITTED :14720  → _txc_committed_kv → reply        bstore_kv_final
+STATE_KV_DONE      :14724  deferred txn? → _deferred_queue    bstore_kv_final
+STATE_FINISHING    :14739  → _txc_finish, txc retired         bstore_kv_final
+```
+
+**IOs:** starts them all, does none itself: the data `io_submit`
+(PREPARE) and the deferred replay (KV_DONE).
+**Locks:** `kv_lock` while queueing and waking the kv thread
+(`:14704`); IO_DONE requires the sequencer's `qlock` (asserted
+`:14672`; taken by its caller `_txc_finish_io`, `:14763`);
+`_deferred_queue` takes the sequencer's `deferred_lock` (`:15650`).
+
+## 4.6 submit_transaction_sync — make the transaction durable
+
+[`RocksDBStore.cc:1668`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/RocksDBStore.cc#L1668)
+— takes the `KeyValueDB::Transaction` (a wrapped `rocksdb::WriteBatch`
+holding every `set`/`rmkey` the kv batch staged). This is the kv-sync
+thread's per-batch commit — §3's lines #11/#15.
+
+```
+submit_transaction_sync              RocksDBStore.cc:1668
+  woptions.sync = !disableWAL                :1673   (sync = true)
+  └► submit_common                           :1607
+       └► db->Write(woptions, batch)         :1624
+            append batch to the WAL file     → #13 (BlueFS)
+            insert keys into the memtable    (memory only)
+            sync → fsync the WAL file        → #12/#14, barrier #2
+```
+
+The async twin `submit_transaction` (`:1654`, `sync = false`) is the
+same call without the fsync — used for the optional early submit and
+deferred cleanup, never for the client-visible commit.
+
+**IOs:** the 4 KiB WAL append and the flush behind it (§3.5), via
+BlueFS. SST files are written later by compaction, off the write path.
+**Locks:** RocksDB's internal writer mutex — concurrent committers form
+a write group whose leader writes the WAL once; nothing on the Ceph
+side.
