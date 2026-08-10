@@ -37,7 +37,6 @@
 BEGIN
 {
   printf("%10s %7s  %-16s %-38s %s\n", "us", "tid", "thread", "function", "event");
-  @t0 = (uint64)0;
   @stk = str($2) == "--stack" ? 1 : 0;
 }
 

@@ -59,10 +59,10 @@ uprobe:$1:_ZN9BlueStore*_txc_committed_kvE*
          (nsecs - @birth[arg1]) / 1000,
          @prep[arg1], @dio[arg1], (nsecs - @last[arg1]) / 1000);
   @client_us = hist((nsecs - @birth[arg1]) / 1000);
-  @sum_prep  = sum(@prep[arg1]);
-  @sum_dio   = sum(@dio[arg1]);
-  @sum_kvc   = sum((nsecs - @last[arg1]) / 1000);
-  @n         = count();
+  @n++;
+  @sum_prep += @prep[arg1];
+  @sum_dio  += @dio[arg1];
+  @sum_kvc  += (nsecs - @last[arg1]) / 1000;
   delete(@birth[arg1]); delete(@prep[arg1]);
   delete(@dio[arg1]);   delete(@last[arg1]);
 }
@@ -70,5 +70,11 @@ uprobe:$1:_ZN9BlueStore*_txc_committed_kvE*
 END
 {
   clear(@qt); clear(@birth); clear(@prep); clear(@dio); clear(@last);
+  $n = (uint64)@n;
+  if ($n > 0) {
+    printf("\n%lld txcs, avg [us]: prep %lld + data_io %lld + kv_commit %lld\n",
+           $n, @sum_prep / $n, @sum_dio / $n, @sum_kvc / $n);
+  }
+  clear(@n); clear(@sum_prep); clear(@sum_dio); clear(@sum_kvc);
   printf("\nclient-visible latency (queue_transactions -> kv committed), us:\n");
 }

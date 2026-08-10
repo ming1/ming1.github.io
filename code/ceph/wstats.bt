@@ -25,8 +25,13 @@
  * the "_ZN<len><Class>" prefix pins the class (assert-fail and std::function
  * helper symbols embed the method name but start _ZN4ceph/_ZNSt, so they
  * cannot match) and the trailing "E*" pins the end of the method name (so
- * _txc_finish does not catch _txc_finish_io).  Before trusting a new
- * pattern, verify it matches EXACTLY the intended symbols:
+ * _txc_finish does not catch _txc_finish_io).  One thing the glob cannot
+ * pin is the end of the SYMBOL: optimized builds emit compiler clones like
+ * foo.cold / foo.part.N, and a trailing "E*" matches those too -- at a
+ * clone's entry the argument registers do not hold the function's
+ * parameters, so a matched clone silently corrupts counts and arg reads.
+ * Before trusting a pattern on a new binary, verify it matches EXACTLY the
+ * intended symbols (no .cold/.part suffixes):
  *     bpftrace -l 'uprobe:BIN:PATTERN'
  * bufferlist length lives at offset 24 (gdb: ptype /o
  * ceph::buffer::v15_2_0::list -> _len).

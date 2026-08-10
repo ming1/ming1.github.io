@@ -35,9 +35,15 @@ NVMe device. Every offset quoted is a real offset from that run.
 
 ```bash
 ../src/vstart.sh -n --without-dashboard --bluestore-devs /dev/nvme0n1
-bin/ceph osd pool create p1 8
+bin/ceph osd pool create p1 32
 bin/ceph osd pool set p1 size 1 --yes-i-really-mean-it
 ```
+
+**32 PGs is deliberate too.** It is the autoscaler's steady state for this
+pool; create it smaller and `autoscale_mode on` splits it to 32 under you
+mid-run, renumbering every pg id in your traces (`pool ls detail` records
+the split in `lfor`). With pg_num 32 the pg ids quoted below are stable and
+reproducible.
 
 **One OSD and size=1 are deliberate.** With replication the primary also
 emits `osd_repop` messages to its peers, and the peers' BlueStore activity
@@ -590,11 +596,17 @@ headers:
   `_ZN<len><Class>` prefix pins the class (those helper symbols start
   `_ZN4ceph`/`_ZNSt`, so they cannot match) and the trailing `E*` pins the
   end of the method name (so `_txc_finishE*` cannot catch
-  `_txc_finish_io`). Before trusting any new pattern, verify what it
-  matches:
+  `_txc_finish_io`). One thing the glob cannot pin is the end of the
+  *symbol*: optimized builds emit compiler clones like `foo.cold` /
+  `foo.part.N`, which a trailing `E*` also matches — and at a clone's entry
+  the argument registers do not hold the function's parameters, so a
+  matched clone silently corrupts counts and `arg` reads. No clones exist
+  for these functions in this build, but that is a property of the binary,
+  not the pattern. Before trusting any pattern on a new binary, verify
+  what it matches:
 
   ```bash
-  bpftrace -l 'uprobe:bin/ceph-osd:_ZN9BlueStore*_txc_finishE*'   # expect exactly 1
+  bpftrace -l 'uprobe:bin/ceph-osd:_ZN9BlueStore*_txc_finishE*'   # expect exactly 1, no .cold/.part
   ```
 
 * every `_txc_*` function takes `TransContext*` as its first parameter
@@ -657,7 +669,7 @@ or in one terminal:
 
 ```bash
 bpftrace wtrace.bt bin/ceph-osd > /tmp/trace.txt 2>&1 &
-until grep -q pthread /tmp/trace.txt; do sleep 1; done   # wait for attach
+until grep -q thread /tmp/trace.txt; do sleep 1; done   # column header = attached
 rados -p p1 put obj /root/4k
 sleep 2; kill -INT %1; cat /tmp/trace.txt
 ```
@@ -748,16 +760,18 @@ Direct and deferred writes in one run (deferred enabled mid-run via
 
 ```
 txc            clientlat = prep + data_io + kv_commit [us]
-0x56134af08380    13392 = 286 + 1907 + 11198     <- direct
-0x56134af0b500    15420 = 228 + 2258 + 12932     <- direct
-0x56134af00a80     9651 = 285 +    6 +  9357     <- deferred
-0x56134af0aa80     7425 = 183 +    3 +  7238     <- deferred
+0x55674621a700    14347 = 255 + 2773 + 11318     <- direct
+0x556745979180    12932 = 210 + 1790 + 10929     <- direct
+0x5567469e1500     6707 = 364 +    9 +  6331     <- deferred
+0x556746186a80     7593 = 222 +    7 +  7362     <- deferred
 
-@client_us: [4K, 8K) 2   [8K, 16K) 4
+4 txcs, avg [us]: prep 262 + data_io 1144 + kv_commit 8998
+
+@client_us: [4K, 8K) 2   [8K, 16K) 2
 ```
 
 The breakdown answers §1's latency question in one line per IO: prep (CPU —
-allocation, checksum, encoding) is ~200 µs; everything else is the two
+allocation, checksum, encoding) is ~250 µs; everything else is the two
 fdatasync barriers inside kv_commit. Deferred halves the client latency by
 dropping the data barrier — its `data_io` shows a few microseconds, not
 zero, because `_txc_state_proc` falls through and calls `_txc_finish_io`
