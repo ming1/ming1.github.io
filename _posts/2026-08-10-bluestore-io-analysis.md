@@ -881,14 +881,14 @@ prepared, nothing is durable yet:
 ```
 #1  queue_transactions           :15980  OSD hands BlueStore the transaction
     └► _txc_add_transaction      :16098  walk the op list, in order:
-#2     ├► OP_WRITE → _write :18109 → _do_write :17875    "off=0x0 len=0x4000"
-#3     │  └► _do_write_big       :17089  16 KiB = whole 4 KiB units
-       │     └► _do_alloc_write  :17308  allocate ONE contiguous 16 KiB
+#2     ├► OP_WRITE → _write :18085 → _do_write :17851    "off=0x0 len=0x4000"
+#3     │  └► _do_write_big       :17077  16 KiB = whole 4 KiB units
+       │     └► _do_alloc_write  :17290  allocate ONE contiguous 16 KiB
        │        │                        extent, checksum 4× crc32c
 #4     │        └► KernelDevice::aio_write (KernelDevice.cc:1143)
        │                                 "off=0x73000 len=0x4000" — queued
        │                                 on the txc, NOT yet submitted
-       └► OP_OMAP_SETKEYS → _omap_setkeys :18545
+       └► OP_OMAP_SETKEYS → _omap_setkeys :18521
 #5,6      └► set(P, ...) ×2              pg log entry + pg info, staged
                                          in the in-memory rocksdb txn
     └► _txc_write_nodes          :14789
@@ -999,9 +999,13 @@ P keylen=15 val=4B
 P keylen=14 val=1021B
 ```
 
-A 4 B flag and a ~1 KiB pg-info blob are written once per PG and never
-again; from the second write on, the pgmeta settles into the two-record
-steady state above. If you trace a fresh pool and your byte counts do
+The key lengths name the records (8-byte nid + `.` + user key):
+keylen 15 is `_epoch` (the 4 B osdmap epoch), keylen 14 is `_info` (the
+full ~1 KiB `pg_info_t`), and the steady state's keylen 18 is
+`_fastinfo` — the small per-write delta that replaces them. `_epoch`
+and `_info` are rewritten only when the full info must be persisted
+again (a new osdmap epoch, an interval change); on a quiet pool that is
+effectively once. If you trace a fresh pool and your byte counts do
 not match this post's, write twice and read the second trace.
 
 <!-- analysis sections follow -->
