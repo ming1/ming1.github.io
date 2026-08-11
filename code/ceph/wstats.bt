@@ -76,9 +76,18 @@ uprobe:$1:_ZN12RocksDBStore*5mergeE*
 uprobe:$1:_ZN12RocksDBStore*submit_transactionE*
 { @d_kv_commit_async = count(); }
 
-/* RocksDBStore::submit_transaction_sync (the kv_sync_thread commit) */
+/* BlueStore::_txc_apply_kv -- one call per txc entering the kv batch */
+uprobe:$1:_ZN9BlueStore*_txc_apply_kvE*
+{ @batchn++; }
+
+/* RocksDBStore::submit_transaction_sync (the kv_sync_thread commit).
+ * txcs applied since the last sync commit = this batch's size; the two
+ * fdatasync barriers are paid per BATCH, so this histogram is the
+ * amortization factor of the commit cost */
 uprobe:$1:_ZN12RocksDBStore*submit_transaction_syncE*
-{ @d_kv_commit_sync = count(); @ts_kv[tid] = nsecs; }
+{ @d_kv_commit_sync = count(); @ts_kv[tid] = nsecs;
+  if (@batchn > 0) { @d_kv_batch_txcs = hist(@batchn); }
+  @batchn = 0; }
 /* RocksDBStore::submit_transaction_sync (return) */
 uretprobe:$1:_ZN12RocksDBStore*submit_transaction_syncE*
 /@ts_kv[tid]/
@@ -118,4 +127,4 @@ uretprobe:$1:_ZN6BlueFS5fsyncE*
 uprobe:$1:_ZN9BlueStore*_deferred_submit_unlockE*
 { @h_deferred_batches = count(); }
 
-END { clear(@ts_kv); clear(@ts_fl); clear(@ts_bf); }
+END { clear(@ts_kv); clear(@ts_fl); clear(@ts_bf); clear(@batchn); }

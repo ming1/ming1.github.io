@@ -7,18 +7,32 @@
  *         Wait for the banner line (wildcard probes take ~10 s to attach),
  *         run write workload, Ctrl-C.
  * Silent while tracing; Ctrl-C prints one latency histogram per stage
- * (prep, data_io, kv_commit) plus the client-visible total and an
- * average line.  A mixed direct/deferred run shows up as a bimodal
- * data_io histogram: milliseconds for direct, microseconds for deferred.
+ * (prep, data_io, kv_queued, kv_commit) plus the client-visible total
+ * and an average line.  A mixed direct/deferred run shows up as bimodal
+ * data_io and kv_queued histograms: milliseconds for direct,
+ * microseconds for deferred.
+ *
+ * Per-transaction lines (one per commit -- only sane at low rates):
+ *         bpftrace wlat.bt -- <path-to-ceph-osd> --per-txc
  *
  * Stage boundaries (all take TransContext* so one txc is followed through):
  *
- *   queue_transactions entry        t0  prepare: decode ops, allocate,
- *   first _txc_state_proc(txc)      t1    checksum, stage kv -- CPU only
- *   _txc_finish_io(txc)             t2  data_io: aio_write to NVMe
- *   _txc_committed_kv(txc)          t3  kv_wait+commit: flush + rocksdb fsync
+ *   queue_transactions entry        t0  prep:      decode ops, allocate,
+ *   first _txc_state_proc(txc)      t1               checksum, stage kv (CPU)
+ *   _txc_finish_io(txc)             t2  data_io:   aio_write to NVMe
+ *   _txc_apply_kv(txc)              t3  kv_queued: waiting for the kv_sync
+ *                                                  thread to take the batch
+ *   _txc_committed_kv(txc)          t4  kv_commit: rocksdb sync commit
+ *                                                  (WAL fsync) + callback
  *
- * Client-visible latency ends at t3 (kv committed fires the commit callback),
+ * The kv_queued/kv_commit split mirrors BlueStore's own
+ * state_kv_queued_lat / kv_commit_lat perf counters.  Note the flush
+ * semantics: the kv_sync thread fsyncs the DATA device before applying
+ * the batch, so for a direct write that barrier lands in kv_queued
+ * (~5 ms on this lab), while a deferred write -- which needs no data
+ * flush -- shows kv_queued of tens of microseconds.
+ *
+ * Client-visible latency ends at t4 (kv committed fires the commit callback),
  * so each txc is recorded there.  A deferred write shows data_io of a few
  * microseconds, not milliseconds: with no data aio pending, _txc_state_proc
  * falls through PREPARE -> AIO_WAIT inline and calls _txc_finish_io itself
@@ -27,14 +41,21 @@
  */
 
 BEGIN
-{ printf("tracing bluestore write latency... Ctrl-C for report\n"); }
+{
+  printf("tracing bluestore write latency... Ctrl-C for report\n");
+  @pertxc = str($2) == "--per-txc" ? 1 : 0;
+  if (@pertxc) {
+    printf("%-16s %8s = %s\n", "txc", "client",
+           "prep + data_io + kv_queued + kv_commit [us]");
+  }
+}
 
-/* stage prepare starts when the transaction enters BlueStore */
+/* stage prep starts when the transaction enters BlueStore */
 /* BlueStore::queue_transactions */
 uprobe:$1:_ZN9BlueStore*queue_transactionsE*
 { @qt[tid] = nsecs; }
 
-/* first _txc_state_proc on the same thread = this txc leaving prepare */
+/* first _txc_state_proc on the same thread = this txc leaving prep */
 /* BlueStore::_txc_state_proc */
 uprobe:$1:_ZN9BlueStore*_txc_state_procE*
 /@qt[tid] && !@birth[arg1]/
@@ -51,6 +72,14 @@ uprobe:$1:_ZN9BlueStore*_txc_finish_ioE*
 /@last[arg1]/
 { @dio[arg1] = (nsecs - @last[arg1]) / 1000; @last[arg1] = nsecs; }
 
+/* kv_sync thread takes the txc into its commit batch: everything since
+ * finish_io was queue wait (incl. the data-device flush), everything
+ * after is the commit itself */
+/* BlueStore::_txc_apply_kv */
+uprobe:$1:_ZN9BlueStore*_txc_apply_kvE*
+/@last[arg1]/
+{ @kvq[arg1] = (nsecs - @last[arg1]) / 1000; @last[arg1] = nsecs; }
+
 /* kv durable -> commit callback -> client reply.  This is the end of the
  * client-visible latency, so record here.  (A deferred txc's _txc_finish
  * can lag until the next kv cycle -- background replay, not client cost.) */
@@ -61,29 +90,38 @@ uprobe:$1:_ZN9BlueStore*_txc_committed_kvE*
   $kvc = (nsecs - @last[arg1]) / 1000;
   @prep_us      = hist(@prep[arg1]);
   @data_io_us   = hist(@dio[arg1]);
+  @kv_queued_us = hist(@kvq[arg1]);
   @kv_commit_us = hist($kvc);
   @client_us    = hist((nsecs - @birth[arg1]) / 1000);
   @n++;
   @sum_prep += @prep[arg1];
   @sum_dio  += @dio[arg1];
+  @sum_kvq  += @kvq[arg1];
   @sum_kvc  += $kvc;
+  if (@pertxc) {
+    printf("0x%-14lx %8lld = %lld + %lld + %lld + %lld\n", arg1,
+           (nsecs - @birth[arg1]) / 1000, @prep[arg1], @dio[arg1],
+           @kvq[arg1], $kvc);
+  }
   delete(@birth[arg1]); delete(@prep[arg1]);
-  delete(@dio[arg1]);   delete(@last[arg1]);
+  delete(@dio[arg1]);   delete(@kvq[arg1]); delete(@last[arg1]);
 }
 
 END
 {
-  clear(@qt); clear(@birth); clear(@prep); clear(@dio); clear(@last);
+  clear(@qt); clear(@birth); clear(@prep); clear(@dio); clear(@kvq);
+  clear(@last); clear(@pertxc);
   $n = (uint64)@n;
   if ($n > 0) {
-    printf("\n%lld txcs, avg [us]: prep %lld + data_io %lld + kv_commit %lld\n",
-           $n, @sum_prep / $n, @sum_dio / $n, @sum_kvc / $n);
+    printf("\n%lld txcs, avg [us]: prep %lld + data_io %lld + kv_queued %lld + kv_commit %lld\n",
+           $n, @sum_prep / $n, @sum_dio / $n, @sum_kvq / $n, @sum_kvc / $n);
   }
-  clear(@n); clear(@sum_prep); clear(@sum_dio); clear(@sum_kvc);
+  clear(@n); clear(@sum_prep); clear(@sum_dio); clear(@sum_kvq); clear(@sum_kvc);
   /* print in pipeline order, then clear so exit does not re-print them
    * (client_us last: queue_transactions -> kv committed, us) */
   print(@prep_us);      clear(@prep_us);
   print(@data_io_us);   clear(@data_io_us);
+  print(@kv_queued_us); clear(@kv_queued_us);
   print(@kv_commit_us); clear(@kv_commit_us);
   print(@client_us);    clear(@client_us);
 }

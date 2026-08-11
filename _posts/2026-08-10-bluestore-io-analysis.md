@@ -577,7 +577,7 @@ boundaries §1 walked:
 | `RocksDBStore::submit_transaction_sync` | the kv_sync commit (§1.6.1) |
 | `BlueFS::fsync` | RocksDB → BlueFS (§1.7) |
 | `KernelDevice::aio_write` / `flush` | → NVMe (§1.8) |
-| `BlueStore::_txc_{state_proc,finish_io,committed_kv,finish}` | txc state machine (§1.6.2) |
+| `BlueStore::_txc_{state_proc,finish_io,apply_kv,committed_kv,finish}` | txc state machine (§1.6.2) |
 
 Three implementation details make the scripts work, all documented in their
 headers:
@@ -656,6 +656,18 @@ records (`P` — two per write), 10 sync commits, and per write one data
 two fdatasyncs. Disk writes are keyed by the issuing thread's name because
 the thread *is* the writer's identity: `tp_osd_tp` = object data,
 `bstore_kv_sync` = RocksDB WAL, anything else = deferred replay.
+
+Sequential puts commit one txc at a time; under a real queue depth the
+`@d_kv_batch_txcs` histogram (txcs applied per sync commit, counted at
+`_txc_apply_kv`) shows how the per-batch fdatasync cost amortizes. An
+rbd fio 4 KiB randwrite at iodepth 16 against this OSD:
+
+```
+@d_kv_batch_txcs: [1] 557   [2, 4) 695   [4, 8) 923   [8, 16) 1668
+```
+
+Batches of 8–16 transactions sharing one commit are what let ~500 IOPS
+coexist with an ~11 ms two-barrier commit floor.
 
 ## 2.3 Single-IO mode — wtrace.bt
 
@@ -752,35 +764,51 @@ transaction via its `TransContext*`:
 
 ```
 queue_transactions entry ──prep──► first _txc_state_proc ──data_io──►
-_txc_finish_io ──kv_commit──► _txc_committed_kv (= client reply)
+_txc_finish_io ──kv_queued──► _txc_apply_kv ──kv_commit──►
+_txc_committed_kv (= client reply)
 ```
+
+The kv stage is split in two at `_txc_apply_kv` — the moment the
+kv_sync thread takes the txc into its commit batch — mirroring
+BlueStore's own `state_kv_queued_lat` / `kv_commit_lat` perf counters:
+`kv_queued` is everything between the data aio completing and the batch
+being taken (including the data-device flush, which the kv thread runs
+*before* applying), `kv_commit` is the RocksDB sync commit itself.
 
 The script emits nothing per event — every txc is aggregated at
 `_txc_committed_kv` and Ctrl-C prints one histogram per stage plus the
-client-visible total. Two direct and two deferred writes in one run
+client-visible total. Three direct and three deferred writes in one run
 (deferred enabled mid-run via `bluestore_prefer_deferred_size 32768`):
 
 ```
-4 txcs, avg [us]: prep 278 + data_io 1178 + kv_commit 11282
+6 txcs, avg [us]: prep 209 + data_io 1061 + kv_queued 3828 + kv_commit 7397
 
-@prep_us:       [128, 256) 1   [256, 512) 3
-@data_io_us:    [4, 8) 2       [2K, 4K) 2       <- deferred | direct
-@kv_commit_us:  [8K, 16K) 4
-@client_us:     [8K, 16K) 4
+@prep_us:       [128, 256) 6
+@data_io_us:    [4, 8) 3        [1K, 2K) 2  [2K, 4K) 1    <- deferred | direct
+@kv_queued_us:  [16, 128) 3     [4K, 8K) 2  [8K, 16K) 1   <- deferred | direct
+@kv_commit_us:  [4K, 8K) 5  [8K, 16K) 1
+@client_us:     [4K, 8K) 1  [8K, 16K) 4  [16K, 32K) 1
 ```
 
-The mixed run is legible in exactly one place: `@data_io_us` is bimodal.
-Direct writes pay the device — milliseconds of data aio plus its barrier;
-deferred writes show 4–8 µs — not zero, because `_txc_state_proc` falls
-through and calls `_txc_finish_io` inline when no data aio exists
+The mixed run is legible in exactly two places, and they say different
+things. `@data_io_us` is bimodal: direct writes pay the device —
+milliseconds of data aio; deferred writes show 4–8 µs — not zero,
+because `_txc_state_proc` falls through and calls `_txc_finish_io`
+inline when no data aio exists
 ([`BlueStore.cc:14735`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L14735));
-those µs are queue overhead, not device wait. Every other stage is
-mode-blind: prep (CPU — allocation, checksum, encoding) is a few hundred
-µs either way, and kv_commit is the fdatasync barriers of §1.6.1. Note
-what the log2 buckets do to the deferred saving: dropping a ~2 ms data
-barrier inside an [8K, 16K) kv-dominated total does not move `@client_us`
-to a different bucket — the averages line, not the histogram, is where a
-delta that size shows up.
+those µs are queue overhead, not device wait. `@kv_queued_us` is bimodal
+for a subtler reason: a direct write's batch cannot be applied until the
+data device is flushed, so barrier #1 of §1.8 lands in *this* stage
+(~5 ms); a deferred write needs no data flush and gets taken in tens of
+microseconds. The remaining stages are mode-blind: prep (CPU —
+allocation, checksum, encoding) is a few hundred µs either way, and
+kv_commit is the WAL fsync barrier. Per-transaction lines are available
+for low-rate runs with `bpftrace wlat.bt -- bin/ceph-osd --per-txc`:
+
+```
+0x558c57236700    14469 = 841 + 2602 + 4469 + 6536   <- direct
+0x558c57491c00     7460 = 221 +    3 +   40 + 7186   <- deferred
+```
 
 Two reporting subtleties the script encodes: each txc is recorded at
 `_txc_committed_kv`, not `_txc_finish`, because that is where the client
