@@ -1488,3 +1488,53 @@ device path.
 **Locks:** `kv_finalize_lock` around the sleep and the swaps; the txc
 steps take the sequencer's `qlock` inside `_txc_committed_kv`
 (`:14957`) and `_txc_finish` (`:15006`).
+
+# 5. Performance analysis
+
+## 5.1 fio latency vs wlat latency — what each one measures
+
+The two numbers are routinely compared and routinely disagree, because
+they measure different spans of the same write. Every latency metric in
+this post nests on one timeline:
+
+```
+client ─► wire ─► recv_stamp ─► dequeued ─► execute_ctx ─► BlueStore txc ─► commit cb ─► reply ─► wire ─► fio
+                  │◄ op_before_dequeue ►│                 │◄─ wlat client ─►│
+                                        │◄────────── op_w_process_latency ───────────►│
+                  │◄───────────────────────── op_w_latency ──────────────────────────►│
+│◄─────────────────────────────────────────────── fio clat ────────────────────────────────────────────────►│
+```
+
+* **`wlat client`** — BlueStore *service* time: txc birth to
+  `_txc_committed_kv`, the point where the commit callbacks are queued
+  and the client reply is set in motion (§2.4, §3.6). It knows nothing
+  about queues in librbd, the wire, or the OSD dispatch layers.
+* **`op_w_latency`** — the OSD's own span, defined at
+  `PrimaryLogPG.cc:4541` as `now - m->get_recv_stamp()`:
+  `recv_stamp` is captured when the message's preamble arrives, before
+  throttling and before the payload is read (`ProtocolV2.cc:1173`,
+  attached at `:1460`), and `now` is taken in `log_op_stats`, called
+  from the *same `register_on_commit` lambda that sends the reply*
+  (§3.6) — just before the send. So it covers message throttle and
+  read, queueing, dispatch, `execute_ctx`, BlueStore, and the
+  commit-callback hop, but excludes the reply transmission and
+  everything client-side.
+* **`op_w_process_latency`** — the same endpoint, but starting at
+  `op.get_dequeued_time()`; subtracting it from `op_w_latency` yields
+  the queue wait, which the separate `op_before_dequeue_op_lat`
+  counter measures independently — a built-in cross-check (with one
+  caveat: `op_before_dequeue` covers all op types while the `op_w_*`
+  pair is writes-only, so match populations on mixed workloads).
+* **`fio clat`** — the client's *sojourn* time: submission to
+  completion, including librbd, both wire crossings, every OSD queue,
+  and the reply path. It is the only span no server-side tool can
+  fully see.
+
+The consequence for comparisons: at a fixed iodepth, fio's clat is
+pinned by Little's law — with the queue kept full at `iodepth` IOs in
+flight, `clat ≈ iodepth / IOPS`, *regardless of how fast any
+individual layer is*. In that regime clat is a statement about
+throughput, not about service time; wlat's client figure
+(`@client_us`, printed as `= client` on the average line) is the
+service time, and the difference between the two is real waiting —
+located above BlueStore, in the spans the diagram places between them.
