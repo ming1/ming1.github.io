@@ -1019,6 +1019,60 @@ the commit callbacks run and the client's `ondisk` reply leaves. The
 `put` returns at +17.6 ms, of which ~11.5 ms was the two barriers and
 ~3.4 ms the data IO. Everything else in the trace cost microseconds.
 
+**Where exactly is the reply sent?** Not in `_txc_committed_kv` — it
+only *queues* the commit callbacks; the send happens at the end of
+that callback chain, back on a `tp_osd_tp` shard worker
+(`PLP` = `PrimaryLogPG.cc`, `RB` = `ReplicatedBackend.cc`):
+
+```
+bstore_kv_final                  │  tp_osd_tp (shard worker)
+                                 │
+#16 _txc_committed_kv  :14952    │
+    └► ch->commit_queue          │
+        ->queue(txc->oncommits)  │
+                       :14960    │  the shard dequeues and runs:
+       = the OSD shard's         │
+         context_queue           │  C_OSD_OnOpCommit           RB:354
+         (wired: OSD.cc:5399)    │  └► op_commit               RB:681
+                                 │     waiting_for_commit now empty
+                                 │     └► on_commit->complete()
+                                 │        = C_OSD_RepopCommit  PLP:11609
+                                 │        └► repop_all_committed :11620
+                                 │           └► eval_repop       :11647
+                                 │              runs repop->on_committed:
+                                 │              the lambda registered by
+                                 │              execute_ctx        :4473
+                                 │              └► send_message_osd_client(
+                                 │                   reply, ...)    :4483
+                                 │                 mark_commit_sent  :4485
+```
+
+Reading it backwards: the reply-sending code is a **lambda that
+`execute_ctx` registered on the OpContext before the write was even
+submitted** (`ctx->register_on_commit`, PLP:4473 — §3.3's line #1 is
+downstream of that same `execute_ctx`). BlueStore collected the
+transaction's contexts in `queue_transactions` (:15988), and the OSD
+had put `C_OSD_OnOpCommit` among them in
+`ReplicatedBackend::submit_transaction` (RB:668). The commit
+notification retraces the submission chain in reverse: backend →
+repop → OpContext lambda → messenger.
+
+Three details worth noticing:
+
+* the callbacks do not run on a BlueStore finisher — `OSD.cc:5399`
+  points every collection's `commit_queue` at its **op shard's
+  `context_queue`**, so the reply is sent from `tp_osd_tp` with normal
+  shard/PG context. #16 on `bstore_kv_final` is only the enqueue;
+* the lambda's last act is `ctx->op->mark_commit_sent()` (PLP:4485) —
+  precisely the op tracker's `commit_sent` event, which §1.5 measured
+  41 µs after `op_commit`: the cost of this whole chain plus one
+  thread hop;
+* with `size > 1` this is also where replication would converge:
+  `op_commit` (RB:681) completes the repop only when
+  `waiting_for_commit` is empty — the local BlueStore commit and every
+  peer ack are just entries in that set. On this single-OSD lab the
+  set empties immediately.
+
 ## 3.7 The first write into a PG
 
 The very first write into each pg staged three `P` records, not two:
