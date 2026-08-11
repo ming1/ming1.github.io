@@ -110,32 +110,30 @@ uprobe:$1:_ZN9BlueStore*_txc_committed_kvE*
 
 
 /* ---- OSD-level op span (op_w_latency's territory) -------------------- */
-/* OSD::ms_fast_dispatch(Message*) -- op arrives from the messenger.
- * Together with log_op_stats below this reproduces the OSD's
- * op_w_latency counter minus only the pre-dispatch microseconds
- * (message throttle + payload read, = op_before_queue_op_lat):
- * validated at 4030 us probe vs 4072 us counter over 82k ops. */
-uprobe:$1:_ZN3OSD16ms_fast_dispatchE*
-{ @oparr[arg1] = nsecs; }
+/* OpTracker::create_request<OpRequest, Message*> (return) -- the op
+ * enters request tracking, microseconds after ms_fast_dispatch.
+ * OpRequestRef (a boost::intrusive_ptr) is returned via the Itanium
+ * sret convention: retval holds the return-slot address and its
+ * first eight bytes are the OpRequest* -- an ABI-derived key, no
+ * struct offsets, nothing to re-derive per build. */
+uretprobe:$1:_ZN9OpTracker14create_request*
+{ @req_start[*(uint64*)retval] = nsecs; }
 
-/* PrimaryLogPG::log_op_stats(OpRequest&,..) -- called from the same
- * register_on_commit lambda that sends the client reply, i.e. the
- * exact endpoint of op_w_latency.  OpRequest::request (a Message*)
- * lives at offset 408 in this build -- re-derive per build with:
- *   gdb -batch -ex "ptype /o OpRequest" bin/ceph-osd | grep request
- * Covers every logged op (reads and rw class ops too, matching
- * l_osd_op_lat; on a write-only workload it equals op_w_latency).
- * Messages that never reach log_op_stats (replica ops) leave stale
- * @oparr entries; harmless on a single OSD, cleared at END. */
+/* PrimaryLogPG::log_op_stats(const OpRequest&, uint64 inb, uint64
+ * outb) -- the exact endpoint of the osd's op_w/op_r latency
+ * counters (two call sites: the write commit lambda and
+ * complete_read_ctx, each just before the reply send); arg1 is the
+ * same OpRequest* that create_request returned.  Covers every
+ * successfully replied op, reads included (equals op_w_latency on a
+ * write-only workload).  Error paths bypass log_op_stats, so their
+ * entries go stale; cleared at END. */
 uprobe:$1:_ZN12PrimaryLogPG12log_op_statsE*
+/@req_start[arg1]/
 {
-  $m = *(uint64*)(arg1 + 408);
-  if (@oparr[$m]) {
-    @osd_op_us  = hist((nsecs - @oparr[$m]) / 1000);
-    @sum_osdop += (nsecs - @oparr[$m]) / 1000;
-    @osdn++;
-    delete(@oparr[$m]);
-  }
+  @osd_op_us  = hist((nsecs - @req_start[arg1]) / 1000);
+  @sum_osdop += (nsecs - @req_start[arg1]) / 1000;
+  @osdn++;
+  delete(@req_start[arg1]);
 }
 
 END
@@ -153,10 +151,10 @@ END
   clear(@n); clear(@sum_prep); clear(@sum_dio); clear(@sum_kvq); clear(@sum_kvc); clear(@sum_client);
   $on = (uint64)@osdn;
   if ($on > 0) {
-    printf("%lld osd ops, avg dispatch -> commit cb (~op_w_latency): %lld us\n",
+    printf("%lld osd ops, avg create_request -> log_op_stats (~op_w_latency): %lld us\n",
            $on, @sum_osdop / $on);
   }
-  clear(@osdn); clear(@sum_osdop); clear(@oparr);
+  clear(@osdn); clear(@sum_osdop); clear(@req_start);
 
   /* print in pipeline order, then clear so exit does not re-print them
    * (client_us last: queue_transactions -> kv committed, us) */

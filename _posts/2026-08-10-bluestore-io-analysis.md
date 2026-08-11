@@ -578,6 +578,8 @@ boundaries §1 walked:
 | `BlueFS::fsync` | RocksDB → BlueFS (§1.7) |
 | `KernelDevice::aio_write` / `flush` | → NVMe (§1.8) |
 | `BlueStore::_txc_{state_proc,finish_io,apply_kv,committed_kv,finish}` | txc state machine (§1.6.2) |
+| `OpTracker::create_request` (return) | the op enters request tracking (§2.4, §2.5) |
+| `PrimaryLogPG::log_op_stats` | op accounted, reply leaving — `op_w/op_r_latency`'s endpoint (§2.4, §2.5) |
 
 Three implementation details make the scripts work, all documented in their
 headers:
@@ -613,7 +615,13 @@ headers:
   (arg1 — arg0 is `this`), which is a free per-IO correlation key;
 * the two struct offsets peeked at (`bufferlist::_len` at +24, `std::string`
   data/size at +0/+8) come from `gdb -batch -ex "ptype /o ..."` on the
-  binary's own debug info, not from guessing.
+  binary's own debug info, not from guessing;
+* op-level correlation needs no offsets at all: `create_request`
+  returns `OpRequestRef` (a one-pointer `intrusive_ptr`) via the
+  Itanium **sret** convention, so at its uretprobe `retval` holds the
+  return-slot address and the first eight bytes are the `OpRequest*` —
+  the same pointer `log_op_stats` later receives as `arg1`. An
+  ABI-derived key: nothing to re-derive on any build.
 
 The binary path is not hard-coded: every probe uses bpftrace's positional
 parameter `$1`, so the path to `ceph-osd` is passed on the command line
@@ -781,14 +789,35 @@ client-visible total. Three direct and three deferred writes in one run
 (deferred enabled mid-run via `bluestore_prefer_deferred_size 32768`):
 
 ```
-6 txcs, avg [us]: prep 209 + data_io 1061 + kv_queued 3828 + kv_commit 7397
+6 txcs, avg [us]: prep 314 + data_io 1374 + kv_queued 2721 + kv_commit 15560 = client 19985
+6 osd ops, avg create_request -> log_op_stats (~op_w_latency): 20733 us
 
-@prep_us:       [128, 256) 6
-@data_io_us:    [4, 8) 3        [1K, 2K) 2  [2K, 4K) 1    <- deferred | direct
-@kv_queued_us:  [16, 128) 3     [4K, 8K) 2  [8K, 16K) 1   <- deferred | direct
-@kv_commit_us:  [4K, 8K) 5  [8K, 16K) 1
-@client_us:     [4K, 8K) 1  [8K, 16K) 4  [16K, 32K) 1
+@prep_us:       [256, 512) 6
+@data_io_us:    [2, 4) 1  [4, 8) 2       [1K, 2K) 1  [2K, 4K) 2   <- deferred | direct
+@kv_queued_us:  [32, 64) 1  [64, 128) 2  [4K, 8K) 3               <- deferred | direct
+@kv_commit_us:  [4K, 8K) 1  [8K, 16K) 1  [16K, 32K) 4
+@client_us:     [4K, 8K) 1  [8K, 16K) 1  [16K, 32K) 4
+@osd_op_us:     [4K, 8K) 1  [8K, 16K) 1  [16K, 32K) 4
 ```
+
+(A slow-device day on this lab inflated kv_commit — read the
+structure, not the absolutes.) The `= client` figure is measured
+directly per txc (birth → `_txc_committed_kv`), not derived from the
+stages — the printed stage sum doubles as a built-in self-check, and
+the two agree up to integer truncation.
+
+**The second line is the OSD-level span**, wrapping the BlueStore one:
+`OpTracker::create_request` (the op enters tracking, µs after the
+messenger hands it over) to `PrimaryLogPG::log_op_stats` (the op is
+accounted, in the same breath its reply is sent — the exact endpoint
+of the `op_w_latency` counter, which is how this line was validated
+to ~1%). Correlation is by the `OpRequest*` from `create_request`'s
+sret return (§2.1) — no struct offsets. `osd_op − client` is the OSD's
+own overhead around BlueStore: dispatch, `execute_ctx`, and the
+commit-callback hop (748 µs in this capture, Debug build). One
+caveat inherited from the endpoint: `log_op_stats` fires only for
+successful ops, so error paths are absent from this line. §2.5's
+oplat.bt is this pairing distilled into a standalone tool.
 
 The mixed run is legible in exactly two places, and they say different
 things. `@data_io_us` is bimodal: direct writes pay the device —
@@ -806,8 +835,8 @@ kv_commit is the WAL fsync barrier. Per-transaction lines are available
 for low-rate runs with `bpftrace wlat.bt -- bin/ceph-osd --per-txc`:
 
 ```
-0x558c57236700    14469 = 841 + 2602 + 4469 + 6536   <- direct
-0x558c57491c00     7460 = 221 +    3 +   40 + 7186   <- deferred
+0x55896dd8ca80    25286 = 307 + 1952 + 4767 + 18235   <- direct
+0x55896529ea80     7381 = 363 +    4 +   72 +  6922   <- deferred
 ```
 
 Two reporting subtleties the script encodes: each txc is recorded at
@@ -815,6 +844,40 @@ Two reporting subtleties the script encodes: each txc is recorded at
 reply fires — and because a deferred txc's `_txc_finish` lags until the
 next kv cycle retires its replay, which is background cost, not client
 latency.
+
+## 2.5 Request mode — oplat.bt
+
+```bash
+bpftrace oplat.bt bin/ceph-osd   # run workload, Ctrl-C for the report
+```
+
+The whole tool is **two probes and one key**: `create_request`'s
+uretprobe stamps the start under the `OpRequest*` (the sret trick of
+§2.1), and `log_op_stats` — receiving the same pointer as `arg1` —
+closes the span at the counters' own endpoint. Classification costs
+nothing: `log_op_stats(op, inb, outb)` carries bytes written and read
+as arguments, so `inb>0` is a write, `outb>0` a read, `0/0` "other"
+(lock/watch/class ops). No struct offsets anywhere.
+
+A validation run against fio (rbd engine, 4 KiB, iodepth 4, write
+test then read test under one oplat session):
+
+```
+3234 writes, avg request latency: 17634 us     fio: 3241 issued, clat 18.5 ms
+132256 reads,  avg request latency:  330 us     fio: 132474 issued, clat 449 us
+18 other,  avg request latency: 4796 us
+```
+
+Counts agree to 99.8% on both populations and the deltas are the
+client side (librbd + both wire crossings), consistent with §5.1's
+timeline. The span is queue-inclusive — `create_request` sits before
+the mclock queue — which is why reads show their full cost here.
+
+Two caveats, both inherited from the endpoint: only *successful* ops
+reach `log_op_stats` (the write-error path and failed reads bypass
+it), so counts mean "successful client ops"; and on a multi-OSD
+cluster, replica ops create tracked requests that never reach a
+primary's `log_op_stats` — their stale entries are cleared at END.
 
 # 3. Case study: one 16 KiB write
 
