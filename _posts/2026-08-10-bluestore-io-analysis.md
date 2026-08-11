@@ -1114,6 +1114,71 @@ why §2.4's wlat.bt records at `_txc_committed_kv`, not `_txc_finish`.
 (`_txc_create` has one other caller: `_deferred_replay` at mount,
 rebuilding txcs for L records that survived a crash.)
 
+### 4.1.2 OpSequencer — per-collection ordering, and the txc's queue
+
+[`BlueStore.h:2231`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2231)
+
+**Purpose.** One per collection (`Collection::osr`) — the object that
+keeps a PG's txcs *ordered* while four threads process them in
+parallel, and the rendezvous point for anyone who must wait for them:
+
+```
+class OpSequencer : RefCountedObject             BlueStore.h:2231
+  qlock, qcond      guard/wake for everything below
+  q                 the in-flight txcs, IN SUBMISSION ORDER — an
+                    intrusive list threaded through the txc's own
+                    sequencer_item hook: the txc IS the list node,
+                    queueing allocates nothing
+  deferred_pending, deferred_running, deferred_lock
+                    this collection's deferred replay batches
+  txc_with_unstable_io, kv_committing_serially    ordering counters
+  zombie            collection deleted, osr still draining
+  drain()/flush()/drain_preceding()   wait on qcond until q empties /
+                                      all txcs reach KV_SUBMITTED
+```
+
+Its ordering job is easiest to see in `_txc_finish_io` (`:14753`): data
+aios complete in device order, not submission order, so the completion
+walks `q` under `qlock` and only advances txcs from the front — a txc
+whose predecessor is still writing waits in IO_DONE. That is how
+commits within a PG never reorder even though the device may.
+
+**Which threads use it.** Everyone, which is why it has real locks
+where the txc has none:
+
+| Thread | Touch |
+|---|---|
+| `tp_osd_tp` | `queue_new` at txc create; `flush()`/`drain()` in collection ops; `deferred_lock` when queueing deferred payloads |
+| `bstore_aio` | `_txc_finish_io` walks `q` under `qlock` to advance in order |
+| `bstore_kv_sync` | reads/decrements the ordering counters per batch |
+| `bstore_kv_final` | pops `q`, `qcond.notify_all` for flush/drain waiters, reaps zombies |
+| deferred kickers (mempool trim, drains, throttled submitters — whoever calls `deferred_try_submit`, §4.2.8) | `deferred_lock`, `deferred_pending`/`running` |
+
+**Lifetime.** Refcounted, and deliberately able to outlive its
+collection:
+
+```
+collection opened / created
+  _osr_attach                          :15094   new OpSequencer — or the
+   │                                            zombie for the same cid,
+   │                                            so ordering survives a
+   │                                            remove+recreate
+  lives as c->osr; every txc passes through q
+   │
+collection removed
+  _osr_register_zombie                 :15120   zombie = true, parked in
+   │                                            zombie_osr_set; in-flight
+   │                                            txcs keep draining
+last txc's _txc_finish                 :15062   erased from zombie_osr_set
+   │
+refcount → 0 → freed        (_osr_drain_all :15197 sweeps zombies too)
+```
+
+The zombie mechanism is the subtle part: a PG can be deleted while its
+last writes are still in the kv pipeline, and a *new* collection with
+the same cid must not start ordering from scratch ahead of them —
+reattaching the zombie (`:15105-15112`) closes that window.
+
 ## 4.2 Function reference
 
 The functions doing the heavy lifting above, in the order a write
