@@ -1233,6 +1233,82 @@ last writes are still in the kv pipeline, and a *new* collection with
 the same cid must not start ordering from scratch ahead of them —
 reattaching the zombie (`:15105-15112`) closes that window.
 
+### 4.1.3 OpContext — the op above the txc
+
+[`PrimaryLogPG.h:680`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.h#L680)
+— one layer up from BlueStore: where §4.1.1's txc carries one
+*transaction*, `PrimaryLogPG::OpContext` carries one *client op* — the
+`writefull` of §1.4 — from decode to reply. The layering is:
+
+```
+OpContext        client-op semantics: ops → transaction + reply
+  └► RepGather   replication tracking (local commit + replica acks)
+       └► ObjectStore::Transaction ──► TransContext (§4.1.1)
+```
+
+**Purpose.** Everything the op accumulates while being interpreted:
+
+```
+struct OpContext                            PrimaryLogPG.h:680
+  op                the tracked client request (MOSDOp)
+  obc               the object's in-memory context + rw locks
+  new_obs, new_snapset    the SPECULATIVE object state this op
+                    produces — applied in memory before commit
+  op_t              the PGTransaction do_osd_ops fills, later
+                    encoded into the ObjectStore::Transaction
+  reply, sent_reply the pre-built MOSDOpReply and its latch
+  on_committed, on_success, on_finish     the op's completion
+                    program, registered during execute_ctx
+  bytes_written / bytes_read, delta_stats   accounting
+```
+
+The three callback lists are the whole design: `execute_ctx` does not
+*send* a reply for a write — it **registers** the reply as an
+`on_committed` lambda (`PrimaryLogPG.cc:4473`: add `ONDISK`, send,
+`mark_commit_sent`) and the cleanup as `on_finish` (`:4497`,
+`delete ctx`), then submits. The op's future is data, stored in the op
+itself.
+
+**Which threads use it.**
+
+| Thread | Touch |
+|---|---|
+| `tp_osd_tp` | creates it in `do_op` (`:2500`), runs `do_osd_ops`, submits; a *read* completes here inline (`complete_read_ctx`) and the ctx dies without ever leaving the thread |
+| `bstore_kv_final` | at txc commit (§3 line #16), `BlessedContext` re-takes the PG lock and `eval_repop` runs `on_committed` — the reply leaves from this thread |
+| messenger workers | with replicas, the last `MOSDRepOpReply` ack can be what drives `eval_repop` — completion then runs on a msgr thread instead |
+
+Like the txc, the OpContext has no lock of its own — but for the
+opposite reason: every touch happens under the **PG lock** (held by
+`do_op`, re-taken by `BlessedContext`), not via exclusive handoff. What
+it does hold is the object's rw locks (`obc`, via `get_rw_locks`,
+`:954`), which is what serializes ops *per object* on top of the PG.
+
+**Lifetime.**
+
+```
+do_op: new OpContext                        PrimaryLogPG.cc:2500
+   │     get_rw_locks, execute_ctx: do_osd_ops fills op_t,
+   │     new_obs applied in memory, reply pre-built,
+   │     callbacks registered
+   │
+   ├─ read ──► reply + delete inline, same thread
+   │
+   └─ write ─► handed to a RepGather → issue_repop →
+               queue_transactions ... (the whole of §3) ...
+                   │
+               txc commits → on_committed → reply     (#16)
+                   │  (+ replica acks, if any)
+               eval_repop → remove_repop              :11792
+                   → rw locks released, on_finish → delete ctx
+```
+
+The gap between "reply sent" (`on_committed`) and "ctx deleted"
+(`on_finish`, at `remove_repop`) mirrors the txc's #16/#17 split one
+layer up — and on error paths the same teardown runs early via
+`close_op_ctx` (`:2522`), which is why the completion program lives in
+lists on the ctx rather than in code after the submit: whoever ends the
+op, the same callbacks run.
+
 ## 4.2 Function reference
 
 The functions doing the heavy lifting above, in the order a write
