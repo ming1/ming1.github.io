@@ -93,6 +93,7 @@ uprobe:$1:_ZN9BlueStore*_txc_committed_kvE*
   @kv_queued_us = hist(@kvq[arg1]);
   @kv_commit_us = hist($kvc);
   @client_us    = hist((nsecs - @birth[arg1]) / 1000);
+  @sum_client  += (nsecs - @birth[arg1]) / 1000;
   @n++;
   @sum_prep += @prep[arg1];
   @sum_dio  += @dio[arg1];
@@ -113,10 +114,13 @@ END
   clear(@last); clear(@pertxc);
   $n = (uint64)@n;
   if ($n > 0) {
-    printf("\n%lld txcs, avg [us]: prep %lld + data_io %lld + kv_queued %lld + kv_commit %lld\n",
-           $n, @sum_prep / $n, @sum_dio / $n, @sum_kvq / $n, @sum_kvc / $n);
+    printf("\n%lld txcs, avg [us]: prep %lld + data_io %lld + kv_queued %lld + kv_commit %lld = client %lld\n",
+           $n, @sum_prep / $n, @sum_dio / $n, @sum_kvq / $n, @sum_kvc / $n,
+           @sum_client / $n);   /* client measured directly: birth -> committed_kv,
+                                   not the stage sum -- if the two disagree beyond
+                                   rounding, the stage chain is broken */
   }
-  clear(@n); clear(@sum_prep); clear(@sum_dio); clear(@sum_kvq); clear(@sum_kvc);
+  clear(@n); clear(@sum_prep); clear(@sum_dio); clear(@sum_kvq); clear(@sum_kvc); clear(@sum_client);
   /* print in pipeline order, then clear so exit does not re-print them
    * (client_us last: queue_transactions -> kv committed, us) */
   print(@prep_us);      clear(@prep_us);
