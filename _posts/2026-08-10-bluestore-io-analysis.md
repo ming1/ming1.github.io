@@ -879,6 +879,69 @@ it), so counts mean "successful client ops"; and on a multi-OSD
 cluster, replica ops create tracked requests that never reach a
 primary's `log_op_stats` — their stale entries are cleared at END.
 
+**Where the two probes sit** — bpftrace's frame-pointer walker
+truncates stacks on this build (§2.3), but `perf` can sit uprobes on
+the same two symbols and unwind with DWARF, which needs no frame
+pointers:
+
+```bash
+perf probe -x bin/ceph-osd --add 'oplat_create=<mangled create_request>'
+perf probe -x bin/ceph-osd --add 'oplat_logstats=<mangled log_op_stats>'
+perf record -e 'probe_ceph:*' --call-graph dwarf -p $(pgrep ceph-osd) -- sleep 8
+perf script          # then: perf probe --del 'probe_ceph:*'
+```
+
+The captured stacks, intact. `create_request` fires on the
+**msgr-worker** thread, straight off the wire:
+
+```
+OpTracker::create_request<OpRequest, Message*>
+OSD::ms_fast_dispatch
+Dispatcher::ms_fast_dispatch2
+Messenger::ms_fast_dispatch
+DispatchQueue::fast_dispatch
+ProtocolV2::handle_message              <- frame fully read off the socket
+ProtocolV2::handle_read_frame_dispatch
+  ... (ProtocolV2 continuation machinery, msgr event loop)
+```
+
+`log_op_stats` has two arrival stacks, both on a **tp_osd_tp** shard
+worker. The write stack is §3.6's reply chain, captured live, frame
+for frame:
+
+```
+PrimaryLogPG::log_op_stats
+PrimaryLogPG::execute_ctx::{lambda()#1}::operator()   <- register_on_commit (:4473)
+PrimaryLogPG::eval_repop
+PrimaryLogPG::repop_all_committed
+C_OSD_RepopCommit::finish
+ReplicatedBackend::op_commit
+C_OSD_OnOpCommit::finish
+PrimaryLogPG::BlessedContext::finish
+OSD::ShardedOpWQ::handle_oncommits       <- the commit_queue drain (OSD.cc:5399)
+OSD::ShardedOpWQ::_process
+ShardedThreadPool::shardedthreadpool_worker
+```
+
+and the read stack is the entire synchronous read pipeline in one
+call chain:
+
+```
+PrimaryLogPG::log_op_stats
+PrimaryLogPG::complete_read_ctx          <- (:9367)
+PrimaryLogPG::execute_ctx
+PrimaryLogPG::do_op_impl / do_op / do_request
+OSD::dequeue_op
+ceph::osd::scheduler::OpSchedulerItem::run   <- out of the mclock queue
+OSD::ShardedOpWQ::_process
+ShardedThreadPool::shardedthreadpool_worker
+```
+
+A separate bpftrace `@[ustack] = count()` run under mixed load put
+numbers on the split: 590 write-stack hits + 20 431 read-stack hits =
+21 021 `create_request` hits exactly — one entry point, two exits,
+zero requests unaccounted.
+
 # 3. Case study: one 16 KiB write
 
 This section takes one 16 KiB write on a freshly rebuilt lab (§1.1
