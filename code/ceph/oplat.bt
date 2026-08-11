@@ -1,0 +1,81 @@
+#!/usr/bin/env bpftrace
+/*
+ * oplat.bt -- OSD request latency (reads, writes, other), tracked by
+ * OpRequestRef.  Two probes, no struct offsets.
+ *
+ * Usage:  bpftrace oplat.bt <path-to-ceph-osd>
+ *         run workload, Ctrl-C for the report.
+ *
+ * Span: OpTracker::create_request (the op enters request tracking,
+ * microseconds after ms_fast_dispatch) -> PrimaryLogPG::log_op_stats
+ * (the op is accounted, in the same breath the reply is sent: from
+ * the commit lambda for writes, from complete_read_ctx for reads).
+ * log_op_stats is the exact endpoint of the osd's op_w_latency /
+ * op_r_latency counters, so this span equals those counters minus
+ * only the pre-tracking head (message throttle+read, ~tens of us).
+ *
+ * Correlation is one key, ABI-derived, zero struct offsets:
+ * create_request returns OpRequestRef (a boost::intrusive_ptr, i.e.
+ * one pointer) via the Itanium sret convention -- at the uretprobe,
+ * retval holds the return slot address and its first 8 bytes are the
+ * OpRequest*.  log_op_stats receives that same OpRequest* as arg1.
+ * Classification also needs no probes: log_op_stats(op, inb, outb)
+ * -- inb (arg2) = bytes written, outb (arg3) = bytes read.
+ * Metadata-only ops (0/0, e.g. object-map class calls) count as
+ * "other".
+ *
+ * Ops that never reach log_op_stats (failed ops, replica ops on a
+ * multi-OSD cluster) leave stale entries, cleared at END.
+ */
+
+BEGIN
+{ printf("oplat: tracking OpRequest create -> log_op_stats... Ctrl-C for report\n"); }
+
+/* OpTracker::create_request<OpRequest, Message*> (return) --
+ * the OpRequest exists; start its clock */
+uretprobe:$1:_ZN9OpTracker14create_request*
+{ @req_start[*(uint64*)retval] = nsecs; }
+
+/* PrimaryLogPG::log_op_stats(const OpRequest&, uint64 inb, uint64 outb) */
+uprobe:$1:_ZN12PrimaryLogPG12log_op_statsE*
+/@req_start[arg1]/
+{
+  $lat_us = (nsecs - @req_start[arg1]) / 1000;
+  if (arg2 > 0) {
+    @write_us = hist($lat_us);
+    @sum_write_us += $lat_us;  @n_writes++;
+  } else if (arg3 > 0) {
+    @read_us = hist($lat_us);
+    @sum_read_us += $lat_us;   @n_reads++;
+  } else {
+    @other_us = hist($lat_us);
+    @sum_other_us += $lat_us;  @n_other++;
+  }
+  delete(@req_start[arg1]);
+}
+
+END
+{
+  clear(@req_start);
+  $writes = (uint64)@n_writes;
+  $reads  = (uint64)@n_reads;
+  $other  = (uint64)@n_other;
+  if ($writes > 0) {
+    printf("\n%lld writes, avg request latency: %lld us\n",
+           $writes, @sum_write_us / $writes);
+  }
+  if ($reads > 0) {
+    printf("%lld reads,  avg request latency: %lld us\n",
+           $reads, @sum_read_us / $reads);
+  }
+  if ($other > 0) {
+    printf("%lld other,  avg request latency: %lld us\n",
+           $other, @sum_other_us / $other);
+  }
+  clear(@n_writes); clear(@sum_write_us);
+  clear(@n_reads);  clear(@sum_read_us);
+  clear(@n_other);  clear(@sum_other_us);
+  print(@write_us); clear(@write_us);
+  print(@read_us);  clear(@read_us);
+  print(@other_us); clear(@other_us);
+}
