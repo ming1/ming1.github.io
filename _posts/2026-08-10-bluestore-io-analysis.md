@@ -885,8 +885,12 @@ the same two symbols and unwind with DWARF, which needs no frame
 pointers:
 
 ```bash
-perf probe -x bin/ceph-osd --add 'oplat_create=<mangled create_request>'
-perf probe -x bin/ceph-osd --add 'oplat_logstats=<mangled log_op_stats>'
+B=bin/ceph-osd
+# create_request is a template instantiation => WEAK (W) symbol, not T
+CRT=$(nm $B | awk '/ [TW] _ZN9OpTracker14create_request/{print $3; exit}')
+LOG=$(nm $B | awk '/ [TW] _ZN12PrimaryLogPG12log_op_statsE/{print $3; exit}')
+perf probe --del 'probe_ceph:*' 2>/dev/null    # retries fail on leftovers
+perf probe -x $B --add "oplat_create=$CRT" --add "oplat_logstats=$LOG"
 perf record -e 'probe_ceph:*' --call-graph dwarf -p $(pgrep ceph-osd) -- sleep 8
 perf script          # then: perf probe --del 'probe_ceph:*'
 ```
