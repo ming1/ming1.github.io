@@ -252,3 +252,73 @@ the new version; the option only affects newly created WAL files).
   invariant caused the bug, but the same mutability gave a deterministic
   x86 reproducer, which is what made red/green verification possible on
   every machine involved.
+
+## 1.9 Appendix — code paths under the reproducer
+
+The test workload is `many_small_writes()` (append a 4076/4077-byte chunk,
+`fsync`, repeat to 256K), a remount, then `many_small_reads()` with the same
+rhythm. Three panels, one per phase; the skipped journal flush in the first
+panel is envelope mode's entire reason to exist.
+
+Indentation is call depth; the lone `│` separates workload phases.
+
+**Write — append + fsync per chunk:**
+
+```
+many_small_writes           append 4076/4077 B, fsync, repeat to 256K
+   │
+open_for_write              WAL dir + conf ⇒ envelope mode
+  _create_writer            page-aligned appender; stamp = f(uuid, ino)
+   │
+append_try_flush            per chunk
+  append_hole(8)            buffer empty ⇒ reserve envelope head
+                            ★ the #79141 alignment assert
+  h->append                 copy into page-aligned chunks
+                            (4 KB < min_flush_size ⇒ no early flush)
+   │
+fsync → _fsync              per chunk
+  _flush_envelope_F         append 8 B stamp; patch length into the
+                            reserved head (contiguous_filler)
+    _flush_range_F          allocate extents on first need
+      flush_buffer          pad to 4K, splice out, keep dup tail,
+                            clear() if the next head would not fit
+      KernelDevice          aio_write, O_DIRECT
+  _flush_bdev               device flush              (fdatasync #1)
+  _flush_and_sync_log_LD    only if extents changed: journal
+                            op_file_update_inc + flush (fdatasync #2 —
+                            SKIPPED for pure content growth: the whole
+                            point of envelope mode)
+```
+
+**Remount — sizes rebuilt from data, not journal:**
+
+```
+mount → _replay             journal restores extents, NOT sizes
+  _envmode_index_file       walk the file end to end
+    _read_envelope          read 8 B head → skip len → verify 8 B stamp;
+                            append {content_off, file_off, len} to
+                            envelopes[]; bad stamp ⇒ torn tail discarded;
+                            content_size / size := scan results
+```
+
+**Read — content offsets in, translated reads out:**
+
+```
+many_small_reads            read 4076/4077 B at content offsets
+   │
+open_for_read               FileReader (indexes file if needed)
+   │
+read(h, off, len)           per chunk; off/len are CONTENT offsets
+  _read_envmode             dispatch: envelope files only (BlueFS.h)
+    _envmode_seek_to        envelopes[] walk: content off → envelope +
+                            bytes left inside it
+    _read                   file_off = env.file_off + 8 + (off −
+                            env.content_off); one call per envelope
+                            crossed — 16 B stamp+head hopped invisibly
+      FileReaderBuffer      miss: fnode.seek() → extent
+        _bdev_read          read rounded + prefetch, serve the slice
+```
+
+The final `ASSERT_EQ(content, read_content)` closes the loop: header
+patching, padding, journal-less size recovery, and offset translation all
+have to agree byte-for-byte for the two 256K streams to match.
