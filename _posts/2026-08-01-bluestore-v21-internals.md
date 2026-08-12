@@ -3478,6 +3478,117 @@ CLEAR:                 BlueFS.cc:4480    in _fsync    right after signaling
 
 ## 6.10 Interfaces
 
+### BlueFS::append_try_flush
+
+The data-ingest interface of BlueFS (`BlueFS.cc:4230`): every byte rocksdb
+writes — WAL, SSTs, MANIFEST — enters through this one function via
+`BlueRocksWritableFile::Append`. It appends into the FileWriter's buffer
+and flushes opportunistically (the "try"): data moves toward the device
+only once the buffer crosses `bluefs_min_flush_size`. Key points:
+
+- Structure is a buffer-then-maybe-flush loop (`:4242`): append up to a
+  1 GiB buffer cap (`:4241`); when `get_buffer_length() >=
+  bluefs_min_flush_size` (`:4250`), call `_flush_F(h, force=true)`
+  (`:4254`) — force, because the threshold decision was already made
+  here. If the cap is hit the iteration flushes *without* appending
+  first, and the progress assert (`:4259`) guarantees the loop
+  terminates.
+- Flush is not sync: `_flush_F` stages the data write (allocating and
+  SETting `File::is_dirty` via `_flush_range_F` — see that map) but no
+  fnode/journal durability happens here; that is the fsync interfaces'
+  job. An OSD crash after append_try_flush returns can lose everything
+  it appended.
+- Envelope mode (`:4235`): the first append into an empty buffer
+  reserves the record head via `append_hole(head_size)`, to be patched
+  by `_flush_envelope_F` framing later. The assert at `:4239`
+  (`p2aligned(pos1 ^ pos2, CEPH_PAGE_SIZE)`) pins the contract that
+  makes the patch legal: the filler's memory address and its file
+  position must agree modulo the page size — the O_DIRECT alignment
+  invariant.
+- Post-flush hook (`:4264`): if anything actually flushed,
+  `_maybe_compact_log_LNF_NF_LD_D()` runs after `h->lock` is dropped —
+  append traffic is what grows the journal, so the compaction check
+  rides on the ingest path (this is the edge in the jump_D tree below).
+- Locks: the whole append+flush loop runs under `h->lock` (`:4234`) —
+  one writer per file, serialized; log/dirty locks are only reached
+  downstream if a flush or compaction triggers (`_WF_LNF_NF_LD_D`).
+
+```
+BlueFS::append_try_flush                 [public]     BlueFS.cc:4230
+  BlueRocksWritableFile::Append          [rocksdb boundary]  BlueRocksEnv.cc:198  (driver: every rocksdb WAL/SST/MANIFEST write)
+  BlueFS::revert_wal_to_plain(dir,file)  [private]    BlueFS.cc:2398 (call :2419)  (envelope-WAL -> plain copy loop)
+    BlueFS::revert_wal_to_plain()        [public]     BlueFS.cc:2433
+      BlueStore::revert_wal_to_plain     -> (see BlueFS::revert_wal_to_plain())
+
+Tests and debug-injection callers (kept out of the main tree):
+
+BlueFS::append_try_flush  <- test_bluefs.cc:298,970,1049,1138,1585; store_test.cc:12593
+
+Not on any path: BlueRocksWritableFile::PositionedAppend (returns
+NotSupported, BlueRocksEnv.cc:205); BlueFS::flush / flush_range (drain
+the buffer this function fills, never append to it);
+FileWriter::append(bufferlist&) (internal-only overload used by the
+log writer (ino 1), not this interface).
+```
+
+### BlueFS::revert_wal_to_plain()
+
+The envelope-mode escape hatch (`BlueFS.cc:2433`): converts every
+envelope-encoded WAL file back to plain encoding so a store written
+with `bluefs_wal_envelope_mode = true` can be handed to code without
+envelope support. Offline-only by design — reached exclusively through
+`ceph-bluestore-tool revert-wal-to-plain` on an unmounted store. Key
+points:
+
+- The public overload orchestrates: only `db.wal` is scanned (`:2435`);
+  the dir's `file_map` is copied before iterating (`:2443` — the
+  conversions mutate the map underneath); each envelope file is
+  converted (`:2446`) and `sync_metadata(true)` (`:2447`) flushes the
+  journal per file — the `true` is `avoid_compact`, suppressing the
+  trailing compaction check, not a force flag. Then the runtime switch flips
+  (`conf_wal_envelope_mode = false`, `:2454`), `_compact_log_sync_LNF_LD`
+  (`:2456`) rewrites the journal so no envelope-mode records linger in
+  old transactions — asserted by `!log.uses_envelope_mode` (`:2457`) —
+  and `_write_super(BDEV_DB)` (`:2458`) persists the post-revert state.
+- The per-file worker (`:2398`) is a copy machine: open a
+  `__tmp_name__.log` writer in the same dir and force its
+  `fnode.encoding = PLAIN` (`:2409`) so all writes take the legacy
+  path; read the envelope file through the normal `read()` — the
+  reader de-frames envelopes transparently, so what is copied is the
+  logical payload — in 1 MiB chunks into `append_try_flush` (`:2419`,
+  the edge in that entry's tree); `fsync` the copy (`:2423`),
+  `close_writer` (`:2427` — the `force_dirty=true` producer in the
+  `_fsync` map below), then a journaled `rename` (`:2428`) swaps the
+  copy over the original name.
+- Sharp edge: the swap is not guarded by the copy's success, and the
+  envelope reader suppresses errors on top. `_read_envmode` (`:2768`)
+  prefers returning the bytes it did read over any error (`:2813`),
+  and an invalid envelope just breaks its loop with `r` still `0`
+  (`:2790`) — indistinguishable from clean EOF. A corrupt WAL
+  envelope therefore takes the success path (`fsync` at `:2423`,
+  `rename` at `:2428`) and silently installs a truncated copy over
+  the original.
+- Flipping `bluefs_wal_envelope_mode = false` in config does NOT
+  convert anything — existing envelope files stay envelope-encoded and
+  are read via per-file `fnode.encoding`, not the flag. Conversion
+  happens only through this interface.
+
+```
+BlueFS::revert_wal_to_plain(dir,file)    [private]    BlueFS.cc:2398  (the per-file copy worker)
+  BlueFS::revert_wal_to_plain()          [public]     BlueFS.cc:2433 (call :2446)  cond: file->envelope_mode()
+    BlueStore::revert_wal_to_plain       [public]     BlueStore.cc:11046 (call :11052; cold_open -> bluefs -> cold_close)
+      ceph-bluestore-tool revert-wal-to-plain  [tool root]  bluestore_tool.cc:743
+
+Tests and debug-injection callers (kept out of the main tree):
+
+BlueFS::revert_wal_to_plain()  <- test_bluefs.cc:1144
+
+Not on any path: any mount-time caller — neither BlueStore::_mount nor
+BlueFS::mount auto-reverts (the census finds the tool as the sole
+production root); BlueFS::_compact_log_sync_LNF_LD / sync_metadata
+(appear inside the conversion, never drive it).
+```
+
 ### BlueFS::_fsync
 
 ```
