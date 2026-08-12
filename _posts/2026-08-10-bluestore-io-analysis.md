@@ -1601,6 +1601,40 @@ STATE_FINISHING    :14739  → _txc_finish, txc retired         bstore_kv_final
 `:14672`; taken by its caller `_txc_finish_io`, `:14763`);
 `_deferred_queue` takes the sequencer's `deferred_lock` (`:15650`).
 
+**Captured callers** — a perf uprobe on this function (§2.5's
+recipe), DWARF-unwound over a 182-write run: **728 samples, exactly
+four distinct stacks, exactly 182 hits each**. The state machine is
+entered precisely four times per direct-write txc, once per driver:
+
+```
+25%  tp_osd_tp        PREPARE — the initial kick, closing the whole
+                      submission chain in one unwind:
+     _txc_state_proc ← queue_transactions
+       ← ReplicatedBackend::submit_transaction ← issue_repop
+       ← execute_ctx ← do_op ← do_request ← dequeue_op
+       ← OpSchedulerItem::run (out of the mclock queue)
+
+25%  bstore_aio       AIO_WAIT — the data aio completed:
+     _txc_state_proc ← txc_aio_finish ← aio_cb
+       ← KernelDevice::_aio_thread
+
+25%  bstore_aio       IO_DONE — the recursion, photographed:
+     _txc_state_proc ← _txc_finish_io ← _txc_state_proc
+       ← txc_aio_finish ← aio_cb ← KernelDevice::_aio_thread
+
+25%  bstore_kv_final  KV_SUBMITTED → FINISHING → DONE:
+     _txc_state_proc ← _kv_finalize_thread
+```
+
+The third stack shows `_txc_state_proc` twice in one call chain —
+the AIO_WAIT case invoking `_txc_finish_io` (`:14735`), which
+re-enters the state machine for IO_DONE processing: the function's
+self-recursive structure, visible in the frames. And the perfect
+182 × 4 equality is an invariant the logs never stated this tightly:
+four entries per direct-write transaction, no more, no fewer. A
+deferred txc breaks the tie — it loses both `bstore_aio` entries
+(no data aio) and gains the deferred-path drivers instead.
+
 ### 4.2.6 submit_transaction_sync — make the transaction durable
 
 [`RocksDBStore.cc:1668`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/RocksDBStore.cc#L1668)
