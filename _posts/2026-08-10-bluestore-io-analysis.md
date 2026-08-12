@@ -563,6 +563,13 @@ script's banner line before starting the workload:
 | [`wtrace.bt`]({{ site.baseurl }}/code/ceph/wtrace.bt) | event log for a single IO | what happened, in order, on which thread |
 | [`wlat.bt`]({{ site.baseurl }}/code/ceph/wlat.bt) | per-stage latency histograms | where the milliseconds went |
 
+The same uprobe technique, packaged as a maintained tool, is
+[cephtrace](https://github.com/taodd/cephtrace/tree/main): its `radostrace`
+traces per-op latency from the librados client side and `osdtrace` breaks
+down OSD-internal latency, resolving struct offsets from DWARF at attach
+time so one binary works against any Ceph build ([PR #66573](https://github.com/ceph/ceph/pull/66573)
+is upstreaming it into the Ceph tree).
+
 ## 2.1 Probe points
 
 No kernel tracepoints exist for any of this, so all probes are **uprobes on
