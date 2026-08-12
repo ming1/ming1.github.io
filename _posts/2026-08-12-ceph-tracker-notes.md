@@ -322,3 +322,110 @@ read(h, off, len)           per chunk; off/len are CONTENT offsets
 The final `ASSERT_EQ(content, read_content)` closes the loop: header
 patching, padding, journal-less size recovery, and offset translation all
 have to agree byte-for-byte for the two 256K streams to match.
+
+# 2. ceph-bluestore-tool silently re-enables WAL envelope mode
+
+Status: analysis confirmed on the lab; tracker issue not filed yet —
+needs review and confirmation first. Found while validating the #79141
+workaround, prompted by Igor Fedotov's review comment.
+
+## 2.1 The problem in one paragraph
+
+Disabling WAL v2 envelope mode — the workaround for #79141, whether done
+via `ceph config set osd bluefs_wal_envelope_mode false` or via a
+ceph.conf edit — governs only the OSD daemon. `ceph-bluestore-tool` runs
+with its own config context that sees **neither** the mon config database
+**nor**, in its normal invocation, any config file at all. Any tool
+command that opens the store read-write (`repair`, `quick-fix`, …) opens
+RocksDB, RocksDB creates a fresh WAL file for the session, and the tool —
+believing the compiled default `bluefs_wal_envelope_mode=true` — creates
+it as an envelope file. One routine maintenance command silently undoes
+the operator's disable. On a big-page host still running an unfixed
+binary, the tool itself can abort mid-command with the #79141 assert.
+
+## 2.2 Mechanism
+
+Three pieces, each fine in isolation:
+
+- Envelope-ness is decided per file at creation: `open_for_write()` marks
+  a new `*.log` file `ENVELOPE` when the `conf_wal_envelope_mode` member
+  is set; the member is a one-time snapshot of the config option taken in
+  `BlueFS::mount()`.
+- `ceph-bluestore-tool` initializes with
+  `global_init(..., CODE_ENVIRONMENT_UTILITY,
+  CINIT_FLAG_NO_DEFAULT_CONFIG_FILE)` (when run without
+  `--osd-instance`, i.e. the form everyone uses). In `global_pre_init`
+  that flag *also* sets `no_mon_config = true` (global_init.cc):
+
+```
+  if (flags & (CINIT_FLAG_NO_DEFAULT_CONFIG_FILE |
+               CINIT_FLAG_NO_MON_CONFIG)) {
+    conf->no_mon_config = true;
+  }
+```
+
+  So the tool's config = compiled defaults + explicit `-c`/CLI overrides,
+  nothing else. This is deliberate for an offline tool — it must work
+  with the cluster down — but it means the operator's disable is
+  invisible to it.
+- Read-write tool commands open RocksDB, and a RW `DB::Open` creates a
+  new WAL file after recovery — through BlueRocksEnv, i.e. through the
+  tool's BlueFS with the tool's config snapshot.
+
+## 2.3 Reproduced on the lab
+
+4K-page x86 vstart cluster, single OSD on NVMe:
+
+```
+ceph config set osd bluefs_wal_envelope_mode false
+restart osd.0                     asok confirms "false"; new WALs plain
+stop osd.0
+ceph-bluestore-tool --path dev/osd0 --command revert-wal-to-plain
+                                  baseline: every WAL file plain
+ceph-bluestore-tool --path dev/osd0 --command repair
+                                  "repair success"
+bluefs-log-dump                   db.wal/000152.log (ino 141): ENVELOPE
+```
+
+The repair session's RocksDB created an envelope WAL despite the mon-DB
+disable — exactly the feared behavior. (The daemon-side half works as
+intended: the OSD does honor the mon-DB setting at startup.)
+
+## 2.4 Proposed fix
+
+Utilities should never *introduce* envelope files. In `BlueFS::mount()`,
+qualify the snapshot:
+
+```cpp
+conf_wal_envelope_mode =
+  cct->_conf.get_val<bool>("bluefs_wal_envelope_mode") &&
+  g_code_env == CODE_ENVIRONMENT_DAEMON;
+```
+
+The asymmetry is the point. Plain and envelope WAL files coexist freely
+(the read path handles both unconditionally), so a tool-created *plain*
+WAL on a healthy envelope cluster costs one file's optimization until the
+OSD's next WAL rotation — harmless. A tool-created *envelope* WAL on a
+cluster where the operator disabled the mode re-breaks the cluster. Tools
+should take the direction that is safe in both worlds. This also makes
+every tool command safe on big-page hosts running pre-fix binaries.
+
+Alternatives considered: persisting "envelope disabled" in the BlueFS
+superblock (more principled, but needs a tri-state — disabled vs
+not-yet-enabled — plus an upgrade story; disproportionate), and having
+the tool fetch mon config (a non-starter: offline tools must work with
+the monitors down).
+
+## 2.5 Interim guidance
+
+Until a fix lands, the #79141 workaround needs one extra caution: after
+any `ceph-bluestore-tool` command that opens the store read-write, either
+re-run `revert-wal-to-plain`, or pass the option explicitly to the tool
+for that session:
+
+```
+ceph-bluestore-tool --path ... --command repair --bluefs_wal_envelope_mode=false
+```
+
+(`revert-wal-to-plain` itself needs no override — it force-marks its
+output files plain internally.)
