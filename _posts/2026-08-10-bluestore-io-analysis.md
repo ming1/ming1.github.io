@@ -889,10 +889,15 @@ B=bin/ceph-osd
 # create_request is a template instantiation => WEAK (W) symbol, not T
 CRT=$(nm $B | awk '/ [TW] _ZN9OpTracker14create_request/{print $3; exit}')
 LOG=$(nm $B | awk '/ [TW] _ZN12PrimaryLogPG12log_op_statsE/{print $3; exit}')
-perf probe --del 'probe_ceph:*' 2>/dev/null    # retries fail on leftovers
+perf probe --del 'probe_ceph:oplat_*' 2>/dev/null   # retries fail on leftovers
 perf probe -x $B --add "oplat_create=$CRT" --add "oplat_logstats=$LOG"
-perf record -e 'probe_ceph:*' --call-graph dwarf -p $(pgrep ceph-osd) -- sleep 8
-perf script          # then: perf probe --del 'probe_ceph:*'
+perf record -e 'probe_ceph:oplat_*' --call-graph dwarf \
+            -p $(pgrep -x ceph-osd) -- sleep 8
+perf script          # then: perf probe --del 'probe_ceph:oplat_*'
+# scope deletes to oplat_* -- 'probe_ceph:*' would wipe YOUR other probes too
+# 0 samples with -p but the probe fires in /sys/kernel/tracing/trace?
+# per-process uprobe attach is broken on some kernels (seen on 7.0.13;
+# fine on 6.19) -- record system-wide with -a instead of -p
 ```
 
 The captured stacks, intact. `create_request` fires on the
