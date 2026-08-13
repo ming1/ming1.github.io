@@ -329,21 +329,68 @@ Status: analysis confirmed on the lab; tracker issue not filed yet —
 needs review and confirmation first. Found while validating the #79141
 workaround, prompted by Igor Fedotov's review comment.
 
-## 2.1 The problem in one paragraph
+## 2.1 Report
 
 Disabling WAL v2 envelope mode — the workaround for #79141, whether done
 via `ceph config set osd bluefs_wal_envelope_mode false` or via a
-ceph.conf edit — governs only the OSD daemon. `ceph-bluestore-tool` runs
-with its own config context that sees **neither** the mon config database
-**nor**, in its normal invocation, any config file at all. Any tool
-command that opens the store read-write (`repair`, `quick-fix`, …) opens
-RocksDB, RocksDB creates a fresh WAL file for the session, and the tool —
-believing the compiled default `bluefs_wal_envelope_mode=true` — creates
-it as an envelope file. One routine maintenance command silently undoes
-the operator's disable. On a big-page host still running an unfixed
-binary, the tool itself can abort mid-command with the #79141 assert.
+ceph.conf edit — governs only the OSD daemon. Any `ceph-bluestore-tool`
+command that opens the store read-write (`repair`, `quick-fix`, …)
+creates its session's new WAL file in **envelope mode again**, silently
+undoing the operator's disable. On a big-page host still running an
+unfixed binary, the tool itself can abort mid-command with the #79141
+assert.
 
-## 2.2 Mechanism
+Runnable reproducer
+([`envmode-tool-repro.sh`]({{ site.baseurl }}/code/ceph/envmode-tool-repro.sh)) —
+run from a vstart build directory, mon up, prints a verdict:
+
+```bash
+#!/bin/bash
+# Trigger: ceph-bluestore-tool ignores the operator's envelope-mode
+# disable (mon config db) and re-creates an envelope WAL file.
+# Run from a vstart build directory; mon.a must be running.
+set -eu
+export PATH=$PWD/bin:$PATH CEPH_CONF=$PWD/ceph.conf
+
+wal_encoding() {  # encoding of the newest db.wal file, from the BlueFS journal
+  local dump ino
+  dump=$(bin/ceph-bluestore-tool --path dev/osd0 --command bluefs-log-dump 2>/dev/null)
+  ino=$(grep -oE 'op_dir_link  db.wal/[0-9]+\.log to [0-9]+' <<<"$dump" \
+        | tail -1 | grep -oE '[0-9]+$')
+  grep -E "op_file_update  file\(ino $ino " <<<"$dump" | tail -1 \
+    | grep -q ENVELOPE && echo ENVELOPE || echo plain
+}
+
+pkill -f 'ceph-osd -i 0' 2>/dev/null || true; sleep 5   # OSD must be stopped
+
+bin/ceph-bluestore-tool --path dev/osd0 --command revert-wal-to-plain
+echo "baseline WAL:          $(wal_encoding)"     # expect: plain
+
+ceph config set osd bluefs_wal_envelope_mode false
+
+bin/ceph-bluestore-tool --path dev/osd0 --command repair
+echo "WAL created by repair: $(wal_encoding)"     # plain expected, ENVELOPE = bug
+
+[ "$(wal_encoding)" = ENVELOPE ] && echo "BUG REPRODUCED" || echo "bug NOT reproduced"
+
+# cleanup (uncomment to restore the lab):
+# bin/ceph-bluestore-tool --path dev/osd0 --command revert-wal-to-plain
+# ceph config rm osd bluefs_wal_envelope_mode
+# bin/ceph-osd -i 0 -c $PWD/ceph.conf
+```
+
+Output on an unfixed build (any page size — the verdict comes from the
+fnode record in the BlueFS journal, not tool output):
+
+```
+revert-wal-to-plain success
+baseline WAL:          plain
+repair success
+WAL created by repair: ENVELOPE
+BUG REPRODUCED
+```
+
+## 2.2 Analysis
 
 Three pieces, each fine in isolation:
 
@@ -365,33 +412,29 @@ Three pieces, each fine in isolation:
 ```
 
   So the tool's config = compiled defaults + explicit `-c`/CLI overrides,
-  nothing else. This is deliberate for an offline tool — it must work
-  with the cluster down — but it means the operator's disable is
+  nothing else — neither the mon config database nor, in this invocation
+  form, any config file. This is deliberate for an offline tool (it must
+  work with the cluster down), but it makes the operator's disable
   invisible to it.
 - Read-write tool commands open RocksDB, and a RW `DB::Open` creates a
   new WAL file after recovery — through BlueRocksEnv, i.e. through the
-  tool's BlueFS with the tool's config snapshot.
+  tool's BlueFS with the tool's config snapshot, which says envelope mode
+  is on (the compiled default).
 
-## 2.3 Reproduced on the lab
+The failure needs all three: per-file persistence supplies the lasting
+damage, the config blindness supplies the wrong decision, and the RW
+RocksDB open supplies the file-creation event inside the tool.
 
-4K-page x86 vstart cluster, single OSD on NVMe:
+Operational notes. The tool takes exclusive ownership of the store, so
+the natural admin sequence — stop the OSD, `repair`, start it — is
+exactly the trigger. `fsck` does *not* trigger it (read-only open, no
+WAL created); only the writing commands do, so the behavior looks
+nondeterministic to an operator who sometimes checks and sometimes
+fixes. The daemon side is not at fault: an OSD started under the same
+setting reports it via asok and creates only plain WALs (verified
+separately) — only the tool bypasses the disable.
 
-```
-ceph config set osd bluefs_wal_envelope_mode false
-restart osd.0                     asok confirms "false"; new WALs plain
-stop osd.0
-ceph-bluestore-tool --path dev/osd0 --command revert-wal-to-plain
-                                  baseline: every WAL file plain
-ceph-bluestore-tool --path dev/osd0 --command repair
-                                  "repair success"
-bluefs-log-dump                   db.wal/000152.log (ino 141): ENVELOPE
-```
-
-The repair session's RocksDB created an envelope WAL despite the mon-DB
-disable — exactly the feared behavior. (The daemon-side half works as
-intended: the OSD does honor the mon-DB setting at startup.)
-
-## 2.4 Proposed fix
+## 2.3 Proposed fix
 
 Utilities should never *introduce* envelope files. In `BlueFS::mount()`,
 qualify the snapshot:
@@ -416,12 +459,10 @@ not-yet-enabled — plus an upgrade story; disproportionate), and having
 the tool fetch mon config (a non-starter: offline tools must work with
 the monitors down).
 
-## 2.5 Interim guidance
-
-Until a fix lands, the #79141 workaround needs one extra caution: after
-any `ceph-bluestore-tool` command that opens the store read-write, either
-re-run `revert-wal-to-plain`, or pass the option explicitly to the tool
-for that session:
+Interim guidance until a fix lands: after any `ceph-bluestore-tool`
+command that opens the store read-write, either re-run
+`revert-wal-to-plain`, or pass the option explicitly to the tool for that
+session:
 
 ```
 ceph-bluestore-tool --path ... --command repair --bluefs_wal_envelope_mode=false
