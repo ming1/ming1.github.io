@@ -1616,21 +1616,33 @@ entered precisely four times per direct-write txc, once per driver:
 ```
 25%  tp_osd_tp        PREPARE — the initial kick, closing the whole
                       submission chain in one unwind:
-     _txc_state_proc ← queue_transactions
-       ← ReplicatedBackend::submit_transaction ← issue_repop
-       ← execute_ctx ← do_op ← do_request ← dequeue_op
+     _txc_state_proc
+       ← queue_transactions
+       ← ReplicatedBackend::submit_transaction
+       ← issue_repop
+       ← execute_ctx
+       ← do_op
+       ← do_request
+       ← dequeue_op
        ← OpSchedulerItem::run (out of the mclock queue)
 
 25%  bstore_aio       AIO_WAIT — the data aio completed:
-     _txc_state_proc ← txc_aio_finish ← aio_cb
+     _txc_state_proc
+       ← txc_aio_finish
+       ← aio_cb
        ← KernelDevice::_aio_thread
 
 25%  bstore_aio       IO_DONE — the recursion, photographed:
-     _txc_state_proc ← _txc_finish_io ← _txc_state_proc
-       ← txc_aio_finish ← aio_cb ← KernelDevice::_aio_thread
+     _txc_state_proc
+       ← _txc_finish_io
+       ← _txc_state_proc
+       ← txc_aio_finish
+       ← aio_cb
+       ← KernelDevice::_aio_thread
 
 25%  bstore_kv_final  KV_SUBMITTED → FINISHING → DONE:
-     _txc_state_proc ← _kv_finalize_thread
+     _txc_state_proc
+       ← _kv_finalize_thread
 ```
 
 The third stack shows `_txc_state_proc` twice in one call chain —
