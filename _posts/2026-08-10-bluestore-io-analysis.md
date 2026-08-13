@@ -1458,7 +1458,9 @@ meets them: plan (`_do_write_big` / `_do_write_small`) → execute
 (`_do_alloc_write`) → encode (`_txc_write_nodes`) → drive
 (`_txc_state_proc`) → commit (`submit_transaction_sync`) → and the two
 thread loops that own the tail, `_kv_sync_thread` and
-`_kv_finalize_thread`. Bare `:NNNN`
+`_kv_finalize_thread`. §4.2.9 then backtracks to the front door,
+`queue_transactions` — where the transaction, its PG-log `P` records
+already inside, first meets BlueStore. Bare `:NNNN`
 line numbers are
 [`BlueStore.cc` at the v21.3.0 tag](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc)
 (§4.2.6 is `RocksDBStore.cc`); each heading links its definition.
@@ -1752,6 +1754,99 @@ device path.
 **Locks:** `kv_finalize_lock` around the sleep and the swaps; the txc
 steps take the sequencer's `qlock` inside `_txc_committed_kv`
 (`:14957`) and `_txc_finish` (`:15006`).
+
+### 4.2.9 queue_transactions — the entry point, and where the P records come from
+
+[`BlueStore.cc:15980`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15980)
+— the `ObjectStore` interface: a vector of `Transaction`s arrives from
+the OSD on the tp_osd_tp thread. The point easy to miss is that by
+this line **every KV mutation of the commit is already decided** —
+BlueStore will plan, allocate and encode, but it adds no intent of its
+own:
+
+```
+queue_transactions(ch, tls)                                 :15980
+   │
+   ├─ _txc_create — new TransContext on the sequencer       :15998
+   ├─ per Transaction: _txc_add_transaction                 :16003
+   │    decode ops:  OP_WRITE         → _do_write (§4.2.1-3)
+   │                 OP_OMAP_SETKEYS  → _omap_setkeys       :16388
+   │                    prefix = onode's omap prefix        :4845
+   ├─ _txc_write_nodes — onodes encoded, the O set (§4.2.4) :16007
+   ├─ deferred txn? encode the L record                     :16010
+   ├─ _txc_finalize_kv — allocator bookkeeping into txc->t  :16019
+   ├─ throttle.try_start_transaction (may kick deferred)    :16032
+   └─ _txc_state_proc — the §4.2.5 state machine starts     :16060
+```
+
+**The three KV sets.** wtrace.bt (§2.3) shows the same trio for every
+small write — two `P` sets and one `O` set:
+
+```
+139  tp_osd_tp  RocksDBTransactionImpl::set  P keylen=40 val=188B
+154  tp_osd_tp  RocksDBTransactionImpl::set  P keylen=18 val=194B
+172  tp_osd_tp  RocksDBTransactionImpl::set  O keylen=37 val=385B
+```
+
+The `O` set is the object's onode, re-encoded wholesale by
+`_txc_write_nodes` (§4.2.4). The two `P` sets are **not about the
+object at all** — they are the PG's replication bookkeeping, generated
+in the OSD *before* `queue_transactions` was called, while the backend
+was assembling the transaction:
+
+- `ReplicatedBackend::submit_transaction`
+  ([`ReplicatedBackend.cc:659`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L659))
+  calls `log_operation`
+  ([`PrimaryLogPG.h:516`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.h#L516)),
+  which calls `PeeringState::append_log`
+  ([`PeeringState.cc:4772`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.cc#L4772));
+  via `write_if_dirty` (`:554`) that lands in `PG::prepare_write`
+  ([`PG.cc:908`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PG.cc#L908)),
+  which builds one key map and publishes it with
+  `t.omap_setkeys(coll, pgmeta_oid, km)` (`:941`) — plain omap on the
+  PG's hidden *pgmeta* object, riding the same transaction as the
+  write.
+- **`P` #1, `keylen=40 val=188B`** — one `pg_log_entry_t` appended to
+  the PG log: `(*km)[entry.get_key_name()] = bl`
+  ([`PGLog.cc:847`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PGLog.cc#L847));
+  the key is the eversion rendered `"%010u.%020llu"`
+  ([`osd_types.h:921`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.h#L921)),
+  31 chars.
+- **`P` #2, `keylen=18 val=194B`** — the `_fastinfo` record
+  ([`osd_types.h:7103`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.h#L7103)):
+  the condensed `pg_info_t` delta (last_update, stats), re-encoded
+  every op by `prepare_info_keymap`
+  ([`osd_types.cc:7617`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.cc#L7617));
+  the full `_info`/`_biginfo` only when rarer state changes.
+
+BlueStore's only contribution is the column: `_omap_setkeys`
+(`:18521`) asks the target onode for its omap prefix, and
+`calc_omap_prefix` (`:4845`) returns `PREFIX_PGMETA_OMAP` = `"P"`
+(`:139`) because the pgmeta onode carries the `pgmeta_omap` flag
+(regular objects get `"m"`). Each final key is `nid + '.' + user_key`,
+hence the observed lengths: 8+1+31 = 40 and 8+1+9 = 18
+(`"_fastinfo"`). The PG log thus inherits BlueStore's transaction
+atomicity for free — if the txc commits, the write and the log entry
+describing it are durable together — and pgmeta traffic compacts in
+its own RocksDB column family, isolated from user omap.
+
+The set you might *expect* for a write — a freelist record for the
+allocated extents — is absent by design: `bluestore_allocation_from_file`
+defaults to true
+([`global.yaml.in:5461`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L5461)),
+which forces `freelist_type = "null"` (`:7379`); allocation state is
+written to a file at clean shutdown and rebuilt from the onodes'
+extent maps after a crash, so per-txc allocator KV traffic is zero.
+Net: for a small write, two of the three sets — and roughly half the
+KV bytes — are replication machinery, not object state.
+
+**IOs:** none directly; the data aios are queued during planning and
+submitted by the state machine this function kicks at `:16060`.
+
+**Locks:** runs under the caller's PG lock (ops on one PG are already
+serial); the `OpSequencer` orders txcs per collection, and the
+deferred throttle path may briefly raise `deferred_aggressive` and
+drive `deferred_try_submit` (`:16039`).
 
 # 5. Performance analysis
 
