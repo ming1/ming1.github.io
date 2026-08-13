@@ -9,6 +9,17 @@
  *         option parser would otherwise eat --stack):
  *         bpftrace wtrace.bt -- /root/git/ceph/ceph/build/bin/ceph-osd --stack
  *
+ *         With kernel-entry block I/O tracing for one device (any extra
+ *         bare word after the binary is taken as the bdev name; order
+ *         relative to --stack does not matter):
+ *         bpftrace wtrace.bt -- <path-to-ceph-osd> nvme0n1 [--stack]
+ *         This adds kprobes on blkdev_write_iter/blkdev_read_iter (and
+ *         blkdev_fsync, with latency) and prints every I/O any process
+ *         issues to that device node: bdev name, offset, length,
+ *         comm (thread column) and pid.
+ *         System-wide on purpose -- fio hitting /dev/ram0 shows up the
+ *         same as the OSD's KernelDevice writes.
+ *
  *         Wait for the column-header line (wildcard probes take ~10 s to
  *         attach), then issue ONE write:
  *         rados -p p1 put obj /root/4k        and Ctrl-C.
@@ -27,24 +38,32 @@
  * the caller).  Top frames resolve and demangle; deeper frames may print
  * as raw addresses where the build lacks frame pointers.
  *
+ * fsync/fdatasync syscall latency is traced too (kernel tracepoints,
+ * gated to the OSD's pid): each exit prints fd + in-kernel time, so the
+ * barrier cost shows up both as the KernelDevice::flush wrapper and as
+ * the raw syscall underneath it.
+ *
  * To join lines with the Ceph OSD log's 7f... thread column, add a
  * "%12lx" field printing curtask->thread.fsbase -- on x86-64 glibc the
  * FS base equals pthread_self(), which is what the log prints.
  *
- * The clock starts at the first transaction, so run it on a quiet cluster.
+ * The clock starts at the first transaction (or the first matched bdev
+ * I/O, whichever fires first), so run it on a quiet cluster.
  */
 
 BEGIN
 {
   printf("%10s %7s  %-16s %-38s %s\n", "us", "tid", "thread", "function", "event");
-  @stk = str($2) == "--stack" ? 1 : 0;
+  @stk = (str($2) == "--stack" || str($3) == "--stack") ? 1 : 0;
+  if (str($2) != "--stack" && str($2) != "") { @bdev = str($2); }
+  if (str($3) != "--stack" && str($3) != "") { @bdev = str($3); }
 }
 
 /* ---- OSD -> BlueStore: transaction arrives --------------------------- */
 /* BlueStore::queue_transactions */
 uprobe:$1:_ZN9BlueStore*queue_transactionsE*
 {
-  if (@t0 == 0) { @t0 = nsecs; }
+  if (@t0 == 0) { @t0 = nsecs; @osd_pid = pid; }
   printf("%10lld %7d  %-16s %-38s transaction arrives\n",
          (nsecs-@t0)/1000, tid, comm, "BlueStore::queue_transactions");
   if (@stk) { printf("%s\n", ustack); }
@@ -182,6 +201,105 @@ uprobe:$1:_ZN6BlueFS5fsyncE*
          (nsecs-@t0)/1000, tid, comm, "BlueFS::fsync");
   if (@stk) { printf("%s\n", ustack); } }
 
+/* ---- kernel entry of block-device I/O (optional, needs a bdev name) -- */
+/* blkdev_{write,read}_iter are the VFS ->write_iter/->read_iter of block
+ * device files -- every pwritev/preadv/io_submit any process aims at
+ * /dev/<bdev> passes through here, O_DIRECT included, still in the
+ * submitting task's context (so comm/pid are the real issuer).  The
+ * bdev is recovered from the iocb: the device inode is embedded in a
+ * bdev_inode right after its block_device, so container_of() is one
+ * offsetof() subtraction.  Filtered by the kobj name (e.g. "nvme0n1",
+ * "ram0") against the command-line argument. */
+kprobe:blkdev_write_iter,
+kprobe:blkdev_read_iter
+/@bdev != ""/
+{
+  $iocb  = (struct kiocb *)arg0;
+  $iter  = (struct iov_iter *)arg1;
+  $inode = $iocb->ki_filp->f_mapping->host;
+  $bd    = (struct block_device *)((uint64)$inode
+             - offsetof(struct bdev_inode, vfs_inode));
+  $name  = str($bd->bd_device.kobj.name);
+  if ($name == @bdev) {
+    if (@t0 == 0) { @t0 = nsecs; }
+    printf("%10lld %7d  %-16s %-38s %s off=0x%llx len=0x%lx pid=%d\n",
+           (nsecs-@t0)/1000, tid, comm,
+           probe == "kprobe:blkdev_write_iter"
+             ? "blkdev_write_iter" : "blkdev_read_iter",
+           $name, (uint64)$iocb->ki_pos, $iter->count, pid);
+  }
+}
+
+/* blkdev_fsync(filp, start, end, datasync) -- the ->fsync of block
+ * device files: every fsync/fdatasync any process aims at /dev/<bdev>
+ * lands here, the OSD's KernelDevice::flush included.  Device-scoped
+ * counterpart of the pid-gated syscall tracepoints below: this one
+ * sees every process, but only the chosen device.  Silent at entry
+ * (except in stack mode); the return line reports latency + pid. */
+kprobe:blkdev_fsync
+/@bdev != ""/
+{
+  $inode = ((struct file *)arg0)->f_mapping->host;
+  $bd    = (struct block_device *)((uint64)$inode
+             - offsetof(struct bdev_inode, vfs_inode));
+  $name  = str($bd->bd_device.kobj.name);
+  if ($name == @bdev) {
+    if (@t0 == 0) { @t0 = nsecs; }
+    @ts_bf[tid] = nsecs;
+    @bf_ds[tid] = arg3;
+    if (@stk) {
+      printf("%10lld %7d  %-16s %-38s enter %s datasync=%d\n",
+             (nsecs-@t0)/1000, tid, comm, "blkdev_fsync", $name, arg3);
+      printf("%s\n", ustack);
+    }
+  }
+}
+kretprobe:blkdev_fsync
+/@ts_bf[tid]/
+{
+  $us = (nsecs - @ts_bf[tid]) / 1000;
+  printf("%10lld %7d  %-16s %-38s %s datasync=%lld pid=%d %lld us\n",
+         (nsecs-@t0)/1000, tid, comm, "blkdev_fsync",
+         @bdev, @bf_ds[tid], pid, $us);
+  @blkdev_fsync_us = hist($us);
+  @bf_sum += $us; @bf_n++;
+  delete(@ts_bf[tid]); delete(@bf_ds[tid]);
+}
+
+/* ---- fsync/fdatasync syscalls ---------------------------------------- */
+/* Kernel-side latency of the flush barriers.  These are system-wide
+ * tracepoints, so they are gated to the OSD process (pid captured at the
+ * first queue_transactions).  KernelDevice::flush's fdatasync and any
+ * rocksdb/BlueFS file fsync land here -- comparing this line with the
+ * KernelDevice::flush line above splits the barrier's cost into kernel
+ * (this) vs userspace wrapper overhead (the difference).  Silent at
+ * entry (except in stack mode); the exit line reports fd + latency. */
+tracepoint:syscalls:sys_enter_fsync,
+tracepoint:syscalls:sys_enter_fdatasync
+/@t0 && pid == @osd_pid/
+{ @ts_sc[tid] = nsecs; @sc_fd[tid] = args->fd;
+  if (@stk) {
+    printf("%10lld %7d  %-16s %-38s enter fd=%d\n",
+           (nsecs-@t0)/1000, tid, comm,
+           probe == "tracepoint:syscalls:sys_enter_fsync"
+             ? "fsync (syscall)" : "fdatasync (syscall)", args->fd);
+    printf("%s\n", ustack);
+  } }
+
+tracepoint:syscalls:sys_exit_fsync
+/@ts_sc[tid]/
+{ printf("%10lld %7d  %-16s %-38s fd=%d %lld us\n",
+         (nsecs-@t0)/1000, tid, comm, "fsync (syscall)",
+         @sc_fd[tid], (nsecs-@ts_sc[tid])/1000);
+  delete(@ts_sc[tid]); delete(@sc_fd[tid]); }
+
+tracepoint:syscalls:sys_exit_fdatasync
+/@ts_sc[tid]/
+{ printf("%10lld %7d  %-16s %-38s fd=%d %lld us\n",
+         (nsecs-@t0)/1000, tid, comm, "fdatasync (syscall)",
+         @sc_fd[tid], (nsecs-@ts_sc[tid])/1000);
+  delete(@ts_sc[tid]); delete(@sc_fd[tid]); }
+
 /* ---- deferred replay ------------------------------------------------- */
 /* BlueStore::_deferred_submit_unlock */
 uprobe:$1:_ZN9BlueStore*_deferred_submit_unlockE*
@@ -190,4 +308,16 @@ uprobe:$1:_ZN9BlueStore*_deferred_submit_unlockE*
          (nsecs-@t0)/1000, tid, comm, "BlueStore::_deferred_submit_unlock");
   if (@stk) { printf("%s\n", ustack); } }
 
-END { clear(@ts_kv); clear(@ts_fl); clear(@fl_dev); clear(@t0); clear(@stk); }
+END
+{
+  /* blkdev_fsync latency summary for the watched bdev */
+  $n = (uint64)@bf_n;
+  if ($n > 0) {
+    printf("\n%lld blkdev_fsync on %s, avg %lld us\n", $n, @bdev, @bf_sum / $n);
+    print(@blkdev_fsync_us);
+  }
+  clear(@bf_n); clear(@bf_sum); clear(@blkdev_fsync_us);
+  clear(@ts_kv); clear(@ts_fl); clear(@fl_dev); clear(@ts_sc);
+  clear(@sc_fd); clear(@osd_pid); clear(@t0); clear(@stk);
+  clear(@bdev); clear(@ts_bf); clear(@bf_ds);
+}
