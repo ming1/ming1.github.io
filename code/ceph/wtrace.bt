@@ -14,9 +14,9 @@
  *         relative to --stack does not matter):
  *         bpftrace wtrace.bt -- <path-to-ceph-osd> nvme0n1 [--stack]
  *         This adds kprobes on blkdev_write_iter/blkdev_read_iter (and
- *         blkdev_fsync, with latency) and prints every I/O any process
- *         issues to that device node: bdev name, offset, length,
- *         comm (thread column) and pid.
+ *         blkdev_fsync + blkdev_issue_flush, with latency) and prints
+ *         every I/O any process issues to that device node: bdev name,
+ *         offset, length, comm (thread column) and pid.
  *         System-wide on purpose -- fio hitting /dev/ram0 shows up the
  *         same as the OSD's KernelDevice writes.
  *
@@ -266,6 +266,40 @@ kretprobe:blkdev_fsync
   delete(@ts_bf[tid]); delete(@bf_ds[tid]);
 }
 
+/* blkdev_issue_flush(bdev) -- the block-layer cache-flush primitive:
+ * one REQ_PREFLUSH bio to the device, no data.  blkdev_fsync calls it
+ * after writing out dirty pages, so its latency inside the fsync line
+ * above isolates the device write-cache flush from the page writeback;
+ * filesystems (BlueFS is not one -- it flushes via fdatasync) also
+ * call it directly.  arg0 IS the block_device, no container_of here.
+ * On a device with no volatile cache (brd, most enterprise NVMe with
+ * capacitors) the bio short-circuits and this reads ~1 us. */
+kprobe:blkdev_issue_flush
+/@bdev != ""/
+{
+  $name = str(((struct block_device *)arg0)->bd_device.kobj.name);
+  if ($name == @bdev) {
+    if (@t0 == 0) { @t0 = nsecs; }
+    @ts_if[tid] = nsecs;
+    if (@stk) {
+      printf("%10lld %7d  %-16s %-38s enter %s\n",
+             (nsecs-@t0)/1000, tid, comm, "blkdev_issue_flush", $name);
+      printf("%s\n", ustack);
+    }
+  }
+}
+kretprobe:blkdev_issue_flush
+/@ts_if[tid]/
+{
+  $us = (nsecs - @ts_if[tid]) / 1000;
+  printf("%10lld %7d  %-16s %-38s %s pid=%d %lld us\n",
+         (nsecs-@t0)/1000, tid, comm, "blkdev_issue_flush",
+         @bdev, pid, $us);
+  @blkdev_issue_flush_us = hist($us);
+  @if_sum += $us; @if_n++;
+  delete(@ts_if[tid]);
+}
+
 /* ---- fsync/fdatasync syscalls ---------------------------------------- */
 /* Kernel-side latency of the flush barriers.  These are system-wide
  * tracepoints, so they are gated to the OSD process (pid captured at the
@@ -310,13 +344,21 @@ uprobe:$1:_ZN9BlueStore*_deferred_submit_unlockE*
 
 END
 {
-  /* blkdev_fsync latency summary for the watched bdev */
+  /* blkdev_fsync / blkdev_issue_flush latency summary for the bdev */
   $n = (uint64)@bf_n;
   if ($n > 0) {
     printf("\n%lld blkdev_fsync on %s, avg %lld us\n", $n, @bdev, @bf_sum / $n);
     print(@blkdev_fsync_us);
   }
+  $fn = (uint64)@if_n;
+  if ($fn > 0) {
+    printf("\n%lld blkdev_issue_flush on %s, avg %lld us\n",
+           $fn, @bdev, @if_sum / $fn);
+    print(@blkdev_issue_flush_us);
+  }
   clear(@bf_n); clear(@bf_sum); clear(@blkdev_fsync_us);
+  clear(@if_n); clear(@if_sum); clear(@blkdev_issue_flush_us);
+  clear(@ts_if);
   clear(@ts_kv); clear(@ts_fl); clear(@fl_dev); clear(@ts_sc);
   clear(@sc_fd); clear(@osd_pid); clear(@t0); clear(@stk);
   clear(@bdev); clear(@ts_bf); clear(@bf_ds);
