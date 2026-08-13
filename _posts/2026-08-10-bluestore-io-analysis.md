@@ -1848,6 +1848,103 @@ serial); the `OpSequencer` orders txcs per collection, and the
 deferred throttle path may briefly raise `deferred_aggressive` and
 drive `deferred_try_submit` (`:16039`).
 
+## 4.3 Interfaces
+
+What the store promises its caller. Unlike §4.2, the references here
+span several files, so every line number is qualified with its file —
+the bare-`:NNNN` = `BlueStore.cc` convention does not apply in this
+section.
+
+### 4.3.1 queue_transactions — the contract RADOS buys
+
+[`ObjectStore.h:241`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/ObjectStore.h#L241)
+— §4.2.9 walked what the function *does*; this section is what the
+caller is *entitled to*. From the interface's viewpoint
+`queue_transactions` is a contract with six clauses — documented in
+[`Transaction.h:20`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/Transaction.h#L20)
+and
+[`ObjectStore.h:135`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/ObjectStore.h#L135)
+— and everything §4.2 traced exists to honor them.
+
+**1. Asynchrony: three completion events, not a return value.** The
+call queues and returns; results arrive via `Context` callbacks
+embedded in the transactions (`Transaction.h:31`):
+`on_applied_sync`/`on_applied` — the mutations are visible to
+subsequent reads — and `on_commit` — "durably committed to stable
+storage (i.e., are now software/hardware crashproof)"
+(`Transaction.h:48`). RADOS maps `on_commit` to the ondisk client
+reply, which is why client-visible latency ends at the commit
+callbacks `_txc_committed_kv` queues (§3.6).
+
+**2. Per-transaction atomicity.** A `Transaction` applies
+all-or-nothing; after a crash the store must present it fully or not
+at all. This is the clause §4.2.9 leans on: the object write and the
+PG-log `P` records ride one transaction, so peering can trust that a
+logged write exists and an unlogged one doesn't. BlueStore satisfies
+it by funneling everything into a single RocksDB write batch per txc
+(`txc->t`, §4.2.6).
+
+**3. Ordering per collection, parallelism across.**
+`ObjectStore.h:135`: "Any transactions queued under a given
+collection will be applied in sequence. Transactions queued under
+different collections may run in parallel." RADOS maps PG shard →
+collection, preserving client op order per PG while PGs scale across
+CPUs — this is what the per-collection `OpSequencer` implements. Note
+the doc's care: transactions are *applied* in sequence; on durability
+order the interface promises only an on-demand barrier,
+`flush_commit` (`ObjectStore.h:151` — the callback fires "once all
+transactions queued on this collection prior to the call have been
+applied and committed"). The *prefix property* the PG log needs — if
+transaction N is durable, so is everything before it on that PG — is
+a BlueStore implementation property, not an interface clause: the
+`OpSequencer` feeds `_kv_sync_thread`, which commits each swapped
+batch in submission order (§4.2.7).
+
+**4. Isolation is the caller's job, not the store's.** The
+`TRANSACTION ISOLATION` block (`Transaction.h:77`) is the surprising
+clause: the caller "promises not to attempt to read"
+(`Transaction.h:83`) any
+element a pending transaction mutates (until `on_applied_sync`),
+violations need not be detected, and enumerations may see arbitrary
+combinations of a pending transaction's creates/deletes. RADOS
+supplies the promise via the PG lock — ops on one PG are serial, so
+no read races its own write. In exchange BlueStore is "immediately
+readable" when `queue_transactions` returns (the comment at
+[`BlueStore.cc:16062`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L16062))
+with no read-side locking against in-flight txcs — the write path
+needs no reader-vs-writer lock at all, because the isolation the
+store would otherwise need was purchased upstream, once, by the PG
+lock.
+
+**5. No failure path.** The `int` return is vestigial — the OSD
+asserts success or ignores the return outright (the client write
+path, `PrimaryLogPG.h:386`, doesn't even capture it); there is no
+per-op error report and no rollback protocol. Inside
+`_txc_add_transaction`, -ENOENT/-ENODATA on most object ops are
+silently swallowed (`BlueStore.cc:16436`); anything else prints "not
+handled on operation" and dies via `ceph_abort_msg("unexpected
+error")` (`BlueStore.cc:16470`) — an error is either ignored or
+fatal, never reported. The interface effectively requires the caller
+to submit only pre-validated transactions (quota, ENOSPC and
+permission checks happen upstream in the OSD), and the source says it
+outright for ENOSPC: "if we hit *any* ENOSPC, crash, before we do any
+damage by partially applying transactions" (`BlueStore.cc:16460`).
+Deliberate: RADOS has no way to un-replicate a half-applied op.
+
+**6. Buffer stability until commit.** The serialized transaction
+references the caller's buffers zero-copy, so they "must remain
+stable until the on_commit callback completes" (`Transaction.h:56`);
+in practice `bufferlist` refcounting handles it, but it is part of
+the contract.
+
+Notice what the contract does **not** require: fsync-per-transaction.
+Durability is *signaled* per transaction but may be *achieved* in
+batches — the freedom `_kv_sync_thread` (§4.2.7) exploits, amortizing
+one `submit_transaction_sync` (barrier #2) over many txcs'
+`on_commit`s. The contract pins ordering and atomicity and leaves
+*when* to the implementation; that gap is where all of BlueStore's
+throughput engineering lives.
+
 # 5. Performance analysis
 
 ## 5.1 fio latency vs wlat latency — what each one measures
