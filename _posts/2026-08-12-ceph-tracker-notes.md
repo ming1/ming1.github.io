@@ -352,9 +352,11 @@ run from a vstart build directory, mon up, prints a verdict:
 set -eu
 export PATH=$PWD/bin:$PATH CEPH_CONF=$PWD/ceph.conf
 
+q() { "$@" 2>/dev/null; }  # vstart daemons/tools chat on stderr; exit codes still checked
+
 wal_encoding() {  # encoding of the newest db.wal file, from the BlueFS journal
   local dump ino
-  dump=$(bin/ceph-bluestore-tool --path dev/osd0 --command bluefs-log-dump 2>/dev/null)
+  dump=$(q bin/ceph-bluestore-tool --path dev/osd0 --command bluefs-log-dump)
   ino=$(grep -oE 'op_dir_link  db.wal/[0-9]+\.log to [0-9]+' <<<"$dump" \
         | tail -1 | grep -oE '[0-9]+$')
   grep -E "op_file_update  file\(ino $ino " <<<"$dump" | tail -1 \
@@ -363,15 +365,16 @@ wal_encoding() {  # encoding of the newest db.wal file, from the BlueFS journal
 
 pkill -f 'ceph-osd -i 0' 2>/dev/null || true; sleep 5   # OSD must be stopped
 
-bin/ceph-bluestore-tool --path dev/osd0 --command revert-wal-to-plain
+q bin/ceph-bluestore-tool --path dev/osd0 --command revert-wal-to-plain
 echo "baseline WAL:          $(wal_encoding)"     # expect: plain
 
-ceph config set osd bluefs_wal_envelope_mode false
+q ceph config set osd bluefs_wal_envelope_mode false
 
-bin/ceph-bluestore-tool --path dev/osd0 --command repair
-echo "WAL created by repair: $(wal_encoding)"     # plain expected, ENVELOPE = bug
+q bin/ceph-bluestore-tool --path dev/osd0 --command repair
+enc=$(wal_encoding)
+echo "WAL created by repair: $enc"                # plain expected, ENVELOPE = bug
 
-[ "$(wal_encoding)" = ENVELOPE ] && echo "BUG REPRODUCED" || echo "bug NOT reproduced"
+[ "$enc" = ENVELOPE ] && echo "BUG REPRODUCED" || echo "bug NOT reproduced"
 
 # cleanup (uncomment to restore the lab):
 # bin/ceph-bluestore-tool --path dev/osd0 --command revert-wal-to-plain
@@ -446,12 +449,31 @@ conf_wal_envelope_mode =
 ```
 
 The asymmetry is the point. Plain and envelope WAL files coexist freely
-(the read path handles both unconditionally), so a tool-created *plain*
-WAL on a healthy envelope cluster costs one file's optimization until the
-OSD's next WAL rotation — harmless. A tool-created *envelope* WAL on a
-cluster where the operator disabled the mode re-breaks the cluster. Tools
-should take the direction that is safe in both worlds. This also makes
-every tool command safe on big-page hosts running pre-fix binaries.
+(reads and appends follow each file's own persisted `fnode.encoding`, not
+the config), so a tool-created *plain* WAL on a healthy envelope cluster
+costs one file's optimization until the OSD's next WAL rotation —
+harmless. A tool-created *envelope* WAL on a cluster where the operator
+disabled the mode re-breaks the cluster. Tools should take the direction
+that is safe in both worlds. This also makes every tool command safe on
+big-page hosts running pre-fix binaries.
+
+One precision about scope, because the config's reach is wider than
+"file creation": `open_for_write()` runs its conf-gated block on *every*
+`.log` open, existing files included — with the option on it re-stamps
+`encoding = ENVELOPE` and regenerates the stamp at reopen. Under the
+gate a utility skips that block, which is still safe in both reopen
+cases: an existing envelope file keeps its encoding (the block only ever
+sets, never clears; the stamp is already repopulated deterministically by
+`_envmode_index_file()` at mount, `generate_stamp(uuid, ino)`), and an
+existing plain file stays plain. So existing files' behavior is
+untouched — the gate's entire effect is that new `.log` files created by
+utilities are plain. Side observation from the same block: with the
+option on, a daemon reopening an existing *plain* `.log` for write flips
+it to ENVELOPE mid-life, re-marking content that was never
+envelope-framed — a pre-existing sharp edge (reachable only via
+WAL-reuse paths, off by default) that the gate incidentally blunts for
+utilities, and one more reason the #79141 workaround needs the config
+flip rather than conversion alone.
 
 Alternatives considered: persisting "envelope disabled" in the BlueFS
 superblock (more principled, but needs a tri-state — disabled vs
