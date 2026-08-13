@@ -3823,6 +3823,78 @@ or -ENOSPC. Key points:
 
 ## 6.11 contexts
 
+### WAL tail-block rewrite — append-only file, rewrite-in-place device
+
+Trace two consecutive small `rados put`s (wtrace.bt, §2 of the
+io-analysis post) and the WAL flush hits the **same device LBA twice**:
+
+```
+9302  bstore_kv_sync  BlueFS::fsync            WAL file
+9325  bstore_kv_sync  KernelDevice::aio_write  bdev=0x...5900 off=0x1039000 len=0x1000
+```
+
+— and the second put prints the identical `off=0x1039000` again. That
+looks wrong for a journal, but the journal is append-only only at the
+*file-offset* level. Each put appends a small record (~700 B of
+`P`/`P`/`O` metadata) at a strictly advancing file offset; the device,
+however, only takes block-sized writes, and both records fall inside
+the same 4 KiB block of the file — so BlueFS writes that one block
+twice: first record #1 + zero padding, then record #1 + record #2 +
+padding. Same file block ⇒ same extent ⇒ same LBA. When the block
+fills, the write advances (`0x1037000 → 0x1038000 → 0x1039000` over a
+longer capture).
+
+The machinery is `FileWriter::get_flush_buffer` (`BlueFS.cc:3945`),
+"need to pad" path (`:3962`):
+
+- `tail = p2phase(data_end, super_block_size)` (`:3964`) — the partial
+  bytes occupying the last block;
+- zero-fill to alignment and splice whole blocks out to disk
+  (`:3968`);
+- the key line (`:3983`): `buffer_appender.substr_of(bl_to_disk, ...,
+  tail)` — a **byte-identical duplicate of the tail goes back into the
+  buffer**;
+- `buffer_pos += io_size - super_block_size` (`:3986`) — the buffer's
+  file position rewinds to the start of that last block, not past it.
+
+The next flush's `write_offset = get_flush_offset()` (= `buffer_pos`,
+`BlueFS.h:437`; used at `BlueFS.cc:4132`) therefore lands on the same
+block, and `fnode.seek` (`:4137`) maps it to the same extent. `pos =
+want_end` keeps the logical file append-only throughout.
+
+Why the duplicate is byte-identical is the crash-safety design: on
+rewrite, the sectors holding the already-fsynced record #1 receive
+exactly the same content, so a torn write can only damage the
+not-yet-acknowledged record #2. In-place rewrite of a journal tail is
+safe precisely because the overlap is invariant. The cost is write
+amplification — every sub-4K commit is a full 4 KiB device write, and
+N small serial commits can write one LBA N times (RocksDB's `wal_bytes`
+vs `l_bluefs_bytes_written_wal`, `BlueFS.cc:4192`, diverge by exactly
+this padding). At longer timescales the LBAs repeat for a second
+reason: RocksDB recycles WAL files after memtable flushes, and a
+recycled log reuses the old file's extents wholesale.
+
+> **SMR blocker.** This pattern is one of the concrete reasons stock
+> BlueFS cannot sit on host-managed SMR or ZNS zoned media. A zone has
+> a write pointer: every write must land exactly there, strictly
+> sequentially, and rewriting an earlier LBA without resetting the
+> whole zone is an I/O error — yet the WAL rewrites its tail LBA on
+> nearly every small commit. And the blocker is **WAL-mode
+> independent**: the trace above was captured with envelope mode
+> (§6.6) enabled — its default since v21.3.0
+> (`global.yaml.in:4318`) — because `_flush_envelope_F` only frames
+> the buffer and then funnels into the same
+> `_flush_range_F → _flush_data → get_flush_buffer` pad path that
+> plain mode uses. The rewrite follows from block-granular devices
+> meeting sub-block commits, not from any framing choice; disabling
+> envelope mode keeps it and adds back the per-append fnode update
+> through the BlueFS journal — itself another rewrite-in-place
+> structure. Zoned deployment therefore requires either a translation
+> layer (drive-managed SMR) or a flush redesign that never revisits a
+> block: start every commit on a fresh block (a full block of space
+> per commit) or batch commits — a different framing of the same
+> blocks is not enough.
+
 ---
 
 # Part 7 — The Allocation Engine
