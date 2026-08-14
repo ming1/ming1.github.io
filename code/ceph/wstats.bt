@@ -10,29 +10,28 @@
  *         Wildcard probes take ~10 s to attach against the big binary --
  *         wait for the "tracing..." banner before starting the workload.
  *
- * Counts every event involved in handling rados write IO:
- *   - transactions entering BlueStore
- *   - RocksDB key set/rmkey per prefix (O=onode, P=pgmeta-omap, L=deferred, ...)
- *   - RocksDB transaction commits (+ sync-commit latency)
- *   - block-device writes, keyed by the thread that issued them:
- *       tp_osd_tp      = object data (direct write path)
- *       bstore_kv_sync = RocksDB WAL via BlueFS
- *       finisher/other = deferred data replay
- *   - device flushes (fdatasync) and BlueFS fsyncs, with latency
+ * Pure event/byte statistics, no latency measurement (see wlat.bt for that).
+ * Map-name prefixes a_..h_ order the report top-down along the write path:
+ *   a_ transactions entering BlueStore
+ *   b_ object writes and bytes
+ *   c_ RocksDB key set/rmkey/merge per prefix (O=onode, P=pgmeta-omap,
+ *      L=deferred, ...)
+ *   d_ RocksDB commits; batch-size histogram = txcs amortized per
+ *      sync commit (the two fdatasync barriers are paid per batch)
+ *   e_ block-device writes keyed by issuing thread:
+ *        tp_osd_tp      = object data (direct write path)
+ *        bstore_kv_sync = RocksDB WAL via BlueFS
+ *        finisher/other = deferred data replay
+ *   f_ device flushes (fdatasync)   g_ BlueFS fsyncs   h_ deferred batches
  *
  * Probes are uprobes on the unstripped dev binary, using anchored wildcard
  * patterns like  _ZN9BlueStore*_txc_finishE*  instead of full mangled names:
- * the "_ZN<len><Class>" prefix pins the class (assert-fail and std::function
- * helper symbols embed the method name but start _ZN4ceph/_ZNSt, so they
- * cannot match) and the trailing "E*" pins the end of the method name (so
- * _txc_finish does not catch _txc_finish_io).  One thing the glob cannot
- * pin is the end of the SYMBOL: optimized builds emit compiler clones like
- * foo.cold / foo.part.N, and a trailing "E*" matches those too -- at a
- * clone's entry the argument registers do not hold the function's
- * parameters, so a matched clone silently corrupts counts and arg reads.
- * Before trusting a pattern on a new binary, verify it matches EXACTLY the
- * intended symbols (no .cold/.part suffixes):
- *     bpftrace -l 'uprobe:BIN:PATTERN'
+ * the "_ZN<len><Class>" prefix pins the class and the trailing "E*" pins the
+ * end of the method name.  The glob cannot pin the end of the SYMBOL:
+ * optimized builds emit clones like foo.cold / foo.part.N whose entry does
+ * not hold the function's parameters, silently corrupting counts.  Before
+ * trusting a pattern on a new binary, verify it matches EXACTLY the intended
+ * symbols:  bpftrace -l 'uprobe:BIN:PATTERN'
  * bufferlist length lives at offset 24 (gdb: ptype /o
  * ceph::buffer::v15_2_0::list -> _len).
  */
@@ -61,8 +60,7 @@ uprobe:$1:_ZN12RocksDBStore*3setE*PKcmRK*
 { @c_kv_set[str(*(uint64*)arg1)] = count();
   @c_kv_set_bytes[str(*(uint64*)arg1)] = sum(*(uint32*)(arg4+24)); }
 
-/* matches both overloads; prefix is arg1 in each, so one probe covers both */
-/* RocksDBStore::RocksDBTransactionImpl::rmkey */
+/* RocksDBStore::RocksDBTransactionImpl::rmkey (both overloads; prefix=arg1) */
 uprobe:$1:_ZN12RocksDBStore*5rmkeyE*
 { @c_kv_rmkey[str(*(uint64*)arg1)] = count(); }
 
@@ -80,46 +78,29 @@ uprobe:$1:_ZN12RocksDBStore*submit_transactionE*
 uprobe:$1:_ZN9BlueStore*_txc_apply_kvE*
 { @batchn++; }
 
-/* RocksDBStore::submit_transaction_sync (the kv_sync_thread commit).
- * txcs applied since the last sync commit = this batch's size; the two
- * fdatasync barriers are paid per BATCH, so this histogram is the
- * amortization factor of the commit cost */
+/* RocksDBStore::submit_transaction_sync (the kv_sync_thread commit);
+ * txcs applied since the last sync commit = this batch's size */
 uprobe:$1:_ZN12RocksDBStore*submit_transaction_syncE*
-{ @d_kv_commit_sync = count(); @ts_kv[tid] = nsecs;
+{ @d_kv_commit_sync = count();
   if (@batchn > 0) { @d_kv_batch_txcs = hist(@batchn); }
   @batchn = 0; }
-/* RocksDBStore::submit_transaction_sync (return) */
-uretprobe:$1:_ZN12RocksDBStore*submit_transaction_syncE*
-/@ts_kv[tid]/
-{ @d_kv_commit_us = hist((nsecs - @ts_kv[tid]) / 1000); delete(@ts_kv[tid]); }
 
 /* ---- block device ---------------------------------------------------- */
 
-/* args (off, bl, ioc, buffered, hint); keyed by the issuing thread,
- * which identifies the writer (data vs WAL vs deferred) */
-/* KernelDevice::aio_write */
+/* KernelDevice::aio_write(off, bl, ioc, buffered, hint); keyed by the
+ * issuing thread, which identifies the writer (data vs WAL vs deferred) */
 uprobe:$1:_ZN12KernelDevice*aio_writeE*
 { @e_disk_writes[comm] = count(); @e_disk_write_bytes[comm] = sum(*(uint32*)(arg2+24)); }
 
 /* KernelDevice::flush() == fdatasync barrier */
 uprobe:$1:_ZN12KernelDevice*flushE*
-{ @ts_fl[tid] = nsecs; }
-/* KernelDevice::flush (return) */
-uretprobe:$1:_ZN12KernelDevice*flushE*
-/@ts_fl[tid]/
-{ @f_disk_flush = count(); @f_disk_flush_us = hist((nsecs - @ts_fl[tid]) / 1000);
-  delete(@ts_fl[tid]); }
+{ @f_disk_flushes = count(); }
 
 /* ---- BlueFS (RocksDB's filesystem) ----------------------------------- */
 
 /* BlueFS::fsync(FileWriter*) -- WAL file durability */
 uprobe:$1:_ZN6BlueFS5fsyncE*
-{ @ts_bf[tid] = nsecs; }
-/* BlueFS::fsync (return) */
-uretprobe:$1:_ZN6BlueFS5fsyncE*
-/@ts_bf[tid]/
-{ @g_bluefs_fsync = count(); @g_bluefs_fsync_us = hist((nsecs - @ts_bf[tid]) / 1000);
-  delete(@ts_bf[tid]); }
+{ @g_bluefs_fsyncs = count(); }
 
 /* ---- deferred replay ------------------------------------------------- */
 
@@ -127,4 +108,4 @@ uretprobe:$1:_ZN6BlueFS5fsyncE*
 uprobe:$1:_ZN9BlueStore*_deferred_submit_unlockE*
 { @h_deferred_batches = count(); }
 
-END { clear(@ts_kv); clear(@ts_fl); clear(@ts_bf); clear(@batchn); }
+END { clear(@batchn); }
