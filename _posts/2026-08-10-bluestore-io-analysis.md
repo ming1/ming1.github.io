@@ -644,6 +644,12 @@ bpftrace wstats.bt bin/ceph-osd          # start
 # Ctrl-C                    # stop + print summary
 ```
 
+The script is pure counting — event and byte statistics, no latency
+measurement (that is wlat.bt's job, §2.4). The map-name prefixes `a_..h_`
+are deliberate: bpftrace dumps maps alphabetically, so the report reads
+top-down along the write path — transactions, object writes, RocksDB
+staging, commits, device writes, flushes/fsyncs, deferred.
+
 Output for exactly 10 × 4 KiB `rados put` (validation run — every number
 checks against §1):
 
@@ -655,13 +661,12 @@ checks against §1):
 @c_kv_set[P]: 20              @c_kv_set_bytes[P]: 3841
 
 @d_kv_commit_sync: 10         @d_kv_commit_async: 10
-@d_kv_commit_us: [4K, 8K) 8  [8K, 16K) 2
 
 @e_disk_writes[tp_osd_tp]: 10       @e_disk_write_bytes[tp_osd_tp]: 40960
 @e_disk_writes[bstore_kv_sync]: 10  @e_disk_write_bytes[bstore_kv_sync]: 49152
 
-@f_disk_flush: 20             @f_disk_flush_us: [4K, 8K) 18  [8K, 16K) 2
-@g_bluefs_fsync: 10
+@f_disk_flushes: 20
+@g_bluefs_fsyncs: 10
 @h_deferred_batches: 0
 ```
 
@@ -1993,3 +1998,136 @@ throughput, not about service time; wlat's client figure
 (`@client_us`, printed as `= client` on the average line) is the
 service time, and the difference between the two is real waiting —
 located above BlueStore, in the spans the diagram places between them.
+
+## 5.2 C-states and the idle write — verifying `tuned latency-performance`
+
+Everything above measures a pipeline that is *doing* something. But at
+queue depth 1 the OSD's threads spend most of their life asleep, and on
+many machines waking a sleeping core costs more than the work it wakes
+up to do. The write path of §3 crosses four OSD threads; every crossing
+is a condvar signal to a thread whose core may have parked itself in a
+deep C-state between IOs. This section measures that cost and verifies
+the standard fix — the `tuned` `latency-performance` profile — on a real
+Ceph workload.
+
+The rig is a different host from §1.1's lab, chosen so that device time
+is negligible and scheduling cost dominates:
+
+| | |
+|---|---|
+| Host | 64-core server, `acpi_idle` cpuidle driver, `performance` governor |
+| OSD device | `/dev/ram0` (brd, 8 GiB) — device time ≈ 0 |
+| Cluster | `vstart.sh` MON=1 OSD=1 MGR=1, pool `rbd` size=1 |
+| Workload | `rados bench` 64 KiB writes, `-t 1` (probe) and `-t 16` (control) |
+
+The suspect announces itself in sysfs:
+
+```
+$ cat /sys/devices/system/cpu/cpuidle/current_driver
+acpi_idle
+$ for s in /sys/devices/system/cpu/cpu0/cpuidle/state*/; do
+>   echo "$(cat $s/name) latency=$(cat $s/latency)us"; done
+POLL latency=0us
+C1   latency=1us
+C2   latency=800us          # <-- the advertised exit latency
+```
+
+An 800 µs worst-case exit latency sitting under a ~500 µs write. The
+`latency-performance` profile counters it by holding `/dev/cpu_dma_latency`
+open with a low bound (`lsof /dev/cpu_dma_latency` shows the daemon's fd),
+which caps the governor's choice at C1 — a PM-QoS constraint, not a sysfs
+switch: `state2/disable` stays `0`, so verifying the profile means
+verifying *usage*, not configuration.
+
+**The test.** One script,
+[`verify_tuned.sh`]({{ site.baseurl }}/code/ceph/verify_tuned.sh), runs
+both conditions back to back: warm-up, `perf reset`, three timed 10 s
+`-t 1` benches bracketed by a system-wide C2 entry count, the OSD's own
+`state_*_lat` counters, then a `-t 16` control — first with the profile
+active, then after `tuned-adm off`, restoring the profile at the end.
+The measurement core:
+
+```bash
+c2() { awk '{s+=$1} END{print s}' \
+       /sys/devices/system/cpu/cpu*/cpuidle/state2/usage; }
+runset() {
+  echo "===== SET $1: $(tuned-adm active 2>&1)"
+  bin/rados bench -p rbd 5 write -b 65536 -t 1 >/dev/null 2>&1   # warm-up
+  bin/ceph daemon osd.0 perf reset all >/dev/null 2>&1
+  B=$(c2)
+  for i in 1 2 3; do echo "qd1  run$i: $(bench1 1)"; done
+  A=$(c2)
+  echo "C2 usage delta during qd1 runs: $((A-B))"
+  pdump                                    # bluestore state_*_lat avgs
+  echo "qd16 ctrl: $(bench1 16)"
+}
+tuned-adm profile latency-performance; sleep 2; runset A-latency-performance
+tuned-adm off;                        sleep 2; runset B-tuned-off
+tuned-adm profile latency-performance                  # restore
+```
+
+**The result**, verbatim:
+
+```
+===== SET A-latency-performance: Current active profile: latency-performance
+qd1  run1: avg=0.000502423s max=0.00398592s iops=1985
+qd1  run2: avg=0.000457573s max=0.00248433s iops=2181
+qd1  run3: avg=0.000481558s max=0.0068532s iops=2071
+C2 usage delta during qd1 runs: 0
+  state_prepare_lat             46.8 us  n=124779
+  state_aio_wait_lat            12.0 us  n=124779
+  state_kv_queued_lat           12.2 us  n=124779
+  state_kv_commiting_lat        85.1 us  n=124779
+  bluestore-sum 156.1 us
+qd16 ctrl: avg=0.00164261s max=0.00933125s iops=9732
+===== SET B-tuned-off: No current active profile.
+qd1  run1: avg=0.000563971s max=0.00254327s iops=1769
+qd1  run2: avg=0.00055057s max=0.00274805s iops=1812
+qd1  run3: avg=0.000575099s max=0.00260107s iops=1734
+C2 usage delta during qd1 runs: 1602030
+  state_prepare_lat             53.2 us  n=106340
+  state_aio_wait_lat            14.2 us  n=106340
+  state_kv_queued_lat           14.2 us  n=106340
+  state_kv_commiting_lat        84.3 us  n=106340
+  bluestore-sum 166.0 us
+qd16 ctrl: avg=0.00163628s max=0.0109927s iops=9767
+```
+
+Condensed:
+
+| qd=1, 64 KiB writes | profile on | profile off | delta |
+|---|---|---|---|
+| client avg latency | **~480 µs** | ~563 µs | **−83 µs (−15%)** |
+| IOPS | ~2079 | ~1772 | +17% |
+| C2 entries during runs | **0** | 1,602,030 | — |
+| BlueStore `state_*` sum | 156 µs | 166 µs | −10 µs |
+| qd=16 control | 1.643 ms | 1.636 ms | ~0 |
+
+Three independent confirmations are stacked in that table, and each
+answers a different question:
+
+* **Did the mechanism engage?** The C2 entry counter: 1.6 M entries in
+  ~30 s of benching without the profile — cores dipping into the 800 µs
+  state ~50 k times a second, system-wide — versus exactly zero with it.
+* **Where did the 83 µs come from?** Not from BlueStore: its internal
+  sum moved only 10 µs. The other ~73 µs was spent waking messenger and
+  dispatch threads *above* BlueStore — consistent with §5.1's timeline,
+  where those spans sit between fio's clat and BlueStore's service time.
+  The OSD's pipeline threads (`bstore_aio`, `bstore_kv_sync`) ping-pong
+  frequently enough that the governor rarely parked their cores in C2
+  even without the profile; the msgr threads, which sleep until a
+  message arrives, took the hit.
+* **Is it really an idle-exit effect?** The qd=16 control: at high queue
+  depth the cores never idle, and the two conditions are
+  indistinguishable — the signature that separates an idle-state fix
+  from a generic speedup. It is also §5.1's Little's-law regime: at
+  fixed high iodepth, clat states throughput, and a service-time change
+  of tens of microseconds vanishes into the queue.
+
+The operational summary: on a latency test rig, `tuned-adm profile
+latency-performance` (or any equivalent that bounds
+`/dev/cpu_dma_latency`) is worth double-digit percent on low-QD small
+writes, costs nothing at saturation, and its engagement is verifiable
+after the fact from `cpuidle/state*/usage` deltas alone. Benchmarks run
+only at saturation will never notice any of this — which is exactly how
+C-state regressions slip past throughput-oriented CI.
