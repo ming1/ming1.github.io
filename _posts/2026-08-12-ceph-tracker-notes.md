@@ -454,3 +454,117 @@ ceph-bluestore-tool --path ... --command repair --bluefs_wal_envelope_mode=false
 
 (`revert-wal-to-plain` itself needs no override — it force-marks its
 output files plain internally.)
+
+# 3. PR #70892 follow-up — a fix that needed two more commits
+
+Status: commits local on the dev branch, PR not yet refreshed; the
+findings below came out of reviewing two cleanup commits stacked on the
+still-unmerged #79068 fix (`72d06908f15`, PR
+[#70892](https://github.com/ceph/ceph/pull/70892)), reviewed at high
+effort with independent verifier agents.
+
+## 3.1 The dependency, in the unusual direction
+
+In git terms `72d06908f15` is the base of the stack and cannot depend on
+anything above it. The real relationship is a **correctness dependency**:
+the two follow-up commits close hazards that the fix either *created* or
+*put on its critical path*. Shipping it without them trades one failure
+mode for another — and since the PR is unmerged, the three belong in one
+refreshed series rather than a merge-then-repair sequence that
+backporters could split.
+
+## 3.2 Hazard 1: the fix's own ordering creates a reserve-then-park window
+
+`72d06908f15`'s core move is: *reserve all log seqs atomically under
+`dirty.lock`, before anything else* — that is what closes #79068's
+lost-bucket race. But the resulting sequence in
+`_flush_and_sync_log_LD()` is:
+
+```
+take log.lock, dirty.lock
+consume dirty bucket N into the shared log.t          <- staged
+reserve seq N (extension) + N+1 (main)                <- under dirty.lock (the fix)
+release dirty.lock
+_extend_log():
+    while (log_forbidden_to_expand)                   <- async compaction running
+        log_cond.wait(ll)                             <- RELEASES log.lock, parked
+```
+
+The flusher now sleeps holding **reserved-but-unwritten seqs, with its
+ops staged in the shared `log.t`** — a state that could not exist before
+this commit, because pre-fix the extension seq was taken *late* (that
+lateness being exactly the #79068 bug). The fix moved reservation early
+but left the wait late; the combination invents the window.
+
+A second flusher then arrives, and what happens depends on which tree
+you are on. At `72d06908f15` itself, its seq advance trips the old
+`ceph_assert(log.t.seq == log.seq_live)` (the parked flusher left
+`log.t.seq` two behind) — an **OSD crash** under
+compaction + concurrent-fsync load: an availability regression riding
+along with the durability fix. After the cleanup commits removed that
+assert, the same interleaving runs to completion silently: the second
+flusher appends the shared `log.t` — including the parked flusher's
+ops — under *later* seqs, the parked flusher then appends its earlier
+seqs behind them, and replay treats the first out-of-order seq as
+end-of-log, discarding fsync-acknowledged transactions. Crash before
+the cleanups, data loss after; the window itself is the fix's.
+
+The follow-up moves the wait to the *top* of `_flush_and_sync_log_LD()`,
+before consuming and reserving. Setting `log_forbidden_to_expand`
+requires `log.lock`, so once a flusher is past the wait nothing can
+raise the flag before its append: reservation and append become
+effectively atomic with respect to compaction, and seqs reach the
+journal in reservation order — the invariant the fix wanted finally
+holds. The now-unreachable wait inside `_extend_log()` became an assert
+so the parked-reservation window cannot be silently reintroduced.
+
+## 3.3 Hazard 2: the wait can lose its wakeup
+
+The compactor cleared `log_forbidden_to_expand` and called
+`notify_all()` with **no lock held**, while waiters test the flag under
+`log.lock`. A flusher that read *true* but had not yet parked misses the
+notification and sleeps until the next compaction signals — which may
+never come: a hung fsync, a wedged `kv_sync_thread`, a stuck OSD.
+
+Pre-existing — but the fix keeps this wait as a structural element of
+its design, and the pre-wait broadens exposure: **every** flush now
+tests the flag, not just the rare runway-short ones. The pre-wait is
+only a safe parking spot because a flusher there holds nothing; that is
+only true if it reliably wakes. Second follow-up: clear and notify under
+`log.lock` — a waiter is then either not yet parked and sees the cleared
+flag, or fully parked before the compactor can take the lock.
+
+## 3.4 The chain
+
+```
+79068 fix     closes the lost-bucket race, but reserve-early/wait-late
+              creates the parked-reservation window
+pre-wait      moves the wait before reservation -> window gone;
+              broadens who touches the forbidden-flag wait
+wakeup fix    makes that wait lose no wakeups -> no hung fsync
+```
+
+Each commit is the precondition for the one above being safe — the sense
+in which the base "depends on" its follow-ups as a shippable unit.
+
+Also surfaced by the same review, still open: a runway re-check window
+in the async-compaction pre-check (born in the fix; loud
+`bl.length() <= runway` abort, not corruption), a #79068-sibling
+lost-update in the *sync* compaction path (predates the fix; needs its
+own tracker and a bucket-merge design), and a hardening assert
+(`log.seq_appended + 1 == log.seq_live` at the reservation sites) that
+survived 48/48 tests and 1766 forced log compactions on the lab OSD
+without a false positive.
+
+## 3.5 Takeaways
+
+- **A fix can create the very state it set out to forbid.** Moving the
+  reservation early was right; every code path between "reserved" and
+  "appended" then had to be audited for places that release locks. The
+  one `cond.wait` in that span was the whole bug.
+- **Deleting a tripwire is only correct once the trap is gone.** The
+  cleanup that removed the old assert turned a crash into silent data
+  loss; the right order is fix-the-fire first, then remove the alarm.
+- **Unmerged is a gift**: because #70892 has not merged, the fix and its
+  two completions can land as one series, and no backport can pick up
+  the window without its cure.
