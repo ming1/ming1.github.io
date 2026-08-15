@@ -1,0 +1,29 @@
+#!/usr/bin/env bpftrace
+/* wpg.bt -- decompose dequeue_op -> queue_transactions (PG execution),
+ * qd=1 only.
+ *
+ * Usage: bpftrace wpg.bt <path-to-ceph-osd>
+ *        Run a 12-15 s qd=1 bench (--no-cleanup!) inside the 45 s
+ *        window; exits and prints sums after 45 s. Do not SIGINT:
+ *        the map dump does not reliably flush on signals.
+ */
+uprobe:$1:_ZN3OSD10dequeue_opE* { @t0 = nsecs; }
+uprobe:$1:_ZN12PrimaryLogPG5do_opE* /@t0/ {
+  @ns["p1_dequeue_to_do_op"]+=nsecs-@t0; @n["p1_dequeue_to_do_op"]++; @t0=(uint64)0; @t1=nsecs; }
+uprobe:$1:_ZN12PrimaryLogPG19find_object_contextE* /@t1/ {
+  @ns["p2_do_op_to_findobc"]+=nsecs-@t1; @n["p2_do_op_to_findobc"]++; @t1=(uint64)0; @t2=nsecs; }
+uretprobe:$1:_ZN12PrimaryLogPG19find_object_contextE* /@t2/ {
+  @ns["p3_findobc_body"]+=nsecs-@t2; @n["p3_findobc_body"]++; @t2=(uint64)0; @t3=nsecs; }
+uprobe:$1:_ZN12PrimaryLogPG11execute_ctxE* /@t3/ {
+  @ns["p4_findobc_to_exec"]+=nsecs-@t3; @n["p4_findobc_to_exec"]++; @t3=(uint64)0; @t4=nsecs; }
+uprobe:$1:_ZN12PrimaryLogPG10do_osd_opsE* /@t4/ {
+  @ns["p5_exec_to_do_osd_ops"]+=nsecs-@t4; @n["p5_exec_to_do_osd_ops"]++; @t4=(uint64)0; @t5=nsecs; }
+uretprobe:$1:_ZN12PrimaryLogPG10do_osd_opsE* /@t5/ {
+  @ns["p6_do_osd_ops_body"]+=nsecs-@t5; @n["p6_do_osd_ops_body"]++; @t5=(uint64)0; @t6=nsecs; }
+uprobe:$1:_ZN12PrimaryLogPG11issue_repopE* /@t6/ {
+  @ns["p7_finish_ctx_etc"]+=nsecs-@t6; @n["p7_finish_ctx_etc"]++; @t6=(uint64)0; @t7=nsecs; }
+uprobe:$1:_ZN9BlueStore18queue_transactionsE* /@t7/ {
+  @ns["p8_repop_to_queue_txn"]+=nsecs-@t7; @n["p8_repop_to_queue_txn"]++; @t7=(uint64)0; }
+interval:s:45 { exit(); }
+END { clear(@t0); clear(@t1); clear(@t2); clear(@t3); clear(@t4);
+      clear(@t5); clear(@t6); clear(@t7); }

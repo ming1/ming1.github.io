@@ -1,0 +1,51 @@
+#!/usr/bin/env bpftrace
+/* wfuncs.bt -- per-function latency sums over a bench run.
+ * Decomposes state_prepare (tp_osd_tp) and kv_commit (bstore_kv_sync).
+ *
+ * Usage: bpftrace wfuncs.bt <path-to-ceph-osd>
+ *        Run a 12-15 s qd=1 bench (--no-cleanup!) inside the 45 s
+ *        window; exits and prints sums after 45 s. Do not SIGINT:
+ *        the map dump does not reliably flush on signals.
+ *
+ * Note: a3_rocksdb_set_sum counts SETS, not ops -- divide its @ns by
+ * the op count (a0's @n) for the per-op cost, not by its own @n.
+ * b1_kdev_flush averages over BOTH flushes per op (data bdev +
+ * bluefs bdev); it is not scoped inside submit_transaction_sync. */
+
+/* ---- tp_osd_tp: prepare span ---- */
+uprobe:$1:_ZN9BlueStore18queue_transactionsE* /comm=="tp_osd_tp"/ { @qt[tid]=nsecs; }
+uprobe:$1:_ZN9BlueStore9_do_writeE* /@qt[tid]/ {
+  @ns["a1_qt_to_do_write"]+=nsecs-@qt[tid]; @n["a1_qt_to_do_write"]++; @dw[tid]=nsecs; }
+uretprobe:$1:_ZN9BlueStore9_do_writeE* /@dw[tid]/ {
+  @ns["a2_do_write"]+=nsecs-@dw[tid]; @n["a2_do_write"]++; delete(@dw[tid]); }
+uprobe:$1:_ZN12RocksDBStore22RocksDBTransactionImpl3setE* /comm=="tp_osd_tp"/ { @rs[tid]=nsecs; }
+uretprobe:$1:_ZN12RocksDBStore22RocksDBTransactionImpl3setE* /@rs[tid]/ {
+  @ns["a3_rocksdb_set_sum"]+=nsecs-@rs[tid]; @n["a3_rocksdb_set_sum"]++; delete(@rs[tid]); }
+uprobe:$1:_ZN9BlueStore15_txc_aio_submitE* /@qt[tid]/ {
+  @ns["a0_prepare_total"]+=nsecs-@qt[tid]; @n["a0_prepare_total"]++; delete(@qt[tid]); }
+
+/* ---- bstore_kv_sync: kv_commit span ---- */
+uprobe:$1:_ZN12KernelDevice5flushEv /comm=="bstore_kv_sync"/ { @kf[tid]=nsecs; }
+uretprobe:$1:_ZN12KernelDevice5flushEv /@kf[tid]/ {
+  @ns["b1_kdev_flush"]+=nsecs-@kf[tid]; @n["b1_kdev_flush"]++; delete(@kf[tid]); }
+uprobe:$1:_ZN12RocksDBStore18submit_transactionE* /comm=="bstore_kv_sync"/ { @sn[tid]=nsecs; }
+uretprobe:$1:_ZN12RocksDBStore18submit_transactionE* /@sn[tid]/ {
+  @ns["b2_submit_nosync"]+=nsecs-@sn[tid]; @n["b2_submit_nosync"]++; delete(@sn[tid]); }
+uprobe:$1:_ZN12RocksDBStore23submit_transaction_syncE* /comm=="bstore_kv_sync"/ { @ss[tid]=nsecs; }
+uretprobe:$1:_ZN12RocksDBStore23submit_transaction_syncE* /@ss[tid]/ {
+  @ns["b3_submit_sync"]+=nsecs-@ss[tid]; @n["b3_submit_sync"]++; delete(@ss[tid]); }
+uprobe:$1:_ZN6BlueFS5fsyncE* /comm=="bstore_kv_sync"/ { @bf[tid]=nsecs; }
+uretprobe:$1:_ZN6BlueFS5fsyncE* /@bf[tid]/ {
+  @ns["b4_bluefs_fsync"]+=nsecs-@bf[tid]; @n["b4_bluefs_fsync"]++; delete(@bf[tid]); }
+uprobe:$1:_ZN12KernelDevice9aio_writeE* /comm=="bstore_kv_sync"/ { @aw[tid]=nsecs; }
+uretprobe:$1:_ZN12KernelDevice9aio_writeE* /@aw[tid]/ {
+  @ns["b5_wal_aio_write"]+=nsecs-@aw[tid]; @n["b5_wal_aio_write"]++; delete(@aw[tid]); }
+
+/* ---- bstore_kv_final: callback cost ---- */
+uprobe:$1:_ZN9BlueStore17_txc_committed_kvE* /comm=="bstore_kv_final"/ { @ck[tid]=nsecs; }
+uretprobe:$1:_ZN9BlueStore17_txc_committed_kvE* /@ck[tid]/ {
+  @ns["c1_txc_committed_kv"]+=nsecs-@ck[tid]; @n["c1_txc_committed_kv"]++; delete(@ck[tid]); }
+
+END { clear(@qt); clear(@dw); clear(@rs); clear(@kf);
+      clear(@sn); clear(@ss); clear(@bf); clear(@aw); clear(@ck); }
+interval:s:45 { exit(); }

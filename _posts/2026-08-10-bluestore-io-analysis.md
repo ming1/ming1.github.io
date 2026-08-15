@@ -563,6 +563,16 @@ script's banner line before starting the workload:
 | [`wtrace.bt`]({{ site.baseurl }}/code/ceph/wtrace.bt) | event log for a single IO | what happened, in order, on which thread |
 | [`wlat.bt`]({{ site.baseurl }}/code/ceph/wlat.bt) | per-stage latency histograms | where the milliseconds went |
 
+Three more sum-probe scripts, built for §5.2's per-thread budget and
+introduced there (these end themselves via an `interval` timer rather
+than Ctrl-C):
+
+| Script | Mode | Answers |
+|---|---|---|
+| [`wfuncs.bt`]({{ site.baseurl }}/code/ceph/wfuncs.bt) | per-function averages | what each BlueStore function costs, per thread |
+| [`wosd.bt`]({{ site.baseurl }}/code/ceph/wosd.bt) | OSD pipeline spans, qd=1 | dispatch → queue → PG → BlueStore → reply |
+| [`wpg.bt`]({{ site.baseurl }}/code/ceph/wpg.bt) | PG execution spans, qd=1 | where `dequeue_op` → `queue_transactions` goes |
+
 The same uprobe technique, packaged as a maintained tool, is
 [cephtrace](https://github.com/taodd/cephtrace/tree/main): its `radostrace`
 traces per-op latency from the librados client side and `osdtrace` breaks
@@ -2251,7 +2261,219 @@ throughput, not about service time; wlat's client figure
 service time, and the difference between the two is real waiting —
 located above BlueStore, in the spans the diagram places between them.
 
-## 5.2 C-states and the idle write — verifying `tuned latency-performance`
+## 5.2 Per-thread performance analysis — where a qd=1 write's time goes
+
+§3 walked one write through four threads and named every event on the
+way. This section weighs those events: for a warm 64 KiB write at queue
+depth 1, how many microseconds does each thread — and each function
+inside it — actually cost, and which of those microseconds can be taken
+back? The rig is the ramdisk host of §5.3 (`/dev/ram0`, device time ≈ 0),
+so everything measured here is CPU work, scheduling, or waiting — never
+the disk.
+
+### 5.2.1 Three layers of inflation
+
+The starting point is a deceptively simple observation: a single
+`rados put` of 64 KiB shows ~800 µs from `queue_transactions` to
+`_txc_finish`. Three separate inflations sit on top of the real
+number, and each has to be peeled before the breakdown below means
+anything:
+
+* **Cold vs warm.** A one-shot put pays cold caches all the way down —
+  onode, rocksdb block cache, allocator. Warm steady state
+  (`rados bench -t 1`) runs the same span at ~3× less.
+* **The tracer itself.** `wtrace.bt` (§2.3) attaches 31 probes (22
+  declarations, expanded by wildcards) to the hottest functions in the
+  path; each fired probe costs 1–3 µs of kernel round-trip. When the
+  tracer happened to exit mid-experiment, qd=1 IOPS rose from ~1780 to
+  ~1990 — roughly **60 µs/op of observer effect**, concentrated inside
+  the BlueStore stages the probes cover. (Coincidentally close to
+  §5.3's C-state delta; these are independent effects — the tracer
+  comparison ran with C-states already capped.) Trace *or* measure;
+  never both at once.
+* **Debug levels and C-states.** vstart's default debug levels
+  (`debug_rocksdb=4/5` and friends) cost real formatting on the hot
+  path, and a reboot had re-armed the C2 idle state (§5.3).
+
+Peeling all three: `txc_commit_lat` fell from **268 µs**
+(tracer attached, default debug) to **150 µs**
+(no tracer, `debug_* 0/0`, C2 off) to **140 µs** with one more lever
+found below (`bluefs_sync_write`). The client-side average settled
+around 480–530 µs depending on what was attached — which raises the
+better question this section ends on: if BlueStore is ~140 µs, where
+does everything else go?
+
+### 5.2.2 Method — sum probes instead of event logs
+
+Event-log tracing (§2.3) shows one IO beautifully but inherits that
+IO's noise. For averages, a different script shape works better: every
+probe pair adds its delta into a sum map keyed by a stage label, a
+counter map counts events, and an `interval` probe ends the run —
+averages come out in one division per label. Three scripts in this
+style produced every number below, run one at a time under a 12–15 s
+`rados bench -b 65536 -t 1` on a warmed pool:
+
+* [`wfuncs.bt`]({{ site.baseurl }}/code/ceph/wfuncs.bt) — functions
+  *inside* the BlueStore span, per thread;
+* [`wosd.bt`]({{ site.baseurl }}/code/ceph/wosd.bt) — the OSD pipeline
+  *around* BlueStore, dispatch to reply;
+* [`wpg.bt`]({{ site.baseurl }}/code/ceph/wpg.bt) — the PG execution
+  span, magnified.
+
+Because the workload is qd=1, one op is in flight at a time, so the
+pipeline scripts can chain plain global timestamps across threads —
+no per-op correlation needed. Every average was cross-checked against
+the OSD's own `state_*_lat` perf counters (§5.3's `pdump`), which
+agree to within the probes' own overhead. Two traps are worth
+recording: end these scripts with `interval { exit(); }` rather
+than an external `timeout -s INT` (the map dump does not reliably
+flush on signals), and run benches with `--no-cleanup` inside the
+trace window — otherwise the bench's cleanup *deletes* traverse the
+same dispatch→commit pipeline and silently double every event count.
+
+### 5.2.3 Inside BlueStore, thread by thread
+
+`wfuncs.bt`, run with **default debug levels and C2 armed, probes
+attached** (n ≈ 20k ops per label). Two rows marked † come from the
+`state_*_lat` perf counters of the same run, and the third tp_osd_tp
+row is derived (prepare total minus the two measured spans), since
+`_txc_write_nodes` is inlined and cannot be probed:
+
+| thread | span | µs | what it is |
+|---|---|---|---|
+| tp_osd_tp | `queue_transactions` → `_do_write` | 32 | txc creation, transaction decode, onode lookup, throttle |
+| tp_osd_tp | `_do_write` body | 20 | blob placement, allocation, checksums, data `aio_write` prep |
+| tp_osd_tp | after `_do_write` → `_txc_aio_submit` (derived) | 35 | `_txc_write_nodes`: onode + extent-map encode, 3× rocksdb `set` (10 µs/op, ~3.4 µs each), finalize |
+| bstore_aio | aio_wait † | 31 | `io_getevents` wake + `_txc_finish_io` handoff |
+| bstore_kv_sync | queue wait † | 23 | kv_sync thread wakeup |
+| bstore_kv_sync | `submit_transaction` | 35 | memtable insert of the staged keys |
+| bstore_kv_sync | `submit_transaction_sync` | 48 | WAL commit — decomposed below |
+| bstore_kv_final | wakeup + callbacks | 34 | of which the `_txc_committed_kv` body is **5 µs** |
+
+Note what the tracer does to the two † rows: untraced, §5.3 measures
+the same counters at ~12 µs each; with ten probe pairs attached they
+read 31 and 23. The observer effect of §5.2.1 is not evenly spread —
+it concentrates in the wakeup-bounded spans, which is worth
+remembering whenever an event-log trace makes the handoffs look like
+the whole story. (A cross-check the run earns for free:
+`submit_transaction` 35 + `submit_transaction_sync` 48 = 83 µs, right
+against §5.3's untraced `state_kv_commiting_lat` of 85 — the kv-thread
+work itself is barely probe-inflated, because only four probe pairs
+sit inside it.)
+
+The `submit_transaction_sync` interior is the striking one. Its 48 µs
+contain a `BlueFS::fsync` of the RocksDB WAL at 35 µs — but the actual
+WAL `aio_write` is **2 µs**, and a `KernelDevice::flush` averages
+**3 µs** (the probe averages over both flushes per op — the data-bdev
+barrier and the BlueFS one, #10 and #14 in §3.2's map). The missing
+~30 µs of the fsync is the BlueFS write path bouncing through the
+KernelDevice aio thread and back — twice — to complete a write that
+the ramdisk finishes instantly. That observation points at a config
+lever: `bluefs_sync_write=true` makes BlueFS write the WAL
+synchronously in the kv_sync thread instead of queueing aio. It is
+settable live despite not carrying the `runtime` flag — BlueFS
+re-reads it on every call, so `ceph daemon ... config set` takes
+effect at once (with a spurious may-require-restart warning) — and
+`kv_commit_lat` drops 72 → 61 µs (both untraced, `debug 0/0`, C2
+off).
+
+Totalled: on this device, **real device I/O is ~8 µs of the whole
+BlueStore span (one 2 µs WAL write + two ~3 µs flushes; the 64 KiB
+data `aio_write` is issued during prepare and its device time on brd
+is buried inside the aio_wait handoff); thread
+handoffs and wakeups are ~75–120 µs; the rest is CPU work** —
+encoding, rocksdb, allocator. After all levers (`debug 0/0`, C2 off,
+`bluefs_sync_write`), the counters read:
+
+```
+state_prepare_lat      47.0 us      kv_commit_lat   60.8 us
+state_aio_wait_lat     11.7 us      kv_final_lat    26.2 us
+state_kv_queued_lat    11.1 us      txc_commit_lat 139.9 us
+```
+
+(The five per-stage numbers do not sum to `txc_commit_lat`:
+`kv_commit_lat` and `kv_final_lat` are kv-thread durations, not txc
+state times — the state-time family's missing member here is
+`state_kv_commiting_lat`, 80 µs in this configuration.)
+
+### 5.2.4 Outside BlueStore — the other ~360 µs
+
+With BlueStore under 170 µs even as traced, most of a qd=1 write
+never touches the object store. `wosd.bt` spans the OSD pipeline
+(write-only run, n = 28,482 = exactly the op count). One caveat up
+front: the 525 µs client average and every row below are from the
+*probe-attached* run — untraced, the same rig lands nearer 480 µs
+(§5.3), and BlueStore alone at 140. The proportions, not the last
+microsecond, are the point:
+
+| span | µs | what it is |
+|---|---|---|
+| `ms_fast_dispatch` → `enqueue_op` | 5 | op decode tail, queue insert |
+| queue wait (`enqueue_op` → `dequeue_op`) | 21 | mclock shard dequeue + tp_osd_tp wakeup |
+| **`dequeue_op` → `queue_transactions`** | **145** | PG execution — magnified below |
+| `queue_transactions` → commit callback | 168 | BlueStore as traced — a slightly wider bracket than `txc_commit_lat` (function entry precedes txc birth) plus this run's probe overhead; 140 untraced |
+| commit callback → `log_op_stats` | 37 | `eval_repop`, stats, reply *construction* — `log_op_stats` fires just before the send (§5.1), so transmission is in the remainder row |
+| remainder (client + wire + pre-dispatch) | ~150 | localhost TCP ×2, msgr read/decode before `ms_fast_dispatch`, reply transmission, objecter, bench loop |
+
+The 145 µs of PG execution dwarfs everything else the OSD does outside
+the store. `wpg.bt` splits it. Two notes on reading the table: the
+bolded row and the one after it come from a second, finer-probed run
+that put a uretprobe on `find_object_context` (the coarser run
+measured entry-to-`execute_ctx` at 88 µs, of which the body is 52);
+and as printed the rows sum to ~142 against the 145 they decompose —
+the two runs carry slightly different probe overhead, so treat the
+split as proportions:
+
+| span | µs | what it is |
+|---|---|---|
+| `dequeue_op` → `do_op` | 8 | PG lock, dequeue plumbing |
+| `do_op` preamble | 13 | epoch/map checks, op field decode |
+| **`find_object_context` body** | **52** | obc cache miss for the *new* object: two rocksdb attr point-gets that miss (OI, SS), snapdir handling, obc construction |
+| `find_object_context` return → `execute_ctx` | 5 | remaining `do_op` checks |
+| `execute_ctx` → `do_osd_ops` | 2 | op context setup |
+| `do_osd_ops` body | 5 | the actual CEPH_OSD_OP_WRITE handling |
+| `finish_ctx` → `issue_repop` | 30 | pg_log entry build, object_info + snapset encode, stats |
+| `issue_repop` → `queue_transactions` | 26 | repop registration, ReplicatedBackend submit, pg-log keys into the txn |
+
+Three readings of that table:
+
+* **The op itself is nearly free.** Executing the 64 KiB WRITE costs
+  5 µs; the metadata bookkeeping around it — pg_log entries,
+  object_info and snapset encodes, later re-encoded once more by
+  BlueStore into rocksdb keys — costs ten times the op.
+* **The biggest single item is workload-shaped.** `rados bench` (and
+  any fresh `rados put`) writes a *new* object every op, so every op
+  pays 52 µs of object-context establishment, most of it rocksdb
+  lookups for attributes that do not exist. Overwriting an object
+  whose obc is already cached skips almost all of it — a latency test
+  that only writes new objects measures a different pipeline than one
+  that overwrites.
+* **~190 µs sits outside the OSD's op-execution path.** The
+  reply/stats tail (37 µs) plus the client/wire remainder (~150 µs)
+  live in the reply path, the messenger and the client — which is
+  exactly where §5.3 found the C-state win, and where server-side
+  tools stop seeing (§5.1).
+
+### 5.2.5 The budget, and what is actually reducible
+
+The whole write as traced (~525 µs; untraced the same pipeline runs
+~480), in one line each:
+
+```
+client+wire ~150 | dispatch 5 | queue 21 | PG exec 145 | BlueStore 168 (140 untraced) | to-reply 37
+```
+
+Reducible with a switch, all measured here: debug levels to 0/0,
+C-states capped (§5.3), `bluefs_sync_write=true` on fast media, and
+not leaving tracers attached — together worth well over 100 µs on this
+pipeline. Structural, needing code or design changes: the
+thread-handoff wakeups — §3.2's three BlueStore switches plus the
+initial shard-queue wakeup, ~70 µs across the pipeline even tuned —
+the new-object obc establishment, the double metadata encode
+(PG bookkeeping then BlueStore), and the messenger/client span that
+dominates everything else at qd=1.
+
+## 5.3 C-states and the idle write — verifying `tuned latency-performance`
 
 Everything above measures a pipeline that is *doing* something. But at
 queue depth 1 the OSD's threads spend most of their life asleep, and on

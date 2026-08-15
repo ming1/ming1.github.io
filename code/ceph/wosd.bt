@@ -1,0 +1,27 @@
+#!/usr/bin/env bpftrace
+/* wosd.bt -- OSD pipeline spans OUTSIDE BlueStore, qd=1 only.
+ *
+ * Usage: bpftrace wosd.bt <path-to-ceph-osd>
+ *        Run a 12-15 s qd=1 bench inside the 45 s window
+ *        (rados bench <sec> write -b 65536 -t 1 --no-cleanup -- WITH
+ *        --no-cleanup, or the cleanup deletes double every count);
+ *        exits and prints sums after 45 s. Do not SIGINT: the map
+ *        dump does not reliably flush on signals.
+ *
+ * qd=1 lets plain global timestamps chain one op across threads.
+ * s5 ends at log_op_stats, which fires just before the reply is
+ * sent -- reply transmission is NOT included in any span here.
+ */
+uprobe:$1:_ZN3OSD16ms_fast_dispatchE* { @t1 = nsecs; }
+uprobe:$1:_ZN3OSD10enqueue_opE* /@t1/ {
+  @ns["s1_fastdisp_to_enq"]+=nsecs-@t1; @n["s1_fastdisp_to_enq"]++; @t2=nsecs; @t1=(uint64)0; }
+uprobe:$1:_ZN3OSD10dequeue_opE* /@t2/ {
+  @ns["s2_queue_wait"]+=nsecs-@t2; @n["s2_queue_wait"]++; @t3=nsecs; @t2=(uint64)0; }
+uprobe:$1:_ZN9BlueStore18queue_transactionsE* /@t3/ {
+  @ns["s3_pg_exec"]+=nsecs-@t3; @n["s3_pg_exec"]++; @t3=(uint64)0; @t4=nsecs; }
+uprobe:$1:_ZN9BlueStore17_txc_committed_kvE* /@t4/ {
+  @ns["s4_bluestore_to_commit_cb"]+=nsecs-@t4; @n["s4_bluestore_to_commit_cb"]++; @t4=(uint64)0; @t5=nsecs; }
+uprobe:$1:_ZN12PrimaryLogPG12log_op_statsE* /@t5/ {
+  @ns["s5_commit_to_log_op_stats"]+=nsecs-@t5; @n["s5_commit_to_log_op_stats"]++; @t5=(uint64)0; }
+interval:s:45 { exit(); }
+END { clear(@t1); clear(@t2); clear(@t3); clear(@t4); clear(@t5); }
