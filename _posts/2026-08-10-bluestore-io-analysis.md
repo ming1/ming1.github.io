@@ -1239,6 +1239,100 @@ again (a new osdmap epoch, an interval change); on a quiet pool that is
 effectively once. If you trace a fresh pool and your byte counts do
 not match this post's, write twice and read the second trace.
 
+## 3.8 The same write on write v2
+
+v21 ships a second write path, off by default:
+
+```
+ceph config set osd bluestore_write_v2 true      # startup flag: restart the OSD
+ceph osd metadata 0 | grep bluestore_write_mode  # "new" = v2, "classic" = v1
+```
+
+wtrace.bt carries probes for both paths, so the same command traces
+either mode. Three 4 KiB `rados put`s under v2 — a fresh object, an
+overwrite, and an overwrite with the deferred path enabled
+(`bluestore_prefer_deferred_size 32768`) — against the same three in
+classic mode. The v2 fresh write:
+
+```
+   us   thread      function                     event
+    4   tp_osd_tp   BlueStore::queue_transactions  transaction arrives
+   90   tp_osd_tp   BlueStore::_do_write_v2        off=0x0 len=0x1000
+  101   tp_osd_tp   Writer::do_write               loc=0x0
+  110   tp_osd_tp   BlueStore::_punch_hole_2       off=0x0 len=0x1000
+  129   tp_osd_tp   Writer::_defer_or_allocate     need=0x1000
+  158   tp_osd_tp   KernelDevice::aio_write        bdev=..a00 off=0xa000 len=0x1000
+  205+  tp_osd_tp   set(P)/set(O), _txc_aio_submit ...
+```
+
+(`_punch_hole_2` always covers the whole write range — on a fresh
+object there is simply nothing inside it to release.)
+
+Everything from `_txc_aio_submit` on — the aio completion, the two
+barriers, the kv commit, the reply — is line-for-line the §3.2 map.
+**v2 replaces only the planning lane** (§3.3's lines #2–#3); the txc
+state machine, the KV records and the durability protocol are
+untouched. Side by side:
+
+```
+ classic (§3.3)                        write v2
+ ─────────────────                     ────────────────────
+ _do_write                             _do_write_v2
+   └► _do_write_big      — plan          └► Writer::do_write
+   └► _do_write_small    — plan               ├► _split_data / align
+   [wctx accumulates]                         ├► _punch_hole_2   — one emap walk:
+ _do_alloc_write         — allocate,          │    empty the range, collect
+   csum, stage aio       per chunk            │    released AUs + statfs delta
+ _wctx_finish            — release            ├► _defer_or_allocate — ONE
+   old extents                                │    decision, ONE allocator call
+                                              └► place blobs, csum, stage aio
+```
+
+The observable difference is where overwritten data lands. The six
+captures (one continuous session — a different run than the excerpt
+above, so absolute LBAs differ), by data-device LBA:
+
+```
+                       fresh        overwrite      overwrite
+                       (direct)     (direct)       (deferred)
+ classic   data at     0xdd000      0xda000 (new)  0xdb000 (new, via WAL replay)
+ write v2  data at     0xd8000      0xd9000 (new)  0xd9000 (SAME LBA, via WAL replay)
+```
+
+Both modes copy-on-write for a direct overwrite: punch the old AU,
+allocate a new one. The split is the deferred overwrite. Classic still
+allocates a new AU — the WAL only changes *when* the data lands, not
+*where*; the replay writes freshly allocated space. v2's
+`_defer_or_allocate` instead points the write at the extents
+`_punch_hole_2` just released (`disk_allocs.it = released.begin()`,
+[`Writer.cc:1326`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/Writer.cc#L1326))
+— the deferred overwrite goes back to the LBA the object already
+occupied, with no allocator call at all. The v2 deferred trace shows
+the whole shape:
+
+```
+   us   thread          function                     event
+  107   tp_osd_tp       BlueStore::_do_write_v2      off=0x0 len=0x1000
+  129   tp_osd_tp       BlueStore::_punch_hole_2     off=0x0 len=0x1000   ← releases 0xd9000
+  167   tp_osd_tp       Writer::_defer_or_allocate   need=0x1000          ← deferred: reuse it
+  306   tp_osd_tp       set(L)                       keylen=8 val=4135B   ← data rides the txn
+  367   tp_osd_tp       BlueStore::_txc_finish_io    (inline -- no data aio)
+  895   bstore_kv_sync  aio_write (WAL) + ONE barrier, fd=44 only
+11264   bstore_kv_final _txc_committed_kv            → client reply
+        ...
+2273474 bstore_mempool  KernelDevice::aio_write      off=0xd9000          ← replay, in place
+```
+
+One barrier instead of two (no data to flush before the kv commit),
+the 4 KiB payload inside the `L` record, and the background replay
+landing on the punched LBA. Note what this means for §6.11 of the
+internals post: v2's deferred overwrite is rewrite-in-place *by
+design* — better for flash allocator churn, one more pattern zoned
+media cannot accept.
+
+Functions on the new lane: §4.3.10 (`_do_write_v2`) and §4.3.11
+(`Writer::do_write`).
+
 # 4. Code analysis
 
 The trace sections answer *what happened*; this section reads the code
@@ -1339,6 +1433,91 @@ one `submit_transaction_sync` (barrier #2) over many txcs'
 `on_commit`s. The contract pins ordering and atomicity and leaves
 *when* to the implementation; that gap is where all of BlueStore's
 throughput engineering lives.
+
+### 4.1.2 Why this contract — the promises made upstairs
+
+None of the six clauses is a storage-engine preference. Each is the
+compiled form of a promise some layer above has already made: RBD,
+RGW and CephFS promise their users things like "fsync returned, your
+data survives power loss"; RADOS promises the services "acked means
+durable on the quorum, per-object order holds". The OSD can keep
+those promises only if its local store signs exactly this contract.
+
+**Durability as an event (clause 1).** A guest VM's ext4/XFS journal
+is correct only if the virtual disk's FLUSH really means
+durable-on-media — librbd maps a guest flush to "wait for the
+outstanding acks", so the RADOS ack must be a durability event, which
+in turn means the store must *tell* the OSD when commit happened
+(`on_commit`), not merely return. The same shape arrives via POSIX
+`fsync` through CephFS (and through the MDS's own journal, which is
+itself RADOS objects), and via S3 semantics through RGW: a 200 means
+the object survives failures, so the reply may only follow the commit
+event. The applied/commit *split* exists for the other direction —
+read-your-writes must not wait the milliseconds durability costs, so
+visibility is signaled separately (and BlueStore makes it immediate).
+The *async* form exists because a PG shard thread pipelines many ops;
+a store call that blocked on media would serialize a whole PG on
+device latency.
+
+**Atomicity (clause 2): compound ops, and the log.** A RADOS op is
+compound — one op can carry a data write plus xattr plus omap
+mutations (RBD pairs data with object-map updates, RGW writes the
+head object plus its manifest, one MDS journal entry batches a whole
+directory update), and a half-applied compound op after a crash would
+be an inconsistency no client can even detect, let alone repair. But
+the most demanding customer is RADOS itself: the OSD piggybacks the
+PG-log entry on the same transaction (§4.3.9), and peering decides
+which replica has which write by comparing logs — that works only if
+a write and the log entry describing it are inseparable.
+
+**Ordering, scoped (clause 3): replicas converge by construction.**
+Replication is a state machine: every replica applies the same ops in
+the same order, therefore holds the same bytes. The PG log *is* that
+order, and recovery's `last_update`/`last_complete` arithmetic
+assumes the sequence has no holes — hence apply-in-sequence per
+collection. The scoping is the equally deliberate half: an OSD hosts
+hundreds of PGs, and RBD stripes one image across thousands of
+objects precisely so they land in different PGs — cross-collection
+parallelism is where every service's throughput comes from. The
+contract pins the minimum order correctness needs and frees
+everything else.
+
+**Isolation by the caller (clause 4): don't pay twice.** The OSD
+already holds a stronger serialization — the PG lock — *because of*
+the ordering requirement above. A store-level reader/writer lock
+would purchase, on every access, a guarantee its only caller already
+owns. The interface has exactly one, sophisticated, client; the
+contract is shaped to that reality.
+
+**No failure path (clause 5): you cannot roll back a replicated op.**
+By the time the local store applies the transaction, the primary has
+already sent the repop to the replicas — inside
+`ReplicatedBackend::submit_transaction`, `issue_op`
+([`ReplicatedBackend.cc:642`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L642))
+runs before the local `queue_transactions` (`:675`). There is no
+un-replicate protocol — a polite local `EIO` would require
+distributed rollback of peers that may have already committed,
+exactly the complexity RADOS exists to avoid. So the store may only
+succeed or fail-stop: a store that cannot apply is a dead OSD, and
+peering re-replicates its PGs from the healthy copies. The effect for
+RBD/RGW/CephFS is that storage errors surface as temporary
+*unavailability*, never as wrong data — a blocked op is recoverable,
+a corrupted one is not. (ENOSPC is the limit case: it cannot be
+handled transactionally at apply time, so full-ratio checks upstream
+prevent it, and hitting one anyway is a crash by design.)
+
+**Buffer stability (clause 6): zero-copy from NIC to NVMe.** The
+bufferlist that carried the client's bytes off the wire is the same
+one `aio_write` hands to the device. Copying instead of pinning would
+double memory traffic on every replica at full OSD throughput;
+pinning costs the caller a refcount.
+
+Summed up: every clause traces either to a client-visible promise
+(fsync, FLUSH, S3's 200, POSIX) or to the replicated-state-machine's
+internal needs (log atomicity, prefix order, fail-stop). Nothing in
+the contract mentions storage media — which is why the same OSD ran
+on ext4-plus-journal under FileStore yesterday and runs on RocksDB
+plus raw NVMe under BlueStore today.
 
 ## 4.2 Data structures
 
@@ -1561,7 +1740,9 @@ meets them: plan (`_do_write_big` / `_do_write_small`) → execute
 thread loops that own the tail, `_kv_sync_thread` and
 `_kv_finalize_thread`. §4.3.9 then backtracks to the front door,
 `queue_transactions` — where the transaction, its PG-log `P` records
-already inside, first meets BlueStore. Bare `:NNNN`
+already inside, first meets BlueStore — and §4.3.10–4.3.11 cover the
+write-v2 planning lane (§3.8) that replaces the first three entries
+when `bluestore_write_v2` is on. Bare `:NNNN`
 line numbers are
 [`BlueStore.cc` at the v21.3.0 tag](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc)
 (§4.3.6 is `RocksDBStore.cc`); each heading links its definition.
@@ -1948,6 +2129,77 @@ submitted by the state machine this function kicks at `:16060`.
 serial); the `OpSequencer` orders txcs per collection, and the
 deferred throttle path may briefly raise `deferred_aggressive` and
 drive `deferred_try_submit` (`:16039`).
+
+### 4.3.10 _do_write_v2 — the v2 dispatcher
+
+[`BlueStore.cc:17946`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L17946)
+— same parameters as `_do_write`; which one runs is decided per write
+in `_write` (`:18101`) from a flag read once at startup (`:9566`,
+`bluestore_write_v2`, so switching requires an OSD restart but no
+format change — both paths produce the same onode/blob metadata).
+
+```
+_do_write_v2(txc, c, o, offset, length, bl)                 :17946
+   │
+   ├─ _choose_write_options — same wctx knobs as classic
+   ├─ compression on?
+   │    ├─ onode has segment_size: carve the write along segment
+   │    │    boundaries, one _do_write_v2_compressed per segment
+   │    └─ else: single call with a ±128 KiB lookaround      :17998
+   │         (re-pack neighbouring compressed blobs — the
+   │          recompression hook)
+   └─ uncompressed: BlueStore::Writer on the faulted range
+        └► wr.do_write(offset, bl)              (§4.3.11)
+```
+
+**IOs:** none of its own — the Writer (or the compressed helper)
+stages them.
+
+**Locks:** as `_do_write` — the PG lock and the per-collection
+sequencer serialize writers on this onode; `fault_range_ex` loads the
+affected extent-map shards before the Writer runs.
+
+### 4.3.11 Writer::do_write — punch, decide once, place
+
+[`Writer.cc:1415`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/Writer.cc#L1415)
+— the uncompressed v2 write as one object: split the data into
+blob-sized chunks, empty the target range in a single pass, make one
+deferred-vs-direct decision, place the chunks. References in this
+entry are `Writer.cc` lines.
+
+```
+do_write(location, data)                                    :1415
+   │
+   ├─ _split_data / _align_to_disk_block
+   ├─ _punch_hole_2 — ONE extent-map walk                   :44
+   │    splits boundary extents, drops refs, accumulates:
+   │    released AUs, pruned blobs, shared-blob changes,
+   │    statfs_delta (applied once, as values)
+   ├─ _defer_or_allocate(need)                              :1312
+   │    do_deferred = need <= released && released <        :1320
+   │                  prefer_deferred_size
+   │    ├─ deferred: disk_allocs = released                 :1326
+   │    │    -- write lands on the JUST-PUNCHED extents,
+   │    │       in place, no allocator call (§3.8)
+   │    └─ direct: one alloc->allocate for the whole need   :1330
+   └─ place chunks via the blob toolbox                     :333
+        (reuse a neighbour blob's unused space / extend
+         with new allocation / create partial or full blob)
+        csum per blob, stage the aio or the deferred payload
+```
+
+The deferred/direct choice is per write, not per chunk — the comment
+at `:1308` states the principle: "having parts of write executed as
+deferred and other parts as direct is suboptimal in any case".
+
+**IOs:** stages the data aio(s) for direct writes (submitted later by
+`_txc_aio_submit`, §3.3 line #8) or folds the payload into the txc's
+deferred `L` record — the role classic split between
+`_do_alloc_write` and the small-path deferred staging.
+
+**Locks:** none of its own; same upstream serialization as the
+classic planners. The Writer respects shard bounds
+(`left/right_shard_bound`) set from the faulted range by its caller.
 
 # 5. Performance analysis
 

@@ -38,6 +38,11 @@
  * the caller).  Top frames resolve and demangle; deeper frames may print
  * as raw addresses where the build lacks frame pointers.
  *
+ * Covers both write paths: classic (_do_write/_do_write_big/_do_write_small)
+ * and write v2 (_do_write_v2/Writer::do_write/_punch_hole_2/
+ * _defer_or_allocate, active when bluestore_write_v2=true) -- whichever
+ * the OSD runs, the matching probes fire.
+ *
  * fsync/fdatasync syscall latency is traced too (kernel tracepoints,
  * gated to the OSD's pid): each exit prints fd + in-kernel time, so the
  * barrier cost shows up both as the KernelDevice::flush wrapper and as
@@ -89,6 +94,46 @@ uprobe:$1:_ZN9BlueStore*_do_write_smallE*
 /@t0/
 { printf("%10lld %7d  %-16s %-38s sub-alloc, may RMW/defer\n",
          (nsecs-@t0)/1000, tid, comm, "BlueStore::_do_write_small");
+  if (@stk) { printf("%s\n", ustack); } }
+
+/* ---- write v2 (bluestore_write_v2=true replaces the three above) ------ */
+/* BlueStore::_do_write_v2(txc, c, o, offset=arg4, length=arg5, bl, flags) */
+uprobe:$1:_ZN9BlueStore12_do_write_v2E*
+/@t0/
+{ printf("%10lld %7d  %-16s %-38s off=0x%lx len=0x%lx\n",
+         (nsecs-@t0)/1000, tid, comm, "BlueStore::_do_write_v2", arg4, arg5);
+  if (@stk) { printf("%s\n", ustack); } }
+
+/* BlueStore::Writer::do_write(location=arg1, data) -- the uncompressed
+ * v2 path: split/align, punch hole, place blobs */
+uprobe:$1:_ZN9BlueStore6Writer8do_writeE*
+/@t0/
+{ printf("%10lld %7d  %-16s %-38s loc=0x%lx\n",
+         (nsecs-@t0)/1000, tid, comm, "Writer::do_write", arg1);
+  if (@stk) { printf("%s\n", ustack); } }
+
+/* BlueStore::_punch_hole_2(c, o, offset=arg4, length=arg5, ...) -- one
+ * extent-map walk that empties the target range and accumulates
+ * released AUs / pruned blobs / statfs delta.  It returns an
+ * extent_map_t::iterator by value, which the Itanium ABI passes via a
+ * hidden sret pointer -- that shifts every argument register right by
+ * one, so offset is arg4 (not arg3) and length arg5. */
+uprobe:$1:_ZN9BlueStore13_punch_hole_2E*
+/@t0/
+{ printf("%10lld %7d  %-16s %-38s off=0x%lx len=0x%lx\n",
+         (nsecs-@t0)/1000, tid, comm, "BlueStore::_punch_hole_2", arg4, arg5);
+  if (@stk) { printf("%s\n", ustack); } }
+
+/* BlueStore::Writer::_defer_or_allocate(need_size=arg1) -- the single
+ * per-write deferred-vs-direct decision; deferred reuses the extents
+ * _punch_hole_2 just released (no allocator call), direct does one
+ * alloc->allocate for the whole need.  The chosen branch shows in the
+ * events that follow (aio_write = direct, L record + no data aio =
+ * deferred). */
+uprobe:$1:_ZN9BlueStore6Writer18_defer_or_allocateE*
+/@t0/
+{ printf("%10lld %7d  %-16s %-38s need=0x%lx\n",
+         (nsecs-@t0)/1000, tid, comm, "Writer::_defer_or_allocate", arg1);
   if (@stk) { printf("%s\n", ustack); } }
 
 /* ---- RocksDB staging ------------------------------------------------- */

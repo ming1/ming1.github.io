@@ -865,7 +865,13 @@ segmentation is enabled; objects created by older code decode with
 code reading a v3 onode skips the field via the compat frame and rewrites
 it as v2. With the default `bluestore_onode_segment_size = 0` the encoder
 emits struct_v 2 (`_record_onode()` passes `FLAG_DEBUG_FORCE_V2`), which
-the captured OSD confirms.
+the captured OSD confirms. The field's consumer is the v2 write path
+(`bluestore_write_v2`, off by default): `_do_write_v2` carves writes
+along segment boundaries so compressed blobs can be re-packed per
+segment — the recompression hook. Write v2 itself changes **no other
+on-disk structure**: both write paths emit the same onode, blob,
+extent-map and deferred (`L`) encodings; `segment_size` is the only
+format element introduced for it.
 
 ## 6.2 Spanning-blob section
 
