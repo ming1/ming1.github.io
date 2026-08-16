@@ -563,15 +563,17 @@ script's banner line before starting the workload:
 | [`wtrace.bt`]({{ site.baseurl }}/code/ceph/wtrace.bt) | event log for a single IO | what happened, in order, on which thread |
 | [`wlat.bt`]({{ site.baseurl }}/code/ceph/wlat.bt) | per-stage latency histograms | where the milliseconds went |
 
-Three more sum-probe scripts, built for §5.2's per-thread budget and
-introduced there (these end themselves via an `interval` timer rather
-than Ctrl-C):
+Five more qd=1 scripts, built for §5.2's per-thread budget and
+§5.3's tail hunt and introduced there (these end themselves via an
+`interval` timer rather than Ctrl-C):
 
 | Script | Mode | Answers |
 |---|---|---|
 | [`wfuncs.bt`]({{ site.baseurl }}/code/ceph/wfuncs.bt) | per-function averages | what each BlueStore function costs, per thread |
 | [`wosd.bt`]({{ site.baseurl }}/code/ceph/wosd.bt) | OSD pipeline spans, qd=1 | dispatch → queue → PG → BlueStore → reply |
 | [`wpg.bt`]({{ site.baseurl }}/code/ceph/wpg.bt) | PG execution spans, qd=1 | where `dequeue_op` → `queue_transactions` goes |
+| [`wtail.bt`]({{ site.baseurl }}/code/ceph/wtail.bt) | slow ops only, qd=1 | per-stage split of every op over a threshold |
+| [`wxproc.bt`]({{ site.baseurl }}/code/ceph/wxproc.bt) | fio↔OSD cross-process, qd=1 | is the tail in the client, the OSD, or the reply path |
 
 The same uprobe technique, packaged as a maintained tool, is
 [cephtrace](https://github.com/taodd/cephtrace/tree/main): its `radostrace`
@@ -2267,7 +2269,7 @@ located above BlueStore, in the spans the diagram places between them.
 way. This section weighs those events: for a warm 64 KiB write at queue
 depth 1, how many microseconds does each thread — and each function
 inside it — actually cost, and which of those microseconds can be taken
-back? The rig is the ramdisk host of §5.3 (`/dev/ram0`, device time ≈ 0),
+back? The rig is the ramdisk host of §5.4 (`/dev/ram0`, device time ≈ 0),
 so everything measured here is CPU work, scheduling, or waiting — never
 the disk.
 
@@ -2288,12 +2290,12 @@ anything:
   tracer happened to exit mid-experiment, qd=1 IOPS rose from ~1780 to
   ~1990 — roughly **60 µs/op of observer effect**, concentrated inside
   the BlueStore stages the probes cover. (Coincidentally close to
-  §5.3's C-state delta; these are independent effects — the tracer
+  §5.4's C-state delta; these are independent effects — the tracer
   comparison ran with C-states already capped.) Trace *or* measure;
   never both at once.
 * **Debug levels and C-states.** vstart's default debug levels
   (`debug_rocksdb=4/5` and friends) cost real formatting on the hot
-  path, and a reboot had re-armed the C2 idle state (§5.3).
+  path, and a reboot had re-armed the C2 idle state (§5.4).
 
 Peeling all three: `txc_commit_lat` fell from **268 µs**
 (tracer attached, default debug) to **150 µs**
@@ -2323,7 +2325,7 @@ style produced every number below, run one at a time under a 12–15 s
 Because the workload is qd=1, one op is in flight at a time, so the
 pipeline scripts can chain plain global timestamps across threads —
 no per-op correlation needed. Every average was cross-checked against
-the OSD's own `state_*_lat` perf counters (§5.3's `pdump`), which
+the OSD's own `state_*_lat` perf counters (§5.4's `pdump`), which
 agree to within the probes' own overhead. Two traps are worth
 recording: end these scripts with `interval { exit(); }` rather
 than an external `timeout -s INT` (the map dump does not reliably
@@ -2350,14 +2352,14 @@ row is derived (prepare total minus the two measured spans), since
 | bstore_kv_sync | `submit_transaction_sync` | 48 | WAL commit — decomposed below |
 | bstore_kv_final | wakeup + callbacks | 34 | of which the `_txc_committed_kv` body is **5 µs** |
 
-Note what the tracer does to the two † rows: untraced, §5.3 measures
+Note what the tracer does to the two † rows: untraced, §5.4 measures
 the same counters at ~12 µs each; with ten probe pairs attached they
 read 31 and 23. The observer effect of §5.2.1 is not evenly spread —
 it concentrates in the wakeup-bounded spans, which is worth
 remembering whenever an event-log trace makes the handoffs look like
 the whole story. (A cross-check the run earns for free:
 `submit_transaction` 35 + `submit_transaction_sync` 48 = 83 µs, right
-against §5.3's untraced `state_kv_commiting_lat` of 85 — the kv-thread
+against §5.4's untraced `state_kv_commiting_lat` of 85 — the kv-thread
 work itself is barely probe-inflated, because only four probe pairs
 sit inside it.)
 
@@ -2403,7 +2405,7 @@ never touches the object store. `wosd.bt` spans the OSD pipeline
 (write-only run, n = 28,482 = exactly the op count). One caveat up
 front: the 525 µs client average and every row below are from the
 *probe-attached* run — untraced, the same rig lands nearer 480 µs
-(§5.3), and BlueStore alone at 140. The proportions, not the last
+(§5.4), and BlueStore alone at 140. The proportions, not the last
 microsecond, are the point:
 
 | span | µs | what it is |
@@ -2451,7 +2453,7 @@ Three readings of that table:
 * **~190 µs sits outside the OSD's op-execution path.** The
   reply/stats tail (37 µs) plus the client/wire remainder (~150 µs)
   live in the reply path, the messenger and the client — which is
-  exactly where §5.3 found the C-state win, and where server-side
+  exactly where §5.4 found the C-state win, and where server-side
   tools stop seeing (§5.1).
 
 ### 5.2.5 The budget, and what is actually reducible
@@ -2464,7 +2466,7 @@ client+wire ~150 | dispatch 5 | queue 21 | PG exec 145 | BlueStore 168 (140 untr
 ```
 
 Reducible with a switch, all measured here: debug levels to 0/0,
-C-states capped (§5.3), `bluefs_sync_write=true` on fast media, and
+C-states capped (§5.4), `bluefs_sync_write=true` on fast media, and
 not leaving tracers attached — together worth well over 100 µs on this
 pipeline. Structural, needing code or design changes: the
 thread-handoff wakeups — §3.2's three BlueStore switches plus the
@@ -2473,7 +2475,207 @@ the new-object obc establishment, the double metadata encode
 (PG bookkeeping then BlueStore), and the messenger/client span that
 dominates everything else at qd=1.
 
-## 5.3 C-states and the idle write — verifying `tuned latency-performance`
+## 5.3 RBD long-tail latency — an object-map story
+
+§5.2 dissected the average. This section chases a tail: the same
+ramdisk rig, a real `fio` rbd workload, and a 99.9th percentile
+sitting at 2.5–2.8 ms across repeats while the median is under
+800 µs. The root cause turns out to be four layers above BlueStore —
+but the trail runs straight through everything this post has built,
+and the way it was found is half the point, so the dead ends are
+documented alongside the answer.
+
+### 5.3.1 The observation
+
+The workload — note `rate_iops=200`, which paces one write every 5 ms
+into an otherwise idle pipeline, and the 256 GiB image:
+
+```ini
+[global]
+ioengine=rbd
+pool=rbd
+rbdname=img2
+direct=1
+sync=1
+rw=randwrite
+bs=4K
+iodepth=1
+rate_iops=200
+time_based=1
+runtime=300
+
+[rbd-randwrite]
+```
+
+The result of one such run on a freshly created cluster:
+
+```
+clat (usec): min=334, max=8742, avg=727.97, stdev=275.08
+ | 10.00th=[  441], 20.00th=[  469],
+ | 30.00th=[  502], 40.00th=[  570], 50.00th=[  799], 60.00th=[  840],
+ | 99.00th=[ 1287], 99.50th=[ 1926], 99.90th=[ 2769], 99.99th=[ 6128]
+```
+
+Three things are wrong with this workload's latency, and the first is
+visible right in that percentile table: the distribution is
+**bimodal** — a ~450–530 µs mode and an ~850 µs mode, with a valley
+between the 40th and 50th percentiles. The other two take a second
+300 s run with `--write_lat_log` to see. The tail is **periodic**:
+ops over 1.5 ms recur every ~0.5–1 s like a metronome (inter-arrival
+median 710 ms, far too regular for a random subset), with the >2 ms
+population — 263 ops in 60,001 — spaced ~1.1 s. And it **ages**: the
+fast mode's share grows from 9% in the first 30 s window to 57% in
+the last, and a rerun over the same image drops the 99.9th from
+~2.5 ms to ~1 ms. Whatever this is, it is a property of a *young
+image*, not of the pipeline.
+
+### 5.3.2 The elimination round
+
+The aging alone rules out most of the usual suspects, but each was
+also ruled out by direct measurement rather than by argument — on a
+box where a reboot had already silently re-armed C2 once (§5.4),
+"should be fine" is not evidence:
+
+* **C-states / governor** — sysfs confirmed C2 still disabled during
+  the runs.
+* **A periodic daemon** — a 30 s `sched_wakeup` census (who wakes
+  ~1–10×/s) found only the expected timers; nothing at the tail's
+  ~1 Hz cadence that touched the write path.
+* **Memory compaction** — `/proc/vmstat` compaction counters: zero
+  movement during the run.
+* **brd page population** — first-touch page allocation in the
+  ramdisk was acquitted by reproducing the identical tail on a
+  freshly reloaded, never-written `/dev/ram0`.
+* **mon/mgr chatter** — a 12 s `debug_ms=1` capture during the
+  periodic phase: no inbound mon/mgr messages at all.
+* **Background BlueStore transactions** — a probe distinguishing
+  client-op transactions from standalone ones counted 10 standalone
+  in 75 s — 0.13/s cannot drive a ~1/s cadence.
+* **RocksDB background work** — uretprobe pairs on
+  `BackgroundCallFlush`/`BackgroundCallCompaction` across a 345 s
+  window covering a full run: zero flushes, zero compactions. (At
+  800 KiB/s of 4K writes, the memtable simply never fills.)
+
+One probing lesson from this phase, recorded in
+[`wtail.bt`]({{ site.baseurl }}/code/ceph/wtail.bt) (the §5.2-style
+qd=1 chain extended with a slow-op filter — it prints the per-stage
+split only for ops over a threshold, so a whole run costs nothing to
+read; size its `interval` to the run): a long timestamp chain
+silently *drops* every op that skips a stage. The first version
+chained through `_txc_finish_io`, which deferred writes never visit —
+and so the very ops that mattered most were invisible. Keep
+conditional chains short.
+
+### 5.3.3 Three anomalies that converge
+
+What remained was to look at what the OSD actually did per client
+write, and three independent observations all pointed the same way:
+
+* **Paired inbound messages.** The `debug_ms=1` capture showed many
+  of the client's ops arriving in *pairs* — two `osd_op` messages
+  within the same millisecond, for one fio write.
+* **Far more transactions than writes.** After 60,001 client writes,
+  the OSD's own counters read `write_big = 107,946` and — the loud
+  one — `issued_deferred_writes = 122,507` on a pool whose data
+  writes should never defer at all: a 4 KiB aligned write is a big
+  write at `min_alloc_size = 4096`, and the size-threshold deferral
+  of §1.6.3 is off on ssd (`bluestore_prefer_deferred_size_ssd = 0`).
+  These deferrals ride the *other* trigger — a sub-`min_alloc_size`
+  overwrite of an already-allocated blob defers unconditionally, for
+  read-modify-write — so *something* beside the data path was doing
+  small in-place overwrites. The deferred-state counters decompose
+  them: 40,851 deferred transactions × 3 sub-writes each = 122,507,
+  flushed in 2,561 batches of 15.95 — the configured
+  `bluestore_deferred_batch_ops_ssd = 16`, observed in the wild.
+* **The slow ops come in pairs too.** A cross-process tracer,
+  [`wxproc.bt`]({{ site.baseurl }}/code/ceph/wxproc.bt) — uprobes on
+  `rbd_aio_write`/`rbd_aio_get_return_value` in fio's own librbd,
+  chained through the OSD's dispatch and reply markers, possible at
+  qd=1 because one client op owns the whole pipeline — showed runs of
+  ops with ~1.5–2.4 ms inside the OSD span recurring at the tail's
+  cadence. One caveat discovered only later: when a client write
+  fans out into two osd_ops, the chain times the *first* op's OSD
+  span, and the second op's entire round trip lands in the "egress"
+  column — so on this image the egress numbers are not client-side
+  time. The honest reading is: not one slow *stage*, a slow *pair
+  member*.
+
+Small in-place overwrites of some side object, roughly once per
+first-touch write, only while the image is young. `rbd info img2`
+closed the case:
+
+```
+features: layering, exclusive-lock, object-map, fast-diff, deep-flatten
+```
+
+`rbd_default_features = 61` had given the image an **object map** —
+one `rbd_object_map.<id>` object tracking which of the image's 65,536
+4 MiB backing objects exist. On the *first* write to each backing
+object, librbd flips that object's state to EXISTS — by design a
+separate osd_op issued and completed *before* the data write (the
+map may safely over-claim an object that was never written, but must
+never miss one that was, or `rbd du`/`diff`/copy would skip live
+data). That update is a small in-place overwrite of the map object,
+which is exactly the unconditional deferral path above.
+
+The numbers close the loop quantitatively. 60,001 uniformly random
+writes over 65,536 objects should touch 65,536 × (1 − e^(−60,001/65,536))
+≈ **39,300 distinct objects** — against 40,851 observed map
+transactions, a 4% match. The same model predicts the fast-mode share
+per 30 s window (the probability of hitting an already-mapped object):
+~9% in the first window, ~60% in the last — against the measured 9%
+and 57.5%. Even `write_big` fits: 60,001 data writes + ~40,851
+map-op regions ≈ the observed 107,946. First-touch writes pay the
+extra round trip (~850 µs mode); repeat writes skip it (~450–530 µs
+mode); reruns start with the map populated. Bimodality, aging, and
+the rerun improvement, all from one mechanism. One honest loose end:
+the deferred-batch flushes (8.5/s) plausibly explain *that* there are
+2–3 ms collisions in `bstore_kv_sync`, but their ~1 s spacing does
+not fall out of these counters — the metronome's exact cadence
+remains unexplained.
+
+### 5.3.4 The A/B proof
+
+One knob, everything else identical — same fresh cluster recipe, same
+fio job, an image created with `--image-feature layering`. (Strictly
+this drops exclusive-lock and deep-flatten too; exclusive-lock is a
+one-time acquisition, irrelevant at steady state, and the
+single-variable version — `rbd feature disable img2 fast-diff
+object-map` on a fresh image — is the §5.3.5 recipe.)
+
+| | img2 (defaults: object-map, fast-diff) | img3 (layering only) |
+|---|---|---|
+| clat avg ± stdev | 728 ± 275 µs, bimodal | **527 ± 104 µs, unimodal** |
+| 99.90th | 2,769 µs (2.5–2.8 ms across repeats) | **988 µs** |
+| 99.99th | 5.7–6.1 ms | 1.96 ms |
+| `write_small` after run | 122,551 | 71 |
+| `issued_deferred_writes` | 122,507 | 26 |
+| `write_big` per client op | 1.80 | 1.12 |
+
+Average down 28%, the 99.9th down 60%, and the deferred counter down
+nearly four orders of magnitude (122,507 → 26). The residual img3
+tail (99.99th ≈ 2 ms; the single worst op, 9.8 ms, is actually no
+better than img2's) is a separate, much smaller effect — it is the
+distribution's *body* that the object map was moving, not the
+absolute maximum.
+
+### 5.3.5 What to do with this
+
+* **Latency-sensitive volumes**: create them with
+  `--image-feature layering` (or
+  `rbd feature disable <img> object-map fast-diff`) if fast
+  `rbd du`/`diff` isn't worth the first-write tax.
+* **Keeping the object map**: the cost is *first-write-only*.
+  Pre-populating the image (or just accepting the warm-up) makes
+  steady state comparable to the featureless image — aged img2
+  reruns land at 0.9–1.2 ms on the 99.9th, against img3's 988 µs.
+* **For benchmarking**, this is the sharpest edition yet of §5.2's
+  lesson that new-object workloads measure a different pipeline than
+  overwrite workloads: with default rbd features, the *image's age*
+  is a hidden axis of any latency result. A tail percentile quoted
+  without it is not reproducible.
+
+## 5.4 C-states and the idle write — verifying `tuned latency-performance`
 
 Everything above measures a pipeline that is *doing* something. But at
 queue depth 1 the OSD's threads spend most of their life asleep, and on

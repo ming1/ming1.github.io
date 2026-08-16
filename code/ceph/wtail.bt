@@ -1,0 +1,39 @@
+#!/usr/bin/env bpftrace
+/* wtail.bt -- print per-stage breakdown of ops slower than 1.5ms, qd=1.
+ *
+ * Usage: bpftrace wtail.bt <path-to-ceph-osd>
+ *        Run the workload inside the window (adjust the interval
+ *        below to the run length); exits by itself. Do not SIGINT:
+ *        the final counters may not flush on signals.
+ *
+ * qd=1 caveat: qd=1 must hold for OSD-side ops, not just client
+ * iodepth -- a client write that fans out into two osd_ops (e.g.
+ * rbd object-map updates) can overwrite @t1 mid-chain and mis-pair
+ * the stages.
+ *
+ * Chain-design lesson (learned the hard way, see blog 5.3.2): every
+ * probe in a qd=1 timestamp chain is a stage the op MUST visit, or
+ * the chain silently drops it. An earlier variant went through
+ * _txc_finish_io, which deferred writes skip -- so exactly the ops
+ * under investigation were invisible. Keep chains to universal
+ * markers: dispatch, enqueue, dequeue, queue_transactions,
+ * _txc_committed_kv, log_op_stats. */
+BEGIN { @start = nsecs; }
+uprobe:$1:_ZN3OSD16ms_fast_dispatchE* { @t1 = nsecs; }
+uprobe:$1:_ZN3OSD10enqueue_opE* /@t1/ { @d1=nsecs-@t1; @t2=nsecs; @t1=(uint64)0; }
+uprobe:$1:_ZN3OSD10dequeue_opE* /@t2/ { @d2=nsecs-@t2; @t3=nsecs; @t2=(uint64)0; }
+uprobe:$1:_ZN9BlueStore18queue_transactionsE* /@t3/ { @d3=nsecs-@t3; @t4=nsecs; @t3=(uint64)0; }
+uprobe:$1:_ZN9BlueStore17_txc_committed_kvE* /@t4/ { @d4=nsecs-@t4; @t5=nsecs; @t4=(uint64)0; }
+uprobe:$1:_ZN12PrimaryLogPG12log_op_statsE* /@t5/ {
+  $d5 = nsecs-@t5; @t5=(uint64)0;
+  $tot = @d1+@d2+@d3+@d4+$d5;
+  @n["ops"]++;
+  if ($tot > 1500000) {
+    @n["slow"]++;
+    printf("SLOW t=%llums tot=%lluus disp=%llu queue=%llu pg=%llu bluestore=%llu reply=%llu\n",
+      (nsecs-@start)/1000000, $tot/1000, @d1/1000, @d2/1000, @d3/1000, @d4/1000, $d5/1000);
+  }
+}
+interval:s:110 { exit(); }
+END { clear(@t1); clear(@t2); clear(@t3); clear(@t4); clear(@t5);
+      clear(@d1); clear(@d2); clear(@d3); clear(@d4); clear(@start); }

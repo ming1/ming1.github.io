@@ -1,0 +1,35 @@
+#!/usr/bin/env bpftrace
+/* wxproc.bt -- cross-process op chain: fio(librbd) -> osd -> fio,
+ * qd=1 only. Splits each op into ingress (client encode + objecter +
+ * wire + osd msgr read), osd (dispatch -> reply ready), and egress
+ * (reply send + wire + client completion); prints the split for ops
+ * over the threshold, plus running sums for averages.
+ *
+ * Usage: bpftrace wxproc.bt <path-to-ceph-osd>
+ *        librbd path is hardcoded below -- adjust to your distro.
+ *        Start the workload inside the interval window below. The
+ *        slow-op print threshold is 1.4 ms. Chaining across
+ *        processes is sound only at qd=1, where a single client op
+ *        owns the whole pipeline. Exits by itself; do not SIGINT
+ *        (the map dump may not flush on signals).
+ *
+ * Caveats: if one client write fans out into MULTIPLE osd_ops (e.g.
+ * rbd object-map updates, see blog 5.3.3), the chain times only the
+ * FIRST op's OSD span and the remaining ops' full round trips land
+ * in the egress column -- egress is then not client-side time. The
+ * egress column also absorbs fio's own completion-reaping delay. */
+BEGIN { @start = nsecs; }
+uprobe:/lib64/librbd.so.1:rbd_aio_write { @c1 = nsecs; }
+uprobe:$1:_ZN3OSD16ms_fast_dispatchE* /@c1/ { @din=nsecs-@c1; @c2=nsecs; @c1=(uint64)0; }
+uprobe:$1:_ZN12PrimaryLogPG12log_op_statsE* /@c2/ { @dosd=nsecs-@c2; @c3=nsecs; @c2=(uint64)0; }
+uprobe:/lib64/librbd.so.1:rbd_aio_get_return_value /@c3/ {
+  $deg = nsecs-@c3; @c3=(uint64)0;
+  $tot = @din+@dosd+$deg;
+  @n["ops"]++;
+  @s["a_ingress_us"]+=@din/1000; @s["b_osd_us"]+=@dosd/1000; @s["c_egress_us"]+=$deg/1000;
+  if ($tot > 1400000) {
+    @n["slow"]++;
+    printf("SLOW t=%llums tot=%llu ingress=%llu osd=%llu egress=%llu (us)\n",
+      (nsecs-@start)/1000000,$tot/1000,@din/1000,@dosd/1000,$deg/1000); } }
+interval:s:345 { exit(); }
+END { clear(@c1); clear(@c2); clear(@c3); clear(@din); clear(@dosd); clear(@start); }
