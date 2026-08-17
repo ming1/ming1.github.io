@@ -2205,6 +2205,42 @@ wstats sample shows the pairing directly — 10 puts produced
 cycle. (wtrace probes only the sync call; the async submits sit
 unprobed between trace lines #10 and #11.)
 
+**Why the append underneath is still `aio_write` — and how many aios
+one commit costs.** The call is fully synchronous (the committer
+blocks inside until the fsync returns), yet the WAL bytes travel
+through `KernelDevice::aio_write`. For *this* caller aio buys
+nothing — a single small append immediately followed by `fdatasync`
+from the same thread has nothing to overlap — and the code contains
+the admission: `bluefs_sync_write=true` (`BlueFS.cc:4169`) switches
+exactly this into a blocking `pwritev`. It stays aio by default
+because BlueFS has **one write path for every writer**, and the
+other writers need it: a multi-extent flush queues one aio per
+extent (`:4163`) and fires them with a single `aio_submit` (`:4190`)
+— in flight in parallel, where sync writes would serialize; and
+during a big SST write, `append_try_flush` flushes every
+`bluefs_min_flush_size` while rocksdb keeps appending, waiting for
+the *previous* aio only at the next flush (`:4120`) — the device
+chews flush N while the CPU builds flush N+1. The WAL append is the
+odd one out: the only serialized-then-immediately-fsynced writer in
+the system. Nobody optimizes it because the ceremony is ~µs
+(io_submit + reaper wakeup + condvar) under a ~5 ms barrier — our
+traces show `aio_write → blkdev_write_iter` within ~30 µs of each
+other, then the fdatasync at ~5000 µs. On PLP flash, where the
+barrier costs ~10 µs instead, that ratio inverts and
+`bluefs_sync_write` stops being cosmetic. (Probe caveat if you flip
+it: wtrace's `aio_write` probe goes dark on that path — the
+kernel-side `blkdev_write_iter` probe still sees the writes.)
+
+The aio count per commit, verified against the captures: **one** —
+every §2/§3 trace shows exactly one `aio_write` on the BlueFS bdev
+per `submit_transaction_sync`. It grows only when the flush range
+crosses an extent boundary (one aio per extent), or in *plain* WAL
+mode, where the fsync must also update the file's fnode through the
+BlueFS journal — a second append plus a **second fdatasync** for the
+journal sync. Envelope mode (§6.6 of the internals post) exists
+precisely to delete that second pair; its "~50% fewer fdatasync"
+claim is this arithmetic.
+
 **IOs:** the 4 KiB WAL append and the flush behind it (§3.5), via
 BlueFS — the flushed bytes include the async-appended batches. SST
 files are written later by compaction, off the write path.
