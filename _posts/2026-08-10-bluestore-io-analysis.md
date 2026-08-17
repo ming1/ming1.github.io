@@ -1817,6 +1817,101 @@ layer up — and on error paths the same teardown runs early via
 lists on the ctx rather than in code after the submit: whoever ends the
 op, the same callbacks run.
 
+### 4.2.4 BlueStore — the top-level object's state
+
+[`BlueStore.h:2414`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2414)
+— one instance per OSD; everything the previous entries attach to
+hangs off it. The members group into a handful of machines
+(references in this entry are `BlueStore.h` lines):
+
+```
+the engines                                        :2414-2425
+   bluefs        the tiny filesystem under rocksdb        (§6 of the
+                 internals post)
+   db            the KeyValueDB (rocksdb)                 (§4.3.6)
+   bdev          the raw device (KernelDevice)
+   fm            durable freelist (null under NCB)        (§4.3.9)
+   alloc         in-RAM allocator
+
+the namespace                                      :2439-2444
+   coll_map      coll_t → Collection (one per PG),
+                 each owning its OpSequencer (§4.2.2)
+   onode/buffer_cache_shards — metadata and data caches,
+                 sharded to spread lock traffic across CPUs
+
+id allocation                                      :2451-2454
+   nid/blobid {last,max} atomics — lock-free draw against
+                 preallocated ceilings; the kv committer bumps
+                 the durable max ahead of use (§4.3.7)
+
+the deferred machinery                             :2456-2462
+   deferred_lock, deferred_seq, deferred_queue_size,
+   deferred_aggressive (atomic kick flag — no lock needed,
+                 it only nudges wakeups)
+
+the kv pipeline                                    :2467-2484
+   kv_lock + kv_cond + the intake deques  (switch #2, §3.2)
+   kv_finalize_lock + the handoff deques  (switch #3)
+
+admission control                                  :2193
+   throttle — costs charged at queue_transactions, released
+                 mid-cycle by the committer (§4.3.7)
+```
+
+One idiom worth noticing: nearly every tunable that the write path
+reads per-op (`prefer_deferred_size` `:2527`, `deferred_batch_ops`
+`:2524`, `csum_type` `:2496`) is a `std::atomic` refreshed by the
+config observer — that is what makes `ceph config set` take effect on
+a live OSD without any lock appearing on the hot path.
+
+#### kv_lock — what it protects, and why it is a mutex
+
+The producer→committer handoff state, i.e. everything a foreign
+thread can touch while the kv thread might be looking:
+
+| structure | producers | committer use |
+|---|---|---|
+| `kv_queue` (`:2474`) | `_txc_state_proc` IO_DONE, any thread (`BlueStore.cc:14705`) | swapped out per cycle (`:15340`) |
+| `kv_queue_unsubmitted` (`:2475`) | same site | swapped out |
+| `deferred_done_queue` (`:2477`) | `_deferred_aio_finish` (`BlueStore.cc:15791`) | swapped out |
+| `kv_ios` + throttle counters (`:2544`) | incremented at the push site (`:14715`) | read-and-zeroed per cycle |
+| `kv_sync_in_progress`, `kv_stop` | start/stop control | the condvar predicate |
+
+Plus `kv_cond` itself — the lock *is* the condition variable's mutex.
+Not under it: `deferred_aggressive` (atomic, `:2462`), the batch
+deques after the swap (thread-private), and the finalize handoff
+(its own `kv_finalize_lock`, so producers pushing new work never
+contend with the batch handoff).
+
+Why a mutex and not a spinlock, in increasing depth:
+
+1. **The API forces it** — `kv_cond.wait(l)` needs a mutex: the
+   atomic release-and-sleep that keeps a `notify` from slipping into
+   the gap is futex+mutex machinery, and the kv thread sleeps
+   indefinitely here when idle. A spinlock has no "sleep until
+   notified".
+2. **Userspace spinlocks are a trap even for nanosecond sections.**
+   Userspace cannot disable preemption: the moment a spinlock holder
+   is descheduled, every waiter burns its full timeslice against a
+   holder that is not running. Kernel spinlocks work because
+   `spin_lock` implies `preempt_disable`; userspace has no
+   equivalent.
+3. **The mutex already is a spinlock in the case that matters.** An
+   uncontended `std::mutex` acquire is one CAS — no syscall. The
+   futex path engages only under contention, exactly when sleeping
+   beats spinning. Every operation under `kv_lock` is O(1) (push,
+   swap, counter bump); the expensive work — fsync, RocksDB apply —
+   happens strictly outside. When hold time is nanoseconds, the
+   primitive stops mattering; making a lock cheap is about what you
+   do under it.
+
+Ceph adds one layer: `ceph::mutex` compiles to a bare `std::mutex`
+in release builds but to `mutex_debug_impl` in Debug builds —
+ownership tracking, an `nlock` counter, and asserts that turn silent
+double-locks into crashes. Debug-build lock costs are therefore far
+above the one-CAS figure; remember that when reading absolute
+latencies from a Debug lab.
+
 ## 4.3 Function reference
 
 The functions doing the heavy lifting above, in the order a write
