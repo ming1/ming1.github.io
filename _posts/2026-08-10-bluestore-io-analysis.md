@@ -2807,3 +2807,85 @@ writes, costs nothing at saturation, and its engagement is verifiable
 after the fact from `cpuidle/state*/usage` deltas alone. Benchmarks run
 only at saturation will never notice any of this — which is exactly how
 C-state regressions slip past throughput-oriented CI.
+
+# 6. IO500 performance analysis
+
+IO500's genius — and its cruelty toward Ceph — is that it is really six
+different workloads whose scores get geomeaned, so the worst phases
+drag the total. The final score is
+`sqrt(BW_geomean × MD_geomean)`, each side itself a geometric mean —
+**a 2× gain on the worst phase beats 2× on the best by a wide
+margin**. For Ceph the worst phases are reliably ior-hard and
+mdtest-hard, usually one to two orders of magnitude below the easy
+ones.
+
+## 6.1 The pattern, phase by phase
+
+| Phase | I/O pattern | What it really stresses in Ceph |
+|---|---|---|
+| ior-easy write/read | file-per-process, large aligned sequential (MiB-scale transfers), ≥300 s stonewalled | raw data-path bandwidth: client striping → messenger CPU/copies → BlueStore big-write; the *easy* case |
+| ior-hard write/read | **one shared file**, all ranks, strided records of exactly **47008 B, unaligned** | CephFS write caps on a shared file (clients drop to sync I/O), per-op OSD latency, BlueStore unaligned RMW across 4 MiB stripe objects |
+| mdtest-easy create/stat/delete | empty files, **private dir per rank** | MDS create/stat rate, journal flush latency, client cap round-trips; parallelizes across MDS ranks *if you make it* |
+| mdtest-hard | files with one **3901 B** write each, **one shared directory** | single-dirfrag contention on one MDS, dirfrag splitting, plus a tiny sync data write per create |
+| find | parallel namespace walk over everything created | readdir throughput, MDS cache, stat storms |
+
+The structural observation that makes this post's material relevant:
+every "hard" phase degenerates into the same primitive — *small
+synchronous operations whose latency floor is one OSD commit*. That
+floor is exactly what §3 traced and §5.2 decomposed.
+
+## 6.2 Directions, ranked by leverage
+
+**1. The small-sync-op latency floor** (targets mdtest-hard and
+ior-hard — the score killers). The anatomy is measured territory: a
+small commit is prep plus two barriers (§3.5), with the WAL fdatasync
+dominating, and per §4.3.9 two of the three KV sets per write are
+PG-log machinery, not data. Threads to pull:
+
+- **BlueFS envelope mode** (§6.6 of the internals post): halving WAL
+  fdatasyncs is a direct mdtest-hard multiplier — MDS journal appends
+  and the 3901 B creates all ride that path.
+- **kv-sync batching under op storms**: whether the batching window
+  amortizes well at mdtest concurrency is directly measurable with
+  wstats/wlat (§2.2, §2.4) — count `_txc_apply_kv` per sync commit.
+- **The 47008 B case**: below 64 KiB, so `bluestore_prefer_deferred_size`
+  can route it through the WAL, and write v2's deferred path (§3.8)
+  reuses the punched extents in place with no allocator call —
+  precisely the shape ior-hard generates. An hour with the §3.8 probes
+  against a 47008 B strided-overwrite reproducer says where the cycles
+  go.
+
+**2. Messenger CPU** (targets ior-easy, and op-rate ceilings
+everywhere). MSG_ZEROCOPY on the send path aims squarely at
+ior-easy-read — OSD→client streaming of ≥16 KiB payloads — on real
+NICs. The same direction continues: receive-side copies (the read path
+still copies into bufferlists), `ms_crc_data` cost on large transfers
+(a known IO500 lever on trusted fabrics), and dispatch overhead at
+mdtest op rates — oplat's create_request → log_op_stats span (§2.5)
+against wire time isolates it cleanly.
+
+**3. CephFS-layer contention** (the biggest known wins on a stock
+cluster, one layer above this post's scope). The published Ceph IO500
+runs earned their MD score from: multiple MDS ranks with **pinning**
+so mdtest-easy's per-rank dirs actually distribute (`max_mds` +
+ephemeral distributed pinning — without it everything lands on rank
+0); the kernel client's **async dirops** (`nowsync` — creates and
+unlinks without waiting for the MDS round trip, near-mandatory for
+mdtest); and for ior-hard, anything that softens the cap-revocation
+storm a shared file causes — lazyio where legal, or striping layouts
+that put fewer 47008 B records across object boundaries.
+
+**4. Config-level table stakes** (before crediting any code change):
+kernel mount, never FUSE; metadata pool on flash; enough PGs;
+`osd_op_num_shards`/mclock sanity; RocksDB compression off for the
+metadata pool's omap traffic; and enough client processes — IO500
+rewards concurrency, and a single-node cluster measures nothing but
+its own contention.
+
+Expected payoff for *score* on a stock cluster: **3 ≥ 1 > 2 > 4**. But
+directions 1 and 2 are where this post's instrumentation applies
+directly, and their gains survive into every workload, not just the
+benchmark. A concrete starting point: build the 47008 B shared-file
+reproducer and a 3901 B create storm, point wlat/oplat at them, and
+see which of the two barriers owns the latency — that number decides
+whether envelope mode or kv batching is the first patch.
