@@ -2085,6 +2085,39 @@ while (true)                                        :15290
   kv_finalize_cond.notify_one()                     :15497-15517
 ```
 
+The loop is one idea applied twice — *decouple submission from
+durability, then batch the durability* — and most of its cleverness
+hides in the ordering:
+
+- **The batching is self-clocking.** There is no timer and no target
+  size: the swap takes whatever accumulated while the *previous* cycle
+  was blocked in fsync. Slow device → longer cycle → bigger next batch
+  → better amortization — natural congestion control, and why per-write
+  cost at high QD approaches 1/N of an fsync while QD1 pays the full
+  two-barrier price (§5.2). The mode-8-16 batch histogram from §2.2's
+  `_txc_apply_kv` counting is this mechanism at QD16.
+- **Barrier #1 is conditional** (`force_flush`, `:15359-15377`): taken
+  when the cycle saw direct-write aios or has deferred completions to
+  stabilize; on a single shared device the BlueFS commit fsyncs the
+  same fd anyway, so it can sometimes be skipped. A deferred-only
+  cycle is the single-barrier commit §3.8's deferred trace shows.
+  Barrier #2 is unconditional.
+- **The flush promotes `deferred_done` → `deferred_stable`**
+  (`:15389-15396`), and only then do the deferred `L` records get
+  `rm_single_key`'d into `synct` (`:15448-15456`). The ordering is the
+  crash-safety proof: crash before this commit and replay re-executes
+  deferred writes onto already-correct data — idempotent. Deleting `L`
+  records before the data flush would be the fatal order.
+- **`synct` piggybacks the id ceilings** — `nid_max`/`blobid_max`
+  prealloc bumps ride the *earliest* txn in flight (`:15405`) so a new
+  ceiling is durable before any object uses it; the in-memory values
+  advance only after the sync commit returns (`:15521`).
+- **The throttle releases *before* the commit** (`:15442`) — the
+  comment says it all: "this allows new ops to be prepared and enter
+  pipeline while we are waiting on the kv commit sync/flush." Without
+  it every cycle would drain the pipeline, sleep, and stutter awake
+  one transaction at a time.
+
 **IOs:** both barriers of §3.5 — the data-device fdatasync and the WAL
 append + fsync behind the sync commit. This is the only thread that
 pays them.
