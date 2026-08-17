@@ -2154,6 +2154,32 @@ deferred txc breaks the tie — it loses both `bstore_aio` entries
 and commits it with `sync = true`. The surprise is *which* transaction:
 in the kv cycle the client records do **not** travel in this call.
 
+First, what the handle actually is. `KeyValueDB::Transaction` is a
+typedef — `std::shared_ptr<TransactionImpl>`
+([`KeyValueDB.h:144`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/KeyValueDB.h#L144))
+— and `RocksDBStore::get_transaction()`
+([`RocksDBStore.h:349`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/RocksDBStore.h#L349))
+returns a `RocksDBTransactionImpl` whose entire substance is one
+member: `rocksdb::WriteBatch bat` (`:300`). So
+`KeyValueDB::Transaction synct = db->get_transaction()`
+(`BlueStore.cc:15399`) means only "give me a new, empty batch of KV
+mutations": every `t->set()` / `rm_single_key()` appends an encoded
+record to an in-memory buffer, touching nothing in rocksdb. Despite
+the name there is no BEGIN/COMMIT, no reads, no isolation, no
+conflict detection — a `WriteBatch` is blind writes, and its only
+transactional property is **atomicity at apply time**: handed to
+`rocksdb::DB::Write`, all its mutations enter the WAL and memtable as
+one unit, all-or-none after a crash. That is exactly the §4.1
+clause-2 contract and all BlueStore needs — it never reads through
+the KV layer inside a transaction, because the OSD's serialization
+already guarantees no conflicting writer exists. Every txc got its
+own batch the same way at creation (`txc->t`, `_txc_create`); `synct`
+is the committer's extra, per-cycle batch — the **sync**-carrying
+**t**ransaction. The `shared_ptr` answers lifetime: the batch (which
+for deferred cycles includes the 4 KiB payloads inside the `L`
+values, like §3.8's 4135 B record) lives exactly as long as someone
+holds the handle, and dies when the cycle ends.
+
 ```
 one kv cycle (bstore_kv_sync, §3.5)
    │
@@ -2161,7 +2187,7 @@ one kv cycle (bstore_kv_sync, §3.5)
    │    the two P + one O records: appended to the WAL       (via :14919)
    │    buffer + memtable, NO fsync
    └─ once:   db->submit_transaction_sync(synct)           BlueStore.cc:15463
-        synct = nid/blobid-max bumps                       :15399,:15406
+        synct = nid/blobid-max bumps                       :15406,:15415
                 + deferred-cleanup rmkeys                  :15448-15456
         woptions.sync = !disableWAL                        RocksDBStore.cc:1673
         └► submit_common → db->Write                       :1607,:1624
