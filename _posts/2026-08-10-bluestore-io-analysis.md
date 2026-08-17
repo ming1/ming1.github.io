@@ -1057,6 +1057,80 @@ runs only when the arrow wakes it. The whole trace on one map — every
                                                                               #17  _txc_finish
 ```
 
+**How the threads actually talk.** The three switches use different
+mechanisms — one is kernel-mediated, two are classic
+mutex + condvar + deque handoffs — and in every case the *message* is
+the same object: the `TransContext*`.
+
+```
+tp_osd_tp ──#1──► bstore_aio ──#2──► bstore_kv_sync ──#3──► bstore_kv_final
+ io_submit/io_getevents   kv_lock + kv_cond          kv_finalize_lock + _cond
+ txc->ioc (IOContext)     kv_queue:                  kv_committing_to_finalize:
+ (the kernel IS the         deque<TransContext*>       deque<TransContext*>
+  queue)                  batch-drained by swap()    swap-or-append, swap-drained
+```
+
+**Switch #1 has no userspace queue at all — the kernel aio context is
+the queue.** Each txc embeds an `IOContext` (`txc->ioc`) holding the
+`pending_aios` list and an atomic `num_running`; `_txc_aio_submit`
+`io_submit`s the whole batch, and the bstore_aio thread
+(`KernelDevice::_aio_thread`) sits in `io_getevents`. When the *last*
+aio of an `IOContext` completes, the completion callback fires with
+`ioc->priv` — which is the `TransContext*` — landing in
+`txc_aio_finish → _txc_state_proc`. The correlation token is a pointer
+stashed in `priv`; the synchronization primitive is the syscall pair
+itself.
+
+**Switch #2 is `kv_lock` + `kv_cond` + `kv_queue`**
+([`BlueStore.h:2467`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2467):
+`std::deque<TransContext*> kv_queue; ///< ready, already submitted`,
+plus `kv_queue_unsubmitted` for txcs whose RocksDB submit the kv
+thread does itself). The producer is `_txc_state_proc`'s IO_DONE
+case: `kv_queue.push_back(txc)` (`:14705`), `kv_cond.notify_one()`
+(`:14708`). Two details matter:
+
+- *Ordering is enforced before the push*: `_txc_finish_io` walks the
+  OpSequencer's intrusive list (`osr->q`, under `osr->qlock`) and only
+  advances the *contiguous prefix* of txcs that have reached IO_DONE —
+  so even when aios complete out of order, txcs enter `kv_queue` in
+  per-collection submission order. That is §4.1's prefix property
+  materialized as a data structure.
+- *Batching is a swap, not a pop*: the kv_sync thread takes everything
+  at once — `kv_committing.swap(kv_queue)` (`:15340`). One O(1) swap
+  under a briefly-held lock forms the batch that a single
+  `submit_transaction_sync` (barrier #2) then makes durable for all
+  members — the fsync amortization the whole pipeline exists for.
+
+**Switch #3 is `kv_finalize_lock` + `kv_finalize_cond` +
+`kv_committing_to_finalize`**
+([`BlueStore.h:2481`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2481)).
+After the sync commit, kv_sync hands the batch over — swap if the
+target deque is empty, append if the finalizer is running behind
+(`:15497`) — and notifies (`:15216`). The finalize thread swaps it
+back out and runs `_txc_committed_kv` → `_txc_finish` per txc.
+Deferred writes ride the same two threads through parallel deques of
+`DeferredBatch*` (`deferred_done_queue`,
+`deferred_stable_to_finalize`).
+
+**And there is a hidden fourth handoff back to where it started**:
+`_txc_committed_kv` does not send the reply — it queues the commit
+callbacks onto the collection's `commit_queue` (a `ContextQueue` owned
+by the OSD shard), and a tp_osd_tp shard worker executes them (§3.6).
+The txc touches the thread pool twice: once to be born, once to say
+goodbye.
+
+The recurring idiom is **swap-drain**: every consumer takes the entire
+deque in O(1) under a momentary lock, then processes lock-free. That
+is why `kv_lock` never shows up in latency traces despite every write
+crossing it twice — the contention windows are nanoseconds. The cost
+model of this pipeline lives entirely in the *wakeups* (the three
+condvar/aio wakeups are the thread-switch latencies visible in the
+map's timestamps) and the *barriers*, not the locking. Note also what
+is absent: no reply queue, no futures, no per-op completion object
+beyond the txc itself. One heap object carries the write end to end,
+and its `state` field (§4.3.5) is the protocol — the queues are just
+parking lots between state transitions.
+
 The rest of this section zooms into each lane with the code
 locations.
 
