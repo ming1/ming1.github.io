@@ -1829,7 +1829,8 @@ the engines                                        :2414-2425
    bluefs        the tiny filesystem under rocksdb        (§6 of the
                  internals post)
    db            the KeyValueDB (rocksdb)                 (§4.3.6)
-   bdev          the raw device (KernelDevice)
+   bdev          THE data device: the "block" symlink
+                 (not db/wal -- see below)
    fm            durable freelist (null under NCB)        (§4.3.9)
    alloc         in-RAM allocator
 
@@ -1857,6 +1858,33 @@ admission control                                  :2193
    throttle — costs charged at queue_transactions, released
                  mid-cycle by the committer (§4.3.7)
 ```
+
+What `bdev` is exactly — and what it is not: it is the **data
+device**, the `block` symlink in the OSD directory
+(`BlueStore.cc:6250`), holding object data. The db/wal/slow names
+live one layer down, and three naming schemes overlap:
+
+- **Deployment symlinks**: `block` (data, always), `block.db` and
+  `block.wal` (optional faster devices).
+- **BlueFS device slots** ([`BlueFS.h:268`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.h#L268)):
+  `BDEV_WAL=0`, `BDEV_DB=1`, `BDEV_SLOW=2` (plus `NEWWAL`/`NEWDB`
+  used only during live device migration). BlueFS holds its *own*
+  `BlockDevice*` per slot — separate `KernelDevice` instances with
+  separate fds, even when they open the same disk.
+- **RocksDB directory names inside BlueFS**: `db/` → `BDEV_DB`,
+  `db.wal/` → `BDEV_WAL`, `db.slow/` → `BDEV_SLOW` — so `db.slow`
+  is not a device at all but the BlueFS directory whose files land
+  on the slow (data) disk when rocksdb spills.
+
+On a single-device OSD (this post's lab) there is no `block.db` or
+`block.wal`: BlueFS's `BDEV_DB` slot is a second `KernelDevice`
+opened on the *same* disk as `BlueStore::bdev` — which is exactly
+the two `bdev=0x...` pointers and two fd families in every §2/§3
+trace (fd 32 = `BlueStore::bdev`, fd 44 = BlueFS's `BDEV_DB`). The
+split also assigns the barriers: §3.5's barrier #1
+(`bdev->flush()` in the kv committer) is *this* member; barrier #2's
+WAL fsync travels `db → BlueFS → its own bdev`, never touching
+`BlueStore::bdev`.
 
 One idiom worth noticing: nearly every tunable that the write path
 reads per-op (`prefer_deferred_size` `:2527`, `deferred_batch_ops`
