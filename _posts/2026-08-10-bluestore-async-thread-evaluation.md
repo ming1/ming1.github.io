@@ -49,21 +49,31 @@ After — one reactor owns all the state, one worker owns all the
 blocking; every arrow is an eventfd the reactor epolls:
 
 ```
-                          ┌──────────────────── epoll ────────────────────┐
-                          │ bdev efd    submit efd    kv-done efd  stop efd│
-                          └──────┬──────────────────┬──────────────┬──────┘
- tp_osd_tp                       │                  │              │
- (submitter)              bstore_trans (reactor loop)              │
-     │ prepare txc          • reap aio completions, run callbacks  │
-     │ io_submit ──kernel──► • _txc_finish_io ordering             │
-     │                      • staging queues (loop-local, NO lock) │
-     │ io-less txc ─submit efd─► • cut KVSyncBatch when worker idle│
-                            • finalize committed batch ◄───────────┘
-                                     │ hand batch      ▲
-                                     ▼ (worker efd)    │ (kv-done efd)
-                            bstore_kv_sync (commit worker)
-                              flush bdev → submit N txns → one sync_wal
-                              — the only thread that ever blocks
+```
+ tp_osd_tp                    bstore_trans                    bstore_kv_sync
+ (submitter)                  (reactor loop)                  (commit worker)
+     │                        waits in epoll_wait on          waits in
+     │                        four eventfds: bdev,            read(worker_efd)
+     │                        submit, kv-done, stop               │
+     │ prepare txc                │                               │
+     │ io_submit ── kernel;       │                               │
+     │    completion bumps        │                               │
+     │    the bdev efd ─────────► │ reap completions:             │
+     │                            │ callbacks + _txc_finish_io    │
+     │ io-less txc: relay ──────► │ stage txc — loop-local        │
+     │    (submit efd)            │ queues, NO lock               │
+     ▼                            │                               │
+ (back to pool)                   │ worker idle → cut batch       │
+                                  │ ────── write(worker_efd) ───► │ wake
+                                  │                               │ flush(data bdev)
+                                  │ meanwhile: keep reaping       │ submit N + synct
+                                  │ and staging the next batch    │ one sync_wal()
+                                  │                               │ — the only thread
+                                  │                               │   that ever blocks
+                                  │ ◄───── write(kv_done_efd) ─── │ back to read()
+                                  │ finalize: promote deferred,   │
+                                  │ queue client acks (shard)     │
+                                  ▼                               ▼
 ```
 
 Gone: `bstore_kv_final`, the data device's `bstore_aio` thread,
