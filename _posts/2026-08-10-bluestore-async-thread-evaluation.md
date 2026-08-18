@@ -49,7 +49,6 @@ After — one reactor owns all the state, one worker owns all the
 blocking; every arrow is an eventfd the reactor epolls:
 
 ```
-```
  tp_osd_tp                    bstore_trans                    bstore_kv_sync
  (submitter)                  (reactor loop)                  (commit worker)
      │                        waits in epoll_wait on          waits in
