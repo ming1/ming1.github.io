@@ -568,3 +568,195 @@ without a false positive.
 - **Unmerged is a gift**: because #70892 has not merged, the fix and its
   two completions can land as one series, and no backport can pick up
   the window without its cure.
+
+# 4. Making BlueFS WAL flushes synchronous — and proving which callers can take it
+
+Status: commit `c1f32446720` local on `kv-committing-local`, not pushed and
+not yet compiled. This section is a review note rather than a tracker issue:
+the interesting part is not the three-line change but the call-graph argument
+that decides *which* writers may take it.
+
+## 4.1 The observation
+
+A BlueFS flush whose range falls inside a single physical extent produces
+exactly one disk write. Submitting that as aio buys no parallelism — there is
+nothing to overlap it with — and when the caller turns around and fsyncs
+immediately, the aio costs two bounces through the block device's completion
+thread purely to learn that the one write finished. On a ramdisk OSD at qd=1
+those bounces measured ~30µs of a ~35µs BlueFS WAL fsync: the overwhelming
+majority of the operation is scheduling, not I/O.
+
+The obvious move is to call `bdev->write()` instead of `bdev->aio_write()`
+when the flush is a single segment. The first cut did exactly that:
+
+```cpp
+bool single_segment = (x_off + length <= p->length);
+...
+if (cct->_conf->bluefs_sync_write || single_segment) {
+```
+
+That condition is about *geometry*. The justification is about *the caller
+fsyncing right after*. Those are not the same thing, and the gap between them
+is where the review went.
+
+## 4.2 Who actually reaches `_flush_data()`
+
+`_flush_data()` is the only `aio_write` submitter in BlueFS — every other
+`bdev->write()` in the file (superblock, `migrate_file`, device expand) was
+already synchronous. So one function's callers decide everything. There are
+two entries, and they are mutually exclusive by assertion:
+
+- `_flush_range_F()` opens with `ceph_assert(h->file->fnode.ino > 1)` —
+  RocksDB files only.
+- `_flush_special()` opens with `ceph_assert(h->file->fnode.ino <= 1)` —
+  the BlueFS journal only.
+
+Everything above those two funnels down as follows:
+
+| Reaches `_flush_data` via | fsync immediately after? |
+|---|---|
+| `_flush_and_sync_log_core` → `_flush_special` | yes — `_flush_bdev(log.writer)` |
+| `_compact_log_sync` | yes — `_wait_for_aio` + `_flush_bdev()` |
+| `_compact_log_async` | yes — `_flush_bdev(new_log_writer, false)` |
+| `_fsync` → `_flush_F` → `_flush_range_F` | yes — `_flush_bdev(h)` |
+| `truncate` → `_flush_F` | yes — `_flush_bdev(h)` |
+| `close_writer` → `_fsync` + `_drain_writer` | yes |
+| **`append_try_flush` → `_flush_F(h, true)`** | **no** |
+| **`flush()` / `flush_range()`** | **no** |
+
+The last two rows are the problem. `append_try_flush()` is what RocksDB's
+`Append()` lands on, and it flushes to disk as soon as the writer's buffer
+crosses `bluefs_min_flush_size` (512K) — with no fsync behind it. During
+compaction, an SST writer previously submitted that aio and went straight back
+to memcpy'ing the next 512K. Making it synchronous parks the compaction thread
+in `pwritev` for a write nobody is waiting on.
+
+So the fix is not to test geometry but to test the writer:
+
+```cpp
+bool fsync_follows =
+  h->writer_type == WRITER_WAL || h->file->fnode.ino <= 1;
+bool single_segment = (x_off + length <= p->length);
+bool sync_write =
+  cct->_conf->bluefs_sync_write || (single_segment && fsync_follows);
+```
+
+`writer_type` is set by filename in `_open_writer` (`.log` → `WRITER_WAL`,
+`.sst` → `WRITER_SST`, everything else `WRITER_UNKNOWN`). The journal writer
+comes from `_create_writer` instead and never gets a type, so it has to be
+caught by `ino <= 1`; compaction's `new_log` inherits `log_file->fnode.ino`,
+so it falls under the same test.
+
+## 4.3 Are the no-fsync paths reachable for the WAL?
+
+Having excluded SST writers, the question becomes whether the WAL itself ever
+takes those two rows. Reading `BlueRocksEnv`'s `WritableFile` gives three
+different answers:
+
+- **`RangeSync()` → `flush_range()`: never called.** RocksDB only issues
+  `RangeSync` when `bytes_per_sync` / `wal_bytes_per_sync` is set, and Ceph's
+  `bluestore_rocksdb_options` default sets neither. Dead path.
+- **`Flush()` → `fs->flush(h)`: reached, writes nothing.** `flush()` defaults
+  to `force=false`, and `_flush_F` early-returns when the buffered length is
+  below `bluefs_min_flush_size`. A normal WAL commit passes straight through
+  and stays in the writer buffer.
+- **`Append()` → `append_try_flush()`: reached, writes only above 512K.**
+
+So for the ordinary WAL commit the *only* disk write in the whole
+Append/Flush/Sync sequence is the one inside `_fsync`, with `_flush_bdev(h)`
+immediately behind it — exactly the shape being optimized. Records ≥512K do
+exist in Ceph (deferred-write payloads ride inside the WAL record), but there
+the lost overlap is just the memcpy of the batch remainder before RocksDB's
+`Sync()` lands.
+
+For the **journal** the answer is stronger: never, and it is enforced.
+`append_try_flush`, `flush()` and `flush_range()` all funnel through
+`_flush_range_F`, whose `ino > 1` assert the journal cannot satisfy. Its only
+route is `_flush_special`, which has three call sites, no `min_flush_size`
+check, and an fsync behind every one of them. 100% fsync-shaped.
+
+## 4.4 What actually changes — the `bluefs_buffered_io` subtlety
+
+Worth knowing before measuring anything, because it makes most of the change a
+no-op on stock config. `KernelDevice::aio_write` begins:
+
+```cpp
+if (aio && dio && !buffered) { ...real aio... }
+else { _sync_write(off, bl, buffered, write_hint); }
+```
+
+`bluefs_buffered_io` defaults to **true**, and `_flush_range_F` passes it
+through for non-envelope files. So SST writes and plain WAL files were
+*already* synchronous — they were calling `aio_write` and falling out the
+bottom into `_sync_write`. Two kinds of traffic were on the genuine aio path:
+
+- the **journal**, because `_flush_special` passes `buffered=false`
+  unconditionally, and
+- **envelope-mode WAL files**, because `_flush_range_F` forces `buffered=false`
+  for them, and `bluefs_wal_envelope_mode` defaults to true.
+
+Those are precisely the two the gate now targets. It is a happy coincidence
+rather than a design: the `buffered` fallback had been doing half the job
+invisibly for years.
+
+## 4.5 Why the single-segment test stays
+
+The first instinct on review was to relax it — for a WAL, two sequential sync
+writes on the same device looked cheaper than one aio completion bounce. That
+argument was built on the ramdisk numbers, and ramdisk write latency is exactly
+the quantity that does not generalize. The ~30µs bounce is a CPU/scheduling
+cost and roughly device-independent; the write is not. Issuing N segments
+synchronously costs N device latencies, which on any real NVMe — let alone a
+spilled WAL landing on a slow device — swamps a single bounce. The geometry
+test stays as the conservative guard it is.
+
+One related claim in the first draft's commit message was simply wrong: that a
+small WAL commit "cannot straddle" an extent boundary because it is
+block-aligned. Extent boundaries live at allocation-unit multiples in
+*file-offset* space (`_allocate` does `need = round_up_to(len, alloc_unit)`),
+and 4K alignment says nothing about 1M boundaries. A WAL append straddles
+roughly once per allocation unit — 1M with a dedicated WAL device, 64K when
+the WAL sits on the shared device — except that `bluefs_fnode_t::append_extent`
+merges contiguous extents, so on an unfragmented device the boundaries merge
+away entirely and every flush is single-segment. Harmless either way, since a
+straddling flush just takes aio, but the code should not have been described as
+relying on a guarantee it does not have.
+
+## 4.6 Still open: the discarded return value
+
+`_flush_data` ignores what the write returns:
+
+```cpp
+bdev[p->bdev]->write(p->offset + x_off, t, buffered, h->write_hint);
+```
+
+The two paths are not equivalent in failure. On aio, `KernelDevice::_aio_thread`
+calls `note_io_error_event()` and then `ceph_abort_msg("Unexpected IO error")` —
+fail-stop, with device telemetry. On the sync path, `_sync_write` logs a `derr`
+and returns `-errno` to nobody; `_flush_bdev` then fdatasyncs a device that has
+nothing to sync, the log seq is marked stable, and RocksDB is told the WAL is
+durable. An `EIO` on a WAL commit is silently acknowledged.
+
+This existed already under `bluefs_sync_write=true`, but that knob is off by
+default and effectively a debug path. The change puts the journal and every
+envelope WAL onto it — precisely where a dropped write is worst. Elsewhere in
+the same file the same call *is* checked (`int w = bdev[to_bdev]->write(...)`
+in `migrate_file`). Left out of the commit deliberately; it wants its own.
+
+## 4.7 Takeaways
+
+- **A performance condition should test the property the justification names.**
+  "Single segment" correlated with "the caller fsyncs next" often enough to
+  measure well, and would have quietly taxed compaction. Writing the real
+  predicate (`fsync_follows`) made the code say what the commit message said.
+- **Find the one function that owns the behaviour, then enumerate its callers.**
+  `_flush_data` being the sole `aio_write` submitter is what made an exhaustive
+  argument possible at all — and the `ino > 1` / `ino <= 1` assert pair turned
+  "probably never" into "cannot".
+- **Check what the layer below already does.** Half the intended change was
+  redundant: `aio_write` has silently degraded to a synchronous write whenever
+  `buffered` is set, which is the default. Measuring without knowing that would
+  have attributed the win to the wrong writers.
+- **Ramdisk numbers argue for latency structure, not latency magnitude.** They
+  isolate the completion-thread bounce beautifully and say nothing usable about
+  what serializing two device writes costs.
