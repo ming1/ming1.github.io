@@ -74,6 +74,96 @@ because exactly one thread — the loop — ever touches them.
 Kept, deliberately: one blocking pthread for RocksDB and the flush
 barriers (§4), and BlueFS's own completion thread (§5.3).
 
+## 1.1 The same 16 KiB write on the new map
+
+[§3.2 of the I/O-path post]({% post_url 2026-08-10-bluestore-io-analysis %})
+mapped one traced 16 KiB write across the four legacy threads as
+numbered trace lines. Here is the *same write, same line numbers*, on
+the new architecture — three lanes instead of four, and every arrow is
+now either the kernel or an eventfd:
+
+```
+ tp_osd_tp                  bstore_trans                    bstore_kv_sync
+ (PG worker)                (reactor loop)                  (commit worker)
+     │                      waits in epoll_wait             waits in read(worker_efd)
+     │                          ⋮                               ⋮
+ #1  queue_transactions         ⋮                               ⋮
+ #2  └► _do_write               ⋮                               ⋮
+ #3     └► _do_write_big        ⋮                               ⋮
+ #4        └► aio_write         ⋮                               ⋮
+ #5,6  set(P) ×2                ⋮                               ⋮
+ #7    set(O)                   ⋮                               ⋮
+ #8  _txc_aio_submit            ⋮                               ⋮
+     │                          ⋮                               ⋮
+     │ switch #1: io_submit(2) → NVMe writes 16 KiB;            ⋮
+     │ the completion bumps the bdev eventfd (IOCB_FLAG_RESFD)  ⋮
+     └────────────────────► epoll_wait returns                  ⋮
+ (back to pool)             reap_completions()                  ⋮
+                            #9  _txc_finish_io                  ⋮
+                            kv_queue.push_back(txc)             ⋮
+                              ▲ this WAS switch #2              ⋮
+                              (kv_lock + kv_cond + wake) —      ⋮
+                              now a same-thread deque push      ⋮
+                            cut batch (swap), write(worker_efd) ⋮
+                                │ switch #2′: eventfd           ⋮
+                                └──────────────────────► read() returns
+                                                         #10 flush(data bdev)
+                                                         #11 submit_transaction ×N
+                                                         #12 submit_transaction(synct)
+                                                         #13 sync_wal → BlueFS fsync
+                                                             └► pwritev (WAL block —
+                                                                SYNCHRONOUS; was
+                                                                aio_write + a wait
+                                                                on the bluefs reaper)
+                                                         #14     └► flush(bluefs bdev)
+                                                         #15 done — durable
+                                                             write(kv_done_efd)
+                                │ switch #3′: eventfd           │
+                            epoll_wait returns ◄────────────────┘
+                            #16 _txc_committed_kv
+                                → commit_queue (OSD shard)
+                            #17 _txc_finish
+                            (the bstore_kv_final lane is
+                             gone — finalize ran inline)
+```
+
+Lines #1–#8 are untouched: submission is still concurrent, still on
+the PG worker. Lines #11–#13 change shape because the old
+`submit_transaction_sync` (#11–#12 in the legacy map) is now split
+into N cheap submits plus one explicit `sync_wal()`. Everything else
+is the same code running on a different thread.
+
+How the lanes talk, in the legacy map's format — the message is still
+one `TransContext*` end to end:
+
+```
+tp_osd_tp ──#1──► bstore_trans ──#2′──► bstore_kv_sync ──#3′──► bstore_trans
+ io_submit + IOCB_FLAG_RESFD     trans_batch: ONE slot,      the same batch object,
+ (the kernel is still the        swap-cut by the loop,       left in place; the loop
+  queue; the completion now      handed over by writing      epolls kv_done_efd and
+  bumps an eventfd the loop      worker_efd to a worker      finalizes it inline
+  epolls)                        blocked in read())
+```
+
+Three things to notice against the legacy map:
+
+- **The legacy map's switch #2 — `kv_lock` + `kv_cond` + `kv_queue` —
+  is not replaced; it is deleted.** The thread that reaps the aio
+  completion *is* the thread that owns the staging queue, so line #9
+  and the push are one uninterrupted run. The swap-drain idiom
+  survives (the batch cut is still an O(1) swap), but the parking lot
+  now has a single owner instead of a lock.
+- **Wakeup count on the durability path drops from five to three.**
+  Legacy: wake `bstore_aio`, wake `bstore_kv_sync`, wake
+  `bstore_kv_final`, plus two hidden inside #13 (the WAL `aio_write`
+  woke the bluefs reaper, which woke the waiting committer). New: wake
+  the loop, wake the worker, wake the loop — and #13's internal pair
+  is gone entirely because the WAL block is written synchronously.
+- **The hidden fourth handoff is unchanged.** `_txc_committed_kv`
+  still queues the commit callback onto the collection's
+  `commit_queue`, and a `tp_osd_tp` shard worker still sends the
+  client reply — the txc touches the thread pool twice in both worlds.
+
 # 2. Why this shape — the one-paragraph version
 
 The obvious objection to merging the kv threads is that it serializes
