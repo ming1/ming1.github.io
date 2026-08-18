@@ -611,25 +611,115 @@ two entries, and they are mutually exclusive by assertion:
 - `_flush_special()` opens with `ceph_assert(h->file->fnode.ino <= 1)` —
   the BlueFS journal only.
 
-Everything above those two funnels down as follows:
+Everything above those two funnels down as follows. Reverse call tree, every
+edge read at the call site; line numbers from PR #71122's head:
 
-| Reaches `_flush_data` via | fsync immediately after? |
-|---|---|
-| `_flush_and_sync_log_core` → `_flush_special` | yes — `_flush_bdev(log.writer)` |
-| `_compact_log_sync` | yes — `_wait_for_aio` + `_flush_bdev()` |
-| `_compact_log_async` | yes — `_flush_bdev(new_log_writer, false)` |
-| `_fsync` → `_flush_F` → `_flush_range_F` | yes — `_flush_bdev(h)` |
-| `truncate` → `_flush_F` | yes — `_flush_bdev(h)` |
-| `close_writer` → `_fsync` + `_drain_writer` | yes |
-| **`append_try_flush` → `_flush_F(h, true)`** | **no** |
-| **`flush()` / `flush_range()`** | **no** |
+```
+BlueFS::_flush_data                                    BlueFS.cc:4137
 
-The last two rows are the problem. `append_try_flush()` is what RocksDB's
-`Append()` lands on, and it flushes to disk as soon as the writer's buffer
-crosses `bluefs_min_flush_size` (512K) — with no fsync behind it. During
-compaction, an SST writer previously submitted that aio and went straight back
-to memcpy'ing the next 512K. Making it synchronous parks the compaction thread
-in `pwritev` for a write nobody is waiting on.
+  BlueFS::_flush_range_F           [private]  BlueFS.cc:4124   ceph_assert(ino > 1)
+    BlueFS::_flush_envelope_F      [private]  BlueFS.cc:4077
+      BlueFS::flush_range          [public]   BlueFS.cc:4059   cond: envelope_mode()
+      BlueFS::_flush_F             [private]  BlueFS.cc:4351   cond: envelope_mode()
+        -> (see BlueFS::_flush_F)
+    BlueFS::flush_range            [public]   BlueFS.cc:4061   cond: !envelope_mode()
+      BlueRocksWritableFile::RangeSync  [rocksdb boundary]  BlueRocksEnv.cc:282
+                                       cond: wal_bytes_per_sync != 0 (unset in Ceph)
+    BlueFS::_flush_F               [private]  BlueFS.cc:4353   cond: !envelope_mode()
+      BlueFS::append_try_flush     [public]   BlueFS.cc:4296
+                                       cond: buffer >= bluefs_min_flush_size
+        BlueRocksWritableFile::Append  [rocksdb boundary]  BlueRocksEnv.cc:198
+        BlueFS::revert_wal_to_plain  [tool]   BlueFS.cc:2446
+          BlueStore::revert_wal_to_plain      BlueStore.cc:11119
+            ceph-bluestore-tool downgrade-wal-to-v1  bluestore_tool.cc:743
+      BlueFS::flush                [public]   BlueFS.cc:4316
+                                       cond: force || buffer >= bluefs_min_flush_size
+        BlueRocksWritableFile::Flush   [rocksdb boundary]  BlueRocksEnv.cc:228
+                                       (passes force=false)
+      BlueFS::truncate             [public]   BlueFS.cc:4397   cond: get_buffer_length()
+        BlueRocksWritableFile::Truncate  [rocksdb boundary]  BlueRocksEnv.cc:215
+      BlueFS::_fsync               [private]  BlueFS.cc:4484
+        BlueFS::fsync              [public]   BlueFS.cc:4473
+          BlueRocksWritableFile::Sync      [rocksdb boundary]  BlueRocksEnv.cc:233
+          BlueRocksWritableFile::Close     [rocksdb boundary]  BlueRocksEnv.cc:223
+          BlueRocksWritableFile::InvalidateCache  [rocksdb bnd]  BlueRocksEnv.cc:271
+          BlueFS::revert_wal_to_plain  [tool]  BlueFS.cc:2450
+            -> (see BlueFS::revert_wal_to_plain)
+        BlueFS::close_writer       [public]   BlueFS.cc:4925
+          BlueRocksWritableFile::~BlueRocksWritableFile   BlueRocksEnv.cc:182
+          BlueFS::revert_wal_to_plain  [tool]  BlueFS.cc:2454
+            -> (see BlueFS::revert_wal_to_plain)
+
+  BlueFS::_flush_special           [private]  BlueFS.cc:4373   ceph_assert(ino <= 1)
+    BlueFS::_flush_and_sync_log_core   [private]  BlueFS.cc:3846
+      BlueFS::_flush_and_sync_log_LD   [private]  BlueFS.cc:3925
+        BlueFS::mkfs             [public]     BlueFS.cc:798
+          BlueStore::_open_db_and_around       BlueStore.cc:7941
+        BlueFS::_fsync           [private]    BlueFS.cc:4502
+                                       cond: dirty.seq_stable < file->dirty_seq
+          -> (see BlueFS::_fsync)
+        BlueFS::sync_metadata    [public]     BlueFS.cc:4756
+          BlueRocksDirectory::Fsync        [rocksdb boundary]  BlueRocksEnv.cc:314
+          BlueRocksEnv::{Rename,Delete,Link}  [rocksdb bnd]  BlueRocksEnv.cc:403,444,505
+          BlueStore::_kv_sync_thread / umount  BlueStore.cc:20472, 21674
+      BlueFS::_flush_and_sync_log_jump_D  [private]  BlueFS.cc:3952
+        BlueFS::_compact_log_async_LD_LNF_D  [private]  BlueFS.cc:3510
+          -> (see BlueFS::_compact_log_async_LD_LNF_D)
+    BlueFS::_compact_log_sync_LNF_LD    [private]  BlueFS.cc:3359
+      BlueFS::revert_wal_to_plain  [tool]   BlueFS.cc:2483
+        -> (see BlueFS::revert_wal_to_plain)
+      BlueFS::compact_log        [public]   BlueFS.cc:3055
+                                       cond: bluefs_compact_log_sync
+        BlueStore::_open_db_and_around       BlueStore.cc:20457
+      BlueFS::_maybe_compact_log_LNF_NF_LD_D  [private]  BlueFS.cc:4771
+                                       cond: bluefs_compact_log_sync
+                                             && _should_start_compact_log_L_N()
+        BlueFS::append_try_flush [public]   BlueFS.cc:4306  cond: flushed_sum
+        BlueFS::flush            [public]   BlueFS.cc:4320  cond: flushed
+        BlueFS::_fsync           [private]  BlueFS.cc:4504
+        BlueFS::sync_metadata    [public]   BlueFS.cc:4761  cond: !avoid_compact
+    BlueFS::_compact_log_async_LD_LNF_D  [private]  BlueFS.cc:3631
+      BlueFS::compact_log        [public]   BlueFS.cc:3057  cond: !bluefs_compact_log_sync
+      BlueFS::_maybe_compact_log_LNF_NF_LD_D  [private]  BlueFS.cc:4773
+        -> (see BlueFS::_maybe_compact_log_LNF_NF_LD_D)
+```
+
+Two things fall out of the tree that the flat reading missed.
+
+First, **every `_flush_special` branch fsyncs immediately** — `_flush_bdev(log.writer)`
+in both log-sync variants, `_wait_for_aio` + `_flush_bdev()` in
+`_compact_log_sync_LNF_LD`, `_flush_bdev(new_log_writer, false)` in the async one.
+The journal has no exception at all, and it cannot acquire one: the
+`ino > 1` / `ino <= 1` assert pair makes the two halves of the tree disjoint,
+so no public API can route journal data through the `_flush_range_F` side.
+
+Second, on the `_flush_range_F` side only three frames reach `_flush_data`
+*without* an fsync behind them: `append_try_flush`, `flush`, and `flush_range`.
+Everything else on that side arrives via `_fsync` or `truncate`, both of which
+call `_flush_bdev(h)` on the next line. `append_try_flush()` is the one that
+matters — it is what RocksDB's `Append()` lands on, and it flushes to disk as
+soon as the writer's buffer crosses `bluefs_min_flush_size` (512K), with no
+fsync behind it. During compaction, an SST writer previously submitted that aio
+and went straight back to memcpy'ing the next 512K. Making it synchronous parks
+the compaction thread in `pwritev` for a write nobody is waiting on.
+
+The tree also shows a loop worth noting: `append_try_flush` and `flush` both
+call `_maybe_compact_log_LNF_NF_LD_D()` after flushing, which is itself a route
+into `_flush_special`. A RocksDB `Append()` can therefore end up writing the
+journal, not just the file it was appending to.
+
+Callers reached only from tests: `ceph_test_bluefs` drives `compact_log()` and
+`revert_wal_to_plain()` directly (`test_bluefs.cc:576`, `:1144` and friends),
+entering at public roots already in the tree — no extra edges.
+
+Not on any path, verified: `BlueFS::_write_super` (`BlueFS.cc:1345`),
+`BlueFS::migrate_file` and the device-expand paths (`:2102`, `:2227`, `:2367`)
+all call `bdev->write()` directly rather than going through a FileWriter;
+`BlueFS::preallocate` (`:4710`) only allocates; `BlueFS::_flush_bdev` reaps aio
+and fdatasyncs but never submits. The look-alike worth calling out is
+`BlueFS::_close_writer` (`:4907`) — it is `_drain_writer` plus `delete`, with no
+flush, and is *not* the public `close_writer` (`:4912`) that does `_fsync`
+first. The two differ by one underscore and by whether unflushed data survives.
 
 So the fix is not to test geometry but to test the writer:
 
