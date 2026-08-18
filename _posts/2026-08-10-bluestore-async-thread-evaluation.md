@@ -1,7 +1,7 @@
 ---
 title: "Can Classic BlueStore Go Async? Evaluating a Reactor Rework of the Write-Path Threads"
 category: storage
-tags: [ceph, bluestore, osd, async, io_uring, coroutines, crimson, seastar, threading]
+tags: [ceph, bluestore, osd, async, reactor, epoll, eventfd, libaio, crimson, threading]
 ---
 
 * TOC
@@ -11,218 +11,400 @@ The [BlueStore I/O path analysis]({% post_url 2026-08-10-bluestore-io-analysis %
 ended with a map: one write crosses four threads — `tp_osd_tp`,
 `bstore_aio`, `bstore_kv_sync`, `bstore_kv_final` — with three switches
 between them, two condvar wakeups and one hardware completion. A natural
-question follows: could the three service threads be merged into one,
-driven by async/await? This post evaluates that rework for the
-**classic** OSD code base: what it buys, what blocks it, and how much
-work it is. All line numbers are
-[`BlueStore.cc` at v21.3.0](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc).
+question follows: could the service threads be merged into one event
+loop? This post started life as a paper evaluation of that rework. It is
+now the documentation of a working implementation: a five-patch series
+that replaces the three service threads with **one epoll reactor plus
+one blocking commit worker**, passes the full objectstore test matrix on
+two machines, and holds queue-depth-1 latency while gaining ~14 % at
+queue depth 16.
 
-# 1. Why not just merge the two kv threads?
+The post reads top-down: the architecture first, then one level of
+detail per section, ending with what the tests caught and what the
+original evaluation got right and wrong.
 
-The smallest version first: fold `_kv_finalize_thread` into
-`_kv_sync_thread` and save one handoff (~70 µs measured). Mechanically
-trivial — `_txc_state_proc` does not care which thread drives
-`KV_SUBMITTED → FINISHING`. But with blocking OS threads, merging
-serializes:
+# 1. The picture: before and after
 
-```
-split (today):
-  bstore_kv_sync   │ barriers N │ barriers N+1 │ barriers N+2 │  ← always flushing
-  bstore_kv_final  │            │ callbacks N  │ callbacks N+1│  ← overlapped
-
-merged:
-  one thread       │ barriers N │ callbacks N │ barriers N+1 │ callbacks N+1 │
-                                  ^^^^^^^^^^^ dead time for the pipeline
-```
-
-The kv thread's iteration time *is* the commit cadence; the barriers
-(~11 ms of fdatasync per cycle on my lab device) are the scarce
-resource. Callback work is unbounded — it grows with batch size, and
-batches grow exactly when the system is busiest — so the merge turns
-cycle time from `max(barriers, callbacks)` into `barriers + callbacks`.
-It also puts arbitrary completion code (which takes the sequencer
-`qlock`, PG-side locks, and can re-enter the store) onto the thread
-that gates every write's durability. The split exists on purpose: the
-finalize thread was carved out of kv_sync historically because callback
-processing was inflating commit latency for the whole batch, and the
-same lean-committer philosophy shows elsewhere — kv_sync releases the
-throttle *before* the sync commit and drops `kv_lock` before flushing
-(`:15350`) so submitters never queue behind a flush.
-
-# 2. async/await changes the answer
-
-The objection above is about *blocking*, not merging. A coroutine that
-`co_await`s yields the thread instead of occupying it, so the pipeline
-overlap survives inside one pthread:
+Before — four threads, three handoffs, every arrow a wakeup:
 
 ```
-one reactor thread, run-to-completion:
-
-  txc A:  prepare ─ co_await aio ····· resume ─ co_await commit ····· reply
-  txc B:              prepare ─ co_await aio ····· resume ─ ...
-  kv cycle:                co_await flush ····· co_await wal_fsync ·····
-                └──── while every await is pending, the reactor runs
-                      whatever else is ready — nothing idles, no wakeups
+ tp_osd_tp            bstore_aio           bstore_kv_sync        bstore_kv_final
+ (submitter)          (io_getevents)       (commit)              (callbacks)
+     │ prepare txc         │                    │                     │
+     │ io_submit ──────────►                    │                     │
+     │                     │ reap, callbacks    │                     │
+     │                     │ kv_lock, push ────►│                     │
+     │                     │  + kv_cond wake    │ swap queues         │
+     │                     │                    │ flush bdev          │
+     │                     │                    │ submit + sync WAL   │
+     │                     │                    │ finalize_lock ─────►│
+     │                     │                    │  + finalize_cond    │ committed_kv
+     │                     │                    │                     │ deferred, reap
+     ▼                     ▼                    ▼                     ▼
+   shared state: kv_lock, kv_cond, kv_finalize_lock, kv_finalize_cond,
+                 five queues touched from four kinds of threads
 ```
 
-The three thread bodies map naturally:
-
-| Today | In the reactor |
-|---|---|
-| `bstore_aio` (`io_getevents` loop) | the loop's io_uring completion poll |
-| `_kv_sync_thread` (`:15290`) | a coroutine: `co_await flush; co_await commit` |
-| `_kv_finalize_thread` (`:15564`) | continuations on the commit future |
-
-The three switches become same-thread continuation resumes, and
-`kv_lock`, `kv_finalize_lock`, and their condvars cease to exist —
-run-to-completion is the mutual exclusion.
-
-**Whether it pays depends on the device.** On my lab NVMe the switches
-cost ~60–100 µs each against a 17.6 ms write — under 1 %, because two
-~6 ms flushes dominate. On a power-loss-protected device where flush is
-tens of microseconds, the hops and locks *become* the write path. That
-is [crimson's](https://ceph.io/en/news/blog/2023/crimson-multi-core-scalability/)
-stated motivation, and this thought experiment is essentially crimson's
-design applied to one component.
-
-# 3. The RocksDB problem, and the committer-offload answer
-
-`db->Write(sync=true)` is a blocking call with internal mutexes and a
-write-group protocol; it cannot yield to a reactor. But it does not
-have to: run it on one dedicated committer pthread and complete back
-into the loop through an eventfd —
+After — one reactor owns all the state, one worker owns all the
+blocking; every arrow is an eventfd the reactor epolls:
 
 ```
-reactor loop                          committer pthread
-  kv-cycle coroutine                    blocking db->Write(sync=true)
-    co_await flush(data)   io_uring       (RocksDB + BlueFS stay
-    post batch ─────────────────────►      synchronous here)
-    co_await eventfd  ◄─────────────── write eventfd on return
-    continuations run (reply, retire)
+                          ┌──────────────────── epoll ────────────────────┐
+                          │ bdev efd    submit efd    kv-done efd  stop efd│
+                          └──────┬──────────────────┬──────────────┬──────┘
+ tp_osd_tp                       │                  │              │
+ (submitter)              bstore_trans (reactor loop)              │
+     │ prepare txc          • reap aio completions, run callbacks  │
+     │ io_submit ──kernel──► • _txc_finish_io ordering             │
+     │                      • staging queues (loop-local, NO lock) │
+     │ io-less txc ─submit efd─► • cut KVSyncBatch when worker idle│
+                            • finalize committed batch ◄───────────┘
+                                     │ hand batch      ▲
+                                     ▼ (worker efd)    │ (kv-done efd)
+                            bstore_kv_sync (commit worker)
+                              flush bdev → submit N txns → one sync_wal
+                              — the only thread that ever blocks
 ```
 
-This is exactly the pattern upstream ships as crimson's **AlienStore**:
-BlueStore (RocksDB included) runs on "alien" threads outside Seastar,
-completions return via `seastar::alien::submit_to()` — a lock-free
-queue plus a reactor wakeup. The upstream trail:
+Gone: `bstore_kv_final`, the data device's `bstore_aio` thread,
+`kv_finalize_lock`/`cond`, and `kv_lock` on the hot path (it survives
+only as a start/stop handshake). The staging queues need no lock at all
+because exactly one thread — the loop — ever touches them.
 
-- the design thread
-  ["\[crimson\] bluestore in an alien world"](https://lists.ceph.io/hyperkitty/list/dev@ceph.io/message/K6QXLFF5ADUIUROUI2B3WDOSSEABR755/)
-  (dev@ceph.io) — including the rejected alternative of porting
-  RocksDB's `Mutex`/`CondVar`/`Thread` port layer to green threads;
-- [ceph/ceph#31041](https://github.com/ceph/ceph/pull/31041), the
-  original AlienStore implementation;
-- the [crimson dev doc](https://docs.ceph.com/en/reef/dev/crimson/crimson/)
-  ("a thin proxy in the Seastar thread to communicate with BlueStore,
-  which uses POSIX threads — alien world from a Seastar perspective");
-- [Crimson: evolving Ceph for high-performance NVMe](https://next.redhat.com/2021/01/18/crimson-evolving-ceph-for-high-performance-nvme/).
+Kept, deliberately: one blocking pthread for RocksDB and the flush
+barriers (§4), and BlueFS's own completion thread (§5.3).
 
-The caveat upstream keeps hitting: each boundary hop costs a cross-core
-queue op and cache migration, and RocksDB drags its compaction threads
-into the process anyway. Reactor purity stays local. AlienStore is the
-bridge; SeaStore is the destination.
+# 2. Why this shape — the one-paragraph version
 
-# 4. Is it doable in the classic tree?
-
-Yes — as an *internal* BlueStore re-architecture. The `ObjectStore`
-interface is already asynchronous (contexts in, callbacks out), so the
-three service threads and their handshakes are private to
-`os/bluestore/` + `blk/`. The surgery has a boundary.
-
-What the honest accounting looks like:
-
-- It is never literally one pthread: the RocksDB committer survives
-  (plus RocksDB's own compaction pool), and `tp_osd_tp` stays
-  multi-threaded.
-- **The submit side remains concurrent**, so the onode/buffer cache
-  shard locks, the allocator mutex, and the collection/sequencer
-  locking all stay. The merge only eliminates `kv_lock`,
-  `kv_finalize_lock`, and two hops per write. Full lock elimination
-  requires moving submission onto sharded reactors too — and that
-  slope ends at crimson, which is why upstream built a new store
-  instead of performing this surgery on the old one.
-
-# 5. The work
-
-| Piece | Nature | Size |
-|---|---|---|
-| Mini-executor + awaitables (or Boost.Asio io_uring + C++20 coros) | new code | 1–2 weeks |
-| `blk/` event mode: completions into the loop, async fsync, discard | invasive; `bdev_ioring` in-tree is a head start | 3–4 weeks |
-| kv sync + finalize (~400 lines) → coroutine + committer offload | rewrite | 2–3 weeks |
-| aio completion path (`aio_cb` / `_txc_finish_io` / IOContext) → awaits | rewrite | 2 weeks |
-| Deferred replay call sites routed to the loop | fiddly — see below | 1–2 weeks |
-| Dual-mode (classic threads behind a `bluestore_reactor` option) | +50 % everywhere | — |
-| Crash-consistency + perf validation | **the long pole** | 2–3 months |
-
-Two line items deserve their justification, because both exist to
-protect invariants the merge would otherwise silently break.
-
-## 5.1 Deferred replay must be funneled through the loop
-
-Deferred replay is a *third* IO state machine competing for the two
-resources the loop owns — the data device (replay `aio_write`s from
-`_deferred_submit_unlock`, `:15787`) and the kv cycle (the cleanup keys
-in the next `synct`). And it is kicked from at least five places on
-four kinds of threads:
+The obvious objection to merging the kv threads is that it serializes
+the pipeline: commit barriers (`fdatasync`, milliseconds) and completion
+callbacks (unbounded, grows with load) end up on the same timeline, and
+cycle time becomes `barriers + callbacks` instead of
+`max(barriers, callbacks)`. That objection is about *blocking*, not
+about merging. Split the work by its nature instead of by pipeline
+stage: everything that blocks goes on one worker thread, everything
+event-driven goes on one reactor, and the overlap survives:
 
 ```
-MempoolThread::entry            :5660    ← the cache-trim thread!
-_txc_finish                     :15057   ← bstore_kv_final
-_kv_finalize_thread             :15614   ← bstore_kv_final
-_osr_drain_all                  :15207   ← umount, collection flush,
-                                           PG split/merge — arbitrary
-queue_transactions (throttle)            ← every tp_osd_tp submitter
-        │
-        └──► deferred_try_submit → _deferred_submit_unlock → aio_write
+ worker : │ flush+submit+sync batch N  │ flush+submit+sync batch N+1 │
+ loop   : │ reap/stage batch N+1  ...  │ finalize N, reap/stage N+2  │
 ```
 
-If these call sites keep doing the work inline, foreign threads issue
-device IO and mutate the per-osr deferred queues concurrently with the
-loop: `deferred_lock` must stay, and the crash-ordering invariants —
-replay only after the WAL record is durable, cleanup key only after the
-replayed data is flushed — go back to being cross-thread problems. So
-every site becomes "post a kick to the loop" (drains become "post,
-await drained"). Mechanical, but it must be complete: one missed site
-breaks the single-writer premise.
+While the worker holds batch N in an `fdatasync`, the loop keeps
+reaping completions and staging batch N+1; the moment the kv-done
+eventfd fires, the loop finalizes batch N — running the *cheap* part of
+finalize inline (callbacks are only **queued** to the OSD shard queues
+and finishers; the heavy work never runs on the loop) — and immediately
+cuts batch N+1. Batches self-clock on the worker's done events, exactly
+the cadence the old swap-based batching had, minus two condvar wakeups
+and one thread.
 
-## 5.2 Dual-mode is the entry fee, not gold-plating
+This is the "committer offload" pattern from the original evaluation —
+the same shape as crimson's
+[AlienStore](https://docs.ceph.com/en/reef/dev/crimson/crimson/)
+(reactor on one side, blocking RocksDB on threads on the other,
+completions returning through a queue plus a wakeup) — but implemented
+with ~200 lines of epoll and five eventfds (four epolled by the loop,
+one waking the worker) instead of coroutines. No
+executor, no `co_await`, no io_uring dependency. Run-to-completion on
+the loop is the mutual exclusion; the eventfds are the awaits.
 
-- **Rollback.** BlueStore is the data plane of every cluster; a
-  thread-architecture flag day is unmergeable and un-operable. An
-  off-by-default option gives canaries and same-binary rollback.
-- **Environment coverage.** io_uring (and `IORING_OP_FSYNC`) is absent
-  or deliberately disabled on plenty of production kernels and hardened
-  environments; the libaio + threads path must keep working.
-- **Hardware where it cannot pay.** On HDDs and non-PLP devices the
-  barriers dominate by orders of magnitude — zero benefit, nonzero
-  risk.
-- **Precedent.** This is how BlueStore lands architecture: v21.3 ships
-  `bluestore_write_v2` present but off by default, and `bdev_ioring`
-  experimental-and-off. Both paths coexist, the new one bakes in
-  teuthology and A/B runs on the same binary, the default flips
-  releases later.
+# 3. The reactor loop, one level down
 
-The "+50 % everywhere" is exactly this: every touched component keeps
-two correct implementations, conditionally initialized, with a doubled
-test matrix, until the old one can be deleted.
+`_trans_thread()` is a textbook epoll loop with four fds and one rule:
+**it must never block on anything but `epoll_wait`**.
 
-# 6. Verdict
+```
+ while (true) {
+   if worker idle && work pending:        # cut a batch
+       trans_batch ← swap(staging queues)
+       write(worker_efd)                  # hand off; worker wakes
+   if stop requested && everything empty: break
 
-Doable, and containable — a working prototype is ~4–6 weeks for one
-strong engineer; production quality is two to three quarters, dominated
-by re-proving crash safety rather than by writing the loop. The
-invariants that make validation expensive are the ones the
-[I/O-path post]({% post_url 2026-08-10-bluestore-io-analysis %})
-documents: data-flush-before-metadata-commit, replay strictly after WAL
-durability, per-sequencer ordering. Today every one of them is enforced
-by *thread structure*; the rework re-enforces them with continuation
-ordering. Getting that wrong does not crash — it corrupts on power
-loss, which is why review and test cost dwarf coding cost.
+   epoll_wait(...)
+   for each ready fd:
+     bdev efd   → while (reap_completions() > 0) {}   # callbacks run HERE
+     submit efd → drain relay queue → _txc_state_proc(txc)…
+     kv-done efd→ promote deferred done→stable; _kv_finalize_process()
+     stop efd   → stop_requested = true
+ }
+```
 
-The scoped experiment I would actually run: keep `bstore_aio` as-is and
-coroutine-merge only the two kv threads with the committer-offload
-(~3 weeks). It isolates the riskiest invariants, kills two locks and
-one hop, and measures the real handoff savings before committing to the
-device-layer surgery. If the goal is the full reactor win at µs-scale
-devices, the economics upstream already ran still hold: you end up
-wanting sharded submission too — and that is crimson.
+Three design points carry the correctness load:
+
+**Who gets to enter.** The staging queues (`kv_queue`,
+`deferred_done_queue`) are plain `std::deque`s with no lock, so only
+the loop may touch them. Writes with data IO get in naturally: their
+aio completions are reaped *by* the loop, so `_txc_finish_io` and the
+queue pushes already run there. IO-less transactions are prepared on
+the submitter (`tp_osd_tp`) thread but **relayed**: `_txc_state_proc`
+at `STATE_PREPARE` detects it is not the loop thread, parks the txc in
+a small mutex-protected MPSC queue, and writes the submit eventfd. The
+old "wake the kv thread" nudges (`_osr_drain*`, deferred-aggressive
+submission) become the same eventfd write with no payload.
+
+**No lost wakeups, by eventfd semantics.** The loop reads the eventfd
+*before* draining the associated queue. An enqueue that races with the
+drain either lands before the swap (drained now) or after (its eventfd
+write leaves the counter nonzero, so the next `epoll_wait` returns
+immediately). A counting eventfd cannot lose an edge the way a condvar
+without its mutex can.
+
+**Ordering is inherited, not re-invented.** Per-sequencer commit order
+was always enforced by `_txc_finish_io` walking the OpSequencer queue —
+a txc advances only when every earlier txc on its osr has finished IO.
+That function simply runs on the loop now, single-threaded, so the
+FIFO staging queue receives txcs already in commit order, and the batch
+cut is a swap that preserves it.
+
+# 4. The commit worker and the batch cycle
+
+The worker (`_kv_worker_thread`, keeping the historical `bstore_kv_sync`
+thread name) is deliberately boring: block on its eventfd, run one
+batch, signal done.
+
+One batch = one crash-consistency epoch, and the order inside it is
+load-bearing:
+
+```
+   ① bdev->flush()            # data of this batch's txcs becomes stable
+                              # (also promotes deferred done → stable)
+   ② submit_transaction(t)    # per txc, in queue order — WAL append +
+      … × N                   # memtable, sync=false, no fsync
+   ③ submit_transaction(synct)# cleanup keys of the deferred batches
+                              # made stable at ①
+   ④ sync_wal()               # ONE fdatasync covers ②+③ entirely
+   ⑤ write(kv_done_efd)       # loop finalizes: acks in queue order
+```
+
+(The nid/blobid preallocation bumps piggyback on the batch's *first*
+transaction; `synct` only carries them when the batch is empty.)
+
+① before ④ is the invariant that survives power loss: metadata must
+never become durable while pointing at data the device hasn't
+stabilized. ② in queue order from a single thread means the WAL records
+the txcs exactly in commit order — if we crash before ④, RocksDB
+replays the CRC-valid prefix, which is a prefix *in that order*, and
+none of those clients were ever acked. The deferred-write cleanup obeys
+the same edge: a deferred batch's `done` → `stable` promotion happens
+at the flush in ①, and its WAL cleanup keys ride ③ of that same cycle —
+safe because the key removal only becomes *durable* at ④, strictly
+after the flush that stabilized the replayed data. When ① is skipped
+(shared BlueFS/data device, where the BlueFS commit does the flushing),
+promotion waits: the loop promotes the batch at ⑤ and its cleanup keys
+ride the *next* cycle's ③. Either way "data stable before cleanup
+durable" holds, so a crash always leaves either the WAL deferred record
+or the stabilized data, never neither.
+
+Step ④ needed an API that didn't exist, which is the first patch of the
+series, next section.
+
+# 5. Down the stack: the three enabling patches
+
+## 5.1 kv: split the WAL sync out of `submit_transaction_sync`
+
+RocksDB's `submit_transaction_sync()` couples "append the record" and
+"make everything durable" in one call, which forces the *last*
+transaction of every batch to be special. The series adds
+`KeyValueDB::sync_wal()` — for RocksDB, `db->SyncWAL()` — so the batch
+becomes uniform: submit N cheap transactions, then one explicit
+durability point. `SyncWAL()` is safe here because with
+`manual_wal_flush` off, every `Write()` already pushed its record into
+the WAL file's buffer, so syncing the file covers everything submitted
+before the call. (A user-supplied `manual_wal_flush=true` would break
+that silently — records would sit in a user-space buffer the sync never
+touches — so the option is now rejected at open time.)
+
+By itself this is structure, not speed: same total work. Its value is
+that BlueStore now owns *where* the durability point is — which is what
+makes the batch handoff clean, and what lets the BlueFS patch below
+actually land on the commit-critical bytes.
+
+## 5.2 blk: external completion reaping for KernelDevice
+
+The loop needs the data device's aio completions as an epollable event.
+The obstacle: **libaio's `io_context_t` is not a file descriptor.** It
+is an opaque kernel AIO context consumed only by `io_getevents()` —
+`poll`/`epoll` won't accept it, which is exactly why `bstore_aio` was a
+dedicated thread in the first place. The kernel's one bridge to
+poll-land is `IOCB_FLAG_RESFD`: attach an eventfd to each iocb
+(`io_set_eventfd`), and the completion path increments that eventfd —
+*that* is pollable.
+
+So KernelDevice gains an opt-in per-instance mode: no completion thread;
+every submitted iocb carries the device's completion eventfd; the owner
+epolls it and drains with `reap_completions()`, which is the old
+thread's loop body factored out unchanged (`_reap_completions()`) — same
+processing, same single-threaded callback ordering, different driver.
+`switch_to_external/internal_completions()` flips an open, quiescent
+device between modes, so mount enables it and unmount restores the
+thread for whoever touches the device next (fsck, remount).
+
+Why not let the *worker* reap instead? Three reasons, in decreasing
+order of importance: the callbacks push into the loop-local staging
+queues, so a second reaping thread reintroduces the locks the design
+exists to remove; the worker spends its life inside flush/submit/sync,
+so completions would wait out entire commit cycles; and completions
+have always been processed serially in one thread — `_txc_finish_io`'s
+ordering scan depends on it.
+
+## 5.3 bluefs: write single-segment flushes synchronously
+
+The last cross-thread dependency on the commit path was inside
+`sync_wal()` itself: BlueFS flushed the WAL bytes with
+`aio_write` + `aio_submit`, then `fsync` waited for that aio — reaped
+by *BlueFS's* completion thread — before the `fdatasync`. Per commit:
+submit, sleep, wake the reaper, wake the waiter, sync. Four context
+switches to write one buffer.
+
+The observation that removes it: a WAL append that lands inside a
+single physical extent segment gains nothing from asynchrony — there is
+exactly one contiguous write and the caller must wait for it anyway.
+BlueFS now detects the single-segment case in `_flush_data` and issues
+a plain blocking `pwritev` in the calling thread. Multi-segment flushes
+(an append straddling an extent boundary) keep the parallel-aio path
+unchanged. Since BlueFS extents are allocation-unit aligned and the
+append path merges contiguous extents, the hot WAL append is
+essentially always single-segment — so on the commit path, the kv
+worker now writes and syncs synchronously, with no completion-thread
+dependency left in the common case (a rare boundary-straddling append
+still takes the aio path). This patch alone, A/B-tested before the rest of the
+series existed, produced its largest fsync-workload win: 27–48 % lower
+fsync-path latency depending on device.
+
+BlueFS itself still owns a `bstore_aio` thread — it has its own
+KernelDevice instance, and only the data bdev is switched to external
+completions. That is the one service thread the rework keeps, and it is
+off the commit path.
+
+# 6. What the tests caught: a reactor that put itself to sleep
+
+The single-owner design has a failure mode blocking threads don't: the
+loop is now the *only* thread that frees aio queue slots. The
+objectstore AUSize suite found the consequence within minutes on a
+4 KiB-min-alloc config:
+
+```
+ loop: finalize → deferred_try_submit → io_submit  → EAGAIN (queue full)
+            │                                            │
+            │            retry loop: usleep, backoff ◄───┘
+            │                        ▲      │
+            └── the ONLY thread that ─┘     └─► 16 retries later:
+                could reap the queue            ceph_assert(r == 0)
+```
+
+The submission queue can only drain if completions are reaped;
+completions are only reaped by the thread that is now asleep in the
+retry loop. Classic self-starvation — invisible in the legacy
+architecture, where the sleeping submitter and the reaping thread were
+different threads.
+
+The fix gives the io queue an `eagain_wait` hook that replaces the
+sleep: when the retrying submitter *is* the registered reaper, drain
+completions instead of sleeping (running the callbacks in exactly the
+thread they always run in), and poll the completion eventfd when
+nothing is reapable; any other thread just sleeps briefly. Because the
+hook can return early, the retry budget switched from counting attempts
+to wall-clock time matching the old backoff's total. The first version
+of this fix — reap-or-sleep-125 µs — still crashed: sixteen 125 µs
+sleeps is a 2 ms budget against a device that takes longer than that to
+complete anything. The exponential backoff it replaced had been the
+real time budget all along. Worth writing down: **when you replace a
+wait, you must replace its budget, not just its trigger.**
+
+Beyond that bug, review of the series surfaced two more races of the
+same family — all fixed before the final cut: installing the hook (a
+`std::function`) while other threads could be mid-`submit_batch`, and a
+shutdown ordering where the worker could observe the stop flag after
+being handed a final batch and exit without processing it, hanging the
+join. The pattern across all three: single-owner designs concentrate
+correctness into *lifecycle edges* — startup, shutdown, and the moments
+a thread wears two hats.
+
+# 7. Results
+
+Measured on the lab boxes (single OSD, fresh cluster per cell, fio 4 KiB
+randwrite via librbd on a ramdisk-backed OSD; methodology per the
+[I/O-path post]({% post_url 2026-08-10-bluestore-io-analysis %})):
+
+| Metric | legacy threads | trans loop | delta |
+|---|---|---|---|
+| service threads (data path) | 3 (`aio`+`kv_sync`+`kv_final`) | 2 (loop + worker) | −1 thread, −2 handoffs |
+| hot-path locks | `kv_lock`, `kv_finalize_lock` | MPSC relay mutex only | staging is single-owner |
+| QD1 avg latency | ~381 µs | ~378–386 µs | tie |
+| QD16 IOPS | 9 840 | 11 182 | **+13.6 %** |
+| fsync-heavy path (patch 5.3 alone) | — | — | −27…−48 % latency |
+
+The QD1 tie is worth being honest about: with CPU idle states pinned,
+the condvar handoffs the loop eliminates were already cheap (~tens of
+µs against a ~380 µs write), matching the original evaluation's
+prediction that the win depends on how much the barriers dominate. The
+QD16 gain is where the structure pays: less wakeup churn and a reaping
+loop that stays hot under load.
+
+Correctness: the full objectstore matrix (`StoreTest`,
+`StoreTestSpecificAUSize`, `ceph_test_bluefs`) is outcome-identical to
+the legacy pipeline on both a bare-metal EPYC box and a VM — same
+passes, same known environmental failures, zero new ones — including
+the deadlock reproducer above, repeated mount/unmount cycles to
+exercise the reworked shutdown, and remount in both directions (there
+is no on-disk format change; this is thread architecture only).
+
+# 8. The original evaluation, revisited
+
+This post's first life estimated the rework before writing it. Scoring
+that estimate against the implementation:
+
+**Right.** The committer-offload shape (blocking RocksDB on its own
+pthread, completions via eventfd) was the load-bearing idea, and it is
+exactly what got built. The prediction that validation would be the
+long pole held emphatically: the loop itself is ~200 lines and worked
+quickly; the real costs were the deadlock the AUSize suite caught, the
+shutdown races review caught, and re-proving the crash-ordering
+invariants — all in the "re-prove safety" bucket the estimate priced,
+none in the "write the loop" bucket. The warning that deferred replay
+touches the loop's resources from foreign threads (§6's bug is that
+warning coming true) was also correct.
+
+**Wrong, in a useful direction.** No coroutines, no executor, no
+io_uring were needed — plain epoll + eventfds carried the whole design,
+which removed the largest new-code line items from the estimate. The
+"+50 % everywhere" dual-mode tax was real but temporary: the series was
+built dual-mode (option-gated, same-binary A/B — that is what produced
+the table above), and then collapsed to loop-only on the development
+branch once the A/B was done, with the dual-mode commits recut into a
+clean extraction-refactor + swap. Whether upstream wants the fallback
+kept is the open question below, but as *development methodology*,
+dual-mode-then-collapse was cheaper than maintaining both forever and
+safer than never having the A/B.
+
+**Still true.** The submit side stays concurrent, so this is not
+crimson: onode/cache/allocator locking is untouched, and the full
+sharded-reactor economics still end at a new store, not surgery on this
+one. This rework buys the thread and lock structure of the commit
+pipeline, nothing more — and measures what that alone is worth.
+
+# 9. Open questions
+
+- **Portability is the upstream-blocking one.** The loop requires
+  Linux (epoll/eventfd) and a libaio KernelDevice: io_uring, SPDK,
+  PMEM, and FreeBSD builds currently cannot mount. Upstream needs
+  either the legacy pipeline retained as a fallback (the dual-mode
+  commits exist and could be recut back in) or a deprecation story.
+  io_uring is the natural second backend — its ring fd is natively
+  pollable, so it needs no eventfd bridge at all.
+- **The loop's no-blocking rule is enforced by discipline, not by the
+  compiler.** Finalize only *queues* callbacks, but
+  `_txc_release_alloc`'s discard path is synchronous when discard is
+  enabled without async discard threads, and the EAGAIN hook can hold
+  the loop for a poll interval under pressure. A may-not-block assert
+  (or watchdog) on the loop is the next hardening step.
+- **Two debug facilities lived in the deleted completion thread** — the
+  stalled-aio watchdog (`bdev_debug_aio`) and the aio-path crash
+  injection — and are inactive in external-completion mode until
+  reimplemented on the loop.
+- **One measured anomaly left unchased:** batch merging. The worker
+  submits N per-txc WriteBatches sequentially; a single writer never
+  benefits from RocksDB's write-group batching, so merging a batch into
+  one `Write()` should cut per-record overhead at high queue depth.
+  The `sync_wal` split makes the experiment a small patch.
