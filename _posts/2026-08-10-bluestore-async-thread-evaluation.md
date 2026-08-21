@@ -342,13 +342,15 @@ driver.
 Each `KernelDevice` owns the whole chain privately:
 
 ```
+ owner           eventfd(EFD_NONBLOCK|EFD_CLOEXEC)  ──► BlueStore-owned fd
+                 bdev->set_completion_eventfd(fd)        (BEFORE open();
+                 the device only borrows the fd)
  open()          io_setup() ──► a private kernel aio context (io_queue)
- enable          eventfd(EFD_NONBLOCK|EFD_CLOEXEC) ──► completion_efd
-                 io_queue->set_notify_eventfd(completion_efd)
+                 _aio_start(): thread NOT created (see below)
  submit          submit_batch() stamps EVERY iocb:
                    io_set_eventfd(&iocb, notify_eventfd)   # IOCB_FLAG_RESFD
  completion      kernel writes the event into THIS context's ring
-                 AND increments completion_efd  ──► epoll_wait wakes
+                 AND increments the eventfd  ──► epoll_wait wakes
  drain           reap_completions(max): io_getevents(0) + callbacks,
                  repeated until the ring is empty
 ```
@@ -379,15 +381,56 @@ reapers on the *same* context, because each ring event is delivered
 exactly once, to whichever `io_getevents()` caller grabs it, which
 would scatter callbacks across two threads.
 
-`switch_to_external/internal_completions()` flips an open device
-between modes: stop the completion thread, arm the eventfd (or the
-reverse). The caller must guarantee **no aio is in flight** across a
-switch — stopping the thread does not drain, and `io_destroy` discards
-pending events, so an aio completing mid-switch would lose its callback
-forever. BlueStore satisfies this by switching only inside
-`_kv_start`/`_kv_stop`, where mount/unmount ordering guarantees
-quiescence; the switch back at `_kv_stop` exists so later users of the
-device (fsck-on-umount reads, a remount) get a reaper again.
+After all that plumbing, the entire mode reduces to one `if` in
+`_aio_start()`, and it is worth understanding why *this* is the
+mechanism and everything else is preparation:
+
+```cpp
+ int KernelDevice::_aio_start() {
+   r = io_queue->init(fds);          // io_setup() - ring ALWAYS created
+   ...
+   if (!external_completions) {      // ← the whole mode
+     aio_thread.create("bstore_aio");
+   }
+ }
+```
+
+The ring and submission work identically in both modes; the only
+decision is **who consumes the ring** — and since `IOCB_FLAG_RESFD` is
+additive (the ring receives every event regardless), external mode
+cannot work by *redirecting* delivery. If the thread were created
+*and* the loop epolled the eventfd, both would call `io_getevents()`
+on the same context, the kernel would hand each event to exactly one
+of them arbitrarily, and callbacks would execute on two threads —
+destroying the single-owner queues the design exists for. So the mode
+is enforced by **not creating the competing consumer**; the eventfd is
+merely how the surviving consumer learns when to look.
+
+Suppressing the start also explains why the design settled on
+*born-external* rather than the mode-*switching* it went through
+first. An earlier revision started the thread normally and flipped an
+open device with `switch_to_external/internal_completions()` — and all
+the deleted complexity lived in that flip: stopping the thread does
+not drain, `io_destroy` discards pending events, so every switch
+needed a no-in-flight-aio contract, a failure-restore path, and a
+symmetric switch-back at `_kv_stop`. Deciding before `open()` means
+the thread never exists: nothing to stop, no window where an in-flight
+aio can lose its callback, no contract. The flag is per-instance, so
+BlueFS's devices — which never receive the setter — take the `false`
+branch and keep their threads with zero special-casing.
+
+The asymmetry has one consequence the owner must carry: with no thread
+ever backstopping this device, *any* aio issued while the loop is not
+running has no reaper. That invariant is cheap for client IO and
+deferred replay (both live inside the `_kv_start`/`_kv_stop` window),
+but it caught one non-obvious customer: **deep fsck** reads object
+data with `aio_read` + `aio_wait` *after* the replay-only kv bracket
+used to end — reads that previously worked only because the
+switch-back had restored the device's thread. The fix moved the
+boundary rather than the reaping: `_fsck` now keeps the pipeline
+running across the whole scan (read-only fsck included; the commit
+worker just idles), so fsck's reads are ordinary submitter-waits
+served by the loop.
 
 Why not let the *worker* reap instead? Three reasons, in decreasing
 order of importance: the callbacks push into the loop-local staging
@@ -420,9 +463,9 @@ reaps:
        └─ bdev->open(p)
           ├─ per-write-hint fds opened on p
           └─ _aio_start(): io_queue->init() → io_setup()   ← ring A
-             + aio_thread.create("bstore_aio")   [legacy; the trans
-               design later stops THIS instance's thread via
-               _kv_start's switch_to_external_completions()]
+             thread NOT created: _open_bdev installed BlueStore's
+             eventfd before open(), so this instance is born
+             external - the trans loop is its reaper for life
 ```
 
 Path two — BlueFS's devices, a few calls deeper in the very same
@@ -486,8 +529,9 @@ service:
  };
 ```
 
-so `switch_to_external_completions()` — a method call on one object —
-stops only *that object's* thread.  Every device BlueFS relies on
+so `set_completion_eventfd()` — called on one object before its
+`open()` — suppresses only *that object's* thread.  Every device
+BlueFS relies on
 keeps its own `bstore_aio` running (they merely share the display
 name).  Counting threads makes the structure visible: on a single
 shared disk, legacy mode shows **two** `bstore_aio` (the data
@@ -544,7 +588,8 @@ waiting on completions only the trans loop can reap, while the loop
 might be waiting on the worker's kv-done event: a deadlock built into
 the architecture. Two device instances, two reapers, no cycle — and
 it is also why `ps -T` still shows exactly one `bstore_aio` thread in
-the final design: it is BlueFS's, and the switch never touches it.
+the final design: it is BlueFS's, born on a device that never received
+the eventfd.
 
 ## 5.3 bluefs: write single-segment flushes synchronously
 
@@ -571,9 +616,9 @@ series existed, produced its largest fsync-workload win: 27–48 % lower
 fsync-path latency depending on device.
 
 BlueFS itself still owns a `bstore_aio` thread — it has its own
-KernelDevice instance, and only the data bdev is switched to external
-completions. That is the one service thread the rework keeps, and it is
-off the commit path.
+KernelDevice instance, and only the data bdev is born in external
+completion mode. That is the one service thread the rework keeps, and
+it is off the commit path.
 
 # 6. What the tests caught: a reactor that put itself to sleep
 
