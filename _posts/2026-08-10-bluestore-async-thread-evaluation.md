@@ -404,19 +404,66 @@ load-bearing: does switching the data device to external completions
 change aio delivery for **BlueFS**? No — and not by configuration, but
 by construction.
 
-BlueStore's data device is created in `_open_bdev()`:
+Both instances are born inside the same mount call, three frames
+apart. Path one — BlueStore's data device, the one the trans loop
+reaps:
 
-```cpp
- string p = path + "/block";
- bdev = BlockDevice::create(cct, p, aio_cb, this, discard_cb, this, ...);
- bdev->open(p);
+```
+ BlueStore::_mount()
+ └─ _open_db_and_around()
+    └─ _open_bdev()
+       ├─ p = path + "/block"
+       ├─ bdev = BlockDevice::create(cct, p, aio_cb, this, ...)
+       │         │       └── completion callback → the txc state machine
+       │         └─ detect_device_type(p) → new KernelDevice
+       │            (ctor: io_queue = new aio_queue_t)
+       └─ bdev->open(p)
+          ├─ per-write-hint fds opened on p
+          └─ _aio_start(): io_queue->init() → io_setup()   ← ring A
+             + aio_thread.create("bstore_aio")   [legacy; the trans
+               design later stops THIS instance's thread via
+               _kv_start's switch_to_external_completions()]
 ```
 
-BlueFS never sees that object. BlueStore hands BlueFS *paths*, and
-`BlueFS::add_block_device()` calls `BlockDevice::create()` **itself**
-for each of WAL/DB/SLOW — even when the "slow" path is literally the
-same `path + "/block"` string. So a single-shared-disk deployment has
-two `KernelDevice` objects open on the same inode:
+Path two — BlueFS's devices, a few calls deeper in the very same
+`_open_db_and_around()`:
+
+```
+ BlueStore::_open_db_and_around()
+ └─ _open_db() → _open_bluefs() → _minimal_open_bluefs()
+    ├─ "block.db"  exists? → bluefs->add_block_device(BDEV_DB,  ...)
+    ├─ "block"     ALWAYS  → bluefs->add_block_device(shared_bdev,
+    │                          path + "/block", &shared_alloc)   ← the
+    │                          SAME path string BlueStore opened
+    └─ "block.wal" exists? → bluefs->add_block_device(BDEV_WAL, ...)
+
+ BlueFS::add_block_device(id, path, ...)
+ ├─ b = BlockDevice::create(cct, path, NULL, NULL, ...)  ← NULL aio
+ │      callback: BlueFS has no completion callbacks, its waiters
+ │      block in IOContext::aio_wait()
+ ├─ if shared: b->set_no_exclusive_lock()   ← else the second open()
+ │      would lose the O_EXCL/flock fight against the first
+ └─ b->open(path)
+    └─ same KernelDevice::open → _aio_start → io_setup()  ← ring B
+       + its own "bstore_aio" thread (never touched by the switch)
+```
+
+The fork point is one line: `_minimal_open_bluefs` passes BlueFS the
+path *string* `path + "/block"`, not BlueStore's `bdev` pointer — so
+`add_block_device` inevitably constructs a second `KernelDevice` on
+the same inode. The only concessions to sharing are
+`set_no_exclusive_lock()` and the shared allocator context (space
+arbitration); everything IO-related is duplicated. Note also the
+ordering: `_minimal_open_bluefs` runs *before* `_kv_start` in the
+mount sequence, so when the switch flips BlueStore's device, BlueFS's
+instances already exist with their threads running — the switch
+operates on one object among several open on the same disk.
+Separate-device deployments just take the `block.db`/`block.wal`
+branches too, adding a third and fourth instance, each with its own
+ring and thread.
+
+The result, for a single-shared-disk deployment — two `KernelDevice`
+objects open on the same inode:
 
 ```
  BlueStore bdev                     BlueFS bdev[BDEV_SLOW]
