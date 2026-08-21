@@ -330,14 +330,49 @@ poll-land is `IOCB_FLAG_RESFD`: attach an eventfd to each iocb
 (`io_set_eventfd`), and the completion path increments that eventfd —
 *that* is pollable.
 
-So KernelDevice gains an opt-in per-instance mode: no completion thread;
-every submitted iocb carries the device's completion eventfd; the owner
-epolls it and drains with `reap_completions()`, which is the old
-thread's loop body factored out unchanged (`_reap_completions()`) — same
-processing, same single-threaded callback ordering, different driver.
-`switch_to_external/internal_completions()` flips an open, quiescent
-device between modes, so mount enables it and unmount restores the
-thread for whoever touches the device next (fsck, remount).
+So KernelDevice gains an opt-in **per-instance** mode: no completion
+thread; every submitted iocb carries the device's completion eventfd;
+the owner epolls it and drains with `reap_completions()`, which is the
+old thread's loop body factored out unchanged (`_reap_completions()`)
+— same processing, same single-threaded callback ordering, different
+driver.
+
+### 5.2.1 The mechanism, end to end
+
+Each `KernelDevice` owns the whole chain privately:
+
+```
+ open()          io_setup() ──► a private kernel aio context (io_queue)
+ enable          eventfd(EFD_NONBLOCK|EFD_CLOEXEC) ──► completion_efd
+                 io_queue->set_notify_eventfd(completion_efd)
+ submit          submit_batch() stamps EVERY iocb:
+                   io_set_eventfd(&iocb, notify_eventfd)   # IOCB_FLAG_RESFD
+ completion      kernel writes the event into THIS context's ring
+                 AND increments completion_efd  ──► epoll_wait wakes
+ drain           reap_completions(max): io_getevents(0) + callbacks,
+                 repeated until the ring is empty
+```
+
+Two properties carry the correctness. First, the eventfd counter is
+incremented by the kernel *at completion time*, independently of any
+reader — so a completion landing between the loop's drain and its next
+`epoll_wait` leaves the counter nonzero and the wait returns
+immediately; a counting eventfd cannot lose an edge. Second, the drain
+must run **to empty**: the loop reads (zeroes) the eventfd before
+draining, so completions left unreaped at that point would wake nobody.
+That is why the loop's drain is an unbounded
+`while (reap_completions() > 0)` — bounding it would be a bug, not a
+politeness.
+
+`switch_to_external/internal_completions()` flips an open device
+between modes: stop the completion thread, arm the eventfd (or the
+reverse). The caller must guarantee **no aio is in flight** across a
+switch — stopping the thread does not drain, and `io_destroy` discards
+pending events, so an aio completing mid-switch would lose its callback
+forever. BlueStore satisfies this by switching only inside
+`_kv_start`/`_kv_stop`, where mount/unmount ordering guarantees
+quiescence; the switch back at `_kv_stop` exists so later users of the
+device (fsck-on-umount reads, a remount) get a reaper again.
 
 Why not let the *worker* reap instead? Three reasons, in decreasing
 order of importance: the callbacks push into the loop-local staging
@@ -346,6 +381,54 @@ exists to remove; the worker spends its life inside flush/submit/sync,
 so completions would wait out entire commit cycles; and completions
 have always been processed serially in one thread — `_txc_finish_io`'s
 ordering scan depends on it.
+
+### 5.2.2 Why BlueFS is untouched: the switch is per-instance, not per-disk
+
+A question worth answering explicitly, because the answer is
+load-bearing: does switching the data device to external completions
+change aio delivery for **BlueFS**? No — and not by configuration, but
+by construction.
+
+BlueStore's data device is created in `_open_bdev()`:
+
+```cpp
+ string p = path + "/block";
+ bdev = BlockDevice::create(cct, p, aio_cb, this, discard_cb, this, ...);
+ bdev->open(p);
+```
+
+BlueFS never sees that object. BlueStore hands BlueFS *paths*, and
+`BlueFS::add_block_device()` calls `BlockDevice::create()` **itself**
+for each of WAL/DB/SLOW — even when the "slow" path is literally the
+same `path + "/block"` string. So a single-shared-disk deployment has
+two `KernelDevice` objects open on the same inode:
+
+```
+ BlueStore bdev                     BlueFS bdev[BDEV_SLOW]
+ ─ own fds                          ─ own fds
+ ─ own io_setup() context           ─ own io_setup() context
+ ─ notify eventfd ARMED             ─ notify eventfd -1 (never armed)
+ ─ no completion thread             ─ own bstore_aio thread
+ ─ callbacks → trans loop           ─ no callbacks (IOContext waits)
+```
+
+The per-iocb eventfd is stamped at submit time by *the submitting
+instance's* io_queue, and kernel aio delivers a completion strictly to
+the ring of the context that submitted it — there is no per-device or
+per-inode routing that could cross over. BlueFS's iocbs flow through
+its own context, are reaped by its own thread, and wake its own
+`IOContext::aio_wait()` callers.
+
+This isolation is not a detail; it is what makes the commit worker
+safe. The worker's `sync_wal()` descends into BlueFS — buffer flush,
+possibly a multi-segment `aio_write` + wait, then `fdatasync` — and
+every one of those waits is served by *BlueFS's* completion thread.
+If BlueFS shared BlueStore's device object, the worker would be
+waiting on completions only the trans loop can reap, while the loop
+might be waiting on the worker's kv-done event: a deadlock built into
+the architecture. Two device instances, two reapers, no cycle — and
+it is also why `ps -T` still shows exactly one `bstore_aio` thread in
+the final design: it is BlueFS's, and the switch never touches it.
 
 ## 5.3 bluefs: write single-segment flushes synchronously
 
@@ -398,27 +481,44 @@ retry loop. Classic self-starvation — invisible in the legacy
 architecture, where the sleeping submitter and the reaping thread were
 different threads.
 
-The fix gives the io queue an `eagain_wait` hook that replaces the
-sleep: when the retrying submitter *is* the registered reaper, drain
-completions instead of sleeping (running the callbacks in exactly the
-thread they always run in), and poll the completion eventfd when
-nothing is reapable; any other thread just sleeps briefly. Because the
-hook can return early, the retry budget switched from counting attempts
-to wall-clock time matching the old backoff's total. The first version
-of this fix — reap-or-sleep-125 µs — still crashed: sixteen 125 µs
-sleeps is a 2 ms budget against a device that takes longer than that to
-complete anything. The exponential backoff it replaced had been the
-real time budget all along. Worth writing down: **when you replace a
-wait, you must replace its budget, not just its trigger.**
+The first fix attacked the wait: an `eagain_wait` hook in the io queue
+that, when the retrying submitter *is* the reaper, drains completions
+instead of sleeping. It worked — but earning that "worked" cost two
+more bugs (a 2 ms retry budget where the replaced exponential backoff
+had silently been an 8-second one — **when you replace a wait, you
+must replace its budget, not just its trigger** — and a
+`std::function` installed while other threads could be reading it),
+and the surviving code was the subtlest in the series: a reaper-tid
+check, a stale-eventfd-counter analysis for non-reaper waiters, a
+wall-clock budget.
 
-Beyond that bug, review of the series surfaced two more races of the
-same family — all fixed before the final cut: installing the hook (a
-`std::function`) while other threads could be mid-`submit_batch`, and a
-shutdown ordering where the worker could observe the stop flag after
-being handed a final batch and exit without processing it, hanging the
-join. The pattern across all three: single-owner designs concentrate
-correctness into *lifecycle edges* — startup, shutdown, and the moments
-a thread wears two hats.
+The final design deletes all of it by attacking the other conjunct.
+The deadlock needs *sole reaper* **and** *reaper submits* — so make
+the loop **never submit**: its few deferred-submission call sites
+route through the finisher (the same `C_DeferredTrySubmit` hop one of
+them always used; the aggressive path kicks its single osr through a
+targeted context), the rule is centralized inside
+`deferred_try_submit()` itself so a future call site cannot forget
+it, and `_txc_aio_submit`, `_deferred_submit_unlock` and the read
+paths all `ceph_assert(!in_trans_thread())`. Every *other* thread may
+sleep freely in the untouched legacy EAGAIN backoff, because the loop
+keeps reaping underneath it. The hook, the budget, and the tid
+machinery ceased to exist; the blk patch shrank to the eventfd and
+the extraction; and the deferred-heavy reproducer runs *faster* than
+it did with the hook (70 s vs 93 s), because the finisher hop costs
+nothing measurable while the deleted machinery did.
+
+Review of the series surfaced one more race of the same family, fixed
+the same week: a shutdown ordering where the worker could observe the
+stop flag after being handed a final batch and exit without processing
+it, hanging the join (fixed by raising the stop flag only after the
+loop is joined — the loop exits only with the worker idle). The
+pattern across all of them: single-owner designs concentrate
+correctness into *lifecycle edges* — startup, shutdown, and the
+moments a thread wears two hats. The corollary that ultimately won:
+when an invariant is getting expensive to defend, it is often cheaper
+to strengthen the invariant ("the reaper never submits") than to
+armor the defense.
 
 # 7. Results
 
@@ -492,12 +592,14 @@ pipeline, nothing more — and measures what that alone is worth.
   commits exist and could be recut back in) or a deprecation story.
   io_uring is the natural second backend — its ring fd is natively
   pollable, so it needs no eventfd bridge at all.
-- **The loop's no-blocking rule is enforced by discipline, not by the
-  compiler.** Finalize only *queues* callbacks, but
-  `_txc_release_alloc`'s discard path is synchronous when discard is
-  enabled without async discard threads, and the EAGAIN hook can hold
-  the loop for a poll interval under pressure. A may-not-block assert
-  (or watchdog) on the loop is the next hardening step.
+- **The loop's never-submit rule is now asserted** (six
+  `!in_trans_thread()` sites, plus drained-queue asserts at loop
+  exit), but the softer no-*blocking* rule remains discipline:
+  finalize only *queues* callbacks, yet `_txc_release_alloc`'s discard
+  path is synchronous when discard is enabled without async discard
+  threads, and allocator release on the loop contends with BlueFS
+  allocation on the worker. A loop-occupancy watchdog is the
+  remaining hardening step.
 - **Two debug facilities lived in the deleted completion thread** — the
   stalled-aio watchdog (`bdev_debug_aio`) and the aio-path crash
   injection — and are inactive in external-completion mode until
