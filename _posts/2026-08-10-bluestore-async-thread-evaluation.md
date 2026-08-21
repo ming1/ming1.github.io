@@ -364,6 +364,21 @@ That is why the loop's drain is an unbounded
 `while (reap_completions() > 0)` — bounding it would be a bug, not a
 politeness.
 
+One thing `IOCB_FLAG_RESFD` is **not**: an alternative delivery path.
+In the kernel's `aio_complete()`, the event is written into the aio
+context's ring buffer unconditionally — flag or no flag — and the
+`eventfd_signal()` is an *additional* side effect.  `io_getevents()`
+neither knows nor cares whether an event's iocb was stamped, so a
+completion thread would reap stamped events exactly like plain ones
+(the eventfd would just tick with nobody listening).  The eventfd is a
+doorbell bolted onto the side of the ring; the ring is the queue.  Two
+consequences: external mode works not because stamping *redirects*
+completions but because the thread that would have consumed them is
+never started — and the one configuration that must never exist is two
+reapers on the *same* context, because each ring event is delivered
+exactly once, to whichever `io_getevents()` caller grabs it, which
+would scatter callbacks across two threads.
+
 `switch_to_external/internal_completions()` flips an open device
 between modes: stop the completion thread, arm the eventfd (or the
 reverse). The caller must guarantee **no aio is in flight** across a
@@ -412,12 +427,66 @@ two `KernelDevice` objects open on the same inode:
  ─ callbacks → trans loop           ─ no callbacks (IOContext waits)
 ```
 
-The per-iocb eventfd is stamped at submit time by *the submitting
-instance's* io_queue, and kernel aio delivers a completion strictly to
-the ring of the context that submitted it — there is no per-device or
-per-inode routing that could cross over. BlueFS's iocbs flow through
-its own context, are reaped by its own thread, and wake its own
-`IOContext::aio_wait()` callers.
+The completion thread itself is part of that per-instance state —
+`aio_thread` is a *member* of `KernelDevice`, not a process-wide
+service:
+
+```cpp
+ class KernelDevice {
+   struct AioCompletionThread : public Thread { ... } aio_thread;
+   std::unique_ptr<io_queue_t> io_queue;   // one io_setup() per instance
+   ...
+ };
+```
+
+so `switch_to_external_completions()` — a method call on one object —
+stops only *that object's* thread.  Every device BlueFS relies on
+keeps its own `bstore_aio` running (they merely share the display
+name).  Counting threads makes the structure visible: on a single
+shared disk, legacy mode shows **two** `bstore_aio` (the data
+instance's and BlueFS's), the event-loop mode shows **one** (BlueFS's
+— the data instance's is replaced by the loop); a separate-WAL/DB
+deployment would keep up to three BlueFS threads, all untouched.  The
+per-rep topology captures in the A/B runs confirmed exactly those
+counts on both arms.
+
+But if two instances each run a completion thread against the *same
+physical disk*, why doesn't one thread reap the other's IOs?  Because
+kernel AIO routes completions by **`io_context_t`**, not by file,
+inode, or device.  Each instance's `open()` ran its own `io_setup()`,
+creating a private kernel object with its **own completion ring**; at
+`io_submit(ctx, ...)` every request is permanently bound to the ctx it
+was submitted through (the target fd is just where the bytes go); and
+`aio_complete()` writes the event into *that ctx's* ring and nowhere
+else.  `io_getevents(ctx_A)` and `io_getevents(ctx_B)` read two
+different queues that happen to be fed by the same disk:
+
+```
+ BlueStore bdev instance               BlueFS bdev instance
+ io_setup() → ctx_A ─ ring A           io_setup() → ctx_B ─ ring B
+ io_submit(ctx_A, fd_a, data io)       io_submit(ctx_B, fd_b, wal io)
+        │                                     │
+        └───────────► same physical disk ◄────┘
+              completions route by ctx, never by disk:
+ ring A ◄── data io done               ring B ◄── wal io done
+ reaped by the trans loop              reaped by BlueFS's bstore_aio
+```
+
+The right mental model: an `io_context_t` is like an epoll instance —
+queue identity comes from the handle you submitted through, not from
+the resource underneath, just as two epoll fds watching the same file
+don't steal each other's events.  The per-iocb eventfd inherits the
+same scoping: it is stamped at submit time by the submitting
+instance's io_queue, so BlueFS's iocbs (notify fd `-1`) never signal
+BlueStore's eventfd.
+
+Sharing the disk *does* matter one layer up, and BlueStore handles
+both cases explicitly: durability — `fdatasync` is a device-wide
+barrier regardless of which instance's fd issues it, which is exactly
+what the shared-device `force_flush` logic exploits (BlueFS's fsync
+also stabilizes BlueStore's completed deferred writes); and space —
+the two instances must not write the same blocks, which is the shared
+allocator's job, a pure userspace agreement.
 
 This isolation is not a detail; it is what makes the commit worker
 safe. The worker's `sync_wal()` descends into BlueFS — buffer flush,
