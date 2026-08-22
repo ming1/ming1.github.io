@@ -1435,10 +1435,15 @@ kernel-client CephFS mount, and the trace follows the write through
 **three processes** — the kernel client, the MDS, and the OSD. Client,
 MDS and OSD all run in one VM, so bpftrace's monotonic clock covers
 all of them and the events sort onto a single timeline with no
-correlation machinery at all; the script is `wfstrace.bt` (client lane
-= syscall tracepoints on the `dd` process plus kprobes on `fs/ceph` /
-`libceph` entry points; MDS and OSD lanes = uprobes as in §2.3, plus
-`Objecter::_op_submit` in `libceph-common.so`, gated to the MDS pid).
+correlation machinery at all; the script is `wfstrace.bt`. Its client
+lane is syscall tracepoints on the `dd` process plus kprobes on
+`fs/ceph` / `libceph` entry points; the MDS lane is a new uprobe set
+(`Server`, `MDLog`, `Journaler`, `Locker`, and `Objecter::_op_submit`
+in `libceph-common.so`, gated to the MDS pid); the OSD lane is §2.3's
+BlueStore commit probes plus the request-path functions of §2.5's
+oplat family (`ms_fast_dispatch` through `log_op_stats`) — and minus
+§2.3's txc state-machine internals (`_txc_aio_submit`,
+`_txc_finish_io`, `_txc_finish` print nothing here).
 
 The lab: a vstart cluster (1 mon / 1 osd / 1 mds, replica 1) inside a
 qemu VM, cluster state on a dedicated virtio NVMe disk, kernel 7.2,
@@ -1446,10 +1451,14 @@ mounted with the new device syntax over msgr2
 (`admin@fsid.a=/ … ms_mode=crc`). The tree is `c288211aa56` —
 v21.3.0 plus ~2000 upstream commits plus a local BlueStore branch
 under development. Everything this section traces (messenger, MDS,
-OSD request path, the probed BlueStore functions) is upstream code
-and the §3.1 lanes apply unchanged, but absolute timings belong to
-this tree, this Debug build, and this virtio disk — each `fdatasync`
-barrier costs 6–13 ms here, so read the shape, not the microseconds.
+OSD request path, the probed BlueStore functions) is upstream code;
+the branch's one behavioral change — data-aio completions are reaped
+inside `bstore_kv_sync` instead of being handed off by §3.1.4's
+`bstore_aio` thread — sits between two probe points and prints no
+line either way, so the trace below reads the same on stock. Absolute
+timings, though, belong to this tree, this Debug build, and this
+virtio disk — each `fdatasync` barrier costs 6–13 ms here, so read
+the shape, not the microseconds.
 (One lab wart worth recording: this gcc-16 build segfaults in the
 `BinnedLRUCache` rocksdb shim at DB open; `rocksdb_cache_type = lru`
 sidesteps it, for the mon and — via `bluestore_rocksdb_cfs` — for the
@@ -1463,8 +1472,10 @@ split is the point of this case study:
 | 2 | `cephfs.a.meta` | MDS journal (`200.*`), dir objects (omap), SessionMap, InoTable |
 | 3 | `cephfs.a.data` | file data: one object per 4 MiB stripe, named `<ino-hex>.<block>` |
 
-The MDS never touches the data pool; the client never writes the
-metadata pool. Every BlueStore transaction in the trace below can be
+In this trace the MDS never touches the data pool (it does write
+inode backtraces onto data-pool objects, but only at log-segment
+expiry); the client never writes the metadata pool. Every BlueStore
+transaction in the trace below can be
 attributed to one side or the other purely by the object name and
 pool id printed at `ReplicatedBackend::submit_transaction`.
 
@@ -1510,14 +1521,14 @@ line belongs to; `thread` is the comm, as before.
 22      6379    2119  osd    tp_osd_tp       BlueStore::queue_transactions          transaction arrives
 23      6428    2119  osd    tp_osd_tp       BlueStore::_do_write                   off=0x0 len=0x4000
 24      6431    2119  osd    tp_osd_tp       BlueStore::_do_write_big               whole min_alloc units
-25      6460    2119  osd    tp_osd_tp       KernelDevice::aio_write                bdev=0x..3b080 off=0x56000 len=0x4000
-26     16178    2087  osd    bstore_kv_sync  KernelDevice::flush                    fdatasync bdev=0x..3b080 8411 us
+25      6460    2119  osd    tp_osd_tp       KernelDevice::aio_write                bdev=0x..53b080 off=0x56000 len=0x4000
+26     16178    2087  osd    bstore_kv_sync  KernelDevice::flush                    fdatasync bdev=0x..53b080 8411 us
 27     16345    2087  osd    bstore_kv_sync  RocksDBStore::submit_transaction_sync  start
 28     16361    2087  osd    bstore_kv_sync  BlueFS::fsync                          WAL file
-29     16378    2087  osd    bstore_kv_sync  KernelDevice::aio_write                bdev=0x..3c100 off=0x4be000 len=0x2000
-30     25255    2087  osd    bstore_kv_sync  KernelDevice::flush                    fdatasync bdev=0x..3c100 8028 us
+29     16378    2087  osd    bstore_kv_sync  KernelDevice::aio_write                bdev=0x..53c100 off=0x4be000 len=0x2000
+30     25255    2087  osd    bstore_kv_sync  KernelDevice::flush                    fdatasync bdev=0x..53c100 8028 us
 31     25293    2087  osd    bstore_kv_sync  RocksDBStore::submit_transaction_sync  done (8949 us)
-32     25434    2088  osd    bstore_kv_final BlueStore::_txc_committed_kv           txc 0x..c4700 -> reply
+32     25434    2088  osd    bstore_kv_final BlueStore::_txc_committed_kv           txc 0x..ac4700 -> reply
 33     25527    2119  osd    tp_osd_tp       PrimaryLogPG::log_op_stats             reply -> requester
 34     26054    2224  mds    ms_dispatch     MDSDaemon::ms_dispatch2                MClientCaps
 35     26080    2224  mds    ms_dispatch     Locker::handle_client_caps             cap flush from client
@@ -1539,20 +1550,20 @@ line belongs to; `thread` is the comm, as before.
 51     27351    2116  osd    tp_osd_tp       BlueStore::_do_write_small             sub-alloc, may RMW/defer
 52     27992    2116  osd    tp_osd_tp       BlueStore::_do_write_big               whole min_alloc units
 53     28001    2116  osd    tp_osd_tp       BlueStore::_do_write_small             sub-alloc, may RMW/defer
-54     28061    2116  osd    tp_osd_tp       KernelDevice::aio_write                bdev=0x..3b080 off=0x52000 len=0x1000
+54     28061    2116  osd    tp_osd_tp       KernelDevice::aio_write                bdev=0x..53b080 off=0x52000 len=0x1000
 55     28258    2124  osd    tp_osd_tp       OSD::dequeue_op                        worker picks op
 56     28501    2124  osd    tp_osd_tp       ReplicatedBackend::submit_transaction  obj=200.00000000 pool=2
 57     28629    2124  osd    tp_osd_tp       BlueStore::queue_transactions          transaction arrives
 58     28740    2124  osd    tp_osd_tp       BlueStore::_do_write                   off=0x0 len=0x5a
 59     28777    2124  osd    tp_osd_tp       BlueStore::_do_write_small             sub-alloc, may RMW/defer
-60     35942    2087  osd    bstore_kv_sync  KernelDevice::flush                    fdatasync bdev=0x..3b080 6553 us
+60     35942    2087  osd    bstore_kv_sync  KernelDevice::flush                    fdatasync bdev=0x..53b080 6553 us
 61     36227    2087  osd    bstore_kv_sync  RocksDBStore::submit_transaction_sync  start
 62     36241    2087  osd    bstore_kv_sync  BlueFS::fsync                          WAL file
-63     36254    2087  osd    bstore_kv_sync  KernelDevice::aio_write                bdev=0x..3c100 off=0x4bf000 len=0x3000
-64     44155    2087  osd    bstore_kv_sync  KernelDevice::flush                    fdatasync bdev=0x..3c100 6742 us
+63     36254    2087  osd    bstore_kv_sync  KernelDevice::aio_write                bdev=0x..53c100 off=0x4bf000 len=0x3000
+64     44155    2087  osd    bstore_kv_sync  KernelDevice::flush                    fdatasync bdev=0x..53c100 6742 us
 65     44188    2087  osd    bstore_kv_sync  RocksDBStore::submit_transaction_sync  done (7961 us)
-66     44246    2088  osd    bstore_kv_final BlueStore::_txc_committed_kv           txc 0x..79880 -> reply
-67     44277    2088  osd    bstore_kv_final BlueStore::_txc_committed_kv           txc 0x..00e00 -> reply
+66     44246    2088  osd    bstore_kv_final BlueStore::_txc_committed_kv           txc 0x..079880 -> reply
+67     44277    2088  osd    bstore_kv_final BlueStore::_txc_committed_kv           txc 0x..500e00 -> reply
 68     44313    2116  osd    tp_osd_tp       PrimaryLogPG::log_op_stats             reply -> requester
 69     44374    2116  osd    tp_osd_tp       PrimaryLogPG::log_op_stats             reply -> requester
 70     45009    2312  mds    mds-rank-fin    Server::reply_client_request           reply -> client
@@ -1563,10 +1574,10 @@ line belongs to; `thread` is the comm, as before.
 ```
 
 Ten distinct thread names across three processes: `dd` and a kworker
-on the client;
-`ms_dispatch`, `mds-log-submit` and `mds-rank-fin` in the MDS; the
-§3.1 lanes (msgr-worker, tp_osd_tp, bstore_kv_sync, bstore_kv_final)
-in the OSD. Three BlueStore transactions, all attributable by
+on the client; `ms_dispatch`, `mds-log-submit` and `mds-rank-fin` in
+the MDS; two msgr-workers, tp_osd_tp, bstore_kv_sync and
+bstore_kv_final in the OSD. Three BlueStore transactions, all
+attributable by
 object + pool at a glance: `10000000001.00000000 pool=3` — the file's
 data (the file's ino is `0x10000000001`, this is its first 4 MiB
 block); `200.00000001` and `200.00000000 pool=2` — the MDS journal's
@@ -1575,34 +1586,34 @@ entry object and header object.
 ### 3.2.2 The map — three processes, one fsync
 
 ```
- client (kernel)                 ceph-mds                            ceph-osd
- ───────────────                 ────────                            ────────
- dd        kworker               ms_dispatch  log-submit  rank-fin   (§3.1.2's four lanes)
- #1,2 openat
- #3 create ──────MClientRequest───► #4-6 handle_client_openc
-                                   #7 journal_and_reply
-                                   #9 EUpdate queued ──► #11 append 1694 B
-                                   #8 early reply           (NOT flushed — sits in
-           #10 ◄──MClientReply───┘                           the journal stream)
-           (unsafe)
- #12 write(2)      — page cache only, Fb cap, nothing on the wire —
- #13 fsync ─┐
- #14 MOSDOp └─data────────────────────────────────────────────────► #15-17 e13: dropped
-                                                                    #18-20 e17 resend
-                                                                    #21-25 16 KiB aio
-                                                                    #26-31 commit cycle 1
-           ◄──────────────────────────MOSDOpReply───────────────────#32,33 data durable
- #34 MClientCaps flush (Fw dirty, size 0→16384) ───►
-                                   #35 handle_client_caps
-                                   #36 cap-update EUpdate
-                                   #37,38 flush! ──► #39 append 1699 B
+ client (kernel)                ceph-mds                          ceph-osd
+ ───────────────                ────────                          ────────
+ #1,2 openat (dd)
+ #3 create ───MClientRequest──► #4-6 handle_client_openc (ms_dispatch)
+                                #7 journal_and_reply
+                                #8 early reply ─┐
+ #10 (kworker) ◄─MClientReply───────────────────┘  unsafe
+                                #9 EUpdate queued ─► #11 append 1694 B (log-submit)
+                                                     — NOT flushed: sits in the stream —
+ #12 write(2) (dd)   — page cache only, Fb cap, nothing on the wire —
+ #13 fsync (dd) ─┐
+ #14 MOSDOp ─────┴─16 KiB data──────────────────────────────────► #15-17 e13: dropped
+                                                                  #18-20 e17 resend
+                                                                  #21-25 16 KiB aio
+                                                                  #26-31 commit cycle 1
+ (data durable) ◄──────────────MOSDOpReply────────────────────────#32,33
+ #34 MClientCaps flush ───────► #35 handle_client_caps (ms_dispatch)
+     (Fw dirty, size 0→16384)   #36 cap-update EUpdate
+                                #37,38 flush! ─────► #39 append 1699 B (log-submit)
                                                      #40-42 journal write:
-                                                     200.00000001 + header ──2 MOSDOps──► #43-59 two txns
-                                                                    #60-65 commit cycle 2
-                                                     ◄──────────────#66-69 (ONE kv batch)
-                                                  #70 safe reply ──► kworker
-                                                  #71 flush_ack ───► #72,73
- #74 fsync returns ◄── create safe + caps flushed
+                                                     200.00000001 + header
+                                                       └─2 MOSDOps───────► #43-59 two txns
+                                                                  #60-65 commit cycle 2
+                                                     ◄────────────#66-69 ONE kv batch
+                                #70 safe reply (rank-fin) ─┐
+                                #71 flush_ack ─────────────┤
+ #72,73 (kworker) ◄────────────────────────────────────────┘
+ #74 fsync returns ◄── create safe
 ```
 
 Structurally this is §3.1's map twice over, with a metadata state
@@ -1628,9 +1639,10 @@ things happen there in a deliberately surprising order:
 
 - **The reply goes out first.** `early_reply` (`Server.cc:2298`) sends
   an *unsafe* MClientReply (#8) — flagged so the client knows the
-  update is not yet durable — and `dd`'s `openat` returns ~1.3 ms
-  after it started (#10, the kworker applying the reply's
-  inode+dentry trace via `ceph_fill_trace`, `fs/ceph/inode.c:1593`).
+  update is not yet durable. #10 is the reply's inode+dentry trace
+  being applied via `ceph_fill_trace` (`fs/ceph/inode.c:1593`),
+  ~1.3 ms in; `dd`'s `openat` returns just after (between #10 and
+  #12 — the syscall exit is not probed).
 - **The journal entry is only queued.** `MDLog::_submit_entry`
   (`MDLog.cc:393`) hands the EUpdate to the `mds-log-submit` thread,
   which encodes it into the journal stream (#11,
@@ -1653,8 +1665,8 @@ the client. Those caps are why the next two steps are silent.
 
 ### 3.2.4 The write — nothing on the wire (#12)
 
-`write(2)` of 16 KiB (#12) copies into the page cache and returns in
-a few microseconds. No MDS message, no OSD message: holding `Fb`, the
+`write(2)` of 16 KiB (#12) copies into the page cache and returns.
+No MDS message, no OSD message: holding `Fb`, the
 client may buffer; holding `Fw` + the max_size grant from the create
 reply, it may extend the file to 16384 bytes locally. A steady-state
 CephFS workload does most of its writes exactly like this — the
@@ -1664,7 +1676,8 @@ forces the issue.
 
 ### 3.2.5 fsync, part 1 — the data write (#13–#33)
 
-`ceph_fsync` (`fs/ceph/caps.c:2480`) runs four steps in order:
+`ceph_fsync` (`fs/ceph/caps.c:2480`) runs, in order, the four steps
+that matter here:
 `file_write_and_wait_range` (write back dirty pages, wait), then
 `try_flush_caps` (`:2285`, send dirty metadata to the MDS), then
 `flush_mdlog_and_wait_inode_unsafe_requests` (`:2363`, make the MDS
@@ -1684,13 +1697,13 @@ Lines #15–#20 are a protocol detail worth keeping in the trace
 rather than editing out: the op arrives tagged with the client's
 osdmap epoch, the OSD's map has moved on, and the op is sent again
 4 ms later with the newer epoch before the PG executes it once
-(§3.2.5a below). From #21 the §3.1 pipeline runs exactly as
-documented there for a 16 KiB aligned write: `_do_write_big`, one
+(§3.2.5a below). From #21 the OSD runs the same stations §3.1
+documents for a 16 KiB aligned write: `_do_write_big`, one
 16 KiB data aio (#25), then the kv-sync commit cycle — data-bdev
 `fdatasync` barrier (#26, 8.4 ms), RocksDB commit with the BlueFS WAL
 append + its own barrier (#27–#31, 8.9 ms) — and the commit callback
-sends the MOSDOpReply (#32–#33). Data is durable ~25.5 ms in; `dd`
-is still inside fsync.
+sends the MOSDOpReply (#32–#33). Data is durable ~24 ms into the
+fsync; `dd` is still waiting.
 
 #### 3.2.5a The epoch dance (#15–#17 vs #18–#20)
 
@@ -1703,8 +1716,9 @@ osd_op(client.4153.0:4 3.47 3.c9e0747 ondisk+retry+write+known_if_redirected e17
 ```
 
 Same op (`tid :4`), sent twice. Between the warmup and the traced
-write, the pg autoscaler split `cephfs.a.data` from 32 to 128 PGs —
-so the same object hash now belongs to a *different pg* (3.7 under
+write, the pg autoscaler split `cephfs.a.data` up to its final
+128 PGs — so the same object hash now belongs to a *different pg*
+(3.7 under
 the client's stale `e13`, 3.47 under `e17`), and a pg_num split sets
 the pool's `last_force_op_resend`: an op tagged with a pre-split
 epoch must not be executed (it may be aimed at the wrong pg, as this
@@ -1736,18 +1750,22 @@ update from #39: 1694 + 1699 bytes + two 20-byte envelopes =
 (#41/#50 — the journal is an append-only stream striped over
 `200.*` objects; 0x1b71 is simply where the warmup left the stream).
 A second, 90-byte write updates the journal header object
-`200.00000000` (#42/#58, `Journaler::write_head` — the recovery
-pointer).
+`200.00000000` — the recovery pointer (#42/#58; issued by
+`Journaler::write_head`, `osdc/Journaler.cc:471` — the trace lines
+themselves are its Objecter submit and the OSD-side transaction).
 
 The OSD's view of these two writes is a nice §1.6 contrast with the
 data write's clean `_do_write_big`:
 
-- The 3433-byte append at an unaligned offset splits small/big/small
-  (#51–#53): the tail lands in a freshly allocated block written
-  directly (#54, one 4 KiB aio), while the head — a partial
-  overwrite of a block that already holds journal bytes — takes the
-  **deferred** path (an `L` record in the kv transaction, no data
-  aio; its background replay shows up ~2.4 s later, §3.2.7).
+- The 3433-byte append at an unaligned offset splits into a head and
+  a tail in two adjacent blocks (#51/#53 — the `_do_write_big`
+  between them, #52, is `_do_write_data`'s unconditional call, with a
+  zero-length middle region here): the tail lands in a freshly
+  allocated block written directly (#54, one 4 KiB aio), while the
+  head — a partial overwrite of a block that already holds journal
+  bytes — takes the **deferred** path (an `L` record in the kv
+  transaction, no data aio; its background replay shows up ~2.4 s
+  later, §3.2.7).
 - The header write (90 bytes at offset 0, #58) is small and fully
   deferred: no data aio at all.
 
@@ -1762,15 +1780,20 @@ Back in the MDS, the journal commit completion runs on a third
 thread, `mds-rank-fin` (#70/#71): the create's **safe** reply finally
 goes out (`Server::reply_client_request`), and
 `Locker::file_update_finish` (`Locker.cc:2378`) answers the cap
-flush — on the wire that is two `MClientCaps` back-to-back, a
-`grant` re-issuing the caps against the journaled inode and the
-`flush_ack` for the flush's tid. The client kworker takes both
-(#72/#73), the create is no longer unsafe, `caps_are_flushed` is
-true — and `fsync` returns (#74): 43.6 ms, of which ~24 ms was the data commit cycle,
-~19 ms the journal commit cycle, and 4 ms the epoch dance. The two
-cycles are strictly serialized by the protocol: the cap flush cannot
-leave before the data is written back, and the journal write cannot
-start before the cap flush arrives. An fsync on CephFS is, at
+flush — on the wire (same `debug_ms` rerun as §3.2.5a) that is two
+`MClientCaps` back-to-back, a `grant` re-issuing the caps against
+the journaled inode and the `flush_ack` for the flush's tid. The
+client kworker takes both (#72/#73) — but what actually releases the
+fsync is the safe reply: `flush_mdlog_and_wait_inode_unsafe_requests`
+returns, and §3.2.5's fourth step, the `caps_are_flushed` wait, is
+skipped here because only size/mtime were dirty
+(`dirty & ~CEPH_CAP_ANY_FILE_WR == 0`). `fsync` returns (#74):
+43.6 ms — a ~24 ms data phase (a third of a millisecond of wire,
+the 4 ms epoch dance, then the ~19 ms commit cycle) followed by a
+~19 ms journal phase. The two phases are strictly serialized by the
+protocol: the cap flush cannot leave before the data is written
+back, and the journal write cannot start before the cap flush
+arrives. An fsync on CephFS is, at
 minimum, **two full BlueStore commit cycles end to end** — one on
 the data pool for the bytes, one on the metadata pool for the size.
 
@@ -1791,8 +1814,9 @@ background machinery, all of it pool-2 metadata upkeep:
 ```
 
 `mds0_openfiles.0` is the open-file table being journaled (crash
-recovery hint), the two 4 KiB aios at 2.43 s are the deferred replay
-of §3.2.6's two `L` records finally hitting the disk, and the timer
+recovery hint), the two 4 KiB aios at 2.43 s are — by count, and by
+offsets seen nowhere else in the trace — the deferred replay of
+§3.2.6's two `L` records finally hitting the disk, and the timer
 flush is the MDS's periodic journal maintenance. Note also what is
 *absent*: `dd` exited, the file was closed — and the trace shows no
 message for it. Closing a file releases nothing; the client keeps
