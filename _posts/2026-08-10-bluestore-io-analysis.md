@@ -1586,33 +1586,34 @@ entry object and header object.
 ### 3.2.2 The map — three processes, one fsync
 
 ```
- client (kernel)                ceph-mds                          ceph-osd
- ───────────────                ────────                          ────────
- #1,2 openat (dd)
- #3 create ───MClientRequest──► #4-6 handle_client_openc (ms_dispatch)
-                                #7 journal_and_reply
-                                #8 early reply ─┐
- #10 (kworker) ◄─MClientReply───────────────────┘  unsafe
-                                #9 EUpdate queued ─► #11 append 1694 B (log-submit)
-                                                     — NOT flushed: sits in the stream —
- #12 write(2) (dd)   — page cache only, Fb cap, nothing on the wire —
- #13 fsync (dd) ─┐
- #14 MOSDOp ─────┴─16 KiB data──────────────────────────────────► #15-17 e13: dropped
-                                                                  #18-20 e17 resend
-                                                                  #21-25 16 KiB aio
-                                                                  #26-31 commit cycle 1
- (data durable) ◄──────────────MOSDOpReply────────────────────────#32,33
- #34 MClientCaps flush ───────► #35 handle_client_caps (ms_dispatch)
-     (Fw dirty, size 0→16384)   #36 cap-update EUpdate
-                                #37,38 flush! ─────► #39 append 1699 B (log-submit)
-                                                     #40-42 journal write:
-                                                     200.00000001 + header
-                                                       └─2 MOSDOps───────► #43-59 two txns
-                                                                  #60-65 commit cycle 2
-                                                     ◄────────────#66-69 ONE kv batch
-                                #70 safe reply (rank-fin) ─┐
-                                #71 flush_ack ─────────────┤
- #72,73 (kworker) ◄────────────────────────────────────────┘
+ dd                  kworker            ms_dispatch                 mds-log-submit            mds-rank-fin            ceph-osd
+ (client syscalls)   (reply delivery)   (MDS dispatcher)            (journal writer)          (MDS finisher)          (msgr - tp_osd_tp - kv_sync - kv_final)
+     │                  ⋮                   ⋮                           ⋮                         ⋮                       ⋮
+ #1,2 openat            ⋮                   ⋮                           ⋮                         ⋮                       ⋮
+ #3 create ──────MClientRequest───────► #4-6 handle_client_openc
+     │                  ⋮               #7 journal_and_reply            ⋮                         ⋮                       ⋮
+     │                  ⋮               #8 early reply (unsafe) ─┐                                ⋮                       ⋮
+                     #10 fill_trace ◄────────────────────────────┘
+     │ (openat rets)    ⋮                                               ⋮                         ⋮                       ⋮
+                                        #9 EUpdate queued ────────► #11 append 1694 B
+     │                  ⋮                   ⋮                       (not flushed — the entry      ⋮                       ⋮
+     │                  ⋮                   ⋮                        sits in the stream)          ⋮                       ⋮
+ #12 write(2) 16 KiB — page cache only (Fb cap)                         ⋮                         ⋮                       ⋮
+ #13 fsync              ⋮                   ⋮                           ⋮                         ⋮                       ⋮
+ #14 MOSDOp 16 KiB ────────────────────────────────write 10000000001.00000000 pool 3────────────────────────────────► #15-17 arrives e13: dropped
+     │                  ⋮                   ⋮                           ⋮                         ⋮                   #18-20 client resends e17
+     │                  ⋮                   ⋮                           ⋮                         ⋮                   #21-25 big write, one 16 KiB aio
+     │                  ⋮                   ⋮                           ⋮                         ⋮                   #26-31 commit cycle 1 (two barriers)
+ (data durable) ◄────────────────────────────────────────────MOSDOpReply───────────────────────────────────────────── #32,33 reply
+ (try_flush_caps) ─MClientCaps flush──► #34,35 handle_client_caps
+     │                  ⋮               #36 cap-update EUpdate          ⋮                         ⋮                       ⋮
+                                        #37,38 MDLog::flush ×2 ───► #39 append 1699 B
+     │                  ⋮                   ⋮                       #40 _do_flush: cut it         ⋮                       ⋮
+                                                                    #41,42 200.00000001 + head ──────2 MOSDOps──────► #43-59 two transactions
+     │                  ⋮                   ⋮                           ⋮                         ⋮                   #60-65 commit cycle 2 — ONE kv batch
+                                                                                              (finisher wakes) ◄───── #66-69 two replies
+     │                  ⋮                   ⋮                           ⋮                     #70 safe reply (create)     ⋮
+                     #72,73 handle_caps ×2 ◄──────────────────2 MClientCaps────────────────── #71 grant + flush_ack
  #74 fsync returns ◄── create safe
 ```
 
