@@ -666,6 +666,61 @@ reaper is parked on the eventfd exactly as `bstore_aio` was parked in
 `io_getevents`), and pure-write workloads have no reader to delay —
 only the mix exposes it.
 
+#### How `aio_wait()` itself works
+
+The latch the reader blocks in deserves a close look, because it is a
+compact museum of the synchronization problems this whole post keeps
+meeting. Each logical operation owns an `IOContext`: two atomic
+counters (`num_pending` built-not-submitted, `num_running`
+submitted-not-completed), the aio lists, and a private mutex + condvar
+used *only* for the sleep/wake edge:
+
+```cpp
+ // the wait side                      // the wake side (the reaper,
+ std::unique_lock l(lock);             // once per completed aio)
+ while (num_running.load() > 0)        std::lock_guard l(lock);
+   cond.wait(l);                       if (num_running.fetch_sub(1) == 1)
+                                         cond.notify_all();
+```
+
+Three details carry all the correctness:
+
+- **The mutex exists purely to prevent the condvar lost wakeup**, even
+  though the counter is atomic. Without it: waiter loads
+  `num_running == 1` and decides to sleep → reaper decrements to 0 and
+  notifies *nobody* → waiter enters `wait()` forever. Holding the lock
+  across decrement+notify forces the decrement to land either before
+  the waiter's check (it sees 0, never sleeps) or after the waiter is
+  asleep inside `wait()` (the notify reaches it). Note the symmetry
+  with §6's WakeupFd: this is the same hazard class that let us delete
+  the kv-thread's started-handshake — `IOContext` solves it the mutex
+  way, an eventfd solves it the sticky-counter way, and a condvar
+  without its mutex solves it not at all.
+- **`while`, not `if`** — beyond spurious wakeups, IOContexts are
+  *reused*: BlueFS keeps one per FileWriter and submits waves of aios
+  against it, so a notify from wave N's last completion can race with
+  wave N+1 re-raising the counter. `aio_submit` intentionally runs
+  unlocked against this path (hot path); the re-check is what makes
+  that safe.
+- **Arm before submit**: `aio_submit` does `num_running += n` strictly
+  *before* `io_submit(2)`. Were it after, a fast completion could
+  decrement a counter that does not yet include it — waking the waiter
+  with sibling aios still in flight.
+
+The `priv` field is the reaper's fork between the two completion
+styles: non-NULL means "run the state-machine callback" (write txcs,
+deferred batches), NULL means "just `try_aio_wake()`" (reads, BlueFS
+waits, replay). Error plumbing rides the same object
+(`set_return_value` checked by `_do_read` after the wait), and the
+destructor's `assert(!num_running)` enforces that nobody abandons a
+context with IO in flight — the invariant behind every
+"no in-flight aio" contract in the blk layer.
+
+Cost-wise the whole latch is one futex sleep and one futex wake per
+waited batch, which is why the read-latency story above never
+implicates *this* code: the variable was always who calls
+`try_aio_wake` and how promptly, never what it costs.
+
 The submission side also carries one guard worth noticing: `_do_read`
 asserts the caller is not the sole reaper itself
 (`ceph_assert(!bdev_direct_completions || !in_kv_sync_thread())`) — a
