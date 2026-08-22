@@ -797,6 +797,78 @@ KernelDevice instance, and only the data bdev is born in external
 completion mode. That is the one service thread the rework keeps, and
 it is off the commit path.
 
+### 5.3.1 The generalization: one rule for every lone waiter aio
+
+The final series deletes this BlueFS patch and replaces it — together
+with the single-extent sync *read* — with one blk-level rule at the
+top of `KernelDevice::aio_submit()`:
+
+```cpp
+ if (ioc->num_pending == 1 && ioc->priv == nullptr) {
+   // execute the lone preadv/pwritev synchronously, right here;
+   // never arm the completion machinery - aio_wait() falls through
+ }
+```
+
+Understanding why that condition is exactly right requires
+understanding what `priv` *really is*: it is the field that encodes
+**who owns the continuation** of an IO. The reaper's per-completion
+tail has always branched on it:
+
+```cpp
+ if (ioc->priv) {                       // callback-style:
+   if (--num_running == 0)              //   the completion IS an event;
+     aio_callback(cb_priv, ioc->priv);  //   priv is the continuation's
+ } else {                               //   argument (a TransContext,
+   ioc->try_aio_wake();                 //   a DeferredBatch)
+ }                                      // waiter-style: the completion
+                                        //   only RELEASES a blocked
+                                        //   thread; no payload, because
+                                        //   the consumer's context is
+                                        //   already on its own stack
+```
+
+`priv != nullptr` means the continuation lives in a heap object
+driving a state machine — fire-and-forget submission, the pipeline
+consumes the completion later, and blocking the submitter would
+serialize the whole write path. `priv == nullptr` means the
+continuation is the *stack frame of a thread that blocks in
+`aio_wait()`* — call-and-wait semantics, where executing the IO
+synchronously before submission returns is observationally identical
+and strictly cheaper. The async/sync distinction was in the code all
+along, encoded in one pointer; the fast path just reads it.
+
+One rule then covers both hot cases. Reads: `_do_read` builds
+waiter-style contexts (`IOContext ioc(cct, NULL)`), so the common
+single-extent read executes as a bare `preadv` — no ring, no reaper,
+no wakes. Writes: **every BlueFS IOContext is waiter-style by
+construction** — both creation sites pass `NULL`
+(`BlueFS.cc: ioc[id] = new IOContext(cct, NULL)` and
+`w->iocv[i] = new IOContext(cct, NULL)`), and it could not be
+otherwise: BlueFS creates its devices with a NULL completion
+callback, so a non-NULL `priv` would call a null function pointer at
+reap time. The single-segment WAL append therefore takes the fast
+path with **BlueFS.cc completely untouched by the series**, and the
+single/multi-segment distinction this section's original patch
+encoded by hand falls out of the aio count for free. The txc and
+deferred write pipelines are excluded by the same field
+automatically.
+
+Two implementation notes that keep the rule honest. The write branch
+must arm `io_since_flush` before returning — the completion path and
+`_sync_write` both do, and a following `flush()` must still issue its
+fdatasync. And the interception must live in `aio_submit`, *not* in
+`aio_queue_t::submit_batch` one layer down: by submit_batch time the
+completion counters are armed and the aios spliced to the running
+list, so a synchronously-executed IO there would never deliver a
+completion and `aio_wait()` would hang — the fast path works
+precisely because it runs before anything is armed. The one
+convention the rule rests on, documented rather than enforced: a
+future caller that submits a lone waiter-style aio and does useful
+work *before* waiting would silently lose that overlap (still
+correct — the IO just completes at submit time — but no longer
+concurrent).
+
 # 6. What the tests caught: a reactor that put itself to sleep
 
 The single-owner design has a failure mode blocking threads don't: the
