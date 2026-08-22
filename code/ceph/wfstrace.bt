@@ -1,0 +1,360 @@
+#!/usr/bin/env bpftrace
+/*
+ * wfstrace.bt -- detailed event log for a single CephFS write, across
+ * the kernel client, the MDS and the OSD (all on one host/VM, so one
+ * monotonic clock covers the three processes).
+ *
+ * Usage:  bpftrace wfstrace.bt <ceph-mds> <ceph-osd> <libceph-common.so.2> <mds-pid>
+ *
+ *   $1  path to the ceph-mds binary the running MDS was exec'd from
+ *   $2  path to the ceph-osd binary the running OSD was exec'd from
+ *   $3  path to libceph-common.so.2 (Objecter lives there, not in the
+ *       mds binary); the probe fires in every process that maps the
+ *       library, so prints are gated to the MDS pid:
+ *   $4  pid of the running ceph-mds
+ *
+ * Wait for the column-header line (wildcard probes on a Debug build
+ * take ~10-30 s to attach), then issue ONE write from a `dd` process:
+ *     dd if=/var/tmp/16k of=/mnt/cephfs/f bs=16k count=1 conv=fsync
+ * and Ctrl-C after a few seconds.
+ *
+ * The client lane is the kernel: syscall tracepoints gated to comm
+ * "dd" (use dd for the traced write and nothing else), plus kprobes
+ * on fs/ceph + libceph entry points (they need /sys/kernel/btf for
+ * the struct decodes).  The clock zeroes at dd's first openat.
+ *
+ * Columns:
+ *   us        microseconds since dd's openat of the target file
+ *   tid       kernel thread id
+ *   proc      which process: client (kernel side), mds, osd
+ *   thread    thread name (comm) -- the pipeline stage
+ *   function  the probed function
+ *   event     what happened, with arguments
+ *
+ * Struct-offset notes (computed from the lab tree's DWARF, Debug
+ * build, x86-64; re-derive with gdb ptype /o if your build differs):
+ *   Message::header        +24   (right after RefCountedObject);
+ *                                header.type is +16 inside ceph_msg_header
+ *   MClientRequest head.op +398  (head at +376, op at +22 inside)
+ *   Objecter::Op target    +40; base_oid.name string +48, base_oloc.pool +80
+ *   hobject_t  oid.name string at +0, pool at +56
+ *   bufferlist _len        +24
+ * std::string's first member is the char pointer, so str(*(uint64*)p)
+ * reads a std::string at p whether SSO or heap.
+ */
+
+BEGIN
+{
+  printf("%10s %7s  %-6s %-16s %-38s %s\n",
+         "us", "tid", "proc", "thread", "function", "event");
+}
+
+/* ==== client lane: the syscalls dd makes ============================== */
+
+/* Only paths under /var/tmp (the payload file and the mount) -- dd's
+ * ld.so probing at startup would otherwise spam the first lines and
+ * start the clock early. */
+tracepoint:syscalls:sys_enter_openat
+/comm == "dd" && strncmp(str(args->filename), "/var/tmp", 8) == 0/
+{
+  if (@t0 == 0) { @t0 = nsecs; }
+  printf("%10lld %7d  %-6s %-16s %-38s %s\n",
+         (nsecs-@t0)/1000, tid, "client", comm, "openat (syscall)",
+         str(args->filename));
+}
+
+/* fd != 2: skip dd's exit summary on stderr */
+tracepoint:syscalls:sys_enter_write
+/@t0 && comm == "dd" && args->fd != 2/
+{ printf("%10lld %7d  %-6s %-16s %-38s fd=%d len=%lld\n",
+         (nsecs-@t0)/1000, tid, "client", comm, "write (syscall)",
+         args->fd, args->count); }
+
+tracepoint:syscalls:sys_enter_fsync
+/@t0 && comm == "dd"/
+{ @ts_fs[tid] = nsecs;
+  printf("%10lld %7d  %-6s %-16s %-38s fd=%d\n",
+         (nsecs-@t0)/1000, tid, "client", comm, "fsync (syscall)", args->fd); }
+
+tracepoint:syscalls:sys_exit_fsync
+/@ts_fs[tid]/
+{ printf("%10lld %7d  %-6s %-16s %-38s done (%lld us)\n",
+         (nsecs-@t0)/1000, tid, "client", comm, "fsync (syscall)",
+         (nsecs-@ts_fs[tid])/1000);
+  delete(@ts_fs[tid]); }
+
+
+/* ==== client lane: fs/ceph + libceph (kernel client) ================== */
+
+/* ceph_mdsc_submit_request(mdsc, dir, req) -- an MDS request leaves the
+ * client.  r_op via kernel/module BTF. */
+kprobe:ceph_mdsc_submit_request
+/@t0/
+{
+  $req = (struct ceph_mds_request *)arg2;
+  printf("%10lld %7d  %-6s %-16s %-38s op=0x%x%s\n",
+         (nsecs-@t0)/1000, tid, "client", comm, "ceph_mdsc_submit_request",
+         $req->r_op,
+         $req->r_op == 0x0100 ? " lookup"
+         : ($req->r_op == 0x0101 ? " getattr"
+         : ($req->r_op == 0x1301 ? " create" : "")));
+}
+
+/* ceph_fill_trace(sb, req) -- the MDS reply's inode+dentry trace is
+ * applied to the client cache (runs in the msgr worker delivering the
+ * reply) */
+kprobe:ceph_fill_trace
+/@t0/
+{ printf("%10lld %7d  %-6s %-16s %-38s mds reply applied\n",
+         (nsecs-@t0)/1000, tid, "client", comm, "ceph_fill_trace"); }
+
+/* ceph_handle_caps(session, msg) -- an MClientCaps message (grant,
+ * flush_ack, ...) arrives from the MDS */
+kprobe:ceph_handle_caps
+/@t0/
+{ printf("%10lld %7d  %-6s %-16s %-38s MClientCaps from mds\n",
+         (nsecs-@t0)/1000, tid, "client", comm, "ceph_handle_caps"); }
+
+/* ceph_osdc_start_request(osdc, req) -- a data-pool OSD request leaves
+ * the client (dd's own context on the fsync path, or a writeback
+ * worker).  Object + pool via BTF. */
+kprobe:ceph_osdc_start_request
+/@t0/
+{
+  $r = (struct ceph_osd_request *)arg1;
+  printf("%10lld %7d  %-6s %-16s %-38s obj=%s pool=%lld\n",
+         (nsecs-@t0)/1000, tid, "client", comm, "ceph_osdc_start_request",
+         str($r->r_t.base_oid.name), $r->r_t.base_oloc.pool);
+}
+
+/* ==== MDS lane ======================================================== */
+
+/* MDSDaemon::ms_dispatch2(ref_t<Message>&) -- a message reaches the MDS
+ * dispatcher.  Only the client-facing types are printed; monitor and
+ * mgr chatter is skipped. */
+uprobe:$1:_ZN9MDSDaemon12ms_dispatch2E*
+/@t0/
+{
+  $m = *(uint64*)arg1;               /* ref_t is one pointer */
+  $type = *(uint16*)($m + 24 + 16);  /* Message::header.type */
+  if ($type == 24 || $type == 784 || $type == 787) {
+    printf("%10lld %7d  %-6s %-16s %-38s %s\n",
+           (nsecs-@t0)/1000, tid, "mds", comm, "MDSDaemon::ms_dispatch2",
+           $type == 24 ? "MClientRequest"
+             : ($type == 784 ? "MClientCaps" : "MClientCapRelease"));
+  }
+}
+
+/* Server::handle_client_request(cref_t<MClientRequest>&) */
+uprobe:$1:_ZN6Server21handle_client_requestE*
+/@t0/
+{
+  $req = *(uint64*)arg1;
+  $op = *(uint32*)($req + 398);      /* MClientRequest::head.op */
+  printf("%10lld %7d  %-6s %-16s %-38s op=0x%x%s\n",
+         (nsecs-@t0)/1000, tid, "mds", comm, "Server::handle_client_request",
+         $op,
+         $op == 0x0100 ? " lookup"
+         : ($op == 0x0101 ? " getattr"
+         : ($op == 0x1301 ? " create" : "")));
+}
+
+/* Server::handle_client_openc -- open(O_CREAT): allocate ino, project
+ * dentry+inode, journal */
+uprobe:$1:_ZN6Server19handle_client_opencE*
+/@t0/
+{ printf("%10lld %7d  %-6s %-16s %-38s create+open\n",
+         (nsecs-@t0)/1000, tid, "mds", comm, "Server::handle_client_openc"); }
+
+uprobe:$1:_ZN6Server21handle_client_getattrE*
+/@t0/
+{ printf("%10lld %7d  %-6s %-16s %-38s lookup/getattr\n",
+         (nsecs-@t0)/1000, tid, "mds", comm, "Server::handle_client_getattr"); }
+
+/* Server::journal_and_reply(mdr, in, dn, le, fin) -- the update is
+ * journaled; an unsafe (early) reply may go out before the commit */
+uprobe:$1:_ZN6Server17journal_and_replyE*
+/@t0/
+{ printf("%10lld %7d  %-6s %-16s %-38s submit EUpdate\n",
+         (nsecs-@t0)/1000, tid, "mds", comm, "Server::journal_and_reply"); }
+
+/* Server::early_reply -- the unsafe reply: client may proceed, journal
+ * not yet durable */
+uprobe:$1:_ZN6Server11early_replyE*
+/@t0/
+{ printf("%10lld %7d  %-6s %-16s %-38s unsafe reply -> client\n",
+         (nsecs-@t0)/1000, tid, "mds", comm, "Server::early_reply"); }
+
+/* Server::reply_client_request -- the (safe) reply after the journal
+ * entry committed */
+uprobe:$1:_ZN6Server20reply_client_requestE*
+/@t0/
+{ printf("%10lld %7d  %-6s %-16s %-38s reply -> client\n",
+         (nsecs-@t0)/1000, tid, "mds", comm, "Server::reply_client_request"); }
+
+/* MDLog::_submit_entry(LogEvent*, MDSLogContextBase*) -- EUpdate queued
+ * for the journal */
+uprobe:$1:_ZN5MDLog13_submit_entryE*
+/@t0/
+{ printf("%10lld %7d  %-6s %-16s %-38s event queued\n",
+         (nsecs-@t0)/1000, tid, "mds", comm, "MDLog::_submit_entry"); }
+
+/* MDLog::flush -- kick the submit thread */
+uprobe:$1:_ZN5MDLog5flushEv
+/@t0/
+{ printf("%10lld %7d  %-6s %-16s %-38s kick submit thread\n",
+         (nsecs-@t0)/1000, tid, "mds", comm, "MDLog::flush"); }
+
+/* Journaler::append_entry(bufferlist&) -- the encoded event enters the
+ * journal stream */
+uprobe:$1:_ZN9Journaler12append_entryE*
+/@t0/
+{ printf("%10lld %7d  %-6s %-16s %-38s len=%u B\n",
+         (nsecs-@t0)/1000, tid, "mds", comm, "Journaler::append_entry",
+         *(uint32*)(arg1 + 24)); }
+
+/* Journaler::_do_flush -- the journal write is cut and handed to the
+ * Objecter */
+uprobe:$1:_ZN9Journaler9_do_flushE*
+/@t0/
+{ printf("%10lld %7d  %-6s %-16s %-38s journal write -> objecter\n",
+         (nsecs-@t0)/1000, tid, "mds", comm, "Journaler::_do_flush"); }
+
+/* Locker::handle_client_caps -- an MClientCaps (cap flush: size/mtime)
+ * reaches the locker */
+uprobe:$1:_ZN6Locker18handle_client_capsE*
+/@t0/
+{ printf("%10lld %7d  %-6s %-16s %-38s cap flush from client\n",
+         (nsecs-@t0)/1000, tid, "mds", comm, "Locker::handle_client_caps"); }
+
+/* Locker::file_update_finish -- the cap-update EUpdate committed;
+ * flush_ack goes back */
+uprobe:$1:_ZN6Locker18file_update_finishE*
+/@t0/
+{ printf("%10lld %7d  %-6s %-16s %-38s journaled -> flush_ack\n",
+         (nsecs-@t0)/1000, tid, "mds", comm, "Locker::file_update_finish"); }
+
+/* Objecter::_op_submit(Op*, ...) -- lives in libceph-common, mapped by
+ * every daemon: gate to the MDS pid.  This is the MDS's outgoing
+ * RADOS write (journal object, in the metadata pool). */
+uprobe:$3:_ZN8Objecter10_op_submitE*
+/@t0 && pid == $4/
+{ printf("%10lld %7d  %-6s %-16s %-38s obj=%s pool=%lld\n",
+         (nsecs-@t0)/1000, tid, "mds", comm, "Objecter::_op_submit",
+         str(*(uint64*)(arg1 + 48)),     /* Op.target.base_oid.name */
+         *(int64*)(arg1 + 80)); }        /* Op.target.base_oloc.pool */
+
+/* ==== OSD lane ======================================================== */
+
+/* OSD::ms_fast_dispatch -- an op arrives, still on the msgr worker */
+uprobe:$2:_ZN3OSD16ms_fast_dispatchE*
+/@t0/
+{ printf("%10lld %7d  %-6s %-16s %-38s op arrives\n",
+         (nsecs-@t0)/1000, tid, "osd", comm, "OSD::ms_fast_dispatch"); }
+
+/* OSD::enqueue_op(spg_t pg, OpRequestRef&&, epoch_t epoch) -- spg_t is
+ * MEMORY-class under the SysV ABI (16 bytes but non-trivial), so it
+ * goes on the stack: arg1 is the OpRequestRef, arg2 the epoch.  The
+ * pg/pool attribution comes from submit_transaction below instead. */
+uprobe:$2:_ZN3OSD10enqueue_opE*
+/@t0/
+{ printf("%10lld %7d  %-6s %-16s %-38s epoch %lld -> shard queue\n",
+         (nsecs-@t0)/1000, tid, "osd", comm, "OSD::enqueue_op", arg2); }
+
+/* OSD::dequeue_op -- a tp_osd_tp shard worker picks the op up */
+uprobe:$2:_ZN3OSD10dequeue_opE*
+/@t0/
+{ printf("%10lld %7d  %-6s %-16s %-38s worker picks op\n",
+         (nsecs-@t0)/1000, tid, "osd", comm, "OSD::dequeue_op"); }
+
+/* ReplicatedBackend::submit_transaction(hobject_t&, ...) -- the object
+ * this transaction writes, and its pool: the meta-vs-data attribution */
+uprobe:$2:_ZN17ReplicatedBackend18submit_transactionE*
+/@t0/
+{ printf("%10lld %7d  %-6s %-16s %-38s obj=%s pool=%lld\n",
+         (nsecs-@t0)/1000, tid, "osd", comm, "ReplicatedBackend::submit_transaction",
+         str(*(uint64*)arg1),            /* hobject_t.oid.name */
+         *(int64*)(arg1 + 56)); }        /* hobject_t.pool */
+
+/* BlueStore::queue_transactions -- unchanged from wtrace.bt */
+uprobe:$2:_ZN9BlueStore*queue_transactionsE*
+/@t0/
+{ printf("%10lld %7d  %-6s %-16s %-38s transaction arrives\n",
+         (nsecs-@t0)/1000, tid, "osd", comm, "BlueStore::queue_transactions"); }
+
+/* BlueStore::_do_write(txc, c, o, offset=arg4, length=arg5, bl, flags) */
+uprobe:$2:_ZN9BlueStore*_do_writeE*
+/@t0/
+{ printf("%10lld %7d  %-6s %-16s %-38s off=0x%lx len=0x%lx\n",
+         (nsecs-@t0)/1000, tid, "osd", comm, "BlueStore::_do_write", arg4, arg5); }
+
+uprobe:$2:_ZN9BlueStore*_do_write_bigE*
+/@t0/
+{ printf("%10lld %7d  %-6s %-16s %-38s whole min_alloc units\n",
+         (nsecs-@t0)/1000, tid, "osd", comm, "BlueStore::_do_write_big"); }
+
+uprobe:$2:_ZN9BlueStore*_do_write_smallE*
+/@t0/
+{ printf("%10lld %7d  %-6s %-16s %-38s sub-alloc, may RMW/defer\n",
+         (nsecs-@t0)/1000, tid, "osd", comm, "BlueStore::_do_write_small"); }
+
+/* KernelDevice::aio_write(off=arg1, bl=arg2, ...) */
+uprobe:$2:_ZN12KernelDevice*aio_writeE*
+/@t0/
+{ printf("%10lld %7d  %-6s %-16s %-38s bdev=%p off=0x%lx len=0x%x\n",
+         (nsecs-@t0)/1000, tid, "osd", comm, "KernelDevice::aio_write",
+         arg0, arg1, *(uint32*)(arg2+24)); }
+
+/* KernelDevice::flush -- silent at entry, the return reports latency */
+uprobe:$2:_ZN12KernelDevice*flushE*
+/@t0/
+{ @ts_fl[tid] = nsecs; @fl_dev[tid] = arg0; }
+uretprobe:$2:_ZN12KernelDevice*flushE*
+/@ts_fl[tid]/
+{ printf("%10lld %7d  %-6s %-16s %-38s fdatasync bdev=%p %lld us\n",
+         (nsecs-@t0)/1000, tid, "osd", comm, "KernelDevice::flush",
+         @fl_dev[tid], (nsecs-@ts_fl[tid])/1000);
+  delete(@ts_fl[tid]); delete(@fl_dev[tid]); }
+
+/* BlueFS::fsync(FileWriter*) -- the RocksDB WAL file fsync */
+uprobe:$2:_ZN6BlueFS5fsyncE*
+/@t0/
+{ printf("%10lld %7d  %-6s %-16s %-38s WAL file\n",
+         (nsecs-@t0)/1000, tid, "osd", comm, "BlueFS::fsync"); }
+
+/* RocksDBStore::submit_transaction_sync -- the kv commit */
+uprobe:$2:_ZN12RocksDBStore*submit_transaction_syncE*
+/@t0/
+{ @ts_kv[tid] = nsecs;
+  printf("%10lld %7d  %-6s %-16s %-38s start\n",
+         (nsecs-@t0)/1000, tid, "osd", comm, "RocksDBStore::submit_transaction_sync"); }
+uretprobe:$2:_ZN12RocksDBStore*submit_transaction_syncE*
+/@ts_kv[tid]/
+{ printf("%10lld %7d  %-6s %-16s %-38s done (%lld us)\n",
+         (nsecs-@t0)/1000, tid, "osd", comm, "RocksDBStore::submit_transaction_sync",
+         (nsecs-@ts_kv[tid])/1000); delete(@ts_kv[tid]); }
+
+/* BlueStore::_txc_committed_kv -- commit callbacks fire; the op reply
+ * is set in motion */
+uprobe:$2:_ZN9BlueStore*_txc_committed_kvE*
+/@t0/
+{ printf("%10lld %7d  %-6s %-16s %-38s txc %p -> reply\n",
+         (nsecs-@t0)/1000, tid, "osd", comm, "BlueStore::_txc_committed_kv", arg1); }
+
+/* PrimaryLogPG::log_op_stats -- just before the MOSDOpReply is sent */
+uprobe:$2:_ZN12PrimaryLogPG12log_op_statsE*
+/@t0/
+{ printf("%10lld %7d  %-6s %-16s %-38s reply -> requester\n",
+         (nsecs-@t0)/1000, tid, "osd", comm, "PrimaryLogPG::log_op_stats"); }
+
+/* BlueStore::_deferred_submit_unlock -- background replay of a
+ * deferred (small) write */
+uprobe:$2:_ZN9BlueStore*_deferred_submit_unlockE*
+/@t0/
+{ printf("%10lld %7d  %-6s %-16s %-38s background data replay\n",
+         (nsecs-@t0)/1000, tid, "osd", comm, "BlueStore::_deferred_submit_unlock"); }
+
+END
+{
+  clear(@t0); clear(@ts_fs); clear(@ts_kv); clear(@ts_fl); clear(@fl_dev);
+}
