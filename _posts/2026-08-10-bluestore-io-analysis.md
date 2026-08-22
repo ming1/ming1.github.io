@@ -939,7 +939,7 @@ ProtocolV2::handle_read_frame_dispatch
 ```
 
 `log_op_stats` has two arrival stacks, both on a **tp_osd_tp** shard
-worker. The write stack is §3.6's reply chain, captured live, frame
+worker. The write stack is §3.1.6's reply chain, captured live, frame
 for frame:
 
 ```
@@ -975,16 +975,24 @@ numbers on the split: 590 write-stack hits + 20 431 read-stack hits =
 21 021 `create_request` hits exactly — one entry point, two exits,
 zero requests unaccounted.
 
-# 3. Case study: one 16 KiB write
+# 3. Case studies
 
-This section takes one 16 KiB write on a freshly rebuilt lab (§1.1
+Sections 1 and 2 built the instruments; this section points them at
+real workloads. Each case study is self-contained: a workload, the
+trace it produces, and a line-by-line reading of what the OSD actually
+did. They are the empirical ground the code analysis (§4) and the
+performance analysis (§5) both refer back to.
+
+## 3.1 One 16 KiB write
+
+This case study takes one 16 KiB write on a freshly rebuilt lab (§1.1
 commands; `p1` lands as pool 2 this time, so pg ids read `2.x`) and
 walks its wtrace line by line: which function printed each line, where
 it lives in the code, what it does — and, every time the `thread`
 column changes, what made the next thread run. Bare `:NNNN` line
 numbers are `BlueStore.cc` in the lab tree (`cc6b5e2da077` = v21.3.0).
 
-## 3.1 The workload and the trace
+### 3.1.1 The workload and the trace
 
 ```bash
 head -c 16384 /dev/urandom > /root/16k
@@ -992,7 +1000,7 @@ rados -p p1 put o48 /root/16k        # traced exactly as in §2.3
 ```
 
 Steady-state trace (second write into this pg — the first one stages
-more, see §3.7). The `#` column is added here so the analysis below
+more, see §3.1.7). The `#` column is added here so the analysis below
 can refer to lines; the script does not print it:
 
 ```
@@ -1016,7 +1024,7 @@ can refer to lines; the script does not print it:
 17      17593   33342  bstore_kv_final  BlueStore::_txc_finish                 txc 0x..ff0a80
 ```
 
-## 3.2 The map — four threads, three switches
+### 3.1.2 The map — four threads, three switches
 
 The trace crosses four threads; the right three start asleep and each
 runs only when the arrow wakes it. The whole trace on one map — every
@@ -1115,7 +1123,7 @@ Deferred writes ride the same two threads through parallel deques of
 **And there is a hidden fourth handoff back to where it started**:
 `_txc_committed_kv` does not send the reply — it queues the commit
 callbacks onto the collection's `commit_queue` (a `ContextQueue` owned
-by the OSD shard), and a tp_osd_tp shard worker executes them (§3.6).
+by the OSD shard), and a tp_osd_tp shard worker executes them (§3.1.6).
 The txc touches the thread pool twice: once to be born, once to say
 goodbye.
 
@@ -1134,7 +1142,7 @@ parking lots between state transitions.
 The rest of this section zooms into each lane with the code
 locations.
 
-## 3.3 Lines 1–8, tp_osd_tp — prepare everything
+### 3.1.3 Lines 1–8, tp_osd_tp — prepare everything
 
 One PG worker runs the whole top half synchronously — everything is
 prepared, nothing is durable yet:
@@ -1176,7 +1184,7 @@ returns to its pool after `io_submit`. The `bstore_aio` thread is
 `io_getevents` returns and the thread runs. The 3.4 ms gap between
 +202 and +3 617 is the device (plus reaping).
 
-## 3.4 Line 9, bstore_aio — pass the baton
+### 3.1.4 Line 9, bstore_aio — pass the baton
 
 ```
     io_getevents returns
@@ -1193,7 +1201,7 @@ entirely — `_txc_state_proc` falls through PREPARE → IO_DONE inline on
 the submitting `tp_osd_tp` thread, which then does the push + notify
 itself.
 
-## 3.5 Lines 10–15, bstore_kv_sync — make it durable
+### 3.1.5 Lines 10–15, bstore_kv_sync — make it durable
 
 In trace order:
 
@@ -1237,7 +1245,7 @@ thread moves the batch to `kv_committing_to_finalize` and rings
 `kv_finalize_cond` (`:15497-15517`) — **switch #3**, same sleep/notify
 pattern as switch #2, different condvar.
 
-## 3.6 Lines 16–17, bstore_kv_final — tell the client
+### 3.1.6 Lines 16–17, bstore_kv_final — tell the client
 
 ```
     _kv_finalize_thread          :15564  woken by switch #3
@@ -1282,7 +1290,7 @@ bstore_kv_final                  │  tp_osd_tp (shard worker)
 
 Reading it backwards: the reply-sending code is a **lambda that
 `execute_ctx` registered on the OpContext before the write was even
-submitted** (`ctx->register_on_commit`, PLP:4473 — §3.3's line #1 is
+submitted** (`ctx->register_on_commit`, PLP:4473 — §3.1.3's line #1 is
 downstream of that same `execute_ctx`). BlueStore collected the
 transaction's contexts in `queue_transactions` (:15988), and the OSD
 had put `C_OSD_OnOpCommit` among them in
@@ -1306,7 +1314,7 @@ Three details worth noticing:
   peer ack are just entries in that set. On this single-OSD lab the
   set empties immediately.
 
-## 3.7 The first write into a PG
+### 3.1.7 The first write into a PG
 
 The very first write into each pg staged three `P` records, not two:
 
@@ -1325,7 +1333,7 @@ again (a new osdmap epoch, an interval change); on a quiet pool that is
 effectively once. If you trace a fresh pool and your byte counts do
 not match this post's, write twice and read the second trace.
 
-## 3.8 The same write on write v2
+### 3.1.8 The same write on write v2
 
 v21 ships a second write path, off by default:
 
@@ -1355,13 +1363,13 @@ classic mode. The v2 fresh write:
 object there is simply nothing inside it to release.)
 
 Everything from `_txc_aio_submit` on — the aio completion, the two
-barriers, the kv commit, the reply — is line-for-line the §3.2 map.
-**v2 replaces only the planning lane** (§3.3's lines #2–#3); the txc
+barriers, the kv commit, the reply — is line-for-line the §3.1.2 map.
+**v2 replaces only the planning lane** (§3.1.3's lines #2–#3); the txc
 state machine, the KV records and the durability protocol are
 untouched. Side by side:
 
 ```
- classic (§3.3)                        write v2
+ classic (§3.1.3)                      write v2
  ─────────────────                     ────────────────────
  _do_write                             _do_write_v2
    └► _do_write_big      — plan          └► Writer::do_write
@@ -1449,7 +1457,7 @@ subsequent reads — and `on_commit` — "durably committed to stable
 storage (i.e., are now software/hardware crashproof)"
 (`Transaction.h:48`). RADOS maps `on_commit` to the ondisk client
 reply, which is why client-visible latency ends at the commit
-callbacks `_txc_committed_kv` queues (§3.6).
+callbacks `_txc_committed_kv` queues (§3.1.6).
 
 **2. Per-transaction atomicity.** A `Transaction` applies
 all-or-nothing; after a crash the store must present it fully or not
@@ -1612,17 +1620,17 @@ plus raw NVMe under BlueStore today.
 [`BlueStore.h:1906`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1906)
 
 **Purpose.** One instance per `queue_transactions` call — the txc that
-every §3 trace line orbits. It is the single carrier for everything the
+every §3.1 trace line orbits. It is the single carrier for everything the
 write accumulates on its way to durability:
 
 ```
 struct TransContext final : AioContext           BlueStore.h:1906
   state         the §4.3.5 state machine (STATE_PREPARE .. STATE_DONE)
   osr           the sequencer ordering it against its collection
-  t             the in-memory kv transaction (the P/O records of §3.3)
+  t             the in-memory kv transaction (the P/O records of §3.1.3)
   ioc           IOContext holding the queued data aios; built with
                 priv = this — how the completion callback finds the
-                txc again (§3.4)
+                txc again (§3.1.4)
   onodes, shared_blobs    what _txc_write_nodes must encode (§4.3.4)
   deferred_txn  the deferred payload, if any
   oncommits     contexts run at commit → the client reply
@@ -1633,7 +1641,7 @@ The pointer itself is the correlation key of the whole post: it is
 `arg1` of every `_txc_*` probe in §2's scripts and the txc id printed
 in the traces.
 
-**Which threads use it.** All four lanes of §3.2's map — strictly one
+**Which threads use it.** All four lanes of §3.1.2's map — strictly one
 at a time:
 
 | Thread | States it drives | Role for the instance |
@@ -1668,7 +1676,7 @@ PREPARE → AIO_WAIT → IO_DONE → KV_QUEUED → KV_SUBMITTED
                                                   BlueStore.cc:15051
 ```
 
-Two consequences already visible in §3: the client reply
+Two consequences already visible in §3.1: the client reply
 (`oncommits`) fires at `_txc_committed_kv`, well before the txc dies —
 which is why trace lines #16 and #17 are distinct events; and a
 deferred txc outlives its reply by a whole replay round-trip, which is
@@ -1782,7 +1790,7 @@ itself.
 | Thread | Touch |
 |---|---|
 | `tp_osd_tp` | creates it in `do_op` (`:2500`), runs `do_osd_ops`, submits; a *read* completes here inline (`complete_read_ctx`) and the ctx dies without ever leaving the thread |
-| `bstore_kv_final` | at txc commit (§3 line #16), `BlessedContext` re-takes the PG lock and `eval_repop` runs `on_committed` — the reply leaves from this thread |
+| `bstore_kv_final` | at txc commit (§3.1 line #16), `BlessedContext` re-takes the PG lock and `eval_repop` runs `on_committed` — the reply leaves from this thread |
 | messenger workers | with replicas, the last `MOSDRepOpReply` ack can be what drives `eval_repop` — completion then runs on a msgr thread instead |
 
 Like the txc, the OpContext has no lock of its own — but for the
@@ -1802,7 +1810,7 @@ do_op: new OpContext                        PrimaryLogPG.cc:2500
    ├─ read ──► reply + delete inline, same thread
    │
    └─ write ─► handed to a RepGather → issue_repop →
-               queue_transactions ... (the whole of §3) ...
+               queue_transactions ... (the whole of §3.1) ...
                    │
                txc commits → on_committed → reply     (#16)
                    │  (+ replica acks, if any)
@@ -1851,7 +1859,7 @@ the deferred machinery                             :2456-2462
                  it only nudges wakeups)
 
 the kv pipeline                                    :2467-2484
-   kv_lock + kv_cond + the intake deques  (switch #2, §3.2)
+   kv_lock + kv_cond + the intake deques  (switch #2, §3.1.2)
    kv_finalize_lock + the handoff deques  (switch #3)
 
 admission control                                  :2193
@@ -1879,9 +1887,9 @@ live one layer down, and three naming schemes overlap:
 On a single-device OSD (this post's lab) there is no `block.db` or
 `block.wal`: BlueFS's `BDEV_DB` slot is a second `KernelDevice`
 opened on the *same* disk as `BlueStore::bdev` — which is exactly
-the two `bdev=0x...` pointers and two fd families in every §2/§3
+the two `bdev=0x...` pointers and two fd families in every §2/§3.1
 trace (fd 32 = `BlueStore::bdev`, fd 44 = BlueFS's `BDEV_DB`). The
-split also assigns the barriers: §3.5's barrier #1
+split also assigns the barriers: §3.1.5's barrier #1
 (`bdev->flush()` in the kv committer) is *this* member; barrier #2's
 WAL fsync travels `db → BlueFS → its own bdev`, never touching
 `BlueStore::bdev`.
@@ -1950,7 +1958,7 @@ thread loops that own the tail, `_kv_sync_thread` and
 `_kv_finalize_thread`. §4.3.9 then backtracks to the front door,
 `queue_transactions` — where the transaction, its PG-log `P` records
 already inside, first meets BlueStore — and §4.3.10–4.3.11 cover the
-write-v2 planning lane (§3.8) that replaces the first three entries
+write-v2 planning lane (§3.1.8) that replaces the first three entries
 when `bluestore_write_v2` is on. Bare `:NNNN`
 line numbers are
 [`BlueStore.cc` at the v21.3.0 tag](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc)
@@ -2049,7 +2057,7 @@ one aio per physical extent, so a fragmented allocation queues several
 aios for one blob.
 
 **IOs:** queues the data writes on the txc's IOContext; nothing is
-submitted yet (`_txc_aio_submit` does that, §3.3 line #8). No reads.
+submitted yet (`_txc_aio_submit` does that, §3.1.3 line #8). No reads.
 
 **Locks:** the allocator's internal mutex (inside `allocate`) and a
 buffer-cache shard lock (inside `_buffer_cache_write`); nothing held
@@ -2065,7 +2073,7 @@ across the function.
 for each dirty onode
    └► _record_onode                                         :19618
         encode onode + extent-map shards
-        t->set(PREFIX_OBJ, ...)          ← the O record of §3
+        t->set(PREFIX_OBJ, ...)          ← the O record of §3.1
       o->flushing_count++               (flush() waits on it)
 for each shared blob (clone bookkeeping)
    └► t->set / rmkey(PREFIX_SHARED_BLOB)                    :14822
@@ -2081,7 +2089,7 @@ disk in §4.3.6.
 [`BlueStore.cc:14634`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L14634)
 — takes only the txc. Every thread that touches a txc calls this one
 function; the switch decides what happens next, falling through where
-no wait is needed. The thread running each state is §3.2's map:
+no wait is needed. The thread running each state is §3.1.2's map:
 
 ```
 STATE_PREPARE      :14641  pending aios? → _txc_aio_submit    tp_osd_tp
@@ -2177,11 +2185,11 @@ own batch the same way at creation (`txc->t`, `_txc_create`); `synct`
 is the committer's extra, per-cycle batch — the **sync**-carrying
 **t**ransaction. The `shared_ptr` answers lifetime: the batch (which
 for deferred cycles includes the 4 KiB payloads inside the `L`
-values, like §3.8's 4135 B record) lives exactly as long as someone
+values, like §3.1.8's 4135 B record) lives exactly as long as someone
 holds the handle, and dies when the cycle ends.
 
 ```
-one kv cycle (bstore_kv_sync, §3.5)
+one kv cycle (bstore_kv_sync, §3.1.5)
    │
    ├─ per txc: db->submit_transaction(txc->t)  — ASYNC     BlueStore.cc:15429
    │    the two P + one O records: appended to the WAL       (via :14919)
@@ -2232,7 +2240,7 @@ it: wtrace's `aio_write` probe goes dark on that path — the
 kernel-side `blkdev_write_iter` probe still sees the writes.)
 
 The aio count per commit, verified against the captures: **one** —
-every §2/§3 trace shows exactly one `aio_write` on the BlueFS bdev
+every §2/§3.1 trace shows exactly one `aio_write` on the BlueFS bdev
 per `submit_transaction_sync`. It grows only when the flush range
 crosses an extent boundary (one aio per extent), or in *plain* WAL
 mode, where the fsync must also update the file's fnode through the
@@ -2241,7 +2249,7 @@ journal sync. Envelope mode (§6.6 of the internals post) exists
 precisely to delete that second pair; its "~50% fewer fdatasync"
 claim is this arithmetic.
 
-**IOs:** the 4 KiB WAL append and the flush behind it (§3.5), via
+**IOs:** the 4 KiB WAL append and the flush behind it (§3.1.5), via
 BlueFS — the flushed bytes include the async-appended batches. SST
 files are written later by compaction, off the write path.
 
@@ -2252,8 +2260,8 @@ side.
 ### 4.3.7 _kv_sync_thread — the kv committer (thread bstore_kv_sync)
 
 [`BlueStore.cc:15290`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15290)
-— the thread body behind the `bstore_kv_sync` lane of §3.2; no
-parameters, runs for the OSD's lifetime. Everything §3.5 traced is one
+— the thread body behind the `bstore_kv_sync` lane of §3.1.2; no
+parameters, runs for the OSD's lifetime. Everything §3.1.5 traced is one
 iteration of this loop:
 
 ```
@@ -2285,7 +2293,7 @@ hides in the ordering:
   when the cycle saw direct-write aios or has deferred completions to
   stabilize; on a single shared device the BlueFS commit fsyncs the
   same fd anyway, so it can sometimes be skipped. A deferred-only
-  cycle is the single-barrier commit §3.8's deferred trace shows.
+  cycle is the single-barrier commit §3.1.8's deferred trace shows.
   Barrier #2 is unconditional.
 - **The flush promotes `deferred_done` → `deferred_stable`**
   (`:15389-15396`), and only then do the deferred `L` records get
@@ -2303,7 +2311,7 @@ hides in the ordering:
   it every cycle would drain the pipeline, sleep, and stutter awake
   one transaction at a time.
 
-**IOs:** both barriers of §3.5 — the data-device fdatasync and the WAL
+**IOs:** both barriers of §3.1.5 — the data-device fdatasync and the WAL
 append + fsync behind the sync commit. This is the only thread that
 pays them.
 
@@ -2484,7 +2492,7 @@ do_write(location, data)                                    :1415
    │                  prefer_deferred_size
    │    ├─ deferred: disk_allocs = released                 :1326
    │    │    -- write lands on the JUST-PUNCHED extents,
-   │    │       in place, no allocator call (§3.8)
+   │    │       in place, no allocator call (§3.1.8)
    │    └─ direct: one alloc->allocate for the whole need   :1330
    └─ place chunks via the blob toolbox                     :333
         (reuse a neighbour blob's unused space / extend
@@ -2497,7 +2505,7 @@ at `:1308` states the principle: "having parts of write executed as
 deferred and other parts as direct is suboptimal in any case".
 
 **IOs:** stages the data aio(s) for direct writes (submitted later by
-`_txc_aio_submit`, §3.3 line #8) or folds the payload into the txc's
+`_txc_aio_submit`, §3.1.3 line #8) or folds the payload into the txc's
 deferred `L` record — the role classic split between
 `_do_alloc_write` and the small-path deferred staging.
 
@@ -2523,7 +2531,7 @@ client ─► wire ─► recv_stamp ─► dequeued ─► execute_ctx ─► B
 
 * **`wlat client`** — BlueStore *service* time: txc birth to
   `_txc_committed_kv`, the point where the commit callbacks are queued
-  and the client reply is set in motion (§2.4, §3.6). It knows nothing
+  and the client reply is set in motion (§2.4, §3.1.6). It knows nothing
   about queues in librbd, the wire, or the OSD dispatch layers.
 * **`op_w_latency`** — the OSD's own span, defined at
   `PrimaryLogPG.cc:4541` as `now - m->get_recv_stamp()`:
@@ -2531,7 +2539,7 @@ client ─► wire ─► recv_stamp ─► dequeued ─► execute_ctx ─► B
   throttling and before the payload is read (`ProtocolV2.cc:1173`,
   attached at `:1460`), and `now` is taken in `log_op_stats`, called
   from the *same `register_on_commit` lambda that sends the reply*
-  (§3.6) — just before the send. So it covers message throttle and
+  (§3.1.6) — just before the send. So it covers message throttle and
   read, queueing, dispatch, `execute_ctx`, BlueStore, and the
   commit-callback hop, but excludes the reply transmission and
   everything client-side.
@@ -2557,7 +2565,7 @@ located above BlueStore, in the spans the diagram places between them.
 
 ## 5.2 Per-thread performance analysis — where a qd=1 write's time goes
 
-§3 walked one write through four threads and named every event on the
+§3.1 walked one write through four threads and named every event on the
 way. This section weighs those events: for a warm 64 KiB write at queue
 depth 1, how many microseconds does each thread — and each function
 inside it — actually cost, and which of those microseconds can be taken
@@ -2659,7 +2667,7 @@ The `submit_transaction_sync` interior is the striking one. Its 48 µs
 contain a `BlueFS::fsync` of the RocksDB WAL at 35 µs — but the actual
 WAL `aio_write` is **2 µs**, and a `KernelDevice::flush` averages
 **3 µs** (the probe averages over both flushes per op — the data-bdev
-barrier and the BlueFS one, #10 and #14 in §3.2's map). The missing
+barrier and the BlueFS one, #10 and #14 in §3.1.2's map). The missing
 ~30 µs of the fsync is the BlueFS write path bouncing through the
 KernelDevice aio thread and back — twice — to complete a write that
 the ramdisk finishes instantly. That observation points at a config
@@ -2761,7 +2769,7 @@ Reducible with a switch, all measured here: debug levels to 0/0,
 C-states capped (§5.4), `bluefs_sync_write=true` on fast media, and
 not leaving tracers attached — together worth well over 100 µs on this
 pipeline. Structural, needing code or design changes: the
-thread-handoff wakeups — §3.2's three BlueStore switches plus the
+thread-handoff wakeups — §3.1.2's three BlueStore switches plus the
 initial shard-queue wakeup, ~70 µs across the pipeline even tuned —
 the new-object obc establishment, the double metadata encode
 (PG bookkeeping then BlueStore), and the messenger/client span that
@@ -2972,7 +2980,7 @@ absolute maximum.
 Everything above measures a pipeline that is *doing* something. But at
 queue depth 1 the OSD's threads spend most of their life asleep, and on
 many machines waking a sleeping core costs more than the work it wakes
-up to do. The write path of §3 crosses four OSD threads; every crossing
+up to do. The write path of §3.1 crosses four OSD threads; every crossing
 is a condvar signal to a thread whose core may have parked itself in a
 deep C-state between IOs. This section measures that cost and verifies
 the standard fix — the `tuned` `latency-performance` profile — on a real
@@ -3124,13 +3132,13 @@ ones.
 The structural observation that makes this post's material relevant:
 every "hard" phase degenerates into the same primitive — *small
 synchronous operations whose latency floor is one OSD commit*. That
-floor is exactly what §3 traced and §5.2 decomposed.
+floor is exactly what §3.1 traced and §5.2 decomposed.
 
 ## 6.2 Directions, ranked by leverage
 
 **1. The small-sync-op latency floor** (targets mdtest-hard and
 ior-hard — the score killers). The anatomy is measured territory: a
-small commit is prep plus two barriers (§3.5), with the WAL fdatasync
+small commit is prep plus two barriers (§3.1.5), with the WAL fdatasync
 dominating, and per §4.3.9 two of the three KV sets per write are
 PG-log machinery, not data. Threads to pull:
 
@@ -3141,9 +3149,9 @@ PG-log machinery, not data. Threads to pull:
   amortizes well at mdtest concurrency is directly measurable with
   wstats/wlat (§2.2, §2.4) — count `_txc_apply_kv` per sync commit.
 - **The 47008 B case**: below 64 KiB, so `bluestore_prefer_deferred_size`
-  can route it through the WAL, and write v2's deferred path (§3.8)
+  can route it through the WAL, and write v2's deferred path (§3.1.8)
   reuses the punched extents in place with no allocator call —
-  precisely the shape ior-hard generates. An hour with the §3.8 probes
+  precisely the shape ior-hard generates. An hour with the §3.1.8 probes
   against a 47008 B strided-overwrite reproducer says where the cycles
   go.
 
