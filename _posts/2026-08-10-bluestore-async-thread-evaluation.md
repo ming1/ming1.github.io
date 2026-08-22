@@ -591,6 +591,92 @@ it is also why `ps -T` still shows exactly one `bstore_aio` thread in
 the final design: it is BlueFS's, born on a device that never received
 the eventfd.
 
+### 5.2.3 An aio read, end to end — and why reads inherit the reaper's schedule
+
+Writes get all the attention in this post, but reads are the IO class
+most sensitive to *completion* handling — a thread is actively blocked
+waiting for each one — so their path through the machinery deserves its
+own trace.
+
+**Submission** runs entirely in the client's thread (a `tp_osd_tp`
+worker serving the read op):
+
+```
+ _do_read()                              BlueStore.cc
+ ├─ _read_cache()            cache hits satisfied, misses listed
+ ├─ IOContext ioc(cct, NULL) ← priv=NULL: "wake a waiter,
+ │                             don't run a callback"
+ ├─ _prepare_read_ioc()      per uncached blob:
+ │    └─ bdev->aio_read()    KernelDevice::aio_read
+ │         ├─ allocate an aligned buffer, build the iov
+ │         ├─ aio.preadv(off, len)      # io_prep_preadv
+ │         └─ ioc->pending_aios.push_back, ++num_pending
+ ├─ bdev->aio_submit(&ioc)   KernelDevice::aio_submit
+ │    ├─ pending_aios → running_aios, num_running += n
+ │    └─ submit_batch(): io_set_eventfd on EVERY iocb
+ │                       (external mode) + io_submit(2)
+ └─ ioc.aio_wait()           block until num_running == 0
+```
+
+Note what the `priv=NULL` in the IOContext constructor decides: for
+write txcs, `priv` carries the `TransContext*` and completion runs the
+state machine; for reads there is no callback at all — completion just
+has to *wake the waiter*. `aio_wait()` (BlockDevice.cc) is a plain
+mutex/condvar wait on the atomic `num_running`.
+
+**Completion** is where the design choices bite:
+
+```
+ NVMe completes the preadv
+ └─ kernel aio_complete(): event → the device's ring,
+                           eventfd++ (external mode)
+    └─ THE REAPER — whoever that is — returns from its wait,
+       calls _reap_completions():
+       ├─ io_getevents() pulls the event
+       ├─ r == length checked, io_since_flush set
+       └─ ioc->priv == NULL → ioc->try_aio_wake()
+            └─ --num_running == 0 → wake the condvar
+               └─ client thread resumes in aio_wait()
+                  └─ _generate_read_result_bl() assembles
+                     the result from the aio buffers
+```
+
+Two wakes end to end — reaper, then reader — in every design this post
+discusses. What differs is **who the reaper is and what else that
+thread does**:
+
+| design | reads reaped by | reaper's other duties |
+|---|---|---|
+| legacy | `bstore_aio` | none — parked in `io_getevents` ~always |
+| trans loop | `bstore_trans` | staging + finalize (worker blocks elsewhere) |
+| kv-sync merge (§9 follow-up) | `bstore_kv_sync` | **the commit cycle itself** |
+
+And that last row is the interesting one, because it produces a
+measured, structural effect: when the reaper is also the thread that
+blocks inside `bdev->flush()` and the WAL fsync, a read completing
+during a commit cycle sits in the ring — doorbell rung, nobody home —
+until the cycle ends. The added read latency is a queueing term:
+P(reaper mid-commit) x E[residual cycle time]. In a 70/30 mixed 4K
+workload at qd8 (RelWithDebInfo, ramdisk) it measures as read latency
++4.6% while write latency in the very same reps *improves* 4.2% — the
+two move in opposite directions because the same coupling that makes
+reads wait puts write completions zero handoffs away from their
+committer. Pure-read workloads are unaffected (no commit cycles: the
+reaper is parked on the eventfd exactly as `bstore_aio` was parked in
+`io_getevents`), and pure-write workloads have no reader to delay —
+only the mix exposes it.
+
+The submission side also carries one guard worth noticing: `_do_read`
+asserts the caller is not the sole reaper itself
+(`ceph_assert(!bdev_direct_completions || !in_kv_sync_thread())`) — a
+read issued *by* the reaper would wait on a completion only it can
+reap, a deadlock with no timeout. And if the coupling ever needs
+removing rather than disclosing, the read-side analogue of §5.3's
+write patch is the natural fix: a single-extent read is one contiguous
+`preadv`, and issuing it synchronously in the client thread bypasses
+the ring — and therefore the shared reaper — entirely for the common
+case.
+
 ## 5.3 bluefs: write single-segment flushes synchronously
 
 The last cross-thread dependency on the commit path was inside
