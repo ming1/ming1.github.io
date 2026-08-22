@@ -571,6 +571,42 @@ same scoping: it is stamped at submit time by the submitting
 instance's io_queue, so BlueFS's iocbs (notify fd `-1`) never signal
 BlueStore's eventfd.
 
+One more sharing question completes the picture: within one device,
+the single `io_context_t` is shared by *every* submitter — all ~16
+`tp_osd_tp` workers (8 shards x 2 threads on the ssd class; 5 x 1 on
+hdd), finisher threads submitting deferred batches, the mount thread
+during replay — with **no userspace lock anywhere**. That is not an
+oversight; the ring is a kernel object and the syscalls are the lock.
+The only ways userspace touches the shared state are `io_submit(2)`
+and `io_getevents(2)`, and the kernel serializes both internally
+(submission under the context's spinlock, event dequeue under the
+ring mutex). Sixteen threads calling `io_submit` concurrently on one
+context is fully supported; `submit_batch()` and `aio_submit()`
+accordingly contain no mutex at all.
+
+What looks shared in userspace is not: each thread's iocbs live in
+its own `IOContext`'s lists, submitted from a stack-local array. The
+one genuinely contended per-context resource — queue depth, fixed at
+`io_setup(max_iodepth)` — is arbitrated by the kernel returning
+EAGAIN, which is exactly what the submit retry loop handles;
+userspace never counts global in-flight requests. (The "we should be
+only thread doing this" assertion in `aio_submit` guards a single
+IOContext's fields, not the device context.)
+
+The same is true of reaping: the kernel permits *concurrent*
+`io_getevents` callers on one context and delivers each event to
+exactly one of them. "Single reaper" in every design this post
+discusses is therefore a **Ceph discipline, not a kernel rule** —
+imposed because the reaper runs completion callbacks, and those must
+execute in one thread to keep the staging queues lock-free and the
+`_txc_finish_io` ordering scan simple. The kernel would happily let
+two threads split the events; the callback semantics above it are
+what forbid it. (libaio adds a footnote here: the completion ring
+header is mmapped, and `io_getevents` has a userspace fast path that
+can dequeue without a syscall when events are already present —
+under a single-reaper discipline that is a free win with no
+concurrency question attached.)
+
 Sharing the disk *does* matter one layer up, and BlueStore handles
 both cases explicitly: durability — `fdatasync` is a device-wide
 barrier regardless of which instance's fd issues it, which is exactly
