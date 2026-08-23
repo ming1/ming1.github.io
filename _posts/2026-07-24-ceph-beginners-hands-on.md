@@ -2705,7 +2705,7 @@ names as `top -H` shows them:
  │                             ▼                             │
  │  bstore_aio         disk I/O completions           §10.4  │
  │  bstore_kv_sync     fdatasync + RocksDB commit            │
- │  bstore_kv_final    run completion Contexts               │
+ │  bstore_kv_final    hand completions to the shard         │
  │                             │ on_commit, requeued on      │
  │                             ▼ the op's shard              │
  │                     reply out through the messenger       │
@@ -2714,13 +2714,13 @@ names as `top -H` shows them:
 
 Supporting cast, off the data path: `osd_srv_heartbt` plus dedicated
 heartbeat messengers (peer liveness, §10.5), `safe_timer` (timeouts),
-`rocksdb:low*` (compaction).
+`rocksdb:low` (compaction).
 
 ## 10.2 Shards: the queue in front of every PG
 
 ```
                         OSD
-                         │   PG → shard:  pg_id.hash % num_shards
+                         │   PG → shard:  pg_id.ps() % num_shards
         ┌────────────────┼────────────────┐
         ▼                ▼                ▼
     OSDShard 0       OSDShard 1       OSDShard 2   ...
@@ -2732,17 +2732,29 @@ heartbeat messengers (peer liveness, §10.5), `safe_timer` (timeouts),
        PGs              PGs              PGs       PG lock while running
 ```
 
-Every PG hashes to one shard; every shard owns a queue and a few
-`tp_osd_tp` workers. The defaults come from the same rotational
-detection Section 9.4 met: HDD 5 shards × 1 thread
-(`osd_op_num_shards_hdd`, `osd_op_num_threads_per_shard_hdd`), SSD
-8 × 2 (the `_ssd` variants). One global queue would put every op on
-one lock and one dequeue order; sharding lets unrelated PGs run on
-different cores sharing nothing.
+Each PG belongs to one shard — `ps() % num_shards`, the PG number
+itself, so PGs land on shards round-robin — and every shard owns a
+queue plus a few `tp_osd_tp` workers. The defaults come from the same
+rotational detection Section 9.4 met, and the HDD pair is inverted
+from what older documentation shows:
 
-The queue entries are not raw messages. `enqueue_op()` wraps
-everything — client ops, peering events, recovery, scrub, snap trim —
-into `OpSchedulerItem`s, and a scheduler (mClock by default) decides
+| class | shards | threads/shard |
+|-------|--------|---------------|
+| HDD | 1 (`osd_op_num_shards_hdd`) | 5 (`osd_op_num_threads_per_shard_hdd`) |
+| SSD | 8 (`osd_op_num_shards_ssd`) | 2 (`osd_op_num_threads_per_shard_ssd`) |
+
+Tentacle is the release that flipped HDD from 5 × 1 to 1 × 5
+([`0d81e721`][ceph-hdd-shards], [tracker 66289][tracker-66289]): at
+scale mClock scheduled poorly across several independent queues —
+inconsistent client throughput, slow requests during node failures —
+while one queue with five workers behaved. So sharding still buys
+parallelism on flash, but on spinning disks the current answer is one
+queue and many workers.
+
+The queue entries are not raw messages. A family of `enqueue_*` calls
+wraps each into an `OpSchedulerItem` — `enqueue_op()` for client ops
+and recovery messages, `enqueue_peering_evt()` for peering, siblings
+for scrub and snap trim — and a scheduler (mClock by default) decides
 what a worker dequeues next. This is the seat of QoS: client I/O and
 background work compete here, weighted by `osd_mclock_profile`.
 
@@ -2759,9 +2771,11 @@ When reading `src/osd/`, the synchronization to study is this funnel —
 `enqueue_op → dequeue_op → do_request` — not per-field mutexes.
 
 Why more than one worker per shard: BlueStore commits asynchronously,
-so a worker never sits on the disk wait — but it can be held for
-milliseconds of CPU (checksums, encode/decode) or a contended PG lock,
-and a second worker keeps the shard's *other* PGs moving meanwhile.
+so a worker does not sit through the disk wait — but it can be held
+for milliseconds of CPU (checksums, encode/decode), on a contended PG
+lock, or inside `queue_transactions()` itself when BlueStore's
+throttle is full and in-flight bytes must drain. A second worker keeps
+the shard's *other* PGs moving meanwhile.
 
 ## 10.3 The messenger never runs an op
 
@@ -2790,8 +2804,10 @@ to the connection, the messenger writes it out when the socket allows.
 
 The glue between lanes is everywhere the same pair of primitives: a
 mutex+condvar queue to move work forward, and a `Context` callback —
-Ceph's completion object, run by finisher threads such as
-`bstore_kv_final` — to signal completion back.
+Ceph's completion object — to signal completion back. Note where a
+commit `Context` actually *runs*: not on the thread that fires it.
+`bstore_kv_final` drops it into the owning shard's `context_queue`,
+and a `tp_osd_tp` worker runs it under the PG lock.
 
 ## 10.4 One write, lane by lane
 
@@ -2808,7 +2824,7 @@ hop:
       ⋮                    PG::do_request()
       ⋮                    PrimaryLogPG::do_op()
       ⋮                    issue_repop():
-  TX MOSDRepOp ◄────────── send to osd.2, osd.13      waiting for subops
+  TX MOSDRepOp ◄────────── send to osd.2, osd.13     waiting for subops
       ⋮                    queue_transactions() ──► aio submitted
       ⋮                    PG lock dropped,         bstore_aio: I/O done
       ⋮                    worker moves on          bstore_kv_sync: fsync
@@ -2839,12 +2855,12 @@ Beyond the files Section 8.2 listed, that adds
 
 ```
                MON                            MGR
-      OSDMap ↓  ↑ MOSDBeacon,                  ↑ MMgrReport
-             ↓  ↑ failure reports              ↑ (perf counters, PG stats)
+      OSDMap ↓  ↑ MOSDBeacon,                  ↑ MMgrReport (counters)
+             ↓  ↑ failure reports              ↑ MPGStats  (PG stats)
              ↓  ↑                              ↑
  clients ── MOSDOp ──►   ceph-osd   ◄──► MOSDRepOp, peering, recovery,
                          │      ▲        backfill ─────────── peer OSDs
-                         │      └─────── heartbeats (own messengers)
+                         │      └─────── heartbeats (own sockets)
                          └── admin socket (local UNIX socket, §9.7)
 ```
 
@@ -2852,43 +2868,59 @@ Beyond the files Section 8.2 listed, that adds
   service — exactly the trace of Sections 4.5–4.6.
 - **Peer OSDs** exchange replication (`MOSDRepOp`/`MOSDRepOpReply` —
   the "subops" of the event names; the old `MOSDSubOp` class is gone),
-  peering, recovery and backfill traffic. Heartbeats run over
-  dedicated front/back messengers with their own threads, so liveness
-  checks never queue behind data.
+  peering, recovery and backfill traffic. Heartbeats get dedicated
+  front and back messengers on their own sockets, and `MSG_OSD_PING`
+  is fast-dispatched *inline on the messenger thread* — a ping is
+  answered without ever entering a shard queue, so liveness never
+  waits behind data. What is dedicated is the socket pair and the
+  `osd_srv_heartbt` thread that sends pings and times peers out; those
+  messengers still share the process-wide `msgr-worker` pool, since
+  every `AsyncMessenger` draws from one `NetworkStack` singleton.
 - **MON**: authoritative maps down, beacons and failure reports up.
   Map handling is itself asynchronous — an incoming `MOSDMap` is
   persisted and published, then each PG catches up through the same
   shard queues — alongside the `maybe_share_map` piggyback path of
   Section 4.6.
-- **MGR** receives `MMgrReport` with perf counters and PG stats — the
-  material behind the dashboard and the `ceph -s` throughput line.
+- **MGR** receives `MMgrReport` (perf counters, daemon status) and,
+  separately, `MPGStats` (PG stats) — the material behind the
+  dashboard and the `ceph -s` throughput line.
 - **Local processes** get exactly one door: the admin socket of
   Section 9.7. `ceph tell osd.N` arrives over the normal messenger as
   a command message.
 
 ## 10.6 Old maps, and why this shape scales
 
-Older documentation draws the FileStore OSD; don't port that mental
-model:
+Older documentation draws an unsharded OSD over FileStore; don't port
+that mental model:
 
 ```
- FileStore era                      v20.2.2 + BlueStore
- ─────────────                      ────────────────────
+ Older docs' OSD + FileStore        v20.2.2 + BlueStore
+ ───────────────────────────        ───────────────────
  Messenger                          Messenger, fast dispatch
      ↓ DispatchQueue                    ↓ enqueue_op()
- OSD OpWQ                           OSDShard queues, mClock
+ OSD OpWQ (one queue)               OSDShard queues, mClock
      ↓                                  ↓ tp_osd_tp workers
  PG                                 PG / PrimaryLogPG
      ↓ journal queue                    ↓ queue_transactions()
- FileStore OpWQ                     BlueStore TXC state machine
-     ↓ apply thread, page cache         ↓ aio + kv_sync / kv_final
- write twice (journal + files)      write once + RocksDB metadata
+ FileStore OpWQ (tp_fstore_op)      BlueStore TXC state machine
+     ↓ apply into the page cache        ↓ aio + kv_sync / kv_final
+ write twice (journal + files)      write once (small writes twice)
 ```
+
+Two caveats on that left column. The stages are not contemporaries —
+fast dispatch and the sharded op WQ landed years before FileStore was
+removed in Reef, so the two coexisted for most of a decade; and you
+cannot read FileStore at `v20.2.2`, because `src/os/filestore/` is
+already gone. The right column's "write once" is also only the common
+case: BlueStore's deferred path is a genuine double write, and on an
+HDD-classified OSD every write under `bluestore_prefer_deferred_size`
+(64 KiB, Section 9.4) takes it. The win is that the double write
+became the exception rather than the rule.
 
 The parallelism stacks: many OSDs per cluster × shards per OSD ×
 workers per shard × PGs per shard, with storage asynchronous
 underneath and replication fanning out across machines — no global
-queue, lock or thread on the object data path.
+lock or single thread on the object data path.
 
 > One sentence: messenger threads receive and send, shard workers run
 > the PG state machines, BlueStore threads make it durable, queues and
@@ -2909,6 +2941,8 @@ queue, lock or thread on the object data path.
 [vstart]: https://github.com/ceph/ceph/blob/v20.2.2/src/vstart.sh
 [src-msg]: https://github.com/ceph/ceph/tree/v20.2.2/src/msg/async
 [src-sched]: https://github.com/ceph/ceph/tree/v20.2.2/src/osd/scheduler
+[ceph-hdd-shards]: https://github.com/ceph/ceph/commit/0d81e721378
+[tracker-66289]: https://tracker.ceph.com/issues/66289
 [doc-arch]: https://github.com/ceph/ceph/blob/main/doc/architecture.rst
 [doc-manual]: https://docs.ceph.com/en/latest/install/manual-deployment/
 [doc-cephadm]: https://docs.ceph.com/en/latest/cephadm/install/
