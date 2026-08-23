@@ -3179,9 +3179,9 @@ Worth knowing before you benchmark it: the segment cleaner's
 availability thresholds are compile-time constants, not tunables
 (still constants on `main`, though the cleaner now re-derives them at
 runtime from observed usage); the random-block journal is visibly
-incomplete —
-its `flush()` is a TODO stub and the matching cleaner is inert; and
-ZNS support exists in the tree but is build-gated off by default.
+incomplete — its `flush()` is a TODO stub and the matching cleaner is
+inert; and ZNS support exists in the tree but is build-gated off by
+default.
 CyanStore is memory-only, loses everything on crash, and exists "only
 for measuring OSD overhead, without the cost of actually storing
 data".
