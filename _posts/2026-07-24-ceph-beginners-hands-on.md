@@ -2929,6 +2929,349 @@ lock or single thread on the object data path.
 > keeps it all ordered.
 
 
+# 11. Crimson: the same PG, without the threads
+
+`crimson-osd` is a rewrite of Section 10 on top of
+[Seastar][seastar] — shared-nothing, one pinned reactor thread per
+core, run-to-completion continuations, no blocking calls anywhere.
+Every structure Section 10 spent its length on (the shard queue, the
+worker pool, the PG lock, the requeued `Context`) is gone, and the
+ordering they provided has to be rebuilt out of something else.
+
+Upstream's own framing, from [`doc/glossary.rst`][doc-glossary] rather
+than the Crimson docs, which state no motivation at this tag:
+
+> "A next-generation OSD architecture whose aim is the reduction of
+> latency costs incurred due to cross-core communications. A re-design
+> of the OSD reduces lock contention by reducing communication between
+> shards in the data path. Crimson improves upon the performance of
+> classic Ceph OSDs by eliminating reliance on thread pools."
+
+Status matters before the architecture: at `v20.2.2` Crimson is a
+**tech preview and explicitly not for production** (§11.5), and it
+moves fast enough that several option names in this section have
+already been renamed on `main`. Squid shipped the first preview;
+Tentacle is the release where SeaStore became deployable alongside it.
+
+## 11.1 What replaces what
+
+```
+ classic ceph-osd (§10)             crimson-osd
+ ──────────────────────             ───────────
+ msgr-worker-0..2                   reactor thread per core
+     ↓ enqueue_op()                     ↓ continuation, same core
+ OSDShard queue + mClock            pipeline stages — no queue
+     ↓ tp_osd_tp worker                 ↓ still the same reactor
+ PG lock across do_request          no PG lock: per-PG and per-object
+     ↓ queue_transactions()             ↓   pipelines (§11.2)
+ BlueStore + bstore_* threads       SeaStore: same reactor, no hop
+     ↓ Context requeued on shard    AlienStore: thread pool (§11.4)
+ reply                              reply
+```
+
+Shared-nothing is enforced at compile time, not by convention:
+`src/crimson/` builds its own `ceph-common` with the lock policy set
+to `SINGLE`, so refcounts and locks in shared Ceph code become
+non-atomic. Touching an object from the wrong core is therefore memory
+corruption rather than contention, which is why `assert_core()` and
+`seastar::this_shard_id()` checks are scattered through the tree.
+Process-global state (OSDMap, monclient, superblock) lives in
+`OSDSingletonState` on `PRIMARY_CORE = 0` and is reached by explicit
+`invoke_on(0, …)`.
+
+Threads in a `crimson-osd` process:
+
+- **reactors** — `crimson_seastar_num_threads` (max 32; `0` is a fatal
+  startup error), or derived from `crimson_seastar_cpu_cores`. One per
+  dedicated core; pinning happens only in the cpuset form.
+- **`alien-store-tp`** — `crimson_alien_op_num_threads` plain
+  `std::thread`s, default **6**, present only with AlienStore.
+- **BlueStore's own threads, unchanged.** The alienstore target is
+  compiled *without* `WITH_CRIMSON`, so with the default objectstore
+  every thread from Section 10's BlueStore lane — `bstore_kv_sync`,
+  `bstore_kv_final`, `bstore_aio`, the Finisher, RocksDB's background
+  threads — is still in the process, now behind a thread pool.
+
+## 11.2 Ordering without a PG lock
+
+Section 10's serialization came from one rule: only a shard worker
+holding the PG lock mutates a PG. Crimson has no such lock. Ordering
+is a property of **pipelines** — chains of stages an operation walks,
+where each stage is a per-core object that admits ops either
+exclusively (at most one in the stage, entered in arrival order) or
+concurrently (many in-stage, still FIFO on entry).
+
+```
+ ConnectionPipeline  per connection  await_active, await_map,
+                                     get_pg_mapping
+ PerShardPipeline    per reactor     create_or_wait_pg
+ CommonPGPipeline    per PG          wait_pg_ready [concurrent], get_obc
+ CommonOBCPipeline   per OBJECT      process, wait_repop [concurrent],
+                                     send_reply
+ PGRepopPipeline     per PG          process, wait_commit [concurrent],
+                                     send_reply
+ PGPeeringPipeline   per PG          await_map, process
+```
+
+The granularity is the point, and upstream's
+[`doc/dev/crimson/pipeline.rst`][doc-pipeline] says so directly:
+
+> "Because CommonOBCPipeline is per-object rather than per-connection
+> or per-pg, multiple requests on different objects may be in the same
+> CommonOBCPipeline stage concurrently. This allows us to serve
+> multiple reads in the same PG concurrently. We can also process
+> writes on multiple objects concurrently up to the point at which the
+> write is actually submitted."
+
+So a PG is no longer the unit of mutual exclusion — an object is. What
+holds the chain in order is `PipelineHandle`: entering the next stage
+is queued *before* the previous stage's barrier is released, and that
+deliberate overlap is what stops ops from reordering between stages. A
+head object and its clones share one pipeline through an `Orderer`
+holding the head's `ObjectContext`, while unrelated objects in the
+same PG proceed in parallel. The remaining locks in `pg.h` are narrow:
+a `shared_mutex` for background work (snaptrim, scrub) against client
+I/O, one around transaction submission, and a `tri_mutex` per object
+context — reads pipeline, writes pipeline, but never both at once.
+
+Two more Section 10 mechanisms have no counterpart:
+
+- **The op scheduler is effectively inert for client I/O.** mClock
+  exists in `src/crimson/osd/scheduler/`, but its throttle has exactly
+  one caller in the tree — recovery, always at
+  `background_best_effort` — and it is disabled by default anyway
+  (`crimson_osd_scheduler_concurrency` is `0`, meaning unlimited).
+  Back-pressure comes from the store's concurrent-transaction limit,
+  the messenger's byte throttler and the pipeline stages, not from
+  QoS. §10.2's "seat of QoS" has no equivalent here.
+- **Peering changes are an exception thrown into the chain**, not a
+  requeue from a queue. The op body runs under an interruptor that
+  checks whether the interval changed since it started, and injects
+  `actingset_changed` if so.
+
+## 11.3 One client op, across cores
+
+```
+ socket, reactor A
+   │  ms_dispatch → do_ms_dispatch → handle_osd_op
+   ▼
+ ConnectionPipeline           [core A]
+   await_active → await_map → get_pg_mapping
+                                  │  miss → invoke_on(0), least-loaded
+ ═══ cross-core hop: leave pipeline, move registry entry, ═══
+ ═══ foreign_ptr the connection, reorder by sequence no.  ═══
+                                  ▼
+ PerShardPipeline             [core B]
+   create_or_wait_pg
+   ▼
+ CommonPGPipeline             [per PG]
+   wait_pg_ready → get_obc
+   ▼
+ CommonOBCPipeline            [per OBJECT — parallel inside one PG]
+   process → wait_repop → send_reply
+      │          │
+      │       PGRepopPipeline: process → wait_commit → send_reply
+      │       ReplicatedBackend::submit_transaction
+      ▼
+   FuturizedStore::Shard::do_transaction
+      ├─ SeaStore   same reactor, no thread hop
+      └─ AlienStore queue → alien-store-tp → BlueStore → eventfd back
+```
+
+A PG belongs to a core, but not by the arithmetic of §10.2. The
+mapping is dynamic and load-balanced: a miss is proxied to core 0,
+which picks the core with the fewest PGs, then broadcasts the result
+to every core's local copy. A disagreement is fatal —
+`ceph_abort("The pg mapping is inconsistent!")`.
+
+The hop is unavoidable and common, because a connection's reactor is
+wherever Seastar's socket landed and there is no connection-to-PG
+affinity. Its cost, per op that crosses: exit the source pipeline,
+deregister from the source core's operation registry, convert the
+connection to a `foreign_ptr`, `submit_to` the target core,
+re-register, then wait for the cross-core sequence number to come up
+in order — `smp::submit_to` does not preserve order, so Crimson
+re-establishes it by hand. Ops that already know their PG is active
+(replica ops, recovery subops) take a shorter path that skips the
+connection pipeline entirely.
+
+Introspection replaces the op tracker. Every op is an `Operation` with
+a type code and a compile-time tuple of `BlockingEvent`s: entering a
+stage timestamps it and records which `Blocker` it waited on, so "why
+is this op stuck" is answered by the blocker rather than by a thread
+backtrace. Which is the honest reason `dump_historic_ops` still exists
+here but is not the tool it was in Section 4.6 — the per-request data
+is real, while the `num_ops` field is a hardcoded `0`.
+
+## 11.4 The store: three backends, two worlds
+
+The backend factory recognises exactly two names — `cyanstore` and
+`seastore` — and falls through to AlienStore for everything else,
+which is how `bluestore` (the default, via `crimson_osd_objectstore`)
+is reached. Upstream's split:
+
+> "native" backends "perform I/O operations using the Seastar
+> reactor"; non-native ones "operate through a thread pool proxy,
+> which interfaces with object stores running in alien threads —
+> worker threads not managed by Seastar."
+
+**AlienStore** is the compromise that lets Crimson run today, and its
+cost is concrete. There is exactly one AlienStore for the whole
+process — one `ObjectStore`, one classic `CephContext`, one thread
+pool — and every reactor calls into it. Per read: a semaphore wait, a
+heap allocation plus **an eventfd created per in-flight op**, a
+lockfree-queue push, a futex wakeup into the pool, the blocking
+BlueStore call, then a `write(2)` on that eventfd to wake the reactor
+back up. Two cross-thread hops and two different wakeup mechanisms.
+Writes cross a third time, since BlueStore's commit `Context` fires on
+its own Finisher thread and posts back through
+`seastar::alien::submit_to`. Two details show how thin the bridge is:
+thread choice for non-collection ops is `rand() % n_threads` — a
+locking glibc call on the reactor — and any `dout` from BlueStore
+blocks its alien worker until the reactor drains it, with the source's
+own comment conceding the wait is "indeterministic".
+
+**SeaStore** is the native answer, and it is a different design from
+BlueStore rather than a port of it:
+
+```
+ BlueStore (§10, §6.4)              SeaStore
+ ─────────────────────              ────────
+ RocksDB for all metadata           no KV store at all — B-trees on the
+   over BlueFS                        journal: LBA, backref, onode, omap
+ deferred WAL for small writes      one journal; a transaction *is* a
+                                      record
+ allocator + freelist in RocksDB    segments + host-driven cleaning
+ in-place overwrite of blobs        copy-on-write extents, remap by
+                                      default
+ device GC trusted / discard        GC driven above the device, on
+                                      flash-segment boundaries
+```
+
+The reasoning upstream gives is that flash is internally segmented and
+the device cannot know what is still live, so the host should own the
+layout and the cleaning: "we can design an on-disk layout that is
+friendly to GC at lower layers and drive garbage collection at higher
+layers", noting "in practice discard is poorly implemented in the
+device and intervening software layers". The design is "based heavily
+on both f2fs and btrfs", and each reactor manages its own root — a
+separate store per core, not a shared one.
+
+Mechanically: extents are copy-on-write and addressed logically
+through a refcounted LBA B-tree (which is what makes clone and
+remap-based partial overwrite cheap), with a second backref tree
+mapping physical back to logical purely so the cleaner can ask what is
+still live in a segment. Transactions are **optimistic** — read set,
+write set, retired set; at commit, if every extent in the read set is
+still valid it lands, otherwise it fails with `eagain` and an
+unbounded retry loop runs it again. Rewrites climb a generation ladder
+so similarly-aged extents share segments, and cleaning runs as its own
+tracked transaction type.
+
+Worth knowing before you benchmark it: the segment cleaner's
+thresholds are compile-time constants at this tag, not tunables (that
+changed on `main`); the random-block journal is visibly incomplete —
+its `flush()` is a TODO stub and the matching cleaner is inert; and
+ZNS support exists in the tree but is build-gated off by default.
+CyanStore is memory-only, loses everything on crash, and exists "only
+for measuring OSD overhead, without the cost of actually storing
+data".
+
+## 11.5 What it costs, and what is missing
+
+The costs are the direct price of the model:
+
+- **Reactors busy-poll.** The tuning knobs say so in as many words —
+  `crimson_reactor_idle_poll_time_us` is "idle polling time before
+  sleeping; longer → more CPU".
+- **Sizing is rigid.** CPU allocation "cannot be changed after
+  deployment", and with AlienStore the reactor and alien cpusets must
+  be mutually exclusive.
+- **Cross-core hops are the common case** (§11.3), not the exception.
+- **Nothing may block**, so classic code either becomes futures or
+  goes behind the alien pool at the cost in §11.4.
+- **Debugging is different.** No human-readable backtrace on SIGSEGV
+  or SIGABRT — you run the output through
+  `src/seastar/scripts/seastar-addr2line`. Logs go to stdout, not
+  `log_file`. Section 9.7's admin socket does still work, including
+  per-PG `query` and `scrub`, plus `dump_metrics` and a real
+  Prometheus endpoint under `--prometheus_port`.
+
+Maturity, stated plainly by upstream: "Crimson is in a tech preview
+stage and is **not suitable for production use**", and the monitor
+makes you say so three times — enable an experimental feature, `ceph
+osd set-allow-crimson --yes-i-really-mean-it` (irrevocable), then
+`osd_pool_default_crimson`. Its own warning says crimson-osd "will
+likely cause crashes or data corruption".
+
+Verified restrictions at `v20.2.2`:
+
+| | |
+|---|---|
+| PG autoscale | must be `off`; pools get `NOPGCHANGE`, which cannot be cleared |
+| PG split/merge | not supported (allowed later, on `main`) |
+| Cache tiering | refused for crimson pools |
+| Erasure coding | **not refused — but `ECBackend` is a 37-line stub** whose reads return empty and whose `submit_transaction` does nothing |
+| librados/librbd | 239 `SKIP_IF_CRIMSON()` call sites in the test tree |
+| QA suites | RADOS and RBD only — no RGW or CephFS suite exists at this tag |
+
+Implemented and non-trivial: recovery, backfill, snapshots, scrub,
+watch/notify. The EC entry is the one to internalise — the monitor
+does *not* reject an EC crimson pool, so the failure mode is silence,
+not an error.
+
+## 11.6 Running it
+
+Crimson is not in the release binaries this post used; it needs its
+own build, and a newer toolchain than the rest of Ceph (GCC ≥ 13, for
+C++20 coroutines, against GCC ≥ 11 otherwise):
+
+```
+WITH_CRIMSON=true ./install-deps.sh
+./do_cmake.sh -DWITH_CRIMSON=ON
+cd build && ninja crimson-osd
+```
+
+Then Section 9.4's loop, with the Crimson flags:
+
+```
+MON=1 OSD=3 ../src/vstart.sh -d -n -x --crimson --crimson-smp 2
+MON=1 OSD=3 ../src/vstart.sh -d -n -x --crimson --seastore \
+      --seastore-devs /dev/nvme0n1
+../src/stop.sh --crimson
+```
+
+`--crimson` swaps the binary and forces msgr2; `--crimson-smp` sets
+reactors per OSD; `--crimson-alien-num-threads` sizes the alien pool;
+`--crimson-balance-cpu osd|socket` runs `assign_crimson_cores.py` to
+carve the two cpusets apart. vstart sets `allow_crimson` and forces
+autoscale off for you. One gotcha: unlike `ceph-osd`, `crimson-osd`
+does not daemonize even when told to, which is why `--crimson`
+implies `nodaemon`.
+
+Reading order, once §10's chain is familiar:
+[`src/crimson/osd/osd_operation.h`][src-crimson-op] for every pipeline
+stage in one file, then `pg_shard_manager.h`'s `start_pg_operation`,
+which holds the entire lifecycle of §11.3 — cross-core hop included —
+in a single function. Then `common/operation.h` for the pipeline
+machinery, and either `os/alienstore/thread_pool.h` or
+`os/seastore/cache.h` depending on which store you care about.
+
+> One sentence: Crimson keeps RADOS and throws away the threading —
+> a reactor per core, ordering rebuilt from per-object pipelines
+> instead of a PG lock, and a store that either runs on the reactor
+> (SeaStore) or is bridged to it by a thread pool (BlueStore).
+
+A caution on version: `crimson-osd` moves faster than the rest of
+Ceph. Against `v20.2.2`, `main` has already turned `ECBackend` into a
+real implementation, allowed PG split, replaced the segment cleaner's
+constants with tunables, and renamed most of the `crimson_*` CPU
+options (`crimson_seastar_num_threads` → `crimson_cpu_num`, and
+similarly for the rest). The execution model above — pipelines,
+`PGShardMapping`, the cross-core hop, the alien bridge — is unchanged
+between the two, but check the option names before copying a command.
+
+
 <!-- source links -->
 [ceph-tag]: https://github.com/ceph/ceph/tree/v20.2.2
 [src-osd]: https://github.com/ceph/ceph/tree/v20.2.2/src/osd
@@ -2944,6 +3287,10 @@ lock or single thread on the object data path.
 [src-sched]: https://github.com/ceph/ceph/tree/v20.2.2/src/osd/scheduler
 [ceph-hdd-shards]: https://github.com/ceph/ceph/commit/0d81e721378
 [tracker-66289]: https://tracker.ceph.com/issues/66289
+[seastar]: https://seastar.io/
+[src-crimson-op]: https://github.com/ceph/ceph/blob/v20.2.2/src/crimson/osd/osd_operation.h
+[doc-pipeline]: https://github.com/ceph/ceph/blob/v20.2.2/doc/dev/crimson/pipeline.rst
+[doc-glossary]: https://github.com/ceph/ceph/blob/v20.2.2/doc/glossary.rst
 [doc-arch]: https://github.com/ceph/ceph/blob/main/doc/architecture.rst
 [doc-manual]: https://docs.ceph.com/en/latest/install/manual-deployment/
 [doc-cephadm]: https://docs.ceph.com/en/latest/cephadm/install/
