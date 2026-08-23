@@ -1590,30 +1590,54 @@ entry object and header object.
  (client syscalls)   (reply delivery)   (MDS dispatcher)            (journal writer)          (MDS finisher)          (msgr - tp_osd_tp - kv_sync - kv_final)
      │                  ⋮                   ⋮                           ⋮                         ⋮                       ⋮
  #1,2 openat            ⋮                   ⋮                           ⋮                         ⋮                       ⋮
+     │                  ⋮                   ⋮                           ⋮                         ⋮                       ⋮
  #3 create ──────MClientRequest───────► #4-6 handle_client_openc
+     │                  ⋮                   ⋮                           ⋮                         ⋮                       ⋮
      │                  ⋮               #7 journal_and_reply            ⋮                         ⋮                       ⋮
+     │                  ⋮                   ⋮                           ⋮                         ⋮                       ⋮
      │                  ⋮               #8 early reply (unsafe) ─┐                                ⋮                       ⋮
                      #10 fill_trace ◄────────────────────────────┘
      │ (openat rets)    ⋮                                               ⋮                         ⋮                       ⋮
+     │                  ⋮                   ⋮                           ⋮                         ⋮                       ⋮
                                         #9 EUpdate queued ────────► #11 append 1694 B
      │                  ⋮                   ⋮                       (not flushed — the entry      ⋮                       ⋮
      │                  ⋮                   ⋮                        sits in the stream)          ⋮                       ⋮
+     │                  ⋮                   ⋮                           ⋮                         ⋮                       ⋮
+     │                  ⋮                   ⋮                           ⋮                         ⋮                       ⋮
  #12 write(2) 16 KiB — page cache only (Fb cap)                         ⋮                         ⋮                       ⋮
+     │                  ⋮                   ⋮                           ⋮                         ⋮                       ⋮
+     │                  ⋮                   ⋮                           ⋮                         ⋮                       ⋮
  #13 fsync              ⋮                   ⋮                           ⋮                         ⋮                       ⋮
+     │                  ⋮                   ⋮                           ⋮                         ⋮                       ⋮
  #14 MOSDOp 16 KiB ────────────────────────────────write 10000000001.00000000 pool 3────────────────────────────────► #15-17 arrives e13: dropped
+     │                  ⋮                   ⋮                           ⋮                         ⋮                       ⋮
      │                  ⋮                   ⋮                           ⋮                         ⋮                   #18-20 client resends e17
+     │                  ⋮                   ⋮                           ⋮                         ⋮                       ⋮
      │                  ⋮                   ⋮                           ⋮                         ⋮                   #21-25 big write, one 16 KiB aio
+     │                  ⋮                   ⋮                           ⋮                         ⋮                       ⋮
      │                  ⋮                   ⋮                           ⋮                         ⋮                   #26-31 commit cycle 1 (two barriers)
+     │                  ⋮                   ⋮                           ⋮                         ⋮                       ⋮
  (data durable) ◄────────────────────────────────────────────MOSDOpReply───────────────────────────────────────────── #32,33 reply
+     │                  ⋮                   ⋮                           ⋮                         ⋮                       ⋮
+     │                  ⋮                   ⋮                           ⋮                         ⋮                       ⋮
  (try_flush_caps) ─MClientCaps flush──► #34,35 handle_client_caps
+     │                  ⋮                   ⋮                           ⋮                         ⋮                       ⋮
      │                  ⋮               #36 cap-update EUpdate          ⋮                         ⋮                       ⋮
+     │                  ⋮                   ⋮                           ⋮                         ⋮                       ⋮
                                         #37,38 MDLog::flush ×2 ───► #39 append 1699 B
+     │                  ⋮                   ⋮                           ⋮                         ⋮                       ⋮
      │                  ⋮                   ⋮                       #40 _do_flush: cut it         ⋮                       ⋮
+     │                  ⋮                   ⋮                           ⋮                         ⋮                       ⋮
                                                                     #41,42 200.00000001 + head ──────2 MOSDOps──────► #43-59 two transactions
+     │                  ⋮                   ⋮                           ⋮                         ⋮                       ⋮
      │                  ⋮                   ⋮                           ⋮                         ⋮                   #60-65 commit cycle 2 — ONE kv batch
+     │                  ⋮                   ⋮                           ⋮                         ⋮                       ⋮
                                                                                               (finisher wakes) ◄───── #66-69 two replies
+     │                  ⋮                   ⋮                           ⋮                         ⋮                       ⋮
      │                  ⋮                   ⋮                           ⋮                     #70 safe reply (create)     ⋮
+     │                  ⋮                   ⋮                           ⋮                         ⋮                       ⋮
                      #72,73 handle_caps ×2 ◄──────────────────2 MClientCaps────────────────── #71 grant + flush_ack
+     │                  ⋮                   ⋮                           ⋮                         ⋮                       ⋮
  #74 fsync returns ◄── create safe
 ```
 
