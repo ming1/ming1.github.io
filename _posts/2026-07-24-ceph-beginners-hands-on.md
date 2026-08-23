@@ -2674,6 +2674,228 @@ bluestore_cache_data      61442 bytes   16 items
    devices, `RelWithDebInfo`, CBT.
 
 
+# 10. Inside ceph-osd: threads, shards and queues
+
+Section 4.6 watched an OSD from the wire and Section 6 read one from
+the disk; this section maps the machinery between the two — which
+thread picks a message up, which thread runs the PG, and which thread
+waits on the device. Scope: the classic `ceph-osd` of
+[`v20.2.2`][ceph-tag] with BlueStore, not the Crimson rewrite; thread
+counts are defaults and vary by release and configuration.
+
+## 10.1 The thread map
+
+There is no single "OSD worker thread". `ceph-osd` is a set of
+specialised thread groups handing work to each other through queues —
+names as `top -H` shows them:
+
+```
+      clients              peer OSDs             MON / MGR
+         └─────────────────────┼─────────────────────┘
+                               │ TCP
+ ┌─────────────────────────────┼───────────────── ceph-osd ──┐
+ │                             ▼                             │
+ │  msgr-worker-0..2   event loops: RX/TX, framing,   §10.3  │
+ │  ms_dispatch        fast + slow dispatch                  │
+ │                             │ enqueue_op()                │
+ │                             ▼                             │
+ │  tp_osd_tp          OSDShard queues → mClock       §10.2  │
+ │                     → PG::do_request()                    │
+ │                             │ queue_transactions()        │
+ │                             ▼                             │
+ │  bstore_aio         disk I/O completions           §10.4  │
+ │  bstore_kv_sync     fdatasync + RocksDB commit            │
+ │  bstore_kv_final    run completion Contexts               │
+ │                             │ on_commit, requeued on      │
+ │                             ▼ the op's shard              │
+ │                     reply out through the messenger       │
+ └───────────────────────────────────────────────────────────┘
+```
+
+Supporting cast, off the data path: `osd_srv_heartbt` plus dedicated
+heartbeat messengers (peer liveness, §10.5), `safe_timer` (timeouts),
+`rocksdb:low*` (compaction).
+
+## 10.2 Shards: the queue in front of every PG
+
+```
+                        OSD
+                         │   PG → shard:  pg_id.hash % num_shards
+        ┌────────────────┼────────────────┐
+        ▼                ▼                ▼
+    OSDShard 0       OSDShard 1       OSDShard 2   ...
+        │                │                │
+      queue            queue            queue      OpSchedulerItems
+        │                │                │
+     workers          workers          workers     tp_osd_tp
+        │                │                │
+       PGs              PGs              PGs       PG lock while running
+```
+
+Every PG hashes to one shard; every shard owns a queue and a few
+`tp_osd_tp` workers. The defaults come from the same rotational
+detection Section 9.4 met: HDD 5 shards × 1 thread
+(`osd_op_num_shards_hdd`, `osd_op_num_threads_per_shard_hdd`), SSD
+8 × 2 (the `_ssd` variants). One global queue would put every op on
+one lock and one dequeue order; sharding lets unrelated PGs run on
+different cores sharing nothing.
+
+The queue entries are not raw messages. `enqueue_op()` wraps
+everything — client ops, peering events, recovery, scrub, snap trim —
+into `OpSchedulerItem`s, and a scheduler (mClock by default) decides
+what a worker dequeues next. This is the seat of QoS: client I/O and
+background work compete here, weighted by `osd_mclock_profile`.
+
+The rule that makes it safe:
+
+> No thread mutates PG state except a shard worker that dequeued an
+> item for that PG, and it holds the PG lock while doing so.
+
+Messenger threads only enqueue; timers and peering events arrive as
+queue items too. The consequences: ops on one object are ordered
+(same object → same PG → same shard queue), two workers never run the
+same PG at once (PG lock), and different PGs proceed in parallel.
+When reading `src/osd/`, the synchronization to study is this funnel —
+`enqueue_op → dequeue_op → do_request` — not per-field mutexes.
+
+Why more than one worker per shard: BlueStore commits asynchronously,
+so a worker never sits on the disk wait — but it can be held for
+milliseconds of CPU (checksums, encode/decode) or a contended PG lock,
+and a second worker keeps the shard's *other* PGs moving meanwhile.
+
+## 10.3 The messenger never runs an op
+
+Every connection — client, peer OSD, MON, MGR — is multiplexed onto a
+few `msgr-worker-*` event loops (three by default). Their RX contract
+is strict: decode, hand off, return to `epoll`:
+
+```
+ msgr-worker-N                                   tp_osd_tp
+      │
+   RX bytes → decode MOSDOp
+   ms_fast_dispatch() → enqueue_op()
+      │──────────── OpSchedulerItem ──────────►  shard queue
+      │                                             ⋮
+   back to epoll — never touches               (runs later, §10.2)
+   PG or BlueStore state
+```
+
+If the loop thread executed ops synchronously, one slow storage op
+would stall every connection multiplexed behind it. Latency-critical
+types (`MOSDOp`, repop replies) take this **fast dispatch** path,
+straight from the messenger thread into the shard queue; rare control
+traffic (new osdmaps, commands) goes through a `DispatchQueue` and the
+`ms_dispatch` thread instead. TX mirrors RX: a worker hands the reply
+to the connection, the messenger writes it out when the socket allows.
+
+The glue between lanes is everywhere the same pair of primitives: a
+mutex+condvar queue to move work forward, and a `Context` callback —
+Ceph's completion object, run by finisher threads such as
+`bstore_kv_final` — to signal completion back.
+
+## 10.4 One write, lane by lane
+
+The write Section 4.6 caught in `dump_historic_ops`, spread across the
+lanes — the right column is the event the op tracker stamps at that
+hop:
+
+```
+ msgr-worker-*             tp_osd_tp                bstore_*
+      │
+  RX MOSDOp,
+  enqueue_op() ──────────► shard queue                        initiated
+      ⋮                    mClock dequeue, PG lock              started
+      ⋮                    PG::do_request()
+      ⋮                    PrimaryLogPG::do_op()
+      ⋮                    issue_repop():
+  TX MOSDRepOp ◄────────── send to osd.2, osd.13      waiting for subops
+      ⋮                    queue_transactions() ──► aio submitted
+      ⋮                    PG lock dropped,         bstore_aio: I/O done
+      ⋮                    worker moves on          bstore_kv_sync: fsync
+      ⋮                        ⋮                    bstore_kv_final: ctx
+      ⋮                    ◄── on_commit requeued ────┘       op_commit
+  RX 2× MOSDRepOpReply ──► shard queue                sub_op_commit_rec
+      ⋮                    all copies durable →
+  TX MOSDOpReply ◄──────── reply to client                  commit_sent
+```
+
+So the 20 ms Section 4.6 measured between `waiting for subops` and
+`op_commit` is not a thread blocking anywhere: the worker dropped the
+PG lock and moved on, and the time lives in the `bstore_*` lane (the
+[companion post][bluestore-post] walks that lane in depth). The two
+`sub_op_commit_rec` gaps are the same lanes running on the replicas,
+plus the network.
+
+This chain is also the recommended way into the source: follow this
+one write through `OSD::ms_fast_dispatch → enqueue_op →
+ShardedOpWQ::_process → dequeue_op → PG::do_request →
+PrimaryLogPG::do_op → issue_repop → BlueStore::queue_transactions`.
+Beyond the files Section 8.2 listed, that adds
+[`src/osd/OSD.{h,cc}`][src-osd] (dispatch, `OSDShard`,
+`ShardedOpWQ`), [`src/osd/scheduler/`][src-sched] (mClock) and
+[`src/msg/async/`][src-msg] (the messenger).
+
+## 10.5 Four conversations and a socket
+
+```
+               MON                            MGR
+      OSDMap ↓  ↑ MOSDBeacon,                  ↑ MMgrReport
+             ↓  ↑ failure reports              ↑ (perf counters, PG stats)
+             ↓  ↑                              ↑
+ clients ── MOSDOp ──►   ceph-osd   ◄──► MOSDRepOp, peering, recovery,
+                         │      ▲        backfill ─────────── peer OSDs
+                         │      └─────── heartbeats (own messengers)
+                         └── admin socket (local UNIX socket, §9.7)
+```
+
+- **Clients** reach the primary OSD directly — no gateway, no lookup
+  service — exactly the trace of Sections 4.5–4.6.
+- **Peer OSDs** exchange replication (`MOSDRepOp`/`MOSDRepOpReply` —
+  the "subops" of the event names; the old `MOSDSubOp` class is gone),
+  peering, recovery and backfill traffic. Heartbeats run over
+  dedicated front/back messengers with their own threads, so liveness
+  checks never queue behind data.
+- **MON**: authoritative maps down, beacons and failure reports up.
+  Map handling is itself asynchronous — an incoming `MOSDMap` is
+  persisted and published, then each PG catches up through the same
+  shard queues — alongside the `maybe_share_map` piggyback path of
+  Section 4.6.
+- **MGR** receives `MMgrReport` with perf counters and PG stats — the
+  material behind the dashboard and the `ceph -s` throughput line.
+- **Local processes** get exactly one door: the admin socket of
+  Section 9.7. `ceph tell osd.N` arrives over the normal messenger as
+  a command message.
+
+## 10.6 Old maps, and why this shape scales
+
+Older documentation draws the FileStore OSD; don't port that mental
+model:
+
+```
+ FileStore era                      v20.2.2 + BlueStore
+ ─────────────                      ────────────────────
+ Messenger                          Messenger, fast dispatch
+     ↓ DispatchQueue                    ↓ enqueue_op()
+ OSD OpWQ                           OSDShard queues, mClock
+     ↓                                  ↓ tp_osd_tp workers
+ PG                                 PG / PrimaryLogPG
+     ↓ journal queue                    ↓ queue_transactions()
+ FileStore OpWQ                     BlueStore TXC state machine
+     ↓ apply thread, page cache         ↓ aio + kv_sync / kv_final
+ write twice (journal + files)      write once + RocksDB metadata
+```
+
+The parallelism stacks: many OSDs per cluster × shards per OSD ×
+workers per shard × PGs per shard, with storage asynchronous
+underneath and replication fanning out across machines — no global
+queue, lock or thread on the object data path.
+
+> One sentence: messenger threads receive and send, shard workers run
+> the PG state machines, BlueStore threads make it durable, queues and
+> `Context`s glue the lanes together — and the PG is the unit that
+> keeps it all ordered.
+
+
 <!-- source links -->
 [ceph-tag]: https://github.com/ceph/ceph/tree/v20.2.2
 [src-osd]: https://github.com/ceph/ceph/tree/v20.2.2/src/osd
@@ -2685,6 +2907,8 @@ bluestore_cache_data      61442 bytes   16 items
 [src-auth]: https://github.com/ceph/ceph/tree/v20.2.2/src/auth
 [src-mon]: https://github.com/ceph/ceph/tree/v20.2.2/src/mon
 [vstart]: https://github.com/ceph/ceph/blob/v20.2.2/src/vstart.sh
+[src-msg]: https://github.com/ceph/ceph/tree/v20.2.2/src/msg/async
+[src-sched]: https://github.com/ceph/ceph/tree/v20.2.2/src/osd/scheduler
 [doc-arch]: https://github.com/ceph/ceph/blob/main/doc/architecture.rst
 [doc-manual]: https://docs.ceph.com/en/latest/install/manual-deployment/
 [doc-cephadm]: https://docs.ceph.com/en/latest/cephadm/install/
