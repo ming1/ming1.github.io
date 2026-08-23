@@ -3233,10 +3233,15 @@ error.
 
 That theme extends to the plumbing. In `MonCommands.h` two argument
 descriptors are missing the separator between them, so C string
-concatenation fuses them into `…req=falsename=crimson` — meaning
-`osd pool create … --crimson` is not a parseable flag at all, and
-`osd_pool_default_crimson` is the only working route to a crimson
-pool. Still true on `main`.
+concatenation fuses them into `…req=falsename=crimson`. Descriptors
+are tokenized on whitespace and then split on commas, so the fused
+token collapses back to `yes_i_really_mean_it` alone and `crimson`
+never enters the command signature: `osd pool create … --crimson` is
+not a parseable flag at all, and `osd_pool_default_crimson` is the
+only working route to a crimson pool. The same header carries the rule
+being broken — "Each descriptor must be separated by one space, no
+other characters" — and on `main` it has got worse, with a third
+argument since joining the pileup.
 
 ## 11.6 Running it
 
