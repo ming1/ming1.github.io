@@ -2807,7 +2807,8 @@ mutex+condvar queue to move work forward, and a `Context` callback —
 Ceph's completion object — to signal completion back. Note where a
 commit `Context` actually *runs*: not on the thread that fires it.
 `bstore_kv_final` drops it into the owning shard's `context_queue`,
-and a `tp_osd_tp` worker runs it under the PG lock.
+and a `tp_osd_tp` worker runs it — after the dequeue path has already
+dropped the PG lock, so the `BlessedContext` wrapper retakes it first.
 
 ## 10.4 One write, lane by lane
 
