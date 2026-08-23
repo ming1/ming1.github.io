@@ -2969,21 +2969,25 @@ Tentacle is the release where SeaStore became deployable alongside it.
  reply                              reply
 ```
 
-Shared-nothing is enforced at compile time, not by convention:
-`src/crimson/` builds its own `ceph-common` with the lock policy set
-to `SINGLE`, so refcounts and locks in shared Ceph code become
-non-atomic. Touching an object from the wrong core is therefore memory
-corruption rather than contention, which is why `assert_core()` and
-`seastar::this_shard_id()` checks are scattered through the tree.
-Process-global state (OSDMap, monclient, superblock) lives in
-`OSDSingletonState` on `PRIMARY_CORE = 0` and is reached by explicit
-`invoke_on(0, …)`.
+Shared-nothing is enforced at compile time, not by convention. Under
+`WITH_CRIMSON`, `ceph::mutex`, `ceph::recursive_mutex` and
+`ceph::shared_mutex` become empty structs whose `lock()`/`unlock()`
+compile to nothing, and `ceph_mutex_is_locked()` is `#define`d to
+`true` (`src/common/ceph_mutex.h`). Shared Ceph code that still calls
+`ceph::make_mutex()` therefore gets no mutual exclusion at all, so
+touching an object from the wrong core is a data race rather than
+contention — which is why `seastar::this_shard_id()` assertions guard
+shard-local state, and `PerShardState` wraps its own in an
+`assert_core()`. Process-global state (OSDMap, monclient, superblock)
+lives in `OSDSingletonState` on `PRIMARY_CORE = 0`, reached by
+explicit `invoke_on(0, …)`.
 
 Threads in a `crimson-osd` process:
 
-- **reactors** — `crimson_seastar_num_threads` (max 32; `0` is a fatal
-  startup error), or derived from `crimson_seastar_cpu_cores`. One per
-  dedicated core; pinning happens only in the cpuset form.
+- **reactors** — `crimson_seastar_num_threads` (max 32, and defaulted
+  to `0`, which aborts at startup) or `crimson_seastar_cpu_cores`; one
+  of the two must always be set. One reactor per dedicated core;
+  pinning happens only in the cpuset form.
 - **`alien-store-tp`** — `crimson_alien_op_num_threads` plain
   `std::thread`s, default **6**, present only with AlienStore.
 - **BlueStore's own threads, unchanged.** The alienstore target is
@@ -3031,8 +3035,9 @@ head object and its clones share one pipeline through an `Orderer`
 holding the head's `ObjectContext`, while unrelated objects in the
 same PG proceed in parallel. The remaining locks in `pg.h` are narrow:
 a `shared_mutex` for background work (snaptrim, scrub) against client
-I/O, one around transaction submission, and a `tri_mutex` per object
-context — reads pipeline, writes pipeline, but never both at once.
+I/O, and one around transaction submission. Per-object exclusion is a
+`tri_mutex` on the `ObjectContext` — reads pipeline, writes pipeline,
+but never both at once.
 
 Two more Section 10 mechanisms have no counterpart:
 
@@ -3101,7 +3106,9 @@ stage timestamps it and records which `Blocker` it waited on, so "why
 is this op stuck" is answered by the blocker rather than by a thread
 backtrace. Which is the honest reason `dump_historic_ops` still exists
 here but is not the tool it was in Section 4.6 — the per-request data
-is real, while the `num_ops` field is a hardcoded `0`.
+is real, while the `num_ops` field is a hardcoded `0`. One more trap
+when reading that output: `PGRepopPipeline`'s member is `wait_commit`,
+but the name it reports is `PGRepopPipeline::wait_repop`.
 
 ## 11.4 The store: three backends, two worlds
 
@@ -3169,8 +3176,10 @@ so similarly-aged extents share segments, and cleaning runs as its own
 tracked transaction type.
 
 Worth knowing before you benchmark it: the segment cleaner's
-thresholds are compile-time constants at this tag, not tunables (that
-changed on `main`); the random-block journal is visibly incomplete —
+availability thresholds are compile-time constants, not tunables
+(still constants on `main`, though the cleaner now re-derives them at
+runtime from observed usage); the random-block journal is visibly
+incomplete —
 its `flush()` is a TODO stub and the matching cleaner is inert; and
 ZNS support exists in the tree but is build-gated off by default.
 CyanStore is memory-only, loses everything on crash, and exists "only
@@ -3181,9 +3190,9 @@ data".
 
 The costs are the direct price of the model:
 
-- **Reactors busy-poll.** The tuning knobs say so in as many words —
-  `crimson_reactor_idle_poll_time_us` is "idle polling time before
-  sleeping; longer → more CPU".
+- **Reactors busy-poll.** The tuning knobs say so in as many words:
+  `crimson_reactor_idle_poll_time_us` is documented as "Longer reactor
+  poll time will result in larger CPU utilization."
 - **Sizing is rigid.** CPU allocation "cannot be changed after
   deployment", and with AlienStore the reactor and alien cpusets must
   be mutually exclusive.
@@ -3209,16 +3218,25 @@ Verified restrictions at `v20.2.2`:
 | | |
 |---|---|
 | PG autoscale | must be `off`; pools get `NOPGCHANGE`, which cannot be cleared |
-| PG split/merge | not supported (allowed later, on `main`) |
+| PG split/merge | blocked by that same flag — and the error tells you to unset `nopgchange`, which a crimson pool will not let you do. On `main` split is allowed by default, merge is opt-in per pool |
 | Cache tiering | refused for crimson pools |
 | Erasure coding | **not refused — but `ECBackend` is a 37-line stub** whose reads return empty and whose `submit_transaction` does nothing |
 | librados/librbd | 239 `SKIP_IF_CRIMSON()` call sites in the test tree |
 | QA suites | RADOS and RBD only — no RGW or CephFS suite exists at this tag |
 
 Implemented and non-trivial: recovery, backfill, snapshots, scrub,
-watch/notify. The EC entry is the one to internalise — the monitor
-does *not* reject an EC crimson pool, so the failure mode is silence,
-not an error.
+watch/notify. The EC entry is the one to internalise: the monitor's
+own comment says crimson "requires that the pool be replicated" and
+then never checks it, while `pg_backend.cc` happily constructs the
+stub backend for `TYPE_ERASURE`. The failure mode is silence, not an
+error.
+
+That theme extends to the plumbing. In `MonCommands.h` two argument
+descriptors are missing the separator between them, so C string
+concatenation fuses them into `…req=falsename=crimson` — meaning
+`osd pool create … --crimson` is not a parseable flag at all, and
+`osd_pool_default_crimson` is the only working route to a crimson
+pool. Still true on `main`.
 
 ## 11.6 Running it
 
@@ -3236,10 +3254,16 @@ Then Section 9.4's loop, with the Crimson flags:
 
 ```
 MON=1 OSD=3 ../src/vstart.sh -d -n -x --crimson --crimson-smp 2
-MON=1 OSD=3 ../src/vstart.sh -d -n -x --crimson --seastore \
+
+# SeaStore: one device per OSD, and vstart zeroes the first 1 MiB of each
+MON=1 OSD=1 ../src/vstart.sh -d -n -x --crimson --seastore \
       --seastore-devs /dev/nvme0n1
 ../src/stop.sh --crimson
 ```
+
+`--seastore-devs` takes a comma-separated list matched to OSDs by
+index, so asking for three OSDs and naming one device silently gives
+osd.0 the device and the other two files.
 
 `--crimson` swaps the binary and forces msgr2; `--crimson-smp` sets
 reactors per OSD; `--crimson-alien-num-threads` sizes the alien pool;
@@ -3264,10 +3288,11 @@ machinery, and either `os/alienstore/thread_pool.h` or
 
 A caution on version: `crimson-osd` moves faster than the rest of
 Ceph. Against `v20.2.2`, `main` has already turned `ECBackend` into a
-real implementation, allowed PG split, replaced the segment cleaner's
-constants with tunables, and renamed most of the `crimson_*` CPU
-options (`crimson_seastar_num_threads` → `crimson_cpu_num`, and
-similarly for the rest). The execution model above — pipelines,
+real implementation, allowed PG split by default, made the segment
+cleaner's GC formula a config option and its thresholds self-tuning,
+and renamed most of the `crimson_*` CPU options
+(`crimson_seastar_num_threads` → `crimson_cpu_num`, and similarly for
+the rest). The execution model above — pipelines,
 `PGShardMapping`, the cross-core hop, the alien bridge — is unchanged
 between the two, but check the option names before copying a command.
 
