@@ -1774,10 +1774,19 @@ owns the slow state. Case closed.
 
 ## What is actually happening inside the SSD
 
-The 9100 PRO (like every consumer NVMe) runs a **dynamic pseudo-SLC
-cache**: incoming writes land in flash programmed one bit per cell
-(fast), and firmware later folds them into TLC (slow) during idle. Two
-consequences produced every confusing number in this investigation:
+First, what pSLC actually is. A NAND cell stores bits as charge
+levels: SLC (single-level cell) distinguishes just 2 levels for 1 bit,
+TLC (triple-level cell) squeezes 8 levels into the same cell for 3
+bits. Hitting one of 8 narrowly-spaced levels needs a slow, multi-step
+program-and-verify sequence; hitting one of 2 widely-spaced levels is
+several times faster and far more forgiving. **Pseudo-SLC (pSLC)** is
+the trick of taking ordinary TLC blocks and programming them in 1-bit
+mode: the drive gives up 2/3 of those blocks' capacity in exchange for
+SLC-class program speed, and uses them as a write cache in front of the
+TLC array. The 9100 PRO (like every consumer NVMe) runs this as a
+**dynamic pSLC cache**: incoming writes land in pSLC-mode blocks fast,
+and firmware later folds them into TLC during idle. Two consequences
+produced every confusing number in this investigation:
 
 1. **A budget, not a rate.** The drive absorbs a few hundred GB of 4k
    random writes at 1.6–2.5M IOPS, then drops to its native folded/GC
@@ -1797,10 +1806,11 @@ consequences produced every confusing number in this investigation:
    and the burst budget regenerates. The drive passed every polygraph
    because the interrogation itself gave it time to recover.
 
-A third, smaller observation from the same data: read performance also
-depends on drive state — raw 4k reads measured 1.15M while the drive
-was digesting writes vs 2.5M+ when quiescent — so *read* benchmarks
-taken during or shortly after write tests are contaminated too.
+A third observation initially looked like the same story: raw 4k reads
+measured 1.15–1.22M in some sessions and 2.5M+ in others, which I first
+attributed to reads queueing behind background folding. A follow-up
+experiment found the dominant variable is something else entirely —
+see "Two more reproducibility variables" below.
 
 ## The theory behind it, with citations
 
@@ -1859,13 +1869,12 @@ evidence.
 [[Yoo & Shin, "Reinforcement Learning-Based SLC Cache Technique for Enhancing SSD Write Performance", HotStorage 2020](https://www.usenix.org/system/files/hotstorage20_paper_yoo.pdf)]
 [[Kim et al., "Alleviating Garbage Collection Interference Through Spatial Separation in All Flash Arrays", USENIX ATC 2019](https://www.usenix.org/system/files/atc19-kim-jaeho.pdf)]
 
-**Reads degrade while the drive digests writes.** Reads that land on a
-chip busy with GC/fold traffic queue behind it; the FAST '17 Tiny-Tail
-Flash work measured (in simulation) GC making reads 15–96× slower at
-the 90th–99th percentiles — consistent in kind with raw 4k reads
-measuring 1.15M mid-digestion vs 2.5M quiescent here. Benchmark
-implication: read numbers taken soon after write tests are contaminated
-too.
+**Reads can degrade while the drive digests writes.** Reads that land
+on a chip busy with GC/fold traffic queue behind it; the FAST '17
+Tiny-Tail Flash work measured (in simulation) GC making reads 15–96×
+slower at the 90th–99th percentiles. It is a real effect — but in this
+investigation it turned out to be the *smaller* read-side variable: the
+dominant one was LBA mapping state, covered next.
 [[Yan et al., "Tiny-Tail Flash: Near-Perfect Elimination of Garbage Collection Tail Latencies in NAND SSDs", FAST 2017](https://www.usenix.org/system/files/conference/fast17/fast17-yan.pdf)]
 
 **The host-side moral has a name too.** He et al.'s EuroSys '17 paper
@@ -1876,6 +1885,48 @@ violators — my fio matrix violated the contract knowingly (uniform
 random 4k over 1.8TB is the FTL's worst case) and the drive responded
 exactly as the contract predicts.
 [[He, Kannan, Arpaci-Dusseau & Arpaci-Dusseau, "The Unwritten Contract of Solid State Drives", EuroSys 2017](https://research.cs.wisc.edu/adsl/Publications/eurosys17-he.pdf)]
+
+## Two more reproducibility variables
+
+A later attempt to reproduce the read numbers failed — through-ublk and
+raw reads alike came in at 1.2–1.4M against the recorded 2.1–2.5M —
+and chasing that gap surfaced two more state variables worth naming.
+
+**LBA mapping state dominates random-read results.** After the
+benchmark sessions had overwritten the full 1.8TB with fio data, raw 4k
+randread measured 1.22M. One `blkdiscard` of the whole device — which
+deallocates every LBA — and the very next run measured **2.56M**. The
+mechanism: per NVMe deallocation semantics, a read of a deallocated LBA
+never touches NAND at all — the controller answers from the mapping
+table (typically with zeros) — so a random-read test over a
+mostly-unmapped device is largely benchmarking the controller's fast
+path, not flash reads. The "fast" read sessions had run on a freshly
+provisioned, mostly-unmapped drive; the "slow" ones on a fully-written
+one. Neither number is wrong — they measure different things — but a
+read benchmark is only comparable to another if the mapped fraction of
+the tested range matches. (This also retroactively explains the earlier
+1.15M-vs-2.5M raw-read spread better than GC interference did.)
+[[NVM Express Base Specification](https://nvmexpress.org/specifications/) — deallocated-LBA read behavior]
+
+**Interrupt placement changes per boot — and can land on your pinned
+threads.** After a reboot, the backing NVMe's completion IRQs happened
+to land on the very SMT siblings the benchmark pins ublk queue threads
+to; IRQ handlers and daemons then fight for the same cores. Re-pinning
+the queue threads onto siblings hosting no nvme vector (check
+`/proc/interrupts` + `/proc/irq/*/effective_affinity_list` after every
+boot) recovered ~9% on the spot (1.53M → 1.67M copy-mode reads). The
+IRQ-to-CPU distribution is assigned at device init, so it silently
+reshuffles the playing field on every boot — one more reason absolute
+numbers travel poorly between sessions while same-boot A/B comparisons
+stay valid.
+
+Even with the drive discarded, threads pinned IRQ-aware, and the same
+binary, that boot topped out at ~1.7M/1.8M through ublk versus the
+original session's 2.15M/2.55M — a residual per-boot variance I can
+name but not yet fully attribute. The general lesson compounds: a
+storage benchmark's absolute numbers are a property of drive state,
+boot state, and placement together; only comparisons made inside one
+such state are trustworthy.
 
 ## Conclusions
 
@@ -1895,6 +1946,12 @@ exactly as the contract predicts.
 - **Controls must run inside the anomaly window.** A control probe that
   runs after the system has had time to recover tests a different
   state. This one mistake cost three wrong hypotheses' worth of time.
+- **Random-read results depend on LBA mapping state**: discarded LBAs
+  are answered from the mapping table without touching flash. Normalize
+  with `blkdiscard` (or a full write) before comparing read numbers.
+- **Re-check IRQ affinity after every boot**: completion-vector
+  placement reshuffles at device init and can collide with pinned
+  worker threads.
 
 **About the ublk stack (the question that started all this):** once the
 drive is factored out, ublk-loop shows no read/write asymmetry at all.
