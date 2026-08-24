@@ -15,7 +15,11 @@
  *   a_ transactions entering BlueStore
  *   b_ object writes and bytes
  *   c_ RocksDB key set/rmkey/merge per prefix (O=onode, P=pgmeta-omap,
- *      L=deferred, ...)
+ *      L=deferred, ...), and single-key gets per prefix with their
+ *      found/ENOENT outcome -- the read side of the write path.  A
+ *      steady-state write workload shows ~no O gets (onodes come from
+ *      BlueStore's cache); a growing O get count means cold objects
+ *      (or an onode cache too small for the working set)
  *   d_ RocksDB commits; batch-size histogram = txcs amortized per
  *      sync commit (the two fdatasync barriers are paid per batch)
  *   e_ block-device writes keyed by issuing thread:
@@ -64,6 +68,21 @@ uprobe:$1:_ZN12RocksDBStore*3setE*PKcmRK*
 uprobe:$1:_ZN12RocksDBStore*5rmkeyE*
 { @c_kv_rmkey[str(*(uint64*)arg1)] = count(); }
 
+/* RocksDBStore::get(prefix, key: string, bl*) -- S7_ pins the repeated
+ * std::string parameter so the multi-key set/map overload is excluded */
+uprobe:$1:_ZN12RocksDBStore3getE*S7_P*
+{ @get_pfx[tid] = str(*(uint64*)arg1); }
+
+/* RocksDBStore::get(prefix, key: char*+len, bl*) */
+uprobe:$1:_ZN12RocksDBStore3getE*PKcmP*
+{ @get_pfx[tid] = str(*(uint64*)arg1); }
+
+/* get (return): count per prefix and outcome; 0 = found, -2 = ENOENT */
+uretprobe:$1:_ZN12RocksDBStore3getE*
+/@get_pfx[tid] != ""/
+{ @c_kv_get[@get_pfx[tid], (int32)retval == 0 ? "found" : "ENOENT"] = count();
+  delete(@get_pfx[tid]); }
+
 /* RocksDBStore::RocksDBTransactionImpl::merge(prefix, key, bl) */
 uprobe:$1:_ZN12RocksDBStore*5mergeE*
 { @c_kv_merge[str(*(uint64*)arg1)] = count(); }
@@ -108,4 +127,4 @@ uprobe:$1:_ZN6BlueFS5fsyncE*
 uprobe:$1:_ZN9BlueStore*_deferred_submit_unlockE*
 { @h_deferred_batches = count(); }
 
-END { clear(@batchn); }
+END { clear(@batchn); clear(@get_pfx); }

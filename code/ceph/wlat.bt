@@ -109,6 +109,28 @@ uprobe:$1:_ZN9BlueStore*_txc_committed_kvE*
 }
 
 
+/* ---- kv reads on the write path -------------------------------------- */
+/* RocksDBStore::get -- the onode ('O' key) load during op preparation.
+ * It fires BEFORE queue_transactions and only for objects missing from
+ * BlueStore's caches, so it is invisible to the txc stages above: a
+ * cold-object workload pays it as extra prep the histograms here
+ * price separately.  Zero gets under a steady rewrite workload is the
+ * expected (healthy) reading.  S7_ pins the single-key string
+ * overload; PKcmP the char*+len one. */
+uprobe:$1:_ZN12RocksDBStore3getE*S7_P*
+{ @get_ts[tid] = nsecs; }
+uprobe:$1:_ZN12RocksDBStore3getE*PKcmP*
+{ @get_ts[tid] = nsecs; }
+uretprobe:$1:_ZN12RocksDBStore3getE*
+/@get_ts[tid]/
+{
+  @kv_get_us = hist((nsecs - @get_ts[tid]) / 1000);
+  @sum_get  += (nsecs - @get_ts[tid]) / 1000;
+  @getn++;
+  if ((int32)retval == 0) { @get_found++; } else { @get_miss++; }
+  delete(@get_ts[tid]);
+}
+
 /* ---- OSD-level op span (op_w_latency's territory) -------------------- */
 /* OpTracker::create_request<OpRequest, Message*> (return) -- the op
  * enters request tracking, microseconds after ms_fast_dispatch.
@@ -155,6 +177,13 @@ END
            $on, @sum_osdop / $on);
   }
   clear(@osdn); clear(@sum_osdop); clear(@req_start);
+  $gn = (uint64)@getn;
+  if ($gn > 0) {
+    printf("%lld rocksdb gets (%lld found, %lld ENOENT), avg %lld us\n",
+           $gn, (uint64)@get_found, (uint64)@get_miss, @sum_get / $gn);
+  }
+  clear(@getn); clear(@get_found); clear(@get_miss);
+  clear(@sum_get); clear(@get_ts);
 
   /* print in pipeline order, then clear so exit does not re-print them
    * (client_us last: queue_transactions -> kv committed, us) */
@@ -164,4 +193,5 @@ END
   print(@kv_commit_us); clear(@kv_commit_us);
   print(@client_us);    clear(@client_us);
   print(@osd_op_us);    clear(@osd_op_us);
+  print(@kv_get_us);    clear(@kv_get_us);
 }
