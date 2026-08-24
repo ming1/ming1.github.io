@@ -1504,7 +1504,10 @@ dd if=/var/tmp/16k of=/var/tmp/ceph-mnt/f16k bs=16k count=1 conv=fsync
 almost nothing on the wire — it is the fsync that forces every
 durability promise to be paid at once, and the fan-out it triggers is
 the whole story. The `#` and `proc` columns say which process each
-line belongs to; `thread` is the comm, as before.
+line belongs to; `thread` is the comm, as before. (`wfscollect.sh`
+next to the trace script runs the whole collection — this run,
+§3.2.8's O_DIRECT variant, and the warmup/settle windows both need
+to come out clean.)
 
 ```
  #        us     tid  proc   thread          function                               event
