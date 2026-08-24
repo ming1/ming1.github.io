@@ -1821,6 +1821,93 @@ and, invisible to the client, two MDS→OSD journal writes on the
 metadata pool. Everything else was caps working as designed: the
 write itself, the size change, and the close never left the machine.
 
+### 3.2.8 The same write with O_DIRECT — the fsync splits in two
+
+One flag re-times the whole story. Add `oflag=direct` to the same
+workload:
+
+```bash
+dd if=/var/tmp/16k of=/var/tmp/ceph-mnt/f16kd bs=16k count=1 oflag=direct conv=fsync
+```
+
+and re-collect. The create prologue is the buffered run's #1–#10
+event for event (ordering jitter aside), so the trace below starts
+at the write:
+
+```
+ #        us     tid  proc   thread          function                               event
+11      1313   10453  client dd              write (syscall)                        fd=1 len=16384
+12      1320    7181  mds    mds-log-submit  Journaler::append_entry                len=1729 B
+13      1362   10453  client dd              ceph_osdc_start_request                obj=100000001f8.00000000 pool=3
+14      2597    6587  osd    msgr-worker-1   OSD::ms_fast_dispatch                  op arrives
+15      2613    6587  osd    msgr-worker-1   OSD::enqueue_op                        epoch 23 -> shard queue
+16      2653    7040  osd    tp_osd_tp       OSD::dequeue_op                        worker picks op
+17      2765    7040  osd    tp_osd_tp       ReplicatedBackend::submit_transaction  obj=100000001f8.00000000 pool=3
+18      2812    7040  osd    tp_osd_tp       BlueStore::queue_transactions          transaction arrives
+19     14429    7040  osd    tp_osd_tp       PrimaryLogPG::log_op_stats             reply -> requester (in osd 11821 us)
+20     15040   10453  client dd              fsync (syscall)                        fd=1
+21     15461    7093  mds    ms_dispatch     MDSDaemon::ms_dispatch2                MClientCaps
+22     15469    7093  mds    ms_dispatch     Locker::handle_client_caps             cap flush from client
+23     15504    7093  mds    ms_dispatch     MDLog::_submit_entry                   event queued
+24     15519    7093  mds    ms_dispatch     MDLog::flush                           kick submit thread
+25     15541    7093  mds    ms_dispatch     MDLog::flush                           kick submit thread
+26     15595    7181  mds    mds-log-submit  Journaler::append_entry                len=1742 B
+27     15607    7181  mds    mds-log-submit  Journaler::_do_flush                   journal write -> objecter
+28     15628    7181  mds    mds-log-submit  Objecter::_op_submit                   obj=200.00000001 pool=2
+29     15673    7181  mds    mds-log-submit  Objecter::_op_submit                   obj=200.00000000 pool=2
+30     15784    6586  osd    msgr-worker-0   OSD::ms_fast_dispatch                  op arrives
+31     15802    6586  osd    msgr-worker-0   OSD::enqueue_op                        epoch 23 -> shard queue
+32     15833    6586  osd    msgr-worker-0   OSD::ms_fast_dispatch                  op arrives
+33     15842    6586  osd    msgr-worker-0   OSD::enqueue_op                        epoch 23 -> shard queue
+34     15850    7041  osd    tp_osd_tp       OSD::dequeue_op                        worker picks op
+35     15902    7041  osd    tp_osd_tp       ReplicatedBackend::submit_transaction  obj=200.00000001 pool=2
+36     15936    7041  osd    tp_osd_tp       BlueStore::queue_transactions          transaction arrives
+37     16099    7042  osd    tp_osd_tp       OSD::dequeue_op                        worker picks op
+38     16167    7042  osd    tp_osd_tp       ReplicatedBackend::submit_transaction  obj=200.00000000 pool=2
+39     16210    7042  osd    tp_osd_tp       BlueStore::queue_transactions          transaction arrives
+40     21842    7040  osd    tp_osd_tp       PrimaryLogPG::log_op_stats             reply -> requester (in osd 6043 us)
+41     22161    7180  mds    mds-rank-fin    Server::reply_client_request           reply -> client
+42     22197    7180  mds    mds-rank-fin    Locker::file_update_finish             journaled -> flush_ack
+43     22454   10106  client kworker/11:2    ceph_handle_caps                       MClientCaps from mds
+44     22548   10453  client dd              fsync (syscall)                        done (7508 us)
+45     22548   10106  client kworker/11:2    ceph_handle_caps                       MClientCaps from mds
+46     26369    7040  osd    tp_osd_tp       PrimaryLogPG::log_op_stats             reply -> requester (in osd 10528 us)
+```
+
+Two structural differences against §3.2.4–§3.2.6, both visible at a
+glance:
+
+- **The MOSDOp leaves inside `write(2)`.** With `O_DIRECT`,
+  `ceph_write_iter` takes the `ceph_direct_read_write` path
+  (`fs/ceph/file.c`): no page cache, the OSD write is issued in
+  `dd`'s context 49 µs into the syscall (#13) and the syscall blocks
+  until the ondisk reply (#19) — `write(2)` holds `dd` for
+  ~13 ms. §3.2.4's "nothing on the wire" is a property of the
+  `Fb` cap being *used*, not of the protocol; the flag opts out of
+  the buffering, and the data phase moves from the fsync into the
+  write.
+- **fsync only pays the metadata half.** There are no dirty pages
+  left to write back, so `ceph_fsync` goes straight to the cap
+  flush (#21), and the journal phase runs exactly as in §3.2.6 —
+  cap-update EUpdate, one journal append carrying both entries, the
+  header write behind it — for 7.5 ms total (#44). The header-object
+  write straggles into a later kv batch again (#46, `in osd
+  10528 us`, replying 3.8 ms after the fsync returned) —
+  reproducing §3.2.6's observation on a second run: `write_head` is
+  bookkeeping off the critical path, whichever way the data gets to
+  the pool.
+
+End to end the wall time is nearly unchanged (~22.5 ms vs ~25 ms
+buffered) — the same two BlueStore commit cycles, redistributed. What
+changed is *who waits where*: buffered, the application sails through
+`write(2)` and pays everything at the sync point; direct, every
+`write(2)` is a synchronous RADOS round trip. For this
+one-write-then-fsync shape the difference is cosmetic. For any real
+workload it is not — buffered writes let the client coalesce a
+stream of small writes into few OSD ops at writeback time, while
+`O_DIRECT` pays one round trip *per write* and gives up exactly the
+amortization that caps exist to make safe.
+
 # 4. Code analysis
 
 The trace sections answer *what happened*; this section reads the code
