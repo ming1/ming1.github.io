@@ -19,9 +19,12 @@
  * and Ctrl-C after a few seconds.
  *
  * The client lane is the kernel: syscall tracepoints gated to comm
- * "dd" (use dd for the traced write and nothing else), plus kprobes
- * on fs/ceph + libceph entry points (they need /sys/kernel/btf for
- * the struct decodes).  The clock zeroes at dd's first openat.
+ * "dd" (use dd for the traced write and nothing else), plus probes on
+ * fs/ceph + libceph entry points.  The two that decode structs are
+ * kfunc probes so the types come from the ceph/libceph *module* BTF
+ * (a kprobe cast sees only vmlinux BTF); if your kernel builds cephfs
+ * in (CONFIG_CEPH_FS=y), change kfunc:ceph:/kfunc:libceph: to
+ * kfunc:vmlinux:.  The clock zeroes at dd's first openat.
  *
  * Columns:
  *   us        microseconds since dd's openat of the target file
@@ -87,17 +90,18 @@ tracepoint:syscalls:sys_exit_fsync
 /* ==== client lane: fs/ceph + libceph (kernel client) ================== */
 
 /* ceph_mdsc_submit_request(mdsc, dir, req) -- an MDS request leaves the
- * client.  r_op via kernel/module BTF. */
-kprobe:ceph_mdsc_submit_request
+ * client.  A kfunc probe, not a kprobe: fs/ceph is usually a module,
+ * and typed args come from the module's BTF (a kprobe cast can only
+ * see vmlinux BTF, which has these structs only when CONFIG_CEPH_FS=y). */
+kfunc:ceph:ceph_mdsc_submit_request
 /@t0/
 {
-  $req = (struct ceph_mds_request *)arg2;
   printf("%10lld %7d  %-6s %-16s %-38s op=0x%x%s\n",
          (nsecs-@t0)/1000, tid, "client", comm, "ceph_mdsc_submit_request",
-         $req->r_op,
-         $req->r_op == 0x0100 ? " lookup"
-         : ($req->r_op == 0x0101 ? " getattr"
-         : ($req->r_op == 0x1301 ? " create" : "")));
+         args.req->r_op,
+         args.req->r_op == 0x0100 ? " lookup"
+         : (args.req->r_op == 0x0101 ? " getattr"
+         : (args.req->r_op == 0x1301 ? " create" : "")));
 }
 
 /* ceph_fill_trace(sb, req) -- the MDS reply's inode+dentry trace is
@@ -117,14 +121,14 @@ kprobe:ceph_handle_caps
 
 /* ceph_osdc_start_request(osdc, req) -- a data-pool OSD request leaves
  * the client (dd's own context on the fsync path, or a writeback
- * worker).  Object + pool via BTF. */
-kprobe:ceph_osdc_start_request
+ * worker).  kfunc for the same reason as above: object + pool decode
+ * via libceph's module BTF. */
+kfunc:libceph:ceph_osdc_start_request
 /@t0/
 {
-  $r = (struct ceph_osd_request *)arg1;
   printf("%10lld %7d  %-6s %-16s %-38s obj=%s pool=%lld\n",
          (nsecs-@t0)/1000, tid, "client", comm, "ceph_osdc_start_request",
-         str($r->r_t.base_oid.name), $r->r_t.base_oloc.pool);
+         str(args.req->r_t.base_oid.name), args.req->r_t.base_oloc.pool);
 }
 
 /* ==== MDS lane ======================================================== */
@@ -245,12 +249,29 @@ uprobe:$3:_ZN8Objecter10_op_submitE*
          *(int64*)(arg1 + 80)); }        /* Op.target.base_oloc.pool */
 
 /* ==== OSD lane ======================================================== */
+/*
+ * Deliberately compressed: the request path down to
+ * BlueStore::queue_transactions, then nothing until the reply.  What
+ * happens inside BlueStore between those two lines is exactly the §3.1
+ * trace (wtrace.bt) and is not repeated here.  The reply line instead
+ * carries the op's whole OSD residence time, measured with oplat.bt's
+ * offset-free pairing: uretprobe on OpTracker::create_request returns
+ * OpRequestRef via the Itanium sret convention (retval = return-slot
+ * address, first 8 bytes = OpRequest*), and log_op_stats gets the same
+ * OpRequest* as arg1.
+ */
 
 /* OSD::ms_fast_dispatch -- an op arrives, still on the msgr worker */
 uprobe:$2:_ZN3OSD16ms_fast_dispatchE*
 /@t0/
 { printf("%10lld %7d  %-6s %-16s %-38s op arrives\n",
          (nsecs-@t0)/1000, tid, "osd", comm, "OSD::ms_fast_dispatch"); }
+
+/* OpTracker::create_request<OpRequest, Message*> (return) -- silent;
+ * starts the op's clock for the latency printed at log_op_stats */
+uretprobe:$2:_ZN9OpTracker14create_request*
+/@t0/
+{ @req_start[*(uint64*)retval] = nsecs; }
 
 /* OSD::enqueue_op(spg_t pg, OpRequestRef&&, epoch_t epoch) -- spg_t is
  * MEMORY-class under the SysV ABI (16 bytes but non-trivial), so it
@@ -282,79 +303,17 @@ uprobe:$2:_ZN9BlueStore*queue_transactionsE*
 { printf("%10lld %7d  %-6s %-16s %-38s transaction arrives\n",
          (nsecs-@t0)/1000, tid, "osd", comm, "BlueStore::queue_transactions"); }
 
-/* BlueStore::_do_write(txc, c, o, offset=arg4, length=arg5, bl, flags) */
-uprobe:$2:_ZN9BlueStore*_do_writeE*
-/@t0/
-{ printf("%10lld %7d  %-6s %-16s %-38s off=0x%lx len=0x%lx\n",
-         (nsecs-@t0)/1000, tid, "osd", comm, "BlueStore::_do_write", arg4, arg5); }
-
-uprobe:$2:_ZN9BlueStore*_do_write_bigE*
-/@t0/
-{ printf("%10lld %7d  %-6s %-16s %-38s whole min_alloc units\n",
-         (nsecs-@t0)/1000, tid, "osd", comm, "BlueStore::_do_write_big"); }
-
-uprobe:$2:_ZN9BlueStore*_do_write_smallE*
-/@t0/
-{ printf("%10lld %7d  %-6s %-16s %-38s sub-alloc, may RMW/defer\n",
-         (nsecs-@t0)/1000, tid, "osd", comm, "BlueStore::_do_write_small"); }
-
-/* KernelDevice::aio_write(off=arg1, bl=arg2, ...) */
-uprobe:$2:_ZN12KernelDevice*aio_writeE*
-/@t0/
-{ printf("%10lld %7d  %-6s %-16s %-38s bdev=%p off=0x%lx len=0x%x\n",
-         (nsecs-@t0)/1000, tid, "osd", comm, "KernelDevice::aio_write",
-         arg0, arg1, *(uint32*)(arg2+24)); }
-
-/* KernelDevice::flush -- silent at entry, the return reports latency */
-uprobe:$2:_ZN12KernelDevice*flushE*
-/@t0/
-{ @ts_fl[tid] = nsecs; @fl_dev[tid] = arg0; }
-uretprobe:$2:_ZN12KernelDevice*flushE*
-/@ts_fl[tid]/
-{ printf("%10lld %7d  %-6s %-16s %-38s fdatasync bdev=%p %lld us\n",
-         (nsecs-@t0)/1000, tid, "osd", comm, "KernelDevice::flush",
-         @fl_dev[tid], (nsecs-@ts_fl[tid])/1000);
-  delete(@ts_fl[tid]); delete(@fl_dev[tid]); }
-
-/* BlueFS::fsync(FileWriter*) -- the RocksDB WAL file fsync */
-uprobe:$2:_ZN6BlueFS5fsyncE*
-/@t0/
-{ printf("%10lld %7d  %-6s %-16s %-38s WAL file\n",
-         (nsecs-@t0)/1000, tid, "osd", comm, "BlueFS::fsync"); }
-
-/* RocksDBStore::submit_transaction_sync -- the kv commit */
-uprobe:$2:_ZN12RocksDBStore*submit_transaction_syncE*
-/@t0/
-{ @ts_kv[tid] = nsecs;
-  printf("%10lld %7d  %-6s %-16s %-38s start\n",
-         (nsecs-@t0)/1000, tid, "osd", comm, "RocksDBStore::submit_transaction_sync"); }
-uretprobe:$2:_ZN12RocksDBStore*submit_transaction_syncE*
-/@ts_kv[tid]/
-{ printf("%10lld %7d  %-6s %-16s %-38s done (%lld us)\n",
-         (nsecs-@t0)/1000, tid, "osd", comm, "RocksDBStore::submit_transaction_sync",
-         (nsecs-@ts_kv[tid])/1000); delete(@ts_kv[tid]); }
-
-/* BlueStore::_txc_committed_kv -- commit callbacks fire; the op reply
- * is set in motion */
-uprobe:$2:_ZN9BlueStore*_txc_committed_kvE*
-/@t0/
-{ printf("%10lld %7d  %-6s %-16s %-38s txc %p -> reply\n",
-         (nsecs-@t0)/1000, tid, "osd", comm, "BlueStore::_txc_committed_kv", arg1); }
-
-/* PrimaryLogPG::log_op_stats -- just before the MOSDOpReply is sent */
+/* PrimaryLogPG::log_op_stats(op, inb, outb) -- just before the
+ * MOSDOpReply is sent; the printed latency is the whole BlueStore +
+ * commit machinery this trace elides (see §3.1 for its anatomy) */
 uprobe:$2:_ZN12PrimaryLogPG12log_op_statsE*
-/@t0/
-{ printf("%10lld %7d  %-6s %-16s %-38s reply -> requester\n",
-         (nsecs-@t0)/1000, tid, "osd", comm, "PrimaryLogPG::log_op_stats"); }
-
-/* BlueStore::_deferred_submit_unlock -- background replay of a
- * deferred (small) write */
-uprobe:$2:_ZN9BlueStore*_deferred_submit_unlockE*
-/@t0/
-{ printf("%10lld %7d  %-6s %-16s %-38s background data replay\n",
-         (nsecs-@t0)/1000, tid, "osd", comm, "BlueStore::_deferred_submit_unlock"); }
+/@t0 && @req_start[arg1]/
+{ printf("%10lld %7d  %-6s %-16s %-38s reply -> requester (in osd %lld us)\n",
+         (nsecs-@t0)/1000, tid, "osd", comm, "PrimaryLogPG::log_op_stats",
+         (nsecs-@req_start[arg1])/1000);
+  delete(@req_start[arg1]); }
 
 END
 {
-  clear(@t0); clear(@ts_fs); clear(@ts_kv); clear(@ts_fl); clear(@fl_dev);
+  clear(@t0); clear(@ts_fs); clear(@req_start);
 }
