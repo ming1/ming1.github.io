@@ -136,6 +136,45 @@ uprobe:$1:_ZN9BlueStore6Writer18_defer_or_allocateE*
          (nsecs-@t0)/1000, tid, comm, "Writer::_defer_or_allocate", arg1);
   if (@stk) { printf("%s\n", ustack); } }
 
+/* ---- onode load: the kv read side of a write ------------------------- */
+/* RocksDBStore::get -- fires when op preparation needs a key that is
+ * not in BlueStore's caches, most notably the object's onode ('O' key)
+ * on the FIRST write to a cold object: PrimaryLogPG::do_op ->
+ * get_object_context -> Collection::get_onode -> db->get(PREFIX_OBJ).
+ * Note it runs on tp_osd_tp ~hundreds of us BEFORE that write's
+ * queue_transactions -- so to see it, the clock must already be
+ * running (warm the trace with one write, then write a cold object).
+ * A steady-state rewrite of a warm object prints no get at all: the
+ * onode comes from BlueStore's cache and rocksdb is never asked. */
+/* get(prefix, key: string, bl*) -- S7_ is the mangled repeat of the
+ * std::string parameter, which keeps this from matching the multi-key
+ * set/map overload */
+uprobe:$1:_ZN12RocksDBStore3getE*S7_P*
+/@t0/
+{ @ts_get[tid] = nsecs;
+  printf("%10lld %7d  %-16s %-38s %s keylen=%lld\n",
+         (nsecs-@t0)/1000, tid, comm, "RocksDBStore::get",
+         str(*(uint64*)arg1), *(uint64*)(arg2+8));
+  if (@stk) { printf("%s\n", ustack); } }
+
+/* get(prefix, key: char* + len, bl*) */
+uprobe:$1:_ZN12RocksDBStore3getE*PKcmP*
+/@t0/
+{ @ts_get[tid] = nsecs;
+  printf("%10lld %7d  %-16s %-38s %s keylen=%lld\n",
+         (nsecs-@t0)/1000, tid, comm, "RocksDBStore::get",
+         str(*(uint64*)arg1), arg3);
+  if (@stk) { printf("%s\n", ustack); } }
+
+/* get (return): 0 = found, -2 = ENOENT (asked, not there) */
+uretprobe:$1:_ZN12RocksDBStore3getE*
+/@ts_get[tid]/
+{ printf("%10lld %7d  %-16s %-38s %s (%lld us)\n",
+         (nsecs-@t0)/1000, tid, comm, "RocksDBStore::get",
+         (int32)retval == 0 ? "found" : "ENOENT",
+         (nsecs-@ts_get[tid])/1000);
+  delete(@ts_get[tid]); }
+
 /* ---- RocksDB staging ------------------------------------------------- */
 /* set(prefix, key: string, bl): keylen at key+8, vallen at bl+24 */
 /* RocksDBStore::RocksDBTransactionImpl::set */
@@ -404,7 +443,7 @@ END
   clear(@bf_n); clear(@bf_sum); clear(@blkdev_fsync_us);
   clear(@if_n); clear(@if_sum); clear(@blkdev_issue_flush_us);
   clear(@ts_if);
-  clear(@ts_kv); clear(@ts_fl); clear(@fl_dev); clear(@ts_sc);
+  clear(@ts_kv); clear(@ts_fl); clear(@fl_dev); clear(@ts_sc); clear(@ts_get);
   clear(@sc_fd); clear(@osd_pid); clear(@t0); clear(@stk);
   clear(@bdev); clear(@ts_bf); clear(@bf_ds);
 }

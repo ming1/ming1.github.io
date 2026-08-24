@@ -1024,6 +1024,37 @@ can refer to lines; the script does not print it:
 17      17593   33342  bstore_kv_final  BlueStore::_txc_finish                 txc 0x..ff0a80
 ```
 
+One thing this trace *cannot* show is the kv **read** side: where did
+the object's onode come from? Line #7 writes the `O` key, but nothing
+reads one. Two reasons, both structural. This is the second write to
+`o48`, so the onode is in BlueStore's cache and rocksdb is never
+asked — and even on a first write, the `get` fires during op
+*preparation* (`PrimaryLogPG::do_op` → `get_object_context` →
+`Collection::get_onode` → `db->get(PREFIX_OBJ, …)`), a couple of
+hundred µs **before** `queue_transactions` — before the event that
+starts this script's clock, so a first traced write hides it too.
+`wtrace.bt` now carries a `RocksDBStore::get` probe pair for exactly
+this; with the trace already warmed by an earlier write, a first-ever
+write to a cold object shows the read side in place:
+
+```
+        us     tid  thread           function                               event
+   5059324    8939  tp_osd_tp        RocksDBStore::get                      O keylen=36
+   5059384    8939  tp_osd_tp        RocksDBStore::get                      ENOENT (64 us)
+   5059562    8939  tp_osd_tp        BlueStore::queue_transactions          transaction arrives
+   5059613    8939  tp_osd_tp        BlueStore::_do_write                   off=0x0 len=0x4000
+   ...                               (continues exactly as the trace above)
+```
+
+Same tp_osd_tp worker, ~200 µs of op-prep between the answer and the
+transaction. `ENOENT` is the correct answer for a create — rocksdb
+was consulted, the key was absent, and BlueStore built a fresh onode;
+on a cold *existing* object the same probe prints `found`, reading
+back what line #7's `set` once wrote. The `O keylen=36` matching #7
+is no accident: this `get` and that `set` are the two ends of the
+onode's life in the kv store. (Excerpt collected on §3.2's lab — the
+§1.1 lab has since been rebuilt — but the shape is tree-independent.)
+
 ### 3.1.2 The map — four threads, three switches
 
 The trace crosses four threads; the right three start asleep and each
