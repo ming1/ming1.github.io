@@ -850,3 +850,257 @@ in `migrate_file`). Left out of the commit deliberately; it wants its own.
 - **Ramdisk numbers argue for latency structure, not latency magnitude.** They
   isolate the completion-thread bounce beautifully and say nothing usable about
   what serializing two device writes costs.
+
+
+# 5. The zero-copy path that never ran — every replicated write memcpys its payload on the replica
+
+Found by a bpftrace memory-copy census, not by a bug report · affects
+every replicated client write · component OSD (ReplicatedBackend /
+os/Transaction) · fix: one line · Status: fix implemented and
+verified on a 2-OSD lab (branch `kv-committing-local`), upstream PR
+pending
+
+## 5.1 Symptom
+
+Counting real copies of I/O data inside `ceph-osd` (uprobes on
+`buffer::ptr::copy_in` and `list::rebuild`, two-OSD vstart cluster,
+`rados put` workloads — method in
+[§7 of the I/O-path post]({% post_url 2026-08-10-bluestore-io-analysis %})):
+
+| 10 × 128 KiB replicated writes | payload copies |
+|---|---|
+| primary OSD | **0** — submits to O_DIRECT aio straight from the network rx buffer |
+| replica OSD | **10** — the full 128 KiB, once per write, in `tp_osd_tp` |
+
+The asymmetry is perfect: for each object, whichever OSD is primary
+copies nothing, and whichever is replica copies everything. Deferred
+4 KiB writes show the same thing at deferred-submit time. Nothing is
+wrong functionally — data is correct, scrubs are clean — the cluster
+just spends a full-payload memcpy per replica per write, forever.
+
+## 5.2 Root cause, top to bottom
+
+Each answer below was measured before moving down a level, DWARF
+call stacks first, then dumping the buffer geometry at the probe:
+
+```
+replica memcpys every write payload
+ └─ why?   KernelDevice::aio_write runs rebuild_aligned_size_and_memory
+           and it "had to rebuild"            (KernelDevice.cc:1162)
+           — O_DIRECT requires block-aligned memory; misaligned
+             buffers must be consolidated into a fresh allocation
+ └─ why misaligned?
+           the write data sits at byte +336 of the received DATA
+           segment (measured: bytes at raw+336 == file[0:4]),
+           and 336 % 4096 != 0
+ └─ why at +336?
+           the encoded transaction shipped ALL data in one stream:
+           [xattr blobs ~336 B][write payload] — its aligned
+           section was empty
+ └─ why empty?
+           Transaction::write() routes payload into data_aligned_bl
+           only when is_format_aligned() — i.e. when the transaction
+           knows its peers speak the aligned format (Transaction.h:900)
+ └─ why false?
+           is_format_aligned() tests data_features, and this
+           transaction was built with data_features = 0
+ └─ why 0?
+           ReplicatedBackend::submit_transaction uses the default
+           constructor:                        (ReplicatedBackend.cc:612)
+
+               ObjectStore::Transaction op_t;          // features = 0
+```
+
+The bottom of the chain is a wiring gap. Commit `a0c9fec7f451`
+("os/Transaction: page align write data buffers to improve
+performance", 2025-03) built the whole mechanism — split the encoded
+transaction into an aligned and a misaligned bufferlist, ship the
+aligned one first in the message's page-aligned DATA segment, decode
+it back into page-aligned views on the replica. It converted the
+recovery paths (`_do_push`, `_do_pull_response`,
+[`ReplicatedBackend.cc:989`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L989))
+to the feature-aware constructor — and left the client-write path,
+the hottest path in the OSD, on the default constructor. The same
+commit also deleted the old `header.data_off` alignment hint, the
+previous (v1-messenger-era) mechanism for this. So the old fix is
+gone and the new fix never engages: the machinery is complete,
+tested by every recovery op, and dormant where it matters most.
+
+What the wire actually carries, before and after:
+
+```
+              rx DATA segment on the replica (page-aligned buffer)
+
+  today (features=0)                     with the fix (features=peers)
+  +0   ┌───────────────────┐             +0   ┌───────────────────┐
+       │ attrs etc ~336 B  │                  │ write payload     │
+  +336 ├───────────────────┤                  │ (page-aligned,    │
+       │ write payload     │                  │  submitted as-is) │
+       │  → misaligned     │             +128K├───────────────────┤
+       │  → full memcpy at │                  │ attrs etc ~330 B  │
+       │    aio_write      │                  └───────────────────┘
+       └───────────────────┘
+```
+
+The messenger did its half all along — the DATA segment is always
+received into a page-aligned buffer
+([`ProtocolV2.cc:1234`](https://github.com/ceph/ceph/blob/v21.3.0/src/msg/async/ProtocolV2.cc#L1234),
+[`frames_v2.h:816`](https://github.com/ceph/ceph/blob/v21.3.0/src/msg/async/frames_v2.h#L816)).
+Alignment of the *buffer* is useless when the *payload* starts 336
+bytes into it; only the encode-side split can fix the offset, and
+the split was switched off.
+
+## 5.3 The fix — how
+
+```cpp
+// ReplicatedBackend::submit_transaction
+-  ObjectStore::Transaction op_t;
++  ObjectStore::Transaction op_t{get_parent()->min_peer_features()};
+```
+
+That is the entire change. With `data_features` set,
+`Transaction::write()` splits every ≥ page-size payload at its
+destination-page boundaries: the aligned middle goes to
+`data_aligned_bl`, the ragged head/tail (and everything smaller than
+a page) to `data_misaligned_bl`. The v10 encoding ships aligned
+first ([`Transaction.h:1379`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/Transaction.h#L1379))
+— at offset 0 of the page-aligned rx buffer — and the replica's
+`decode_bl` reassembles the write as views into that region
+([`Transaction.h:717`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/Transaction.h#L717)).
+`rebuild_aligned_size_and_memory` then finds nothing to rebuild.
+
+## 5.4 The fix — why it is safe
+
+Four hazards were checked before trusting one line:
+
+**The encode-version assert.** `Transaction::encode` aborts if an
+aligned-format transaction is encoded for a peer without the feature
+(`ceph_assert(ver >= 10)`). Cannot fire: construction
+(`submit_transaction`) and encoding (`generate_subop`) run in one
+synchronous chain under the PG lock, and peering — the only writer
+of `peer_features` — takes the same lock. Both sites see the same
+value, always.
+
+**Feature-mixing in `Transaction::append`.** Appending transactions
+with different `data_features` would mis-route decode — and is
+guarded by `ceph_assert(data_features == other.data_features)`
+([`Transaction.h:535`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/Transaction.h#L535)).
+The only `append` call sites are the EC/peering rollback visitor,
+whose transactions are all default-constructed among themselves; the
+replicated backend marks its log entries unrollbackable, and `op_t`
+itself is never appended to anything.
+
+**No replicas / mixed versions.** `peer_features` starts at the
+build's full supported set (`CEPH_FEATURES_SUPPORTED_DEFAULT`) and is
+only intersected per peer. No
+peers → aligned format used locally, which the local decode handles
+(and recovery I/O has exercised since the format landed). An old
+peer in the set → the TENTACLE bit drops out → byte-for-byte
+today's behavior. The wire format is self-describing —
+`data_features` travels in the encoding, so the decoder routes by
+what the encoder declared, never by guessing.
+
+**Sub-page and mixed writes.** Writes smaller than a page route
+entirely to the misaligned bl — exactly today's behavior. Mixed
+transactions (write + setattrs + omap + pg-log keys) only move the
+metadata *behind* the payload instead of in front of it.
+
+And the strongest argument is precedent: this is not a new
+construction pattern, it is the one `a0c9fec7f451` itself installed
+on the recovery paths, in production since it merged. The fix makes
+the client path consistent with the paths that already work.
+
+## 5.5 Reproducing
+
+Any vstart cluster where writes actually replicate:
+
+```bash
+MON=1 MGR=1 OSD=2 ../src/vstart.sh -n --without-dashboard
+bin/ceph osd pool create p1 32          # default size 3, 2 OSDs up -> 1 replica/write
+dd if=/dev/urandom of=/tmp/o128k bs=128k count=1
+```
+
+**Signal 1 — no tooling, just a debug line.** The rebuild in
+`KernelDevice::aio_write` logs at `debug_bdev 20`:
+
+```bash
+bin/ceph config set osd debug_bdev 20
+for i in $(seq 1 10); do bin/rados -p p1 put rep-$i /tmp/o128k; done
+bin/ceph config set osd debug_bdev 1/3
+grep -c "rebuilding buffer to be aligned" out/osd.*.log
+```
+
+Unpatched: the count lands on whichever OSD was the *replica* for
+each object — about 2 per write (one per 64 KiB blob), zero on the
+primary. Patched: zero everywhere. (`osd map p1 rep-N` tells you
+who was primary for each object.)
+
+**Signal 2 — the wire format is v10 yet still copies.** With
+`debug_ms 1`, the replica's receive line for a rep op shows
+`front+middle+data` as e.g. `1196+375+131408`: a non-zero middle
+proves the split encoding is active — and `131408 = 131072 + 336`
+says the payload still shares the data segment with 336 bytes of
+metadata in front of it.
+
+**Signal 3 — the precise probe.** Print where each aio write's
+buffer points inside its backing allocation (offsets for this
+layout: bufferlist first node at `+0`, node's raw at `+8`, ptr
+offset at `+16`, bl length at `+24`; find `aio_write`'s address with
+`nm bin/ceph-osd`, symbol-name attach trips on `.cold`-fragment
+twins):
+
+```
+uprobe:/path/to/bin/ceph-osd:0xADDR_OF_aio_write
+{
+  $bl = arg2;
+  if (*(uint32*)($bl+24) >= 65536) {
+    $node = *(uint64*)($bl+0);
+    printf("pid=%d off_in_raw=%d\n", pid, *(uint32*)($node+16));
+  }
+}
+```
+
+Unpatched, the replica prints `off_in_raw=336` (and `65872` for the
+second blob); the primary prints `0`/`65536`. Patched, everyone
+prints page-multiples. Full method — including the copy census that
+found this — in
+[§7 of the I/O-path post]({% post_url 2026-08-10-bluestore-io-analysis %}).
+
+## 5.6 Validation
+
+Same census, patched build, probes re-verified live (metadata
+counters non-zero):
+
+| | before | after |
+|---|---|---|
+| replica submit offset in rx buffer | 336 | **0** |
+| payload copies, 5 × 128 KiB direct writes | 5 × 131072 B (replica) | **0** on both OSDs |
+| payload copies, 5 × 4 KiB deferred writes | 5 × 4096 B (replica, deferred submit) | **0** |
+| `rebuild_aligned` calls | still run (2/op) | still run — but no longer copy |
+| `rados get` md5, 10 objects | ok | ok |
+| deep-scrub of both PGs | 0 errors | **0 errors** |
+| `rados bench` 64 K, qd 8 | — | 1906 writes, healthy |
+
+At pool `size=3` the line removes two full-payload memcpys
+cluster-wide from every client write.
+
+## 5.7 Takeaways
+
+- **A fix that ships but never engages looks exactly like a fix.**
+  The aligned format was reviewed, merged, and exercised daily — by
+  recovery. Nothing measured whether the path it was written for
+  ever took it. Counting copies at runtime found in one afternoon
+  what the code reading could not: `write_v10_aligned_bytes == 0`.
+- **Feature-gated formats need the features at *construction*, not
+  just at encode.** The encode call was dutifully passed
+  `min_peer_features()` — and it made no difference, because the
+  routing decision had already been taken, op by op, when the
+  transaction was built.
+- **Alignment is end-to-end or it is nothing.** Messenger-side
+  page-aligned rx buffers, transaction-side splits, and the
+  device-side rebuild are one chain; the census attributed the copy
+  to the device layer, but the cause — and the fix — live two
+  layers up.
+- Removing `header.data_off` and adding the split in one commit left
+  no overlap: for msgr2 rep ops there was no interval in which *any*
+  alignment mechanism was active on the hot path.
