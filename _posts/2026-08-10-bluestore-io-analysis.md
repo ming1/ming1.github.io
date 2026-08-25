@@ -3666,3 +3666,366 @@ benchmark. A concrete starting point: build the 47008 B shared-file
 reproducer and a 3901 B create storm, point wlat/oplat at them, and
 see which of the two barriers owns the latency — that number decides
 whether envelope mode or kv batching is the first patch.
+
+
+# 7. Memory copies and buffer lifetime — from wire to platter
+
+Where does an OSD actually *copy* I/O data, and who keeps the bytes
+alive? The intuition to overturn: the interesting copies are not in
+BlueStore. On the measured write path BlueStore itself copies nothing —
+the payload copies live in the messenger's receive buffering, in one
+dormant branch of the replication wire format, and inside RocksDB for
+deferred writes. This section is a census (measured, then explained),
+a hop-by-hop map of both paths, and the lifetime rules for the buffers
+underneath.
+
+Scope: classic write path (`bluestore_write_v2=false`), replicated
+backend, msgr2 crc mode. Lab: a two-OSD vstart cluster (pool size 3,
+third OSD down — every client write ships one sub-op to one replica),
+RelWithDebInfo, `rados put` workloads. Line anchors are v21.3.0
+unless marked *main*.
+
+## 7.1 The bufferlist rules — what copies and what doesn't
+
+Everything below reduces to one refcounting fact: a `bufferlist` is a
+chain of `ptr_node`s, each a *(raw, offset, length)* view onto a
+refcounted `raw` allocation. Operations that only make new views never
+touch the bytes.
+
+| primitive | verdict | anchor ([`buffer.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/buffer.cc)) |
+|---|---|---|
+| `append(const list&)`, `append(ptr,off,len)` | ref-share | :1442, :1424 |
+| `claim_append` | move (list splice) | :1291 |
+| `iterator::copy(len, list&)` — despite the name | ref-share | :805 |
+| `substr_of`, `splice`, copy-ctor, `share()` | ref-share | :1577 |
+| `iterator::copy(len, char*)`, `copy_deep` | **memcpy** | :751, :775 |
+| `rebuild()` | **memcpy all** into one buffer | :1172 |
+| `rebuild_aligned_size_and_memory(sz,mem,max)` | **memcpy the unaligned runs only** | :1213 |
+| `c_str()` on a fragmented list | **memcpy** (calls `rebuild`) | :1549 |
+
+Two consequences worth naming:
+
+- **A small view pins the whole raw.** `substr_of` of 4 KiB out of a
+  4 MiB receive buffer keeps all 4 MiB allocated until the last view
+  dies. Memory accounting by `bufferlist::length()` undercounts.
+- **`rebuild_aligned_size_and_memory` is surgical.** A ptr survives
+  untouched iff its *memory address* and its *length* are both
+  block-size-multiples and it sits at an aligned offset within its
+  run; everything else is consolidated and memcpy'd. One misaligned
+  byte at the front of a run drags the whole run into the copy.
+
+## 7.2 A census, not a code reading
+
+Code reading finds *potential* copies; only counting finds the real
+ones. Every bufferlist byte-copy funnels through `ptr::copy_in`, and
+every whole-list flatten through `rebuild(unique_ptr)`, so four
+uprobes on the `ceph-osd` binary cover the userspace data path
+(bpftrace, by raw address — the symtab's `.cold`/assert-stub twins
+break name attach, and `ceph-osd`'s statically linked buffer code
+interposes `libceph-common`, so the exe must be probed, not the lib):
+
+```
+ptr::copy_in(o, l, src, crc)      every bufferlist byte-copy, Σ bytes by thread
+list::rebuild(unique_ptr)         the flatten worker (bl _len at +24)
+list::rebuild_aligned_size_...    alignment checks (calls; copies land above)
+RocksDBTransactionImpl::set       kv ingest, keyed by prefix (arg1 = prefix string)
+```
+
+Ten `rados put` per phase; `comm` (= thread name) identifies the layer
+without stacks; a `perf probe --call-graph dwarf` pass on `rebuild`
+names the exact call sites. Copies ≥ 4096 B are "data", the rest is
+metadata noise.
+
+| phase | primary copies | replica copies | kv `L` bytes |
+|---|---|---|---|
+| 10 × 128 KiB write (direct) | **0** | **1 × 131072 per op** (`tp_osd_tp`, 2×64K chunks) | 0 |
+| 10 × 4 KiB write (deferred) | 0 | **1 × 4096 per op** (`bstore_mempool`) | 4135 per op **per OSD** |
+| 10 × 128 KiB read, cold | **0** | — | 0 |
+| 10 × read, cached | **0** | — | 0 |
+
+Sub-4 KiB traffic per op, for scale: ~0.3–1.5 KiB of xattr flattens
+and message framing, ~1.7 KiB of onode+pglog kv values. The headline:
+
+- **the read path is copy-free in userspace**, cold and warm;
+- **the primary writes client data with zero copies** — straight from
+  the network receive buffer into `io_submit`;
+- **the replica copies every byte of every write**, once — §7.4;
+- **a deferred write's data additionally enters RocksDB whole** — §7.5.
+
+## 7.3 The write path, hop by hop
+
+```
+client                    PRIMARY osd                              REPLICA osd
+  |                         |                                        |
+  | ==network==> [K] socket |                                        |
+  |    recvmsg -> rx DATA segment (page-aligned raw)   <-- (a) <=64K: 1 memcpy
+  |               | ref     Message::data                            |
+  |               | ref     OSDOp::indata                            |
+  |               | ref     PGTransaction  --(b) xattrs flatten      |
+  |               | ref     ObjectStore::Transaction {aligned|mis}   |
+  |               +--------------------.                             |
+  |               | ref                | ref (encode = append)       |
+  |          KernelDevice::aio_write   MOSDRepOp {MIDDLE=meta, DATA} |
+  |     (c) rebuild iff misaligned     | iovec sendmsg [K]           |
+  |          aio_t::bl pins ---> DMA   | ==network==> rx segment     |
+  |                                    |        | ref  Txn decode    |
+  |                                    |        KernelDevice::aio_write
+  |                                    |   (d) rebuild: THE copy, §7.4
+[K] = kernel copy (skb), unavoidable          aio_t::bl pins -> DMA
+```
+
+**Receive.** Each frame segment is read into one contiguous
+allocation, sized and aligned per the wire preamble
+([`ProtocolV2.cc:1234`](https://github.com/ceph/ceph/blob/v21.3.0/src/msg/async/ProtocolV2.cc#L1234));
+the DATA segment always declares page alignment — a compile-time
+constant on `MessageFrame`
+([`frames_v2.h:816`](https://github.com/ceph/ceph/blob/v21.3.0/src/msg/async/frames_v2.h#L816)).
+So a client write's payload lands page-aligned — with one exception,
+(a): reads up to `ms_tcp_prefetch_max_size` (default **64 KiB**) go
+through the connection's readahead buffer and are memcpy'd out of it
+([`AsyncConnection.cc:232`](https://github.com/ceph/ceph/blob/v21.3.0/src/msg/async/AsyncConnection.cc#L232)).
+Small and mid-size writes pay one hidden copy in the msgr worker;
+larger segments are read directly into the destination.
+
+**Up the OSD, by reference the whole way.** Message data →
+`OSDOp::indata` is an iterator-copy = view
+([`osd_types.h:4390`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.h#L4390));
+`do_osd_ops` hands `indata` to `PGTransaction::write` untouched — no
+rebuild, no realignment anywhere in `PrimaryLogPG`; `generate_transaction`
+converts to `ObjectStore::Transaction::write`, which *splits* the data
+by destination alignment into `data_aligned_bl` (the page-aligned
+middle) and `data_misaligned_bl` (head/tail), all `substr_of` views
+([`Transaction.h:900`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/Transaction.h#L900)).
+The one flatten on this leg, (b): `PGTransaction::setattrs` calls
+`rebuild()` on every xattr value
+([`PGTransaction.h:372`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PGTransaction.h#L372))
+— object_info + snapset, a few hundred bytes per op, on the primary.
+
+**Fan-out shares the raws.** `generate_subop` encodes the transaction
+per replica
+([`ReplicatedBackend.cc:1181`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L1181)):
+op metadata into the message MIDDLE segment, the two data bls into
+DATA — and encode of a bufferlist is `append`, so both replica
+messages and the local transaction reference the same client raws.
+Per-replica cost is ptr_nodes and ~1.5 KiB of metadata, not the
+payload. In **secure mode** this changes: TX encryption is
+out-of-place into a fresh contiguous buffer
+([`crypto_onwire.cc:120`](https://github.com/ceph/ceph/blob/v21.3.0/src/msg/async/crypto_onwire.cc#L120))
+— necessarily, since the plaintext raws are shared with the local
+aio — so each replica connection makes one full copy. RX decryption,
+by contrast, is in-place (:206). Asymmetric by design.
+
+**Send is iovec-direct.** One `iovec` per bufferptr, `sendmsg`
+([`PosixStack.cc:132`](https://github.com/ceph/ceph/blob/v21.3.0/src/msg/async/PosixStack.cc#L132));
+frame assembly splices with `claim_append`; nothing flattens.
+
+**Device submit, (c)/(d).** `KernelDevice::aio_write` is O_DIRECT, so
+it runs `rebuild_aligned_size_and_memory(block_size, block_size, IOV_MAX)`
+([`KernelDevice.cc:1133`](https://github.com/ceph/ceph/blob/v21.3.0/src/blk/kernel/KernelDevice.cc#L1133))
+— a no-op for aligned memory, a full memcpy of whatever isn't. Then
+`aio.bl.claim_append(bl)` pins the buffers for the IO's duration
+(:1195). On the primary the rx segment is page-aligned, so (c) never
+copies. On the replica, (d) fired on **every** write in the census.
+That asymmetry is a bug, and it has a one-line fix.
+
+**Touches** (every byte read, nothing copied): wire crc32c on rx and
+tx, cached on the raw; `ms_crc_data`'s replacement in secure mode is
+the in-place AES-GCM pass; the data-digest crc in `do_osd_ops`;
+`is_zero()` zero-block detection per big blob; BlueStore csum
+computation. A 128 KiB replicated write reads its own payload ~4×
+for integrity before any device sees it.
+
+## 7.4 The replica's full copy — a zero-copy design, dormant
+
+The census said: for every replicated write, exactly one side does a
+full-payload rebuild at `aio_write`, and the DWARF stacks put it under
+`ReplicatedBackend::do_repop` — always the replica, never the
+primary. Dumping the buffer at the probe made it concrete:
+
+```
+                       ptr_off_in_raw   raw_len   first bytes at raw+0
+primary  (64K chunk)          0          131072   fc 84 2b 16  = file[0:4]
+replica  (64K chunk)        336          131408   02 00 00 00  = attr-map count
+```
+
+The replica's write data sits at byte **336** of its received DATA
+segment — after the encoded xattr blobs — so `rebuild_aligned` must
+copy all of it. But the segment buffer itself *is* page-aligned, and
+the wire format was explicitly designed to put aligned data first:
+`Transaction::encode` v10 ships
+`DATA = data_aligned_bl + data_misaligned_bl`
+([`Transaction.h:1379`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/Transaction.h#L1379)),
+and the replica's `decode_bl` reassembles the write as views onto the
+aligned region ([`Transaction.h:717`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/Transaction.h#L717)).
+If the aligned bl were populated, the replica would be zero-copy.
+
+It never is. The split only happens when the transaction knows its
+peers' features
+([`Transaction.h:246`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/Transaction.h#L246)),
+and the client-write path constructs it with the default constructor —
+`data_features = 0`:
+
+```cpp
+// ReplicatedBackend::submit_transaction
+  vector<pg_log_entry_t> log_entries(_log_entries);
+  ObjectStore::Transaction op_t;              // <-- ReplicatedBackend.cc:612
+```
+
+so every byte routes into `data_misaligned_bl`, and the v10 encode
+dutifully ships an *empty* aligned segment followed by
+[336 B of attrs][the payload]. The recovery push/pull paths got the
+feature-aware constructor
+([`ReplicatedBackend.cc:989`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L989));
+the hot path did not. The same commit that added the split
+(`a0c9fec7f45`, "os/Transaction: page align write data buffers")
+also removed the old `header.data_off` alignment hint — so the
+previous mechanism is gone and its replacement is dormant.
+
+The fix, and the A/B on the same lab:
+
+```cpp
+-  ObjectStore::Transaction op_t;
++  ObjectStore::Transaction op_t{get_parent()->min_peer_features()};
+```
+
+| | replica ptr_off_in_raw | replica data copies | md5 / deep-scrub |
+|---|---|---|---|
+| before | 336 | 131072 B per 128K op, 4096 B per 4K op | ok / 0 errors |
+| after | **0** | **none** — census empty on both OSDs | ok / 0 errors |
+
+One line engages machinery that already exists, and removes a memcpy
+of the entire payload per replica per client write — at pool size 3,
+two copies cluster-wide for every write. The wire format is
+unchanged (`data_features` travels in the encoding; mixed versions
+fall back to the misaligned path).
+
+## 7.5 Deferred writes buy three more copies
+
+A deferred write (small writes; §1.6.3) journals the data in RocksDB
+before replaying it to the final location. The journaling is a real
+data copy — three, in fact, all inside RocksDB:
+
+```
+deferred op data (bl, ref)  --encode-->  L-record value        [ref: DENC appender
+                                                                keeps bl out-of-band]
+   put_bat: SliceParts of the fragments                        [ref]  RocksDBStore.cc:1688
+     -> WriteBatch rep_ string        append/memcpy   COPY 1
+     -> memtable insert               memcpy          COPY 2   (MemTable::Add)
+     -> WAL writer buffer -> BlueFS   memcpy          COPY 3
+replay: DeferredBatch::iomap bl       [ref]                    BlueStore.cc:5170
+     -> aio_write                     (+ alignment rebuild on the replica, pre-fix)
+```
+
+Measured at the kv boundary: a 4 KiB deferred write hands
+`RocksDBTransactionImpl::set` a **4135 B** `L`-prefix value — 4096 of
+data plus a 39 B envelope — on the primary *and* on each replica.
+The encoded value is never contiguous (the DENC contiguous-appender
+deliberately keeps the payload as out-of-band refs), so `put_bat`
+always takes the SliceParts branch
+([`RocksDBStore.cc:1688`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/RocksDBStore.cc#L1688));
+the ceph→rocksdb handoff itself is by reference, and the copies are
+rocksdb's own (`WriteBatchInternal::Put`, `MemTable::Add`,
+`WritableFileWriter::Append` in the submodule). The replay reads
+nothing back: the deferred aio writes from the in-memory refs.
+
+This is the price of the deferred design, not an accident — the data
+*is* the WAL record. But it means a 4 KiB deferred write moves its
+payload through memory ~5× (wire, 3× rocksdb, replay DMA) where a
+direct write moves it ~2×.
+
+Also in the small-write path, the one true BlueStore payload memcpy:
+`_pad_zeros` copies up to two chunk-size fragments when a sub-chunk
+write lands in a reused blob
+([`BlueStore.cc:16523`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L16523)).
+Bounded by 2 × csum-chunk, not by the payload. The v2 writer
+(`Writer.cc`) has no payload memcpy at all — its padding is
+zero-append plus `claim_append` — leaving `KernelDevice`'s rebuild as
+v2's only copy risk.
+
+## 7.6 The read path is already zero-copy
+
+The census shows nothing ≥ 4 KiB on either cold or cached reads, and
+the code agrees, end to end:
+
+```
+KernelDevice::aio_read   allocates page-aligned, DMA lands in it      [alloc]
+  -> did_read            cache insert, std::move                      [ref]  BlueStore.h:514
+  -> ready_regions       substr_of                                    [ref]
+  -> _generate_read_result_bl   claim_append                          [ref]
+  -> osd_op.outdata      passed down as &outdata, filled in place     [ref]
+  -> MOSDOpReply::data   merge_osd_op_vector_out_data = append        [ref]
+  -> socket              iovec sendmsg                                [K]
+```
+
+Cache hits return `substr_of` views of the live cached buffer — the
+in-flight client reply and the buffer cache genuinely share raws, and
+eviction only drops the cache's ref. Decompression (a copy by nature)
+and csum verify (a touch) are the only per-byte work.
+
+Two asymmetries worth knowing. Reads are cached by default
+(`bluestore_default_buffered_read=true`), writes are not
+(`bluestore_default_buffered_write=false`): write data enters the
+cache only as a transient STATE_WRITING entry that is dropped at
+commit (`_finish_write`, FLAG_NOCACHE). And the anti-pinning guard
+`maybe_rebuild` — deep-copy the buffer if >1 fragment or >1/8 of the
+raw is slop
+([`BlueStore.h:408`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L408))
+— runs on the write→clean transition but **never on `did_read`**, so
+read-populated cache entries pin their chunk-rounded device raws for
+their whole cache lifetime.
+
+## 7.7 Who pins the bytes, and until when
+
+The same raw is typically referenced by four owners at once. Nobody
+copies; everybody holds.
+
+| holder | pins | released when |
+|---|---|---|
+| `Message::data` + `OSDOp::indata` | the rx raws | `OpRequest` destructor / `_unregistered` → `clear_data` ([`OpRequest.cc:97`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OpRequest.cc#L97)) |
+| `InProgressOp` (primary) | the OpRequest | local commit **and** every replica ack — then the client reply is sent and the repop retires |
+| `RepModify` (replica) | the MOSDRepOp | the store's commit callback (`repop_commit`) after the txc commits |
+| `aio_t::bl` | write payload during `io_submit` | aio reaped — `release_running_aios` at STATE_IO_DONE ([`aio.h:37`](https://github.com/ceph/ceph/blob/v21.3.0/src/blk/aio/aio.h#L37): "so that it remains stable for duration") |
+| `deferred_txn` op data + `DeferredBatch` | deferred payload | batch stable & cleaned, `~TransContext` at STATE_DONE |
+| buffer cache (STATE_WRITING) | write payload | `_finish_write` at txc finish (dropped under default config) |
+| msgr `sent` list (lossless conns) | the whole Message, **data included** | peer's ack ([`ProtocolV2.cc:681`](https://github.com/ceph/ceph/blob/v21.3.0/src/msg/async/ProtocolV2.cc#L681), trimmed at :624) |
+
+Three rules fall out:
+
+1. **A client write's rx buffer lives well past the reply.** The
+   OpRequest chain releases at commit+acks+reply, but `aio_t::bl`
+   holds until the device IO completes, and on the replica-facing
+   *lossless* connection the sent MOSDRepOp — sharing the same raws —
+   stays queued for possible retransmit until the peer acks
+   (`requeue_sent` re-encodes payload but must keep data). Lossy
+   client connections free the reply at kernel-write time.
+2. **Multi-op messages pin everything together.** Every `indata` is a
+   view; one long-lived op keeps all ops' data resident.
+3. **The store's isolation contract needs no read locks partly
+   because of these pins** — the buffers a txc is writing are
+   refcounted snapshots; nothing mutates them in place (§4.1.1).
+
+## 7.8 What is left to remove, ranked
+
+1. **Wire the aligned transaction format into `submit_transaction`**
+   (§7.4, the one-liner). Eliminates a full-payload memcpy per
+   replica per write; already validated here. By far the best
+   byte-per-line ratio in this post.
+2. **Let large DATA segments bypass the readahead buffer.** The
+   ≤64 KiB rx memcpy (§7.3a) is the only remaining userspace copy on
+   the direct-write path post-fix; reading data segments straight
+   into their page-aligned destination would close it for the sizes
+   that matter to small-IO workloads.
+3. **Deferred RocksDB copies are structural** — the data is the WAL
+   record. Shrinking them means changing what gets journaled (e.g.
+   the v2 writer's tighter deferred criteria), not the copy code.
+4. **Secure-mode TX copies are load-bearing** — the plaintext is
+   shared with the local aio, so in-place encryption would corrupt
+   it. A per-message scratch pool could reduce allocator traffic,
+   not the copy count.
+5. `_pad_zeros` and the xattr flattens are noise at current sizes —
+   and the first is already gone in write v2.
+
+The method transfers: the four-probe census plus one DWARF stack pass
+answered in an afternoon what the code alone argued about for years —
+including finding a copy nobody would have looked for (readahead) and
+proving absent ones everywhere the code merely *looked* dangerous.
