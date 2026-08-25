@@ -3821,7 +3821,7 @@ frame assembly splices with `claim_append`; nothing flattens.
 
 **Device submit, (c)/(d).** `KernelDevice::aio_write` is O_DIRECT, so
 it runs `rebuild_aligned_size_and_memory(block_size, block_size, IOV_MAX)`
-([`KernelDevice.cc:1133`](https://github.com/ceph/ceph/blob/v21.3.0/src/blk/kernel/KernelDevice.cc#L1133))
+([`KernelDevice.cc:1162`](https://github.com/ceph/ceph/blob/v21.3.0/src/blk/kernel/KernelDevice.cc#L1162))
 — a no-op for aligned memory, a full memcpy of whatever isn't. Then
 `aio.bl.claim_append(bl)` pins the buffers for the IO's duration
 (:1195). On the primary the rx segment is page-aligned, so (c) never
