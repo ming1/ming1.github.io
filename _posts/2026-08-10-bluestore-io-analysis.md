@@ -1904,6 +1904,603 @@ stream of small writes into few OSD ops at writeback time, while
 `O_DIRECT` pays one round trip *per write* and gives up exactly the
 amortization that caps exist to make safe.
 
+## 3.3 One 16 KiB write, replicated
+
+§3.1 traced one write into a size-1 pool: one OSD, four threads,
+seventeen lines. Real pools replicate, and §3.1.6 ended on a promise —
+"with `size > 1` this is also where replication would converge". This
+case study keeps everything else the same — the same 16 KiB `rados
+put`, the same object, the same steady-state overwrite — and adds one
+replica. The trace follows the write through **three processes**: the
+`rados` client, the primary OSD, and the replica OSD. Both OSDs run on
+one host from one binary, so — as in §3.2 — bpftrace's monotonic clock
+covers all of them and the events sort onto a single timeline with no
+correlation machinery; the script is `wreplica.bt`, and the pid decides
+whether a line belongs to the `primary` or the `replica` lane.
+
+What is new is not BlueStore. Each OSD runs §3.1's pipeline unchanged,
+so the BlueStore lane is kept thin here (the store's entry, the data
+`aio_write`, the two barriers, the commit) and the trace spends its
+lines on what §3.1 could not show: how the primary fans the write out
+*before* it writes locally, what the replica does with a `MOSDRepOp`
+from the socket to `queue_transactions`, and how the primary collects
+two independent commits into one client reply. Two things fall out that
+no single-OSD trace can show. One is a memcpy: the replica's data
+`aio_write` starts 329 bytes into its receive buffer, and the O_DIRECT
+path copies the whole payload to realign it — §7.4's dormant zero-copy
+design, caught in the act. The other is an ordering: which OSD commits
+last is not fixed, and two runs of the same command show both cases.
+
+The lab: a vstart cluster in a QEMU VM (kernel 6.19, tree `11c38370dd1`
+RelWithDebInfo, the §3.2 lab), now with two OSDs on two block devices
+and a size-2 pool:
+
+| | |
+|---|---|
+| osd.0 | `/dev/nvme0n1`, 8 GiB, emulated NVMe |
+| osd.1 | `/dev/vdb`, 8 GiB, virtio-blk |
+| pool `p1` | 32 PGs, `size 2`, `min_size 1`, autoscaler off |
+| object `o48` | pg `2.2`, `up [0,1]`, primary osd.0 — so osd.0 is the `primary` lane and osd.1 the `replica` |
+
+```bash
+echo 0 > /sys/block/vdb/queue/rotational     # see below
+MON=1 OSD=2 MGR=1 MDS=0 ../src/vstart.sh -n --without-dashboard \
+    --bluestore-devs /dev/nvme0n1,/dev/vdb
+bin/ceph osd pool create p1 32
+bin/ceph osd pool set p1 size 2
+bin/ceph osd pool set p1 min_size 1
+bin/ceph osd pool set p1 pg_autoscale_mode off
+```
+
+The `rotational` line matters. A virtio disk advertises
+`rotational=1`, and BlueStore would have treated osd.1 as an HDD —
+`bluestore_prefer_deferred_size_hdd = 65536`, so this 16 KiB write
+would have gone *deferred* on the replica and *direct* on the primary,
+and the two lanes would not have been comparable. Clearing the flag
+before the OSD starts makes both OSDs detect `ssd`
+(`osd metadata` → `bluestore_bdev_type: ssd` on both), the same
+defaults §1.1 tabulated. Everything traced below — the replication
+protocol, the messenger, the OSD request path — is upstream code; the
+branch's reap change (§3.2) sits inside the elided BlueStore region and
+prints nothing either way. Absolute timings belong to this VM and its
+two virtual disks — read the shape, not the microseconds.
+
+On an optimized build the symbols must be resolved to addresses first
+(§3.2's `wfsrun.py` wart); `btaddr.py` is the general form of that
+preprocessor, and `wrepcollect.sh` next to the trace script runs the
+whole collection: it finds the primary and replica pids from
+`osd map`, checks that both OSDs were exec'd from the binary being
+probed, does the warmup write, and traces the second one.
+
+### 3.3.1 The workload and the trace
+
+```bash
+head -c 16384 /dev/urandom > /root/16k
+rados -p p1 put o48 /root/16k        # warmup: first write into the pg (§3.1.7)
+rados -p p1 put o48 /root/16k        # traced
+```
+
+Steady-state trace, second write to `o48`. The `#` column is added
+here; `proc` is which process the line belongs to; `bdev` and `txc`
+pointers are shortened for width:
+
+```
+ #       us     tid  proc     thread          function                               event
+ 1        5    9303  client   rados           Objecter::_op_submit                   obj=o48 pool=2 -> MOSDOp
+ 2      708    9306  client   msgr-worker-0   ProtocolV2::write_message              MOSDOp tid=1 -> socket, front+middle+data=219+0+16384 B
+ 3      802    6721  primary  msgr-worker-0   OSD::ms_fast_dispatch                  osd_op tid=1 arrives, 219+0+16384 B (frame rx+decode 44 us)
+ 4      823    6721  primary  msgr-worker-0   OSD::enqueue_op                        epoch 15 -> shard queue
+ 5      880    7189  primary  tp_osd_tp       OSD::dequeue_op                        worker picks op
+ 6      980    7189  primary  tp_osd_tp       PrimaryLogPG::issue_repop              rep_tid=3: replicate to peers + write locally
+ 7      996    7189  primary  tp_osd_tp       ReplicatedBackend::submit_transaction  obj=o48 pool=2: build op_t, waiting_for_commit = all shards
+ 8     1017    7189  primary  tp_osd_tp       ReplicatedBackend::issue_op            rep_tid=3: encode op_t into one MOSDRepOp per peer
+ 9     1035    7189  primary  tp_osd_tp       OSDService::send_message_osd_cluster   MOSDRepOp tid=3 -> osd.1 (encode, queue to msgr-worker)
+10     1083    7189  primary  tp_osd_tp       BlueStore::queue_transactions          transaction arrives
+11     1097    6723  primary  msgr-worker-2   ProtocolV2::write_message              MOSDRepOp tid=3 -> socket, front+middle+data=1130+296+16713 B
+12     1148    7189  primary  tp_osd_tp       KernelDevice::aio_write                bdev=0x..944400 off=0x80000 len=0x4000 src_off=0
+13     1679    7956  replica  msgr-worker-2   OSD::ms_fast_dispatch                  osd_repop tid=3 arrives, 1130+296+16713 B (frame rx+decode 30 us)
+14     1700    7956  replica  msgr-worker-2   OSD::enqueue_op                        epoch 15 -> shard queue
+15     1740    8383  replica  tp_osd_tp       OSD::dequeue_op                        worker picks op
+16     1752    8383  replica  tp_osd_tp       ReplicatedBackend::do_repop            decode MOSDRepOp -> transaction + log (56 us after arrival)
+17     1795    8383  replica  tp_osd_tp       BlueStore::queue_transactions          transaction arrives
+18     1835    8383  replica  tp_osd_tp       KernelDevice::aio_write                bdev=0x..514400 off=0x80000 len=0x4000 src_off=329
+19     1844    8383  replica  tp_osd_tp       buffer::list::rebuild                  memcpy 16384 B into a fresh aligned buffer
+20    10404    7154  primary  bstore_kv_sync  KernelDevice::flush                    fdatasync bdev=0x..944400 6028 us
+21    10793    8348  replica  bstore_kv_sync  KernelDevice::flush                    fdatasync bdev=0x..514400 6419 us
+22    16788    7154  primary  bstore_kv_sync  KernelDevice::flush                    fdatasync bdev=0x..945800 5148 us
+23    16810    7154  primary  bstore_kv_sync  RocksDBStore::submit_transaction_sync  kv commit done (6351 us): metadata durable
+24    16840    7155  primary  bstore_kv_final BlueStore::_txc_committed_kv           txc 0x..11e300 committed -> commit callbacks to shard queue
+25    17152    7181  primary  tp_osd_tp       ReplicatedBackend::op_commit           local commit rep_tid=3, waiting_for_commit=2 shard(s) before erasing self
+26    21686    8348  replica  bstore_kv_sync  KernelDevice::flush                    fdatasync bdev=0x..515800 9871 us
+27    21701    8348  replica  bstore_kv_sync  RocksDBStore::submit_transaction_sync  kv commit done (10868 us): metadata durable
+28    21886    8349  replica  bstore_kv_final BlueStore::_txc_committed_kv           txc 0x..fe0600 committed -> commit callbacks to shard queue
+29    21915    8375  replica  tp_osd_tp       ReplicatedBackend::repop_commit        committed -> MOSDRepOpReply(ONDISK) to osd.0 (in osd 20219 us)
+30    21924    8375  replica  tp_osd_tp       OSDService::send_message_osd_cluster   MOSDRepOpReply tid=3 -> osd.0 (encode, queue to msgr-worker)
+31    22209    7956  replica  msgr-worker-2   ProtocolV2::write_message              MOSDRepOpReply tid=3 -> socket, 111 B
+32    22294    6723  primary  msgr-worker-2   OSD::ms_fast_dispatch                  osd_repop_reply tid=3 arrives, 111 B (frame rx+decode 9 us)
+33    22307    6723  primary  msgr-worker-2   OSD::enqueue_op                        epoch 15 -> shard queue
+34    22878    7181  primary  tp_osd_tp       OSD::dequeue_op                        worker picks op
+35    22891    7181  primary  tp_osd_tp       ReplicatedBackend::do_repop_reply      peer commit received (sub_op_commit_rec), erase peer from waiting_for_commit
+36    22897    7181  primary  tp_osd_tp       PrimaryLogPG::repop_all_committed      rep_tid=3: all shards committed -> eval_repop -> reply
+37    22901    7181  primary  tp_osd_tp       PrimaryLogPG::log_op_stats             reply -> client (in osd 22082 us)
+38    23354    6721  primary  msgr-worker-0   ProtocolV2::write_message              MOSDOpReply tid=1 -> socket, 147 B
+39    23529    9306  client   msgr-worker-0   Objecter::handle_osd_op_reply          MOSDOpReply tid=1 <- primary, write is durable
+```
+
+Thirty-nine lines, three processes, and a handful of numbers worth
+reading before the walk-through:
+
+- **Two tids.** The client's op is `tid=1` (its first op ever — `rados`
+  is a fresh process); the replication round is `rep_tid=3`, the
+  primary's per-OSD counter, which starts at 0 (0 and 2 went to the two
+  warmup writes, 1 to §3.3.7's traced write). The
+  `MOSDRepOp` and its reply carry the rep_tid, the `MOSDOpReply` the
+  client's tid — the two namespaces never mix.
+- **Two wire shapes.** The client's message is
+  `219+0+16384` bytes: a small front, no middle, the payload as the data
+  segment. The primary's message to the replica is `1130+296+16713`:
+  five times the front (the pg-log entry, the primary's pg stats, and
+  the routing fields), a 296-byte middle (the encoded transaction's op
+  list), and a data segment that is **329 bytes longer than the
+  payload**. §3.3.3 takes it apart; §3.3.4 shows what that 329 costs.
+- **Two `src_off`s.** Line #12 and line #18 are the same 16 KiB going
+  to the same LBA on two disks. The primary's source buffer starts at
+  offset 0 of its receive buffer; the replica's at offset 329 — and
+  the very next line on the replica is a 16 KiB memcpy. The primary
+  has no such line.
+- **`in osd`.** The replica held its op for 20.2 ms (#29), the primary
+  for 22.1 ms (#37) — the primary's time *includes* the replica's, plus
+  two network hops and two dispatches.
+- The 703 µs before the `MOSDOp` even reaches the socket (#1→#2) is
+  the fresh `rados` process connecting to osd.0: TCP connect plus the
+  msgr2 banner/auth exchange. A second op on the same connection takes
+  52 µs from `_op_submit` to `write_message` (measured separately with
+  a 6 MiB put, which issues two ops on one connection). Long-lived clients pay it once.
+
+### 3.3.2 The map — two stores, one set
+
+The same three-lane picture as §3.2's map, but the two OSD lanes run
+the *same* pipeline on the *same* write, and the arrows between them
+carry the replication protocol. Thread names sit on the lines rather
+than in columns — with two OSDs, `tp_osd_tp` alone would be ambiguous:
+
+```
+ client (rados)            primary  osd.0                                      replica  osd.1
+ ──────────────            ──────────────                                      ──────────────
+ #1  _op_submit
+     │ connect + auth
+     │ (fresh process)
+ #2  MOSDOp ────────────►  #3  msgr-worker-0  fast_dispatch (rx 44 us)
+     219+0+16384 B         #4      └► shard queue
+                           #5  tp_osd_tp      dequeue_op
+                           #6      issue_repop              rep_tid=3
+                           #7      submit_transaction       waiting_for_commit = {osd.0, osd.1}
+                           #8      issue_op → generate_subop: op_t.encode(p, d)
+                           #9      send_message_osd_cluster ── encode MOSDRepOp, poke msgr-worker-2
+                           #10     queue_transactions           │
+                           #11 msgr-worker-2  write_message ◄───┘
+                                   MOSDRepOp 1130+296+16713 B ─────────────►  #13 msgr-worker-2  fast_dispatch (rx 30 us)
+                           #12 tp_osd_tp      aio_write  src_off=0            #14     └► shard queue
+                                   (io_submit; worker returns to pool)        #15 tp_osd_tp      dequeue_op
+                                                                              #16     do_repop: opt.decode ← views on the rx buffer
+                                                                              #17     queue_transactions [localt, opt]
+                                                                              #18     aio_write  src_off=329
+                                                                              #19     memcpy 16 KiB  (O_DIRECT realign)
+
+                           ┆ §3.1's pipeline, primary copy ┆                  ┆ §3.1's pipeline, replica copy ┆
+                           #20 flush data      6.0 ms                         #21 flush data      6.4 ms
+                           #22 flush WAL       5.1 ms
+                           #23 kv commit done  @16.8 ms
+                           #24 _txc_committed_kv
+                           #25 tp_osd_tp      op_commit    {osd.0, osd.1} → {osd.1}
+                                   … primary waits 5.7 ms for its peer …
+                                                                              #26 flush WAL       9.9 ms
+                                                                              #27 kv commit done  @21.7 ms
+                                                                              #28 _txc_committed_kv
+                                                                              #29 tp_osd_tp      repop_commit  (in osd 20.2 ms)
+                                                                              #30     send_message_osd_cluster ── MOSDRepOpReply
+                           #32 msgr-worker-2  fast_dispatch (rx 9 us) ◄────── #31 msgr-worker-2  write_message, 111 B
+                           #33     └► shard queue
+                           #34 tp_osd_tp      dequeue_op
+                           #35     do_repop_reply             {osd.1} → {}
+                           #36     repop_all_committed → eval_repop
+                           #37     log_op_stats  (in osd 22.1 ms)
+ #39 handle_osd_op_reply ◄ #38 msgr-worker-0  write_message: MOSDOpReply 147 B
+     (put returns, 23.5 ms)
+```
+
+**The primary is two things at once.** From #6 on, osd.0 is a
+*coordinator* — it owns `waiting_for_commit`, a `std::set<pg_shard_t>`
+seeded with every acting/recovery/backfill shard — the acting set, in
+steady state — itself included
+([`ReplicatedBackend.cc:638`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L638))
+— and a *storage node* running §3.1's pipeline on its own disk exactly
+as the replica does. The two roles meet only at the set: the local
+commit (#25) and the peer's reply (#35) each erase one member, and
+whichever erase empties the set fires `on_commit` and sends the client
+reply. There is no "primary commits, then asks the replica" — both
+stores start within 700 µs of each other and run in parallel; the
+client reply waits for the **slowest** of them.
+
+**Both commits ride the same two threads.** The `MOSDRepOp` and the
+`MOSDRepOpReply` are not special-cased anywhere in the OSD: each is a
+`Message` that `ms_fast_dispatch` wraps in an `OpRequest`, `enqueue_op`
+puts on the PG's shard queue, and a `tp_osd_tp` worker dequeues under
+the PG lock. The replica's write (#13–#15) and the primary's handling of
+the reply (#32–#34) go through exactly the three lines a client op does
+(#3–#5). Replication is ordinary op traffic between OSDs.
+
+The following sections walk each leg with the code locations. `RB` is
+`ReplicatedBackend.cc`, `PLP` is `PrimaryLogPG.cc`, `P2` is
+`msg/async/ProtocolV2.cc`, all at v21.3.0.
+
+### 3.3.3 Lines 5–12, the primary fans out before it writes
+
+One `tp_osd_tp` worker does the whole primary-side top half in 270 µs
+(#5→#12), and the order of its calls is the design:
+
+```
+#5  OSD::dequeue_op                  OSD.cc:9978  → pg->do_request → do_op → execute_ctx
+    │                                              (prepare: object context, build the
+    │                                               PGTransaction, prepare the reply — §3.1.6)
+#6  └► PrimaryLogPG::issue_repop     PLP:11696    rep_tid from the OSD's counter (:4501)
+#7     └► RB::submit_transaction     RB:591
+          ├► generate_transaction    RB:365       PGTransaction → ObjectStore::Transaction op_t
+          │                                       (touch, truncate, SETATTRS, omap, hint, WRITE — in that order)
+          ├► in_progress_ops[tid]    RB:626       waiting_for_commit = acting_recovery_backfill = {osd.0, osd.1}  (:638)
+#8        ├► issue_op                RB:1210      for each peer but self:
+          │  └► generate_subop       RB:1150         MOSDRepOp; op_t.encode(p, d, min_peer_features())  (:1181)
+          │                                          p → txn_payload (the middle), d → data      (:1183-1184)
+#9        │  └► send_message_osd_cluster  OSD.cc:1116   → con->send_message → ProtocolV2::send_message  P2:434
+          │                                          encode the MOSDRepOp NOW (fast-prepare), queue it,
+          │                                          poke the connection's msgr-worker
+          ├► log_operation           RB:659       pg-log entry + pg info into op_t (omap keys)
+          ├► register_on_commit      RB:668       C_OSD_OnOpCommit → op_commit, later
+#10       └► queue_transactions      RB:675       BlueStore takes op_t — the primary's §3.1 begins
+#12          └► … _do_write → aio_write           src_off=0: straight from the rx buffer
+#11 msgr-worker-2: write_message     P2:528       meanwhile: the MOSDRepOp goes onto the socket
+```
+
+Two orderings in that list are deliberate, and the trace shows both
+paying off.
+
+**The network leg starts before the local store sees the write.**
+`issue_op` runs *inside* `submit_transaction`, before `log_operation`
+and `queue_transactions`. By the time BlueStore's `queue_transactions`
+prints (#10, +1083), the replica's copy is already encoded and queued
+(#9, +1035), and msgr-worker-2 puts it on the socket (#11, +1097) while
+`tp_osd_tp` is still allocating and checksumming the local write (#12,
++1148). The two disks start their 16 KiB within 690 µs of each other
+(#12 vs #18). Had the primary written first and replicated after, the
+replica's whole pipeline would have been serialized behind the
+primary's `aio_write` and its 6 ms data flush.
+
+**The transaction is shipped, not re-derived.** `generate_subop` does
+not send the client's op to the replica; it sends `op_t` — the
+*result* of the primary's op execution, the same
+`ObjectStore::Transaction` the primary is about to queue locally.
+`op_t.encode(p, d, min_peer_features())` splits it into two
+bufferlists: `p`, the op list and small values (296 B, the middle
+segment), and `d`, the bulk data (16713 B, the data segment). The
+replica will decode and queue it without knowing or caring what RADOS
+op produced it. This is why the replica needs no object context, no
+snapshot logic, no class methods: replication in the replicated
+backend is transaction shipping.
+
+What the 1130+296+16713 bytes are, then:
+
+| Segment | Bytes | Content |
+|---|---|---|
+| front | 1130 | `MOSDRepOp::encode_payload`: reqid, pgid, object, epochs, versions, the encoded pg-log entry (`logbl`), and the primary's `pg_stat_t` — most of the size |
+| middle | 296 | `p`: `TransactionData` + the op list — one `OP_SETATTRS` (2 attrs) and one `OP_WRITE`, with collection/object references |
+| data | 16713 | `d`: **329 B** — 325 B of attr values (map count, `_` = `object_info_t`, `snapset`) plus the 4-byte length prefix the legacy encoding puts in front of the payload — *then* the 16384 B payload |
+
+The 329 come from two things. The op order in `generate_transaction`
+([`RB:450`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L450)
+`setattrs` before
+[`RB:489`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L489)
+`write`) appends the xattr values to the transaction's data stream
+first and the write payload after them; and because `op_t` was
+constructed with `data_features = 0`
+([`RB:612`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L612)),
+`Transaction::write` takes its legacy branch — `encode(write_data,
+data_misaligned_bl)`, a 4-byte length then the bytes
+([`Transaction.h:913`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/Transaction.h#L913))
+— and `Transaction::encode` has no aligned bufferlist to put first, so
+it ships the whole stream as-is. Hold that number for §3.3.4.
+
+The client's `MOSDOp`, by contrast, is `219+0+16384`: the op vector
+(one `write_full`) and the object name in the front, the payload as
+the data segment at offset 0. That is also why #12 reads `src_off=0`:
+the msgr2 receiver puts the data segment into a fresh page-aligned
+buffer (§7.3), the write's bufferlist is a view onto it, and
+`KernelDevice::aio_write` submits it as-is.
+
+**Where the send actually happens.** #9 is `tp_osd_tp` calling
+`OSDService::send_message_osd_cluster(peer, m, epoch)`
+([`OSD.cc:1116`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L1116)):
+it looks up the peer's cluster connection and calls
+`con->send_message(m)`. Inside, `ProtocolV2::send_message`
+([`P2:434`](https://github.com/ceph/ceph/blob/v21.3.0/src/msg/async/ProtocolV2.cc#L434))
+*encodes the message right there* — the OSD's messenger can
+fast-dispatch `MOSDRepOp`, so it may fast-prepare it too — appends it
+to the connection's `out_queue`, and wakes the connection's
+msgr-worker through the event center. The worker runs `write_event` →
+`write_message`
+([`P2:528`](https://github.com/ceph/ceph/blob/v21.3.0/src/msg/async/ProtocolV2.cc#L528)),
+which builds the frame from the already-encoded `payload`/`middle`/
+`data` bufferlists and writes it to the socket — #11, 62 µs after the
+poke, concurrently with `tp_osd_tp`. The PG thread never touches the
+socket; the msgr-worker never touches PG state. Serialization is on the
+PG thread, transmission on the messenger thread.
+
+### 3.3.4 Lines 13–19, the replica: from socket to `queue_transactions`
+
+The replica's msgr-worker-2 reads the frame — 32-byte preamble, then
+the three segments (the data segment into a fresh page-aligned buffer),
+then the epilogue — and `handle_message`
+([`P2:1402`](https://github.com/ceph/ceph/blob/v21.3.0/src/msg/async/ProtocolV2.cc#L1402))
+decodes the header into a `MOSDRepOp` and fast-dispatches it
+([`P2:1552`](https://github.com/ceph/ceph/blob/v21.3.0/src/msg/async/ProtocolV2.cc#L1552)):
+30 µs from preamble to #13. From there it is a client op's path with a
+different type code:
+
+```
+#13 OSD::ms_fast_dispatch            OSD.cc:7690   MOSDRepOp (type 112), tid=3 = the rep_tid
+    └► op_tracker.create_request    :7739         wrap it in an OpRequest — the same tracking as a client op
+#14 └► enqueue_op                    :9920         onto the pg's shard queue
+#15 OSD::dequeue_op                  :9978         a tp_osd_tp worker, PG lock taken
+    └► PrimaryLogPG::do_request     PLP:1824
+       └► pgbackend->handle_message PLP:1915      the backend gets first refusal on every op
+          └► RB::_handle_message    RB:212        switch (type): MSG_OSD_REPOP →
+#16          └► do_repop            RB:1266
+                ├► finish_decode                  the message's late-decoded fields
+                ├► RepModify rm                   opt (the shipped txn), localt (this OSD's own txn)
+                ├► rm->opt.decode(p, d)  RB:1304   p = middle, d = data — views onto the rx buffer, no copy
+                ├► decode(log, m->logbl)          the pg-log entry the primary wrote
+                ├► log_operation(…, rm->localt)  RB:1347  pg-log + pg-info keys into localt
+                ├► register_on_commit  RB:1357    C_OSD_RepModifyCommit → repop_commit, later
+#17             └► queue_transactions  RB:1364    tls = [localt, opt] — the replica's §3.1 begins
+#18                └► … _do_write → aio_write     src_off=329
+#19                   └► rebuild_aligned_size_and_memory → list::rebuild:  memcpy 16384 B
+```
+
+**Two transactions, one `queue_transactions`.** The replica queues a
+vector of two: `localt`, which it built itself (its pg-log entry and
+pg-info update, from the log entries in the message's front), and
+`opt`, the primary's transaction decoded from middle+data. BlueStore
+runs them as one txc — one aio, one kv batch, one commit — so the
+replica's pipeline is line-for-line §3.1's from here. Note what
+`do_repop` does *not* do: no `get_object_context`, no op validation,
+no snapshot bookkeeping — the primary did all of that once, and
+shipped the answer.
+
+**73 µs from arrival to decode, 43 µs from decode to the store**
+(#13→#16, #16→#17; the `56 us` on line #16 is the op tracker's clock,
+which starts inside `ms_fast_dispatch`). The replica's entire CPU contribution to the write
+is a hundred microseconds; the rest of its 20.2 ms is the disk.
+
+**And the copy.** `opt.decode` is zero-copy: the write's bufferlist is
+a view into the received data segment. But that view starts at byte
+329 of the segment (the attr values come first, §3.3.3), and
+`KernelDevice::aio_write` writes O_DIRECT — the source must be
+block-aligned in memory. `rebuild_aligned_size_and_memory`
+([`KernelDevice.cc:1162`](https://github.com/ceph/ceph/blob/v21.3.0/src/blk/kernel/KernelDevice.cc#L1162))
+finds it is not, and `list::rebuild` copies all 16 384 bytes into a
+fresh aligned buffer: line #19, 9 µs after #18. The primary's data
+arrived at offset 0 and needed nothing (#12). At 16 KiB the cost is
+noise; at a 4 MiB object it is a 4 MiB memcpy per replica per write,
+and it happens on every replicated write in the tree — the msgr2
+receive buffer *is* page-aligned, and `Transaction::encode` *has* an
+"aligned data first" wire format
+([`Transaction.h:1379`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/Transaction.h#L1379))
+that would put the payload at offset 0; it is simply never engaged for
+client writes, because `op_t` is built without the peers' features.
+§7.4 has the census and the one-line fix, and
+[§5 of the tracker-notes post]({% post_url 2026-08-12-ceph-tracker-notes %})
+the root-cause chain; §3.3.8 below shows this trace with the fix in.
+
+### 3.3.5 Lines 20–31, two pipelines in parallel
+
+From #12 and #18 on, each OSD runs §3.1's four-lane pipeline on its own
+disk, and the trace interleaves them. Pulled apart, per OSD:
+
+| milestone | primary (osd.0, nvme0n1) | replica (osd.1, vdb) |
+|---|---|---|
+| data `aio_write` submitted | #12 +1.15 ms | #18 +1.84 ms |
+| barrier #1 — data flush done | #20 +10.40 (6.0 ms) | #21 +10.79 (6.4 ms) |
+| barrier #2 — WAL flush done | #22 +16.79 (5.1 ms) | #26 +21.69 (9.9 ms) |
+| kv commit done | #23 +16.81 | #27 +21.70 |
+| `_txc_committed_kv` | #24 +16.84 | #28 +21.89 |
+| commit callback on `tp_osd_tp` | #25 `op_commit` +17.15 | #29 `repop_commit` +21.92 |
+| answer | — (waits for the peer) | #31 `MOSDRepOpReply` on the socket +22.21 |
+
+Everything in the middle is §3.1.3–§3.1.5 twice over — the data aio,
+the kv thread waking on completion, barrier #1, the WAL block, barrier
+#2 — and the barriers dominate exactly as they did there: ~11 ms on the
+primary, ~16 ms on the replica, for one 16 KiB data write plus the
+WAL append per OSD. What is new is the *shape*: the two pipelines are
+independent, start within 0.7 ms of each other, and finish 4.9 ms
+apart. The primary's own write was durable at +16.8 ms; the client
+heard nothing until the replica's was too.
+
+**Whose barrier is slower is a property of the disk, not of the role.**
+Here the replica's WAL flush took 9.9 ms against the primary's 5.1 —
+virtio-blk against emulated NVMe, in a VM. §3.3.7 shows the same
+command with the roles of "fast" and "slow" swapped, on the same two
+disks. The lesson generalizes beyond this lab: with replication the
+client sees the **maximum** over N commit pipelines, each with its own
+two-barrier floor and its own tail — replication turns the median
+commit latency of one OSD into the tail latency of the slowest of two
+or three, on every write.
+
+### 3.3.6 Lines 23–39, collecting the commits, sending the reply
+
+Each OSD's `_txc_committed_kv` (#24, #28) queues that store's commit
+callbacks onto the OSD shard's `context_queue`, and a `tp_osd_tp`
+worker runs them — §3.1.6's hidden fourth handoff. The callbacks differ
+by role, and both end in the same set:
+
+```
+ replica                                  │  primary
+                                          │
+#28 _txc_committed_kv                     │  #24 _txc_committed_kv
+    └► C_OSD_RepModifyCommit  RB:89       │      └► C_OSD_OnOpCommit      RB:354
+#29    └► repop_commit        RB:1369     │  #25    └► op_commit          RB:681
+          MOSDRepOpReply(ONDISK,          │            waiting_for_commit.erase(self)
+            last_complete_ondisk)         │            {osd.0, osd.1} → {osd.1}: not empty,
+#30       send_message_osd_cluster RB:1392│            nothing more to do
+#31       msgr-worker: write_message      │
+          ──────────── 111 B ─────────────►  #32 ms_fast_dispatch (type 113, tid=3)
+                                          │  #33 enqueue_op   #34 dequeue_op
+                                          │  #35 do_repop_reply             RB:706
+                                          │      in_progress_ops.find(rep_tid)
+                                          │      waiting_for_commit.erase(from)
+                                          │      {osd.1} → {}: EMPTY → on_commit->complete(0)
+                                          │      └► C_OSD_RepopCommit       PLP:11609
+                                          │  #36    └► repop_all_committed  PLP:11620
+                                          │            └► eval_repop        PLP:11647
+                                          │               runs repop->on_committed:
+                                          │               the lambda execute_ctx registered  PLP:4473
+                                          │  #37          log_op_stats                      PLP:4534
+                                          │               send_message_osd_client(reply)     PLP:4483
+                                          │  #38          msgr-worker-0: write_message, 147 B
+                                          │               mark_commit_sent
+```
+
+Three details the trace makes concrete:
+
+* **#25 reads `waiting_for_commit=2 before erasing self`.** The
+  primary's local commit landed with both members still in the set —
+  itself and osd.1 — so `op_commit` erased one and returned. The
+  completion was left for whoever erased the last member: here
+  `do_repop_reply` (#35), 5.7 ms later. `op_commit` and
+  `do_repop_reply` are two entry points to one condition
+  (`waiting_for_commit.empty()` at
+  [`RB:698`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L698)
+  and
+  [`RB:753`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L753)),
+  and the code does not know or care which one wins.
+* **The peer's reply is an op.** #32–#34 are `ms_fast_dispatch` →
+  `enqueue_op` → `dequeue_op` again: the 111-byte `MOSDRepOpReply`
+  waits its turn on the PG's shard queue like any client op, and
+  `do_repop_reply` runs under the PG lock. Cheap here (571 µs, most of
+  it an idle worker waking up), but it means a busy PG's queue depth is
+  added to every replicated write's completion path, twice.
+* **From the last erase to the reply is 10 µs** (#35→#37):
+  `on_commit->complete` → `C_OSD_RepopCommit::finish` →
+  `repop_all_committed` → `eval_repop` → the `on_committed` lambda →
+  `log_op_stats`. This is §3.1.6's chain exactly, one frame deeper: in
+  §3.1 `op_commit` itself found the set empty and called
+  `on_commit->complete`; here `do_repop_reply` does. The reply
+  machinery has no idea how many shards there were.
+
+The reply then takes the same road out as the `MOSDRepOp` did: the PG
+thread calls `send_message_osd_client` → `con->send_message` (encode,
+queue, poke), and the client's connection's msgr-worker-0 writes the
+147-byte `MOSDOpReply` (#38); 175 µs later the `rados` process's
+`Objecter` has it (#39) and `put` returns. 23.5 ms wall time for the
+client: ~0.8 ms to reach the primary (mostly the fresh process's
+connect), 22.1 ms inside the OSDs — of which 20.2 ms was the replica's
+own residence — and ~0.6 ms back.
+
+### 3.3.7 The same write, primary last
+
+Run the same command again and the two disks trade places. A run
+collected a minute earlier on the freshly created cluster (its first
+traced write, so the barriers are slower — the shape is what matters).
+The `tid` column is dropped and the `bdev` pointers relabelled
+`(data)`/`(WAL)` for width:
+
+```
+ #       us  proc     thread          function                               event
+12     4045  primary  tp_osd_tp       KernelDevice::aio_write                off=0x80000 len=0x4000 src_off=0
+18     4625  replica  tp_osd_tp       KernelDevice::aio_write                off=0x80000 len=0x4000 src_off=329
+19     4635  replica  tp_osd_tp       buffer::list::rebuild                  memcpy 16384 B into a fresh aligned buffer
+20    14606  replica  bstore_kv_sync  KernelDevice::flush                    fdatasync (data)  6343 us
+21    25165  primary  bstore_kv_sync  KernelDevice::flush                    fdatasync (data) 16825 us
+22    30512  replica  bstore_kv_sync  KernelDevice::flush                    fdatasync (WAL)  15192 us
+23    30537  replica  bstore_kv_sync  RocksDBStore::submit_transaction_sync  kv commit done (15836 us)
+25    31142  replica  tp_osd_tp       ReplicatedBackend::repop_commit        committed -> MOSDRepOpReply(ONDISK) to osd.0 (in osd 26719 us)
+28    31835  primary  msgr-worker-2   OSD::ms_fast_dispatch                  osd_repop_reply tid=1 arrives, 111 B
+31    32343  primary  tp_osd_tp       ReplicatedBackend::do_repop_reply      peer commit received, erase peer from waiting_for_commit
+32    36184  primary  bstore_kv_sync  KernelDevice::flush                    fdatasync (WAL)   5628 us
+33    36203  primary  bstore_kv_sync  RocksDBStore::submit_transaction_sync  kv commit done (11004 us)
+35    36316  primary  tp_osd_tp       ReplicatedBackend::op_commit           local commit rep_tid=1, waiting_for_commit=1 shard(s) before erasing self
+36    36319  primary  tp_osd_tp       PrimaryLogPG::repop_all_committed      rep_tid=1: all shards committed -> eval_repop -> reply
+37    36329  primary  tp_osd_tp       PrimaryLogPG::log_op_stats             reply -> client (in osd 32621 us)
+```
+
+This time the primary's data flush took 16.8 ms, the replica finished
+its whole pipeline *and* its reply crossed the wire (#28, +31.8 ms)
+before the primary's own commit (#33, +36.2 ms) — and the roles in
+§3.3.6 flip: `do_repop_reply` (#31) erased osd.1 and found osd.0 still
+in the set; `op_commit` (#35) then read **`waiting_for_commit=1`**,
+erased itself, found the set empty, and fired the completion itself,
+3 µs before `repop_all_committed` (#36). Same code, same set, opposite
+winner. The client saw 36.8 ms either way — the maximum of the two
+pipelines, whichever one it was.
+
+### 3.3.8 The same write with the aligned transaction format
+
+§7.4's one-line fix — construct the primary's transaction with the
+peers' features, `ObjectStore::Transaction
+op_t{get_parent()->min_peer_features()}` at
+[`RB:612`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L612)
+— rebuilt into both OSDs, same cluster, same command. The fan-out and
+the replica's receive side, from the same probes:
+
+```
+ #       us  proc     thread          function                               event
+ 9     1848  primary  tp_osd_tp       OSDService::send_message_osd_cluster   MOSDRepOp tid=3 -> osd.1 (encode, queue to msgr-worker)
+10     1903  primary  tp_osd_tp       BlueStore::queue_transactions          transaction arrives
+11     1905  primary  msgr-worker-0   ProtocolV2::write_message              MOSDRepOp tid=3 -> socket, front+middle+data=1130+296+16709 B
+12     1948  primary  tp_osd_tp       KernelDevice::aio_write                bdev=0x..892400 off=0x80000 len=0x4000 src_off=0
+13     2051  replica  msgr-worker-1   OSD::ms_fast_dispatch                  osd_repop tid=3 arrives, 1130+296+16709 B (frame rx+decode 39 us)
+14     2067  replica  msgr-worker-1   OSD::enqueue_op                        epoch 22 -> shard queue
+15     2132  replica  tp_osd_tp       OSD::dequeue_op                        worker picks op
+16     2144  replica  tp_osd_tp       ReplicatedBackend::do_repop            decode MOSDRepOp -> transaction + log (82 us after arrival)
+17     2207  replica  tp_osd_tp       BlueStore::queue_transactions          transaction arrives
+18     2266  replica  tp_osd_tp       KernelDevice::aio_write                bdev=0x..01e400 off=0x80000 len=0x4000 src_off=0
+       (nothing follows: no list::rebuild line — the next replica event is bstore_kv_sync's data flush)
+```
+
+Side by side with §3.3.1's lines #11, #18 and #19:
+
+| | stock (§3.3.1) | aligned format |
+|---|---|---|
+| `MOSDRepOp` data segment | 16713 B = [329 B: attrs + length prefix][16384 B payload] | 16709 B = [16384 B payload][325 B attrs] |
+| replica `aio_write` `src_off` | 329 | **0** |
+| replica `list::rebuild` | memcpy 16384 B | **— (line gone)** |
+| every other probe | | the same 38 fire (this run happened to be primary-last, as in §3.3.7) |
+
+With `data_features` set, `Transaction::write` routes the page-aligned
+payload into `data_aligned_bl` with `encode_nohead` (no length prefix —
+the op already carries `len`), the v10 encoding emits the aligned
+bufferlist first
+([`Transaction.h:1379`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/Transaction.h#L1379)),
+so the payload lands at offset 0 of the receiver's page-aligned data
+segment, and `decode_bl`
+([`Transaction.h:717`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/Transaction.h#L717))
+hands `KernelDevice::aio_write` a view that is already aligned. The
+xattr values follow the payload instead of preceding it — 325 bytes,
+the 4-byte prefix gone with the legacy branch. The replica now writes
+from its receive buffer exactly as the primary always did (#12 and #18
+both read `src_off=0`), and the wire carries four bytes less. Nothing
+else in the protocol moves: same messages, same segments up to those
+four bytes, same set, same reply chain.
+
+At 16 KiB the copy this removes — the trace catches it starting 9 µs
+into `aio_write`; the memcpy itself is a microsecond or two — is
+nothing against a 20 ms write: the
+barriers own this trace, and run-to-run barrier variance on these
+virtual disks is far larger than anything the patch changes. The point
+of the trace is not the microseconds; it is that the replica lane lost
+exactly one line, and that line was a full-payload copy on every
+replicated write. §7.4 has the copy census at 128 KiB and 4 KiB
+deferred; the [tracker-notes post]({% post_url 2026-08-12-ceph-tracker-notes %})
+(§5) the root cause and the fix's safety argument.
+
 # 4. Code analysis
 
 The trace sections answer *what happened*; this section reads the code

@@ -1,0 +1,417 @@
+#!/usr/bin/env bpftrace
+/*
+ * wreplica.bt -- one replicated write, traced across the client and BOTH
+ * OSDs: the primary's fan-out and the replica's receive side on one
+ * timeline.
+ *
+ * Usage:
+ *   bpftrace wreplica.bt <ceph-osd> <libceph-common.so.2> <primary-pid> <replica-pid>
+ *
+ *   $1  path to the ceph-osd binary both OSDs were exec'd from
+ *   $2  path to libceph-common.so.2 (the client's Objecter and
+ *       messenger live there; the OSD carries its own copies inside
+ *       the executable, so those are probed via $1)
+ *   $3  pid of the OSD that is primary for the traced object
+ *   $4  pid of the OSD that is its replica
+ *   Use absolute paths (realpath): bpftrace mis-resolves relative ones.
+ *
+ * On an optimized (RelWithDebInfo) build bpftrace expands each symbol
+ * to every inlined instance and aborts on some of them; resolve the
+ * symbols to out-of-line addresses first with btaddr.py (next to this
+ * script) and run the rewritten file with the same four arguments:
+ *   btaddr.py wreplica.bt /tmp/wreplica-addr.bt \
+ *             $(realpath bin/ceph-osd) $(realpath lib/libceph-common.so.2)
+ *   bpftrace /tmp/wreplica-addr.bt <same four args>
+ *
+ * Wait for the column-header line (attach done), then issue ONE write:
+ *   rados -p p1 put o48 /root/16k        and Ctrl-C a few seconds later.
+ *
+ * Columns (as wtrace.bt / wfstrace.bt):
+ *   us        microseconds since the client submitted the op
+ *             (Objecter::_op_submit in the rados process = clock zero)
+ *   tid       kernel thread id
+ *   proc      client | primary | replica -- both OSDs run the same
+ *             binary on the same host, so every ceph-osd uprobe fires
+ *             in both processes; the pid decides which lane a line
+ *             belongs to
+ *   thread    comm: the pipeline stage (msgr-worker-N, tp_osd_tp,
+ *             bstore_kv_sync, bstore_kv_final)
+ *   function  the probed function
+ *   event     what happened, with arguments
+ *
+ * What is probed, and why:
+ *   messenger   ProtocolV2::handle_read_frame_preamble_main (silent:
+ *               stamps when a frame's first 32 bytes land) and
+ *               OSD::ms_fast_dispatch (prints the message type, tid and
+ *               the wire split front+middle+data from the header, plus
+ *               the preamble->dispatch time).  On the send side,
+ *               OSDService::send_message_osd_cluster is the PG thread
+ *               handing a message to the messenger and
+ *               ProtocolV2::write_message is the msgr-worker actually
+ *               serializing it onto the socket.
+ *   PG / backend  PrimaryLogPG::issue_repop -> ReplicatedBackend::
+ *               submit_transaction -> issue_op on the primary;
+ *               ReplicatedBackend::do_repop -> repop_commit on the
+ *               replica; op_commit / do_repop_reply /
+ *               PrimaryLogPG::repop_all_committed as the primary
+ *               collects the commits; PrimaryLogPG::log_op_stats as the
+ *               client reply leaves.
+ *   BlueStore   deliberately thin -- the entry (queue_transactions),
+ *               the data aio_write (with the payload's offset inside
+ *               its backing buffer: a non-page-multiple means the
+ *               O_DIRECT path must memcpy it first, and the
+ *               list::rebuild line right after is that memcpy), the two
+ *               flush barriers and the kv commit, and _txc_committed_kv.
+ *               Everything between those lines is §3.1 (wtrace.bt).
+ *
+ * Struct offsets (from `gdb -batch -ex "ptype /o <type>"` on the
+ * binary's own debug info, not guessed):
+ *   Message: header at +24 -> tid +32, type +40 (u16), front_len +46,
+ *            middle_len +50, data_len +54 (u32); types: 42 osd_op,
+ *            43 osd_op_reply, 112 osd_repop, 113 osd_repop_reply
+ *   hobject_t: oid.name (std::string, data ptr) +0, pool +56
+ *   PrimaryLogPG::RepGather: rep_tid +200
+ *   ReplicatedBackend::InProgressOp: tid +24, waiting_for_commit +32
+ *            (std::set: node count at +40 inside -> +72)
+ *   ReplicatedBackend::RepModify: op +0 (OpRequest*), ackerosd +12
+ *   bufferlist: first ptr_node at +0, _len at +24; ptr_node: offset
+ *            into its raw at +16
+ *   Objecter::Op: target.base_oid.name +48, target.base_oloc.pool +80
+ * Arguments passed by value that are non-trivial (OpRequestRef,
+ * RepModifyRef, MessageRef) arrive as a pointer to a temporary, so the
+ * object pointer is *(uint64*)argN.
+ */
+
+BEGIN
+{
+  printf("%10s %7s  %-7s %-16s %-38s %s\n",
+         "us", "tid", "proc", "thread", "function", "event");
+  @procname[$3] = "primary";
+  @procname[$4] = "replica";
+}
+
+/* ==== client lane: the rados process ================================= */
+
+/* Objecter::_op_submit(Op*, ...) -- the write leaves librados.  This is
+ * the clock zero.  Objecter lives in libceph-common and is mapped by
+ * every daemon (the mgr is a client too), so gate on the rados comm. */
+uprobe:$2:_ZN8Objecter10_op_submitE*
+/comm == "rados"/
+{
+  if (@t0 == 0) { @t0 = nsecs; @client = pid; @procname[pid] = "client"; }
+  printf("%10lld %7d  %-7s %-16s %-38s obj=%s pool=%lld -> MOSDOp\n",
+         (nsecs-@t0)/1000, tid, @procname[pid], comm, "Objecter::_op_submit",
+         str(*(uint64*)(arg1 + 48)), *(int64*)(arg1 + 80));
+}
+
+/* ProtocolV2::write_message(Message*, bool) in the CLIENT's messenger --
+ * the MOSDOp is serialized onto the socket by a rados msgr-worker.
+ * The header lengths are valid here: write_event() encodes the message
+ * before calling write_message. */
+uprobe:$2:_ZN10ProtocolV213write_messageE*
+/@t0 && pid == @client/
+{
+  printf("%10lld %7d  %-7s %-16s %-38s MOSDOp tid=%lld -> socket, front+middle+data=%u+%u+%u B\n",
+         (nsecs-@t0)/1000, tid, @procname[pid], comm, "ProtocolV2::write_message",
+         *(uint64*)(arg1 + 32), *(uint32*)(arg1 + 46),
+         *(uint32*)(arg1 + 50), *(uint32*)(arg1 + 54));
+}
+
+/* Objecter::handle_osd_op_reply(MOSDOpReply*) -- the ondisk reply is
+ * back; rados put returns right after. */
+uprobe:$2:_ZN8Objecter19handle_osd_op_replyE*
+/@t0 && pid == @client/
+{
+  printf("%10lld %7d  %-7s %-16s %-38s MOSDOpReply tid=%lld <- primary, write is durable\n",
+         (nsecs-@t0)/1000, tid, @procname[pid], comm, "Objecter::handle_osd_op_reply",
+         *(uint64*)(arg1 + 32));
+}
+
+/* ==== messenger, receive side (both OSDs) ============================ */
+
+/* ProtocolV2::handle_read_frame_preamble_main -- the first 32 bytes of
+ * a frame have been read on this msgr-worker.  Silent; stamps the time
+ * so ms_fast_dispatch can print how long reading the rest of the frame
+ * (segments land in a fresh page-aligned buffer) plus decoding took. */
+uprobe:$1:_ZN10ProtocolV231handle_read_frame_preamble_mainE*
+/@t0 && (pid == $3 || pid == $4)/
+{ @rx_pre[tid] = nsecs; }
+
+/* OSD::ms_fast_dispatch(Message*) -- the decoded message is handed to
+ * the OSD, still on the msgr-worker.  Header fields only: MOSDOp's op
+ * vector and object are decoded later on the PG thread. */
+uprobe:$1:_ZN3OSD16ms_fast_dispatchE*
+/@t0 && (pid == $3 || pid == $4)/
+{
+  $type  = *(uint16*)(arg1 + 40);
+  $mtid  = *(uint64*)(arg1 + 32);
+  $front = *(uint32*)(arg1 + 46);
+  $mid   = *(uint32*)(arg1 + 50);
+  $data  = *(uint32*)(arg1 + 54);
+  $rx = (uint64)0;
+  if (@rx_pre[tid]) { $rx = (nsecs - @rx_pre[tid]) / 1000; delete(@rx_pre[tid]); }
+  if ($type == 42) {
+    printf("%10lld %7d  %-7s %-16s %-38s osd_op tid=%lld arrives, front+middle+data=%u+%u+%u B (frame rx+decode %lld us)\n",
+           (nsecs-@t0)/1000, tid, @procname[pid], comm, "OSD::ms_fast_dispatch",
+           $mtid, $front, $mid, $data, $rx);
+  } else if ($type == 112) {
+    printf("%10lld %7d  %-7s %-16s %-38s osd_repop tid=%lld arrives, front+middle+data=%u+%u+%u B (frame rx+decode %lld us)\n",
+           (nsecs-@t0)/1000, tid, @procname[pid], comm, "OSD::ms_fast_dispatch",
+           $mtid, $front, $mid, $data, $rx);
+  } else if ($type == 113) {
+    printf("%10lld %7d  %-7s %-16s %-38s osd_repop_reply tid=%lld arrives, %u B (frame rx+decode %lld us)\n",
+           (nsecs-@t0)/1000, tid, @procname[pid], comm, "OSD::ms_fast_dispatch",
+           $mtid, $front, $rx);
+  } else {
+    @other_rx[@procname[pid], $type] = count();
+  }
+}
+
+/* OpTracker::create_request<OpRequest, Message*> (return) -- silent;
+ * starts each op's residence clock.  sret: retval is the return-slot
+ * address, its first 8 bytes the OpRequest*. */
+uretprobe:$1:_ZN9OpTracker14create_request*
+/@t0 && (pid == $3 || pid == $4)/
+{ @req_start[*(uint64*)retval] = nsecs; }
+
+/* OSD::enqueue_op(spg_t, OpRequestRef&&, epoch_t) -- spg_t is
+ * MEMORY-class, so arg1 is the op and arg2 the epoch */
+uprobe:$1:_ZN3OSD10enqueue_opE*
+/@t0 && (pid == $3 || pid == $4)/
+{ printf("%10lld %7d  %-7s %-16s %-38s epoch %lld -> shard queue\n",
+         (nsecs-@t0)/1000, tid, @procname[pid], comm, "OSD::enqueue_op", arg2); }
+
+/* OSD::dequeue_op -- a tp_osd_tp shard worker picks the op up */
+uprobe:$1:_ZN3OSD10dequeue_opE*
+/@t0 && (pid == $3 || pid == $4)/
+{ printf("%10lld %7d  %-7s %-16s %-38s worker picks op\n",
+         (nsecs-@t0)/1000, tid, @procname[pid], comm, "OSD::dequeue_op"); }
+
+/* ==== primary: fan-out ================================================ */
+
+/* PrimaryLogPG::issue_repop(RepGather*, OpContext*) -- the PG has
+ * prepared the write (OpContext) and now issues it: to the backend for
+ * the peers and to the local store.  rep_tid names this replication
+ * round; it becomes the MOSDRepOp's tid. */
+uprobe:$1:_ZN12PrimaryLogPG11issue_repopE*
+/@t0 && (pid == $3 || pid == $4)/
+{ printf("%10lld %7d  %-7s %-16s %-38s rep_tid=%lld: replicate to peers + write locally\n",
+         (nsecs-@t0)/1000, tid, @procname[pid], comm, "PrimaryLogPG::issue_repop",
+         *(uint64*)(arg1 + 200)); }
+
+/* ReplicatedBackend::submit_transaction(const hobject_t&, ...) -- the
+ * object being written; also where the ObjectStore::Transaction for
+ * the local store is generated */
+uprobe:$1:_ZN17ReplicatedBackend18submit_transactionE*
+/@t0 && (pid == $3 || pid == $4)/
+{ printf("%10lld %7d  %-7s %-16s %-38s obj=%s pool=%lld: build op_t, waiting_for_commit = all shards\n",
+         (nsecs-@t0)/1000, tid, @procname[pid], comm, "ReplicatedBackend::submit_transaction",
+         str(*(uint64*)arg1), *(int64*)(arg1 + 56)); }
+
+/* ReplicatedBackend::issue_op(soid, at_version, tid=arg3, ...) -- one
+ * MOSDRepOp per peer: generate_subop encodes op_t into it */
+uprobe:$1:_ZN17ReplicatedBackend8issue_opE*
+/@t0 && (pid == $3 || pid == $4)/
+{ printf("%10lld %7d  %-7s %-16s %-38s rep_tid=%lld: encode op_t into one MOSDRepOp per peer\n",
+         (nsecs-@t0)/1000, tid, @procname[pid], comm, "ReplicatedBackend::issue_op", arg3); }
+
+/* OSDService::send_message_osd_cluster(int peer, Message*, epoch_t) --
+ * the PG thread hands a cluster message to the messenger: MOSDRepOp
+ * from the primary, MOSDRepOpReply from the replica.  The messenger
+ * encodes it right here (fast-prepare) and queues it for the
+ * connection's msgr-worker. */
+uprobe:$1:_ZN10OSDService24send_message_osd_clusterEiP*
+/@t0 && (pid == $3 || pid == $4)/
+{
+  $type = *(uint16*)(arg2 + 40);
+  $mtid = *(uint64*)(arg2 + 32);
+  if ($type == 112) {
+    printf("%10lld %7d  %-7s %-16s %-38s MOSDRepOp tid=%lld -> osd.%d (encode, queue to msgr-worker)\n",
+           (nsecs-@t0)/1000, tid, @procname[pid], comm, "OSDService::send_message_osd_cluster",
+           $mtid, arg1);
+  } else if ($type == 113) {
+    printf("%10lld %7d  %-7s %-16s %-38s MOSDRepOpReply tid=%lld -> osd.%d (encode, queue to msgr-worker)\n",
+           (nsecs-@t0)/1000, tid, @procname[pid], comm, "OSDService::send_message_osd_cluster",
+           $mtid, arg1);
+  } else {
+    @other_tx[@procname[pid], $type] = count();
+  }
+}
+
+/* ProtocolV2::write_message(Message*, bool) in the OSD's messenger --
+ * the msgr-worker serializes the message onto the socket; the header
+ * lengths are the frame's front+middle+data segments */
+uprobe:$1:_ZN10ProtocolV213write_messageE*
+/@t0 && (pid == $3 || pid == $4)/
+{
+  $type  = *(uint16*)(arg1 + 40);
+  $mtid  = *(uint64*)(arg1 + 32);
+  $front = *(uint32*)(arg1 + 46);
+  $mid   = *(uint32*)(arg1 + 50);
+  $data  = *(uint32*)(arg1 + 54);
+  if ($type == 112) {
+    printf("%10lld %7d  %-7s %-16s %-38s MOSDRepOp tid=%lld -> socket, front+middle+data=%u+%u+%u B\n",
+           (nsecs-@t0)/1000, tid, @procname[pid], comm, "ProtocolV2::write_message",
+           $mtid, $front, $mid, $data);
+  } else if ($type == 113) {
+    printf("%10lld %7d  %-7s %-16s %-38s MOSDRepOpReply tid=%lld -> socket, %u B\n",
+           (nsecs-@t0)/1000, tid, @procname[pid], comm, "ProtocolV2::write_message",
+           $mtid, $front);
+  } else if ($type == 43) {
+    printf("%10lld %7d  %-7s %-16s %-38s MOSDOpReply tid=%lld -> socket, %u B\n",
+           (nsecs-@t0)/1000, tid, @procname[pid], comm, "ProtocolV2::write_message",
+           $mtid, $front);
+  } else {
+    @other_tx[@procname[pid], $type] = count();
+  }
+}
+
+/* ==== replica: receive side =========================================== */
+
+/* ReplicatedBackend::do_repop(OpRequestRef) -- the MOSDRepOp is
+ * decoded into a RepModify: the shipped transaction (opt) and the
+ * pg-log entries; both go to the local store as one queue_transactions */
+uprobe:$1:_ZN17ReplicatedBackend8do_repopE*
+/@t0 && (pid == $3 || pid == $4)/
+{
+  $op = *(uint64*)arg1;
+  $in = (uint64)0;
+  if (@req_start[$op]) { $in = (nsecs-@req_start[$op])/1000; }
+  printf("%10lld %7d  %-7s %-16s %-38s decode MOSDRepOp -> transaction + log (%lld us after arrival)\n",
+         (nsecs-@t0)/1000, tid, @procname[pid], comm, "ReplicatedBackend::do_repop", $in);
+}
+
+/* ReplicatedBackend::repop_commit(RepModifyRef) -- the local store
+ * committed; the replica answers the primary with an ONDISK
+ * MOSDRepOpReply.  shared_ptr by value: *(arg1) is the RepModify*. */
+uprobe:$1:_ZN17ReplicatedBackend12repop_commitE*
+/@t0 && (pid == $3 || pid == $4)/
+{
+  $rm = *(uint64*)arg1;
+  $op = *(uint64*)$rm;
+  $in = (uint64)0;
+  if (@req_start[$op]) { $in = (nsecs-@req_start[$op])/1000; }
+  printf("%10lld %7d  %-7s %-16s %-38s committed -> MOSDRepOpReply(ONDISK) to osd.%d (in osd %lld us)\n",
+         (nsecs-@t0)/1000, tid, @procname[pid], comm, "ReplicatedBackend::repop_commit",
+         *(int32*)($rm + 12), $in);
+  delete(@req_start[$op]);
+}
+
+/* ==== primary: collecting the commits ================================ */
+
+/* ReplicatedBackend::op_commit(const ref_t<InProgressOp>&) -- the
+ * primary's OWN store committed.  It erases itself from
+ * waiting_for_commit; the set size printed is before that erase, so
+ * 1 means "everyone else already answered, this completes the op". */
+uprobe:$1:_ZN17ReplicatedBackend9op_commitE*
+/@t0 && (pid == $3 || pid == $4)/
+{
+  $ipo = *(uint64*)arg1;
+  printf("%10lld %7d  %-7s %-16s %-38s local commit rep_tid=%lld, waiting_for_commit=%lld shard(s) before erasing self\n",
+         (nsecs-@t0)/1000, tid, @procname[pid], comm, "ReplicatedBackend::op_commit",
+         *(uint64*)($ipo + 24), *(uint64*)($ipo + 72));
+}
+
+/* ReplicatedBackend::do_repop_reply(OpRequestRef) -- a peer's ONDISK
+ * reply, dispatched through the same shard queue as any op; erases
+ * that peer from waiting_for_commit */
+uprobe:$1:_ZN17ReplicatedBackend14do_repop_replyE*
+/@t0 && (pid == $3 || pid == $4)/
+{
+  $op = *(uint64*)arg1;
+  printf("%10lld %7d  %-7s %-16s %-38s peer commit received (sub_op_commit_rec), erase peer from waiting_for_commit\n",
+         (nsecs-@t0)/1000, tid, @procname[pid], comm, "ReplicatedBackend::do_repop_reply");
+  delete(@req_start[$op]);
+}
+
+/* PrimaryLogPG::repop_all_committed(RepGather*) -- waiting_for_commit
+ * ran empty: on_all_commit fires, eval_repop runs the on_committed
+ * callbacks, one of which sends the client reply */
+uprobe:$1:_ZN12PrimaryLogPG19repop_all_committedE*
+/@t0 && (pid == $3 || pid == $4)/
+{ printf("%10lld %7d  %-7s %-16s %-38s rep_tid=%lld: all shards committed -> eval_repop -> reply\n",
+         (nsecs-@t0)/1000, tid, @procname[pid], comm, "PrimaryLogPG::repop_all_committed",
+         *(uint64*)(arg1 + 200)); }
+
+/* PrimaryLogPG::log_op_stats(op, inb, outb) -- just before the
+ * MOSDOpReply is sent; the op's whole OSD residence time */
+uprobe:$1:_ZN12PrimaryLogPG12log_op_statsE*
+/@t0 && @req_start[arg1]/
+{ printf("%10lld %7d  %-7s %-16s %-38s reply -> client (in osd %lld us)\n",
+         (nsecs-@t0)/1000, tid, @procname[pid], comm, "PrimaryLogPG::log_op_stats",
+         (nsecs-@req_start[arg1])/1000);
+  delete(@req_start[arg1]); }
+
+/* ==== BlueStore, thin (both OSDs) ===================================== */
+
+/* BlueStore::queue_transactions -- the store takes the transaction(s) */
+uprobe:$1:_ZN9BlueStore*queue_transactionsE*
+/@t0 && (pid == $3 || pid == $4)/
+{ printf("%10lld %7d  %-7s %-16s %-38s transaction arrives\n",
+         (nsecs-@t0)/1000, tid, @procname[pid], comm, "BlueStore::queue_transactions"); }
+
+/* KernelDevice::aio_write(off=arg1, bl=arg2, ...) -- src_off is where
+ * the payload starts inside its backing buffer (first ptr_node's
+ * offset into its raw).  O_DIRECT needs a block-aligned source: a
+ * non-4096-multiple here forces rebuild_aligned_size_and_memory to
+ * copy the data first -- see the list::rebuild line that follows. */
+uprobe:$1:_ZN12KernelDevice*aio_writeE*
+/@t0 && (pid == $3 || pid == $4)/
+{
+  $node = *(uint64*)arg2;
+  printf("%10lld %7d  %-7s %-16s %-38s bdev=%p off=0x%lx len=0x%x src_off=%u\n",
+         (nsecs-@t0)/1000, tid, @procname[pid], comm, "KernelDevice::aio_write",
+         arg0, arg1, *(uint32*)(arg2 + 24), *(uint32*)($node + 16));
+}
+
+/* buffer::list::rebuild(unique_ptr<ptr_node>) -- the worker every
+ * whole-list flatten goes through (rebuild() and
+ * rebuild_aligned_size_and_memory() both end here).  Only payload-sized
+ * lists are printed; small metadata rebuilds are noise here. */
+uprobe:$1:_ZN4ceph6buffer7v15_2_04list7rebuildESt10unique_ptr*
+/@t0 && (pid == $3 || pid == $4) && *(uint32*)(arg0 + 24) >= 4096/
+{ printf("%10lld %7d  %-7s %-16s %-38s memcpy %u B into a fresh aligned buffer\n",
+         (nsecs-@t0)/1000, tid, @procname[pid], comm, "buffer::list::rebuild",
+         *(uint32*)(arg0 + 24)); }
+
+/* KernelDevice::flush -- the fdatasync barriers (return probe reports) */
+uprobe:$1:_ZN12KernelDevice*flushE*
+/@t0 && (pid == $3 || pid == $4)/
+{ @ts_fl[tid] = nsecs; @fl_dev[tid] = arg0; }
+uretprobe:$1:_ZN12KernelDevice*flushE*
+/@ts_fl[tid]/
+{ printf("%10lld %7d  %-7s %-16s %-38s fdatasync bdev=%p %lld us\n",
+         (nsecs-@t0)/1000, tid, @procname[pid], comm, "KernelDevice::flush",
+         @fl_dev[tid], (nsecs-@ts_fl[tid])/1000);
+  delete(@ts_fl[tid]); delete(@fl_dev[tid]); }
+
+/* RocksDBStore::submit_transaction_sync -- the kv commit (return
+ * probe reports duration; includes the WAL write and its barrier) */
+uprobe:$1:_ZN12RocksDBStore*submit_transaction_syncE*
+/@t0 && (pid == $3 || pid == $4)/
+{ @ts_kv[tid] = nsecs; }
+uretprobe:$1:_ZN12RocksDBStore*submit_transaction_syncE*
+/@ts_kv[tid]/
+{ printf("%10lld %7d  %-7s %-16s %-38s kv commit done (%lld us): metadata durable\n",
+         (nsecs-@t0)/1000, tid, @procname[pid], comm, "RocksDBStore::submit_transaction_sync",
+         (nsecs-@ts_kv[tid])/1000);
+  delete(@ts_kv[tid]); }
+
+/* BlueStore::_txc_committed_kv(txc) -- commit callbacks queued to the
+ * OSD shard's context queue; a tp_osd_tp worker runs them
+ * (C_OSD_OnOpCommit -> op_commit on the primary,
+ *  C_OSD_RepModifyCommit -> repop_commit on the replica) */
+uprobe:$1:_ZN9BlueStore*_txc_committed_kvE*
+/@t0 && (pid == $3 || pid == $4)/
+{ printf("%10lld %7d  %-7s %-16s %-38s txc %p committed -> commit callbacks to shard queue\n",
+         (nsecs-@t0)/1000, tid, @procname[pid], comm, "BlueStore::_txc_committed_kv", arg1); }
+
+END
+{
+  /* anything else that crossed the OSDs' messengers during the trace */
+  print(@other_rx);
+  print(@other_tx);
+  clear(@other_rx); clear(@other_tx);
+  clear(@t0); clear(@client); clear(@procname);
+  clear(@rx_pre); clear(@req_start); clear(@ts_fl); clear(@fl_dev); clear(@ts_kv);
+}
