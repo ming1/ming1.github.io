@@ -3022,6 +3022,232 @@ double-locks into crashes. Debug-build lock costs are therefore far
 above the one-CAS figure; remember that when reading absolute
 latencies from a Debug lab.
 
+### 4.2.5 bufferlist — the container every hop hands over
+
+[`buffer.h:417`](https://github.com/ceph/ceph/blob/v21.3.0/src/include/buffer.h#L417)
+(`list`), [`:167`](https://github.com/ceph/ceph/blob/v21.3.0/src/include/buffer.h#L167)
+(`ptr`), [`:362`](https://github.com/ceph/ceph/blob/v21.3.0/src/include/buffer.h#L362)
+(`ptr_node`), [`buffer_raw.h:30`](https://github.com/ceph/ceph/blob/v21.3.0/src/include/buffer_raw.h#L30)
+(`raw`)
+
+**Purpose.** `ceph::buffer::list` — `bufferlist` everywhere in the
+tree — is the one type the write's payload travels in from the socket
+to `io_submit`: the messenger receives into it, `MOSDOp` and
+`ObjectStore::Transaction` encode into and decode out of it, BlueStore
+plans blobs as views of it, `aio_t` pins it until the device is done.
+Every probe in §2 that prints a length reads its `_len`; every `src_off`
+in §3.3 reads a node's offset. It is three objects, not one:
+
+```
+ list                                     buffer.h:417   32 bytes, held by value
+   _buffers   singly linked list of ptr_node:  _root.next → first node   +0
+              _tail                                                       +8
+   _carriage  the node append() may still grow in place                   +16
+   _len       total bytes across all nodes                                +24
+   _num       node count                                                  +28
+        │ one or more
+        ▼
+ ptr_node : ptr_hook + ptr                buffer.h:362   heap, one per fragment
+   next       intrusive link to the next node                             +0
+   _raw       → the allocation this fragment lives in                     +8
+   _off,_len  this fragment = raw->data[_off .. _off+_len)                +16, +20
+        │ many nodes may point at one raw
+        ▼
+ raw                                      buffer_raw.h:30  refcounted allocation
+   bptr_storage   reserved slot for an embedded ptr_node (unused today)   +8
+   data, len      the bytes themselves                                    +32, +40
+   nref           atomic refcount — every ptr/ptr_node holds one
+   mempool        which mempool accounts these bytes
+   last_crc_*     one cached crc32c (range → value), under a spinlock
+```
+
+Those offsets — `bl+24` for the length, `node+16` for the offset into
+the raw, `raw+32` for the data — are exactly what §2's `set()` probes,
+§3.3's `src_off`, and §7's census read; they come from
+`gdb -batch -ex "ptype /o ceph::buffer::v15_2_0::list"` on the binary,
+not from the header (the header hides `raw` behind `class raw;`).
+
+A `ptr` is a *(raw, offset, length)* **view**; a `ptr_node` is a `ptr`
+with a list hook; a `list` is a chain of nodes plus a running total.
+Two lists can hold nodes onto the same `raw`, at different offsets, and
+neither knows about the other — the `raw` only knows how many views it
+has. That single fact decides everything that follows.
+
+**Sharing versus copying.** §7.1's table is the operational summary:
+`append(list)`, `append(ptr,off,len)`, `substr_of`, `claim_append`,
+`share()`, and — despite its name — `iterator::copy(len, list&)` create
+nodes and bump `nref`
+([`buffer.cc:1442`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/buffer.cc#L1442),
+[`:1577`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/buffer.cc#L1577),
+[`:805`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/buffer.cc#L805));
+`rebuild()`, `rebuild_aligned_size_and_memory()`, `c_str()` on a
+multi-node list, and `iterator::copy(len, char*)` allocate and memcpy
+([`:1172`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/buffer.cc#L1172),
+[`:1213`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/buffer.cc#L1213),
+[`:1549`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/buffer.cc#L1549),
+[`:751`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/buffer.cc#L751)).
+The `ptr` copy-constructor is `nref++`
+([`:385`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/buffer.cc#L385));
+`ptr::release`
+([`:459`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/buffer.cc#L459))
+is `--nref`, with a fast path that skips the atomic entirely when the
+count is already 1 — the common case of a buffer nobody else ever
+looked at. `raw` is deleted by the last view to go. The corollary that
+bites: a 4 KiB view onto a 4 MiB receive buffer keeps all 4 MiB alive.
+
+`rebuild_aligned_size_and_memory(align_size, align_memory, max)` is the
+one worth knowing by heart, because `KernelDevice::aio_write` calls it
+on every O_DIRECT write. It walks the nodes once: a node whose *address*
+is a multiple of `align_memory` and whose *length* is a multiple of
+`align_size` is kept; any run of nodes that fails either test is
+unlinked, gathered into a scratch list, `rebuild()`-copied into one
+fresh `create_aligned` raw, and relinked in place. Alignment is judged
+per node — which is why the primary's payload (one 16 KiB node at raw
+offset 0) passes and the replica's (one 16 KiB node at raw offset 329)
+is copied whole, §3.3.4. `max_buffers` (`IOV_MAX` from `aio_write`)
+additionally forces consolidation when the list has more nodes than
+one `io_submit` can carry.
+
+**Allocation.** `buffer::create(len)` builds a `raw_combined`
+([`buffer.cc:94`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/buffer.cc#L94)):
+header and bytes in one `posix_memalign` block, the header *after* the
+data so the data can start on the alignment boundary.
+`create_aligned(len, align)`
+([`:348`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/buffer.cc#L348))
+and `create_small_page_aligned`
+([`:357`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/buffer.cc#L357))
+give page-aligned data — the former is what the msgr2 receiver uses for
+each data segment (§7.3), the latter what BlueStore's read path
+allocates into (§7.6). Small appends (`append(char*, len)`,
+[`:1356`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/buffer.cc#L1356))
+go through `_carriage`: the last node is grown in place while its raw
+has room, and a new raw of roughly double size is added when it runs
+out — the encode-side pattern that builds a `MOSDOp` header or a
+transaction's op list from hundreds of tiny `encode()` calls without
+one allocation per call.
+
+**Which threads use it.** A `list` is not thread-safe and never needs
+to be: like the txc (§4.2.1), each list has exactly one owner at a
+time. Only the `raw` is shared across threads, and it is *read-only*
+once handed off — `nref` is atomic precisely so that views can be
+created and dropped from any thread. For one client write's payload
+raw:
+
+| Thread | Does | Nodes onto the payload raw |
+|---|---|---|
+| `msgr-worker` (rx) | `create_aligned` for the frame's data segment; reads the socket into it; crc32c | `Message::data` |
+| `tp_osd_tp` | decodes `MOSDOp` (`indata` = `substr_of`), builds `op_t`, encodes the `MOSDRepOp`, plans blobs (`_do_write_big` cuts views), computes checksums, queues aios | `indata`, `op_t.data_*_bl`, wctx blobs, `aio_t::bl` |
+| `msgr-worker` (tx) | `prepare_iov` over the `MOSDRepOp`'s lists → `sendmsg` | none new — iovecs point into the raw |
+| `bstore_aio` / `bstore_kv_sync` | reap the completion; `aio_t` dies | drops `aio_t::bl` |
+| `tp_osd_tp` (reply) | `OpRequest` dtor → `Message::put` | drops `Message::data` → `nref` 0 → free |
+
+The crc cache is the one piece of mutable state on a `raw`, and it is
+there for this table's shape: the receiving messenger computes a
+crc32c over the data segment and stores (range → value) on the raw
+([`buffer_raw.h:96`](https://github.com/ceph/ceph/blob/v21.3.0/src/include/buffer_raw.h#L96));
+when the same bytes are later sent on — the primary's `MOSDRepOp`
+carries views onto the very raw the `MOSDOp` arrived in — a tx crc over
+an identical range is a lookup
+([`buffer.cc:2096`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/buffer.cc#L2096)),
+not a pass over 16 KiB.
+
+**Lifetime of the payload raw**, from §3.3's trace: born at the
+replica's or primary's `read_frame_segment`, dead when the op's
+`Message` is dropped — after the client reply for the primary, after
+`repop_commit` for the replica. Every hop in between adds a view and
+removes none:
+
+```
+ msgr-worker   create_aligned(16 KiB)  ──►  raw  nref=1   (Message::data)
+ tp_osd_tp     MOSDOp::indata = substr_of            nref=2
+               PGTransaction → op_t.data_misaligned_bl   nref=3   (append: share)
+               MOSDRepOp::data  ← op_t.encode(p, d)      nref=4   (encode_nohead: share)
+               _do_write_big → blob view(s)               nref=5+
+               aio_t::bl.claim_append                      (moves the blob view; no change)
+ msgr-worker   MOSDRepOp sent, Message put                nref-1   (lossless conn: only after the peer acks)
+ bstore_aio    aio completes, aio_t destroyed             nref-1
+ bstore_kv_final _txc_finish: wctx/blobs released         nref-1
+ tp_osd_tp     OpRequest destroyed → MOSDOp put           nref=0  → raw freed
+```
+
+The raw's lifetime is therefore the **union** of every consumer's, and
+the last one is not the device — it is the op tracker releasing the
+request after the reply. §7.7 measures this; the design consequence is
+that a receive buffer's memory is charged to the connection's
+throttler (`Message::byte_throttler`, returned in `~Message`,
+[`Message.h:355`](https://github.com/ceph/ceph/blob/v21.3.0/src/msg/Message.h#L355))
+until the *op* completes, not until the bytes are on disk.
+
+**Typical usage on the sender: `Transaction::write()` and `encode()`.**
+The primary's `op_t` is the clearest example of the whole type in
+action, because it is built, encoded onto the wire, *and* queued to
+the local store — from the same nodes. `write()`
+([`Transaction.h:900`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/Transaction.h#L900))
+records the op in `op_bl` and files the payload into one of two data
+lists:
+
+```cpp
+void write(cid, oid, off, len, const bufferlist& write_data, flags) {
+  Op* _op = _get_next_op();  _op->op = OP_WRITE; _op->off = off; _op->len = len; …
+  if (!is_format_aligned()) {                       // data_features lacks SERVER_TENTACLE
+    encode(write_data, data_misaligned_bl);          // u32 length + append(): SHARE
+    return;
+  }
+  uint64_t alignstart = (0 - off) & ~CEPH_PAGE_MASK;
+  if (len >= CEPH_PAGE_SIZE + alignstart) {
+    … prefix.substr_of(write_data, 0, alignstart);   encode_nohead(prefix,  data_misaligned_bl);
+    aligned.substr_of(write_data, alignstart, alignlen); encode_nohead(aligned, data_aligned_bl);
+    … suffix.substr_of(write_data, suffixstart, …);  encode_nohead(suffix,  data_misaligned_bl);
+  } else {
+    encode_nohead(write_data, data_misaligned_bl);   // sub-page write: all misaligned
+  }
+}
+```
+
+Nothing here copies bytes. `encode(bufferlist)` writes a 4-byte length
+and then `append()`s — new nodes onto the caller's raw;
+`encode_nohead` is the `append` alone; `substr_of` cuts views at the
+page boundaries of the *destination offset* (`alignstart` is how many
+bytes precede the first page boundary of `off`, so a write at `off=0`
+has `alignstart=0` and is entirely aligned). What the branch decides
+is only *which list* the views land in, and therefore where the bytes
+will sit in the wire frame. `encode(p, d, features)`
+([`Transaction.h:1345`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/Transaction.h#L1345))
+then lays the two lists out:
+
+```
+ p_bl (→ MOSDRepOp middle)          d_bl (→ MOSDRepOp data segment)
+ ┌──────────────────────────┐       ┌──────────────────────────────────┐
+ │ ENCODE_START(ver 10)     │       │ data_aligned_bl     (encode_nohead│ ← views; page-aligned
+ │ op_bl  (the Op records)  │       │                       = append)   │   at offset 0 of the
+ │ coll_index, object_index │       │ data_misaligned_bl  (encode_nohead│   receiver's segment
+ │ data (TransactionData)   │       │                       = append)   │
+ │ data_features            │       └──────────────────────────────────┘
+ │ aligned length           │
+ │ misaligned length        │
+ └──────────────────────────┘
+```
+
+`d_bl` is still just nodes onto the original raw: `generate_subop` hands
+it to `MOSDRepOp::set_data`, the messenger's `write_message` builds
+iovecs from its nodes (`prepare_iov`,
+[`buffer.h:1213`](https://github.com/ceph/ceph/blob/v21.3.0/src/include/buffer.h#L1213))
+and `sendmsg`s them — so from the primary's receive buffer to the
+replica's socket, the 16 KiB is never copied in user space (§7.3). On
+the replica, `decode_bl`
+([`Transaction.h:717`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/Transaction.h#L717))
+reverses the split with `decode_nohead` — `iterator::copy(len, list&)`,
+a share — so the reassembled write is, again, views onto the received
+data segment; whether those views start on a page boundary is decided
+entirely by which branch `write()` took on the primary. With
+`data_features = 0` the legacy branch puts the payload behind the attr
+values and a length word (§3.3.3's 329 bytes), and
+`rebuild_aligned_size_and_memory` on the replica copies it once more;
+with the features set, the aligned list goes first and the copy
+disappears (§3.3.8, §7.4). The bufferlist did its job either way —
+the difference is entirely in how `Transaction::write()` arranged the
+views.
+
 ## 4.3 Function reference
 
 The functions doing the heavy lifting above, in the order a write
