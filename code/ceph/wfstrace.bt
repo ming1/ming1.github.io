@@ -261,11 +261,27 @@ uprobe:$3:_ZN8Objecter10_op_submitE*
  * OpRequest* as arg1.
  */
 
-/* OSD::ms_fast_dispatch -- an op arrives, still on the msgr worker */
+/* OSD::ms_fast_dispatch(Message *m) -- an op arrives, still on the
+ * msgr worker.  arg1 is a plain Message*; its header (+24) gives the
+ * message type (+16) and the op's tid (+8) -- the same tid that names
+ * the op in wire logs, osd_op(client.X.0:<tid> ...).  The object and
+ * the op vector are NOT decoded yet at this point (MOSDOp's
+ * final_decode runs later, on the PG thread), so type+tid is the
+ * op's whole identity here; submit_transaction prints the object. */
 uprobe:$2:_ZN3OSD16ms_fast_dispatchE*
 /@t0/
-{ printf("%10lld %7d  %-6s %-16s %-38s op arrives\n",
-         (nsecs-@t0)/1000, tid, "osd", comm, "OSD::ms_fast_dispatch"); }
+{
+  $type = *(uint16*)(arg1 + 24 + 16);
+  $mtid = *(uint64*)(arg1 + 24 + 8);
+  if ($type == 42) {
+    printf("%10lld %7d  %-6s %-16s %-38s osd_op tid=%lld arrives\n",
+           (nsecs-@t0)/1000, tid, "osd", comm, "OSD::ms_fast_dispatch", $mtid);
+  } else {
+    printf("%10lld %7d  %-6s %-16s %-38s msg type=%d tid=%lld arrives\n",
+           (nsecs-@t0)/1000, tid, "osd", comm, "OSD::ms_fast_dispatch",
+           $type, $mtid);
+  }
+}
 
 /* OpTracker::create_request<OpRequest, Message*> (return) -- silent;
  * starts the op's clock for the latency printed at log_op_stats */
