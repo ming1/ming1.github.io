@@ -3754,24 +3754,60 @@ and message framing, ~1.7 KiB of onode+pglog kv values. The headline:
 
 ## 7.3 The write path, hop by hop
 
+Two legs, drawn separately — the ingest into the primary, then the
+fan-out to the replica. The right column answers one question per
+hop: does this hop copy the data? `[K]` marks the two unavoidable
+kernel socket copies.
+
 ```
-client                    PRIMARY osd                              REPLICA osd
-  |                         |                                        |
-  | ==network==> [K] socket |                                        |
-  |    recvmsg -> rx DATA segment (page-aligned raw)   <-- (a) <=64K: 1 memcpy
-  |               | ref     Message::data                            |
-  |               | ref     OSDOp::indata                            |
-  |               | ref     PGTransaction  --(b) xattrs flatten      |
-  |               | ref     ObjectStore::Transaction {aligned|mis}   |
-  |               +--------------------.                             |
-  |               | ref                | ref (encode = append)       |
-  |          KernelDevice::aio_write   MOSDRepOp {MIDDLE=meta, DATA} |
-  |     (c) rebuild iff misaligned     | iovec sendmsg [K]           |
-  |          aio_t::bl pins ---> DMA   | ==network==> rx segment     |
-  |                                    |        | ref  Txn decode    |
-  |                                    |        KernelDevice::aio_write
-  |                                    |   (d) rebuild: THE copy, §7.4
-[K] = kernel copy (skb), unavoidable          aio_t::bl pins -> DMA
+LEG 1 -- client write arrives at the primary, reaches the local disk
+
+  CLIENT == network ==+                       does this hop copy the data?
+                      |
+                      v
+  socket --recvmsg--> rx DATA segment         [K] kernel skb -> buffer;
+     one fresh page-aligned raw per message   (a) plus one memcpy when the
+                      |  ref                      segment is <= 64 KiB
+                      v
+  Message::data ----> OSDOp::indata           no -- sub-views of the same raw
+                      |  ref
+                      v
+  PGTransaction ----> ObjectStore::Transaction
+     {aligned bl | misaligned bl}             no -- substr views;
+                      |  ref                  (b) xattr values flatten,
+                      v                           a few hundred bytes
+  KernelDevice::aio_write
+     aio_t::bl pins the raws                  (c) none if every buffer is
+                      |                           block-aligned -- else a
+                      v                           full rebuild memcpy
+  io_submit -- O_DIRECT DMA --> disk          no -- DMA reads user memory
+```
+
+```
+LEG 2 -- the same write fans out to the replica
+
+  PRIMARY  ObjectStore::Transaction           (the same raws as leg 1)
+                      |  encode = append refs
+                      v
+  MOSDRepOp  MIDDLE = op metadata (~400 B)    no -- one set of raws feeds the
+             DATA   = [aligned][misaligned]   local aio AND every replica
+                      |  iovec sendmsg            message
+                      v
+  == network ==                               [K] kernel skb copy
+                      |                       (secure mode: plus one full
+                      v                        encrypt copy per replica)
+  REPLICA  socket --> rx DATA segment         [K]; (a) applies here too
+     one fresh page-aligned raw
+                      |  ref
+                      v
+  Transaction decode -> the write op's bl     no -- views into the segment
+                      |  ref
+                      v
+  KernelDevice::aio_write
+     aio_t::bl pins the raws                  (d) THE copy: the payload sat at
+                      |                           +336, full rebuild on every
+                      v                           write -- the story of 7.4
+  io_submit -- O_DIRECT DMA --> disk
 ```
 
 **Receive.** Each frame segment is read into one contiguous
