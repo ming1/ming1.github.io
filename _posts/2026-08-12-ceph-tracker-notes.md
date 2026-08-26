@@ -860,7 +860,9 @@ os/Transaction) · fix: one line · Status: fix implemented and
 verified on a 2-OSD lab (branch `kv-committing-local`), upstream PR
 pending
 
-## 5.1 Symptom
+## 5.1 Report
+
+### 5.1.1 The observation
 
 Counting real copies of I/O data inside `ceph-osd` (uprobes on
 `buffer::ptr::copy_in` and `list::rebuild`, two-OSD vstart cluster,
@@ -878,7 +880,65 @@ copies nothing, and whichever is replica copies everything. Deferred
 wrong functionally — data is correct, scrubs are clean — the cluster
 just spends a full-payload memcpy per replica per write, forever.
 
-## 5.2 Root cause, top to bottom
+### 5.1.2 Reproducing it
+
+Any vstart cluster where writes actually replicate:
+
+```bash
+MON=1 MGR=1 OSD=2 ../src/vstart.sh -n --without-dashboard
+bin/ceph osd pool create p1 32          # default size 3, 2 OSDs up -> 1 replica/write
+dd if=/dev/urandom of=/tmp/o128k bs=128k count=1
+```
+
+**Signal 1 — no tooling, just a debug line.** The rebuild in
+`KernelDevice::aio_write` logs at `debug_bdev 20`:
+
+```bash
+bin/ceph config set osd debug_bdev 20
+for i in $(seq 1 10); do bin/rados -p p1 put rep-$i /tmp/o128k; done
+bin/ceph config set osd debug_bdev 1/3
+grep -c "rebuilding buffer to be aligned" out/osd.*.log
+```
+
+Unpatched: the count lands on whichever OSD was the *replica* for
+each object — about 2 per write (one per 64 KiB blob), zero on the
+primary. Patched (the one-liner in 5.3): zero everywhere. (`osd map p1 rep-N` tells you
+who was primary for each object.)
+
+**Signal 2 — the wire format is v10 yet still copies.** With
+`debug_ms 1`, the replica's receive line for a rep op shows
+`front+middle+data` as e.g. `1196+375+131408`: a non-zero middle
+proves the split encoding is active — and `131408 = 131072 + 336`
+says the payload still shares the data segment with 336 bytes of
+metadata in front of it.
+
+**Signal 3 — the precise probe.** Print where each aio write's
+buffer points inside its backing allocation (offsets for this
+layout: bufferlist first node at `+0`, node's raw at `+8`, ptr
+offset at `+16`, bl length at `+24`; find `aio_write`'s address with
+`nm bin/ceph-osd`, symbol-name attach trips on `.cold`-fragment
+twins):
+
+```
+uprobe:/path/to/bin/ceph-osd:0xADDR_OF_aio_write
+{
+  $bl = arg2;
+  if (*(uint32*)($bl+24) >= 65536) {
+    $node = *(uint64*)($bl+0);
+    printf("pid=%d off_in_raw=%d\n", pid, *(uint32*)($node+16));
+  }
+}
+```
+
+Unpatched, the replica prints `off_in_raw=336` (and `65872` for the
+second blob); the primary prints `0`/`65536`. Patched, everyone
+prints page-multiples. Full method — including the copy census that
+found this — in
+[§7 of the I/O-path post]({% post_url 2026-08-10-bluestore-io-analysis %}).
+
+## 5.2 Analysis
+
+### 5.2.1 Root cause, top to bottom
 
 Each answer below was measured before moving down a level, DWARF
 call stacks first, then dumping the buffer geometry at the probe:
@@ -950,7 +1010,7 @@ Alignment of the *buffer* is useless when the *payload* starts 336
 bytes into it; only the encode-side split can fix the offset, and
 the split was switched off.
 
-## 5.3 What `a0c9fec7f451` actually built — and where it was wired
+### 5.2.2 What `a0c9fec7f451` actually built — and where it was wired
 
 The commit behind this whole story
 ([a0c9fec7f451](https://github.com/ceph/ceph/commit/a0c9fec7f451),
@@ -992,7 +1052,7 @@ receiver: decode_bl() rebuilds each write as views: [prefix][middle][suffix]
           → the middle is page-aligned in memory → aio submits it as-is
 ```
 
-Plus the safety rails met in 5.5: the `data_features` member set at
+Plus the safety rails met in 5.3.2: the `data_features` member set at
 construction, `is_format_aligned()` gating the split, the
 encode-version assert, and the `append()` feature-equality assert.
 The same commit gave erasure coding the equivalent treatment:
@@ -1009,7 +1069,7 @@ that is where the commit's coverage is uneven:
 | crimson client writes (`ops_executer`) | yes — `txn(pg->min_peer_features())` |
 | classic recovery (`_do_push`, `_do_pull_response`) | yes |
 | classic replica decode (`RepModify`) | yes |
-| **classic replicated client writes** (`submit_transaction`) | **no — default ctor, §5.2** |
+| **classic replicated client writes** (`submit_transaction`) | **no — default ctor, §5.2.1** |
 | **classic EC client writes** (`ECCommon::RMWPipeline::cache_ready`) | **no — `trans[shard]` default-constructs every per-shard transaction** |
 
 So the next-generation OSD got the hot path, and the classic OSD —
@@ -1026,7 +1086,9 @@ Why the tests didn't catch it: they prove the format *round-trips*
 production write path *produces* transactions carrying features, so
 every test passed while every client write took the legacy branch.
 
-## 5.4 The fix — how
+## 5.3 Proposed solution
+
+### 5.3.1 The fix
 
 ```cpp
 // ReplicatedBackend::submit_transaction
@@ -1045,7 +1107,7 @@ first ([`Transaction.h:1379`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/T
 ([`Transaction.h:717`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/Transaction.h#L717)).
 `rebuild_aligned_size_and_memory` then finds nothing to rebuild.
 
-## 5.5 The fix — why it is safe
+### 5.3.2 Why it is safe
 
 Four hazards were checked before trusting one line:
 
@@ -1086,63 +1148,7 @@ construction pattern, it is the one `a0c9fec7f451` itself installed
 on the recovery paths, in production since it merged. The fix makes
 the client path consistent with the paths that already work.
 
-## 5.6 Reproducing
-
-Any vstart cluster where writes actually replicate:
-
-```bash
-MON=1 MGR=1 OSD=2 ../src/vstart.sh -n --without-dashboard
-bin/ceph osd pool create p1 32          # default size 3, 2 OSDs up -> 1 replica/write
-dd if=/dev/urandom of=/tmp/o128k bs=128k count=1
-```
-
-**Signal 1 — no tooling, just a debug line.** The rebuild in
-`KernelDevice::aio_write` logs at `debug_bdev 20`:
-
-```bash
-bin/ceph config set osd debug_bdev 20
-for i in $(seq 1 10); do bin/rados -p p1 put rep-$i /tmp/o128k; done
-bin/ceph config set osd debug_bdev 1/3
-grep -c "rebuilding buffer to be aligned" out/osd.*.log
-```
-
-Unpatched: the count lands on whichever OSD was the *replica* for
-each object — about 2 per write (one per 64 KiB blob), zero on the
-primary. Patched: zero everywhere. (`osd map p1 rep-N` tells you
-who was primary for each object.)
-
-**Signal 2 — the wire format is v10 yet still copies.** With
-`debug_ms 1`, the replica's receive line for a rep op shows
-`front+middle+data` as e.g. `1196+375+131408`: a non-zero middle
-proves the split encoding is active — and `131408 = 131072 + 336`
-says the payload still shares the data segment with 336 bytes of
-metadata in front of it.
-
-**Signal 3 — the precise probe.** Print where each aio write's
-buffer points inside its backing allocation (offsets for this
-layout: bufferlist first node at `+0`, node's raw at `+8`, ptr
-offset at `+16`, bl length at `+24`; find `aio_write`'s address with
-`nm bin/ceph-osd`, symbol-name attach trips on `.cold`-fragment
-twins):
-
-```
-uprobe:/path/to/bin/ceph-osd:0xADDR_OF_aio_write
-{
-  $bl = arg2;
-  if (*(uint32*)($bl+24) >= 65536) {
-    $node = *(uint64*)($bl+0);
-    printf("pid=%d off_in_raw=%d\n", pid, *(uint32*)($node+16));
-  }
-}
-```
-
-Unpatched, the replica prints `off_in_raw=336` (and `65872` for the
-second blob); the primary prints `0`/`65536`. Patched, everyone
-prints page-multiples. Full method — including the copy census that
-found this — in
-[§7 of the I/O-path post]({% post_url 2026-08-10-bluestore-io-analysis %}).
-
-## 5.7 Validation
+### 5.3.3 Validation
 
 Same census, patched build, probes re-verified live (metadata
 counters non-zero):
@@ -1160,7 +1166,7 @@ counters non-zero):
 At pool `size=3` the line removes two full-payload memcpys
 cluster-wide from every client write.
 
-## 5.8 Takeaways
+### 5.3.4 Takeaways
 
 - **A fix that ships but never engages looks exactly like a fix.**
   The aligned format was reviewed, merged, and exercised daily — by
