@@ -950,7 +950,83 @@ Alignment of the *buffer* is useless when the *payload* starts 336
 bytes into it; only the encode-side split can fix the offset, and
 the split was switched off.
 
-## 5.3 The fix — how
+## 5.3 What `a0c9fec7f451` actually built — and where it was wired
+
+The commit behind this whole story
+([a0c9fec7f451](https://github.com/ceph/ceph/commit/a0c9fec7f451),
+"os/Transaction: page align write data buffers to improve
+performance", Bill Scales, merged via
+[PR #57740](https://github.com/ceph/ceph/pull/57740)) is a careful,
+complete piece of infrastructure. Its idea in one sentence: make
+alignment a property of the *encoding*, so that a payload leaves the
+sender already arranged to land page-aligned in the receiver's
+messenger buffer — instead of hinting about alignment after the fact.
+
+**What it retired.** The old mechanism was a v1-messenger hint: the
+transaction tracked its largest data chunk (`largest_data_len/off/
+off_in_data_bl`), exposed it as `get_data_alignment()`, and
+`generate_subop` stamped that into `header.data_off` — which only
+`ProtocolV1::alloc_aligned_buffer` ever consumed to place its rx
+buffer. On a msgr2 cluster the hint was already dead weight. The
+commit deleted the tracking and the stamp — renaming the fields to
+`unused1/2/3` rather than removing them, because `TransactionData`
+is a packed struct appended to the wire verbatim, and the padding
+keeps the on-wire layout identical.
+
+**What it added.** Three layers that only work as a chain:
+
+```
+sender: Transaction::write(off, len, data)          [split at DESTINATION
+  ├─ prefix up to next page boundary → data_misaligned_bl    page bounds]
+  ├─ page-multiple middle           → data_aligned_bl
+  └─ ragged suffix                  → data_misaligned_bl
+
+sender: encode(p, d, peer_features)                 [two output streams]
+  p = op array + indexes + the two lengths  d = [aligned][misaligned]
+       │                                         │
+wire:  └→ MIDDLE segment (8-byte-aligned rx)     └→ DATA segment
+                                                    (page-aligned rx buffer,
+                                                     aligned bytes at +0)
+
+receiver: decode_bl() rebuilds each write as views: [prefix][middle][suffix]
+          → the middle is page-aligned in memory → aio submits it as-is
+```
+
+Plus the safety rails met in 5.5: the `data_features` member set at
+construction, `is_format_aligned()` gating the split, the
+encode-version assert, and the `append()` feature-equality assert.
+The same commit gave erasure coding the equivalent treatment:
+`ECSubWrite::encode` v5 splits its embedded transaction the same way,
+and `ECSubOpReadReply` aligns shard *read* data flowing back between
+OSDs. It even shipped ~1100 lines of encode/decode round-trip tests.
+
+**Where the constructor was wired — the scorecard.** The format only
+activates where the transaction is *built* with peer features, and
+that is where the commit's coverage is uneven:
+
+| path | feature-aware construction? |
+|---|---|
+| crimson client writes (`ops_executer`) | yes — `txn(pg->min_peer_features())` |
+| classic recovery (`_do_push`, `_do_pull_response`) | yes |
+| classic replica decode (`RepModify`) | yes |
+| **classic replicated client writes** (`submit_transaction`) | **no — default ctor, §5.2** |
+| **classic EC client writes** (`ECCommon::RMWPipeline::cache_ready`) | **no — `trans[shard]` default-constructs every per-shard transaction** |
+
+So the next-generation OSD got the hot path, and the classic OSD —
+the one every production cluster runs — got only its recovery and
+decode sides. The EC row means the gap this section fixes for the
+replicated backend has an exact sibling in the EC write path
+(`shard_id_map::operator[]` value-initializes, so `data_features`
+is 0 for every shard transaction); the ECSubWrite v5 wire format is
+just as dormant as MOSDRepOp's was, and closing it is the natural
+follow-up to this fix.
+
+Why the tests didn't catch it: they prove the format *round-trips*
+— encode with features, decode, compare. Nothing asserted that the
+production write path *produces* transactions carrying features, so
+every test passed while every client write took the legacy branch.
+
+## 5.4 The fix — how
 
 ```cpp
 // ReplicatedBackend::submit_transaction
@@ -969,7 +1045,7 @@ first ([`Transaction.h:1379`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/T
 ([`Transaction.h:717`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/Transaction.h#L717)).
 `rebuild_aligned_size_and_memory` then finds nothing to rebuild.
 
-## 5.4 The fix — why it is safe
+## 5.5 The fix — why it is safe
 
 Four hazards were checked before trusting one line:
 
@@ -1010,7 +1086,7 @@ construction pattern, it is the one `a0c9fec7f451` itself installed
 on the recovery paths, in production since it merged. The fix makes
 the client path consistent with the paths that already work.
 
-## 5.5 Reproducing
+## 5.6 Reproducing
 
 Any vstart cluster where writes actually replicate:
 
@@ -1066,7 +1142,7 @@ prints page-multiples. Full method — including the copy census that
 found this — in
 [§7 of the I/O-path post]({% post_url 2026-08-10-bluestore-io-analysis %}).
 
-## 5.6 Validation
+## 5.7 Validation
 
 Same census, patched build, probes re-verified live (metadata
 counters non-zero):
@@ -1084,7 +1160,7 @@ counters non-zero):
 At pool `size=3` the line removes two full-payload memcpys
 cluster-wide from every client write.
 
-## 5.7 Takeaways
+## 5.8 Takeaways
 
 - **A fix that ships but never engages looks exactly like a fix.**
   The aligned format was reviewed, merged, and exercised daily — by
