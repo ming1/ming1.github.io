@@ -1,5 +1,5 @@
 ---
-title: Diagnosing Network Routing, Latency and Congestion Issues
+title: Diagnosing Network Issues
 category: operation
 tags: [network, diagnostics, linux, troubleshoot]
 ---
@@ -719,6 +719,145 @@ Linux.
 connection fails. It answers: "Is the service actually listening on the
 expected port?" Use `ss -ti` to diagnose slow connections, and `ss -tn state
 established` to see who's connected.
+
+## TCP_INFO: the struct behind `ss -i`
+
+`ss -i` is a formatter. The data is one syscall against the socket:
+
+```c
+struct tcp_info info;
+socklen_t len = sizeof(info);
+getsockopt(fd, SOL_TCP, TCP_INFO, &info, &len);
+```
+
+The kernel fills it in `tcp_get_info()` (`net/ipv4/tcp.c`) — a live snapshot of
+one socket's state machine. `ss` reads it for every socket over netlink; any
+process holding the fd can read its own.
+
+Worth going past `ss -i` when a server already exposes the struct for every
+connection it holds. Ceph dumps it as JSON, next to the peer's entity name and
+address — per-connection attribution to a *peer* that `ss` cannot give you:
+
+```bash
+ceph daemon mon.ceph6 messenger dump              # lists messenger names
+ceph daemon mon.ceph6 messenger dump mon --tcp-info
+```
+
+Without the messenger positional you get the name list and nothing else. The
+catch is that nobody agrees on field names:
+
+```
+ss -i            struct tcp_info                    Ceph JSON
+rtt:196.5/12.3   tcpi_rtt / tcpi_rttvar   (µs!)     tcpi_rtt_us / tcpi_rttvar_us
+rto:408          tcpi_rto                 (µs!)     tcpi_rto_us
+retrans:0/3      tcpi_retrans / tcpi_total_retrans  (unchanged)
+lastsnd:         tcpi_last_data_sent      (ms)      tcpi_last_data_sent_ms
+lastrcv:         tcpi_last_data_recv      (ms)      tcpi_last_data_recv_ms
+lastack:         tcpi_last_ack_recv       (ms)      tcpi_last_ack_recv_ms
+```
+
+`ss` divides the µs fields into ms; Ceph keeps kernel units and appends the unit
+to the key. Grep a Ceph dump for `tcpi_rto` and you get a silent zero, not an
+error.
+
+One trap deserves calling out: **`tcpi_retrans` and `tcpi_retransmits` are
+different fields**, one letter apart. The first is retransmits currently
+outstanding; the second is consecutive RTO firings.
+
+### Ages, not timestamps
+
+Three of these four are "ms since X". Bigger is staler.
+
+| Field | Milliseconds since |
+|-------|--------------------|
+| `tcpi_last_data_sent` | we last *attempted* a data segment |
+| `tcpi_last_ack_recv` | the peer last ACKed us |
+| `tcpi_last_data_recv` | the peer last sent data |
+| `tcpi_last_ack_sent` | **nothing — Linux never sets it** (`/* Not remembered, sorry. */`) |
+
+`last_data_sent` counts retransmissions, because `tcp_event_data_sent()` runs
+inside `__tcp_transmit_skb()`, which the retransmit path also uses. It is also
+stamped *before* the packet reaches the device, so even a segment the qdisc
+drops refreshes it. Pure ACKs and data-less probes do not — the update is
+guarded on carrying payload.
+
+That inverts the obvious reading. A **large** `last_data_sent` means no data
+segment was even attempted in that window — usually an idle application, not a
+stalled one, unless the peer's window is closed: zero-window probes carry no
+payload, so they never refresh it. Check `Send-Q` (`ss -i` prints `notsent:`)
+before concluding idle. A stalled sender looks the opposite way: `last_data_sent` small,
+because retries keep refreshing it, with `last_ack_recv` large and
+`tcpi_unacked` non-zero.
+
+Check `tcpi_unacked` before concluding "idle", though. A large `last_data_sent`
+*with* unacked segments outstanding is the rare third case: data is owed and the
+retransmit timer is not firing either.
+
+### Loss and recovery
+
+| Field | Meaning |
+|-------|---------|
+| `tcpi_total_retrans` | retransmitted segments, connection lifetime |
+| `tcpi_retransmits` | consecutive RTO firings; an ACK of new data resets it |
+| `tcpi_backoff` | RTO backoff exponent |
+| `tcpi_rto` | current retransmit timeout (µs) |
+| `tcpi_unacked` | segments sent but not cumulatively ACKed (`tp->packets_out`) |
+
+`tcpi_unacked` is not in-flight — that subtracts SACKed and lost segments. On a
+LISTEN socket the kernel reuses the same field for the accept-queue depth, which
+bites when parsing a dump that includes listeners.
+
+`tcpi_total_retrans` is cumulative per connection, so normalize by bytes moved
+before calling it bad. Millions of retransmits on a socket that moved 300 TB is
+a different story from the same count on 30 GB.
+
+### retransmits > backoff hints the host is dropping its own packets
+
+`ss -i` prints both (`retransmits:` and `backoff:`). They advance in different
+places inside `tcp_retransmit_timer()`:
+
+```
+tcp_update_rto_stats()        icsk_retransmits++   on the RTO path
+if (tcp_retransmit_skb() > 0)
+        /* "Retransmission failed because of local congestion" */
+        reset timer to 500ms
+        goto out                                   skips the backoff bump
+out_reset_timer:
+        icsk_backoff++                             normally, but see below
+```
+
+A positive return is `NET_XMIT_DROP`: the local qdisc dropped it. So
+`retransmits:11 backoff:6` suggests five retries never left the box — start at
+`tc -s qdisc`.
+
+Confirm before believing it: two other branches zero or skip the backoff bump
+with no local drop involved — thin-stream linear timeouts, and the first few
+SYN-SENT retries (`tcp_syn_linear_timeouts`, default 4). A socket still in
+SYN-SENT after three SYNs shows `retransmits:3 backoff:0` for entirely ordinary
+reasons.
+
+### tcpi_options says whether ECN is live
+
+```
+[timestamps, sack, wscale]              ECN not negotiated
+[timestamps, sack, wscale, ecn]         ECN negotiated
+                        + "ecn seen"    peer's packets arrive ECN-marked
+```
+
+`ecn seen` means ECT(0), ECT(1) **or** CE was seen — not congestion by itself.
+For actual congestion marks read `tcpi_delivered_ce` (`ss -i` prints
+`delivered_ce:`; Ceph's dump stops at `tcpi_options` and omits it). The array
+spelling above is Ceph's; `ss` prints `ecnseen`.
+
+Why it matters: a switch cannot ECN-mark a packet that was never ECT-marked, so
+without `ecn` its only way to signal congestion is to **drop**. If you are
+chasing retransmissions and no socket shows `ecn`, check `net.ipv4.tcp_ecn` —
+the Linux default of `2` means "accept if asked, never ask", so two default
+hosts never negotiate it.
+
+**When to use**: after `nstat` says the host is losing packets and you need to
+know which connection and where. `ss -i` for a quick look; the raw struct when a
+server already exposes it for every connection it holds.
 
 ## Checking firewalls on the server
 
