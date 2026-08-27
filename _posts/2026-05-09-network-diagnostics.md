@@ -783,15 +783,17 @@ guarded on carrying payload.
 
 That inverts the obvious reading. A **large** `last_data_sent` means no data
 segment was even attempted in that window — usually an idle application, not a
-stalled one, unless the peer's window is closed: zero-window probes carry no
-payload, so they never refresh it. Check `Send-Q` (`ss -i` prints `notsent:`)
-before concluding idle. A stalled sender looks the opposite way: `last_data_sent` small,
+stalled one. A stalled sender looks the opposite way: `last_data_sent` small,
 because retries keep refreshing it, with `last_ack_recv` large and
 `tcpi_unacked` non-zero.
 
-Check `tcpi_unacked` before concluding "idle", though. A large `last_data_sent`
-*with* unacked segments outstanding is the rare third case: data is owed and the
-retransmit timer is not firing either.
+Two cases break the "large means idle" reading, so check before concluding it:
+
+- **Bytes unsent** (`ss -i` prints `notsent:`) — a zero-window stall. The peer
+  stopped reading; window probes carry no payload, so they never refresh the
+  counter. Ceph's dump omits this field, so you need `ss` for it.
+- **`tcpi_unacked` non-zero** — rarer: data is owed and the retransmit timer has
+  not fired either.
 
 ### Loss and recovery
 
@@ -845,9 +847,11 @@ reasons.
 ```
 
 `ecn seen` means ECT(0), ECT(1) **or** CE was seen — not congestion by itself.
-For actual congestion marks read `tcpi_delivered_ce` (`ss -i` prints
-`delivered_ce:`; Ceph's dump stops at `tcpi_options` and omits it). The array
-spelling above is Ceph's; `ss` prints `ecnseen`.
+For actual congestion marks, mind the direction: `tcpi_received_ce` counts CE
+on packets arriving from the peer, `tcpi_delivered_ce` counts CE on *our*
+packets fed back via ECE (`ss -i` prints `delivered_ce:`). Ceph's dump stops at
+`tcpi_options` and omits both. The array spelling above is Ceph's; `ss` prints
+`ecnseen`.
 
 Why it matters: a switch cannot ECN-mark a packet that was never ECT-marked, so
 without `ecn` its only way to signal congestion is to **drop**. If you are
