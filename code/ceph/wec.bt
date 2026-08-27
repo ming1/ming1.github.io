@@ -1,0 +1,337 @@
+#!/usr/bin/env bpftrace
+/*
+ * wec.bt -- one client write into an erasure-coded pool, traced across the
+ * client and every OSD that holds a shard, on one timeline.
+ *
+ * Usage:
+ *   bpftrace wec.bt <ceph-osd> <libceph-common.so.2> <pid osd.0> <pid osd.1> <pid osd.2> <pid osd.3>
+ *
+ *   $1      path to the ceph-osd binary all OSDs were exec'd from
+ *   $2      path to libceph-common.so.2 (the client's Objecter/messenger)
+ *   $3..$6  the OSD pids, in osd-id order; the proc column prints osd.N
+ *   Use absolute paths (realpath); on an optimized build resolve the
+ *   symbols to addresses first with btaddr.py (next to this script).
+ *
+ * Wait for the column-header line, then issue ONE write into the EC pool:
+ *   rados -p ecl put o48 /root/16k        and Ctrl-C a few seconds later.
+ *
+ * Columns as wtrace.bt / wreplica.bt: us since the client submitted the
+ * op, kernel tid, proc (client | osd.N), thread (comm), function, event.
+ *
+ * What is probed:
+ *   messenger   preamble stamp + OSD::ms_fast_dispatch (types 42 osd_op,
+ *               108 ec_write, 109 ec_write_reply, 110/111 ec_read/reply),
+ *               OSDService::send_message_osd_cluster (both the per-peer
+ *               and the vector overload the EC pipeline uses) and
+ *               ProtocolV2::write_message.
+ *   EC pipeline (legacy backend, namespace ECLegacy -- what a default
+ *               erasure pool runs): ECBackendL::submit_transaction ->
+ *               RMWPipeline::start_rmw -> ECTransactionL::generate_transactions
+ *               -> ECUtilL::encode (the k+m chunking) -> handle_sub_write on
+ *               every shard (the primary calls its own directly) ->
+ *               sub_write_committed -> handle_sub_write_reply on the
+ *               primary -> try_finish_rmw (return probe: fires "done"
+ *               only when the op left the pipeline).
+ *   BlueStore   thin, as in wreplica.bt: queue_transactions, the data
+ *               aio_write with the payload's offset in its buffer
+ *               (src_off), the list::rebuild memcpy it may force, the
+ *               flush barriers, the kv commit, _txc_committed_kv.
+ *
+ * Struct offsets (gdb ptype /o): Message header +24 -> tid +32, type +40,
+ * front/middle/data_len +46/+50/+54; hobject_t name +0, pool +56;
+ * RepGather::rep_tid +200; bufferlist first node +0, _len +24, node
+ * offset-in-raw +16; std::vector begin/end +0/+8, sizeof(pair<int,
+ * Message*>) = 16.  pg_shard_t is 8 trivially-copyable bytes {int32 osd;
+ * int8 shard} and travels in one register: osd = low 32 bits.  Non-trivial
+ * by-value arguments (OpRequestRef) arrive as a pointer to a temporary.
+ */
+
+BEGIN
+{
+  printf("%10s %7s  %-7s %-16s %-38s %s\n",
+         "us", "tid", "proc", "thread", "function", "event");
+  @procname[$3] = "osd.0"; @procname[$4] = "osd.1";
+  @procname[$5] = "osd.2"; @procname[$6] = "osd.3";
+  @isosd[$3] = 1; @isosd[$4] = 1; @isosd[$5] = 1; @isosd[$6] = 1;
+}
+
+/* ==== client lane ====================================================== */
+
+uprobe:$2:_ZN8Objecter10_op_submitE*
+/comm == "rados"/
+{
+  if (@t0 == 0) { @t0 = nsecs; @client = pid; @procname[pid] = "client"; }
+  printf("%10lld %7d  %-7s %-16s %-38s obj=%s pool=%lld -> MOSDOp\n",
+         (nsecs-@t0)/1000, tid, @procname[pid], comm, "Objecter::_op_submit",
+         str(*(uint64*)(arg1 + 48)), *(int64*)(arg1 + 80));
+}
+
+uprobe:$2:_ZN10ProtocolV213write_messageE*
+/@t0 && pid == @client/
+{
+  printf("%10lld %7d  %-7s %-16s %-38s MOSDOp tid=%lld -> socket, front+middle+data=%u+%u+%u B\n",
+         (nsecs-@t0)/1000, tid, @procname[pid], comm, "ProtocolV2::write_message",
+         *(uint64*)(arg1 + 32), *(uint32*)(arg1 + 46),
+         *(uint32*)(arg1 + 50), *(uint32*)(arg1 + 54));
+}
+
+uprobe:$2:_ZN8Objecter19handle_osd_op_replyE*
+/@t0 && pid == @client/
+{
+  printf("%10lld %7d  %-7s %-16s %-38s MOSDOpReply tid=%lld <- primary, write is durable\n",
+         (nsecs-@t0)/1000, tid, @procname[pid], comm, "Objecter::handle_osd_op_reply",
+         *(uint64*)(arg1 + 32));
+}
+
+/* ==== messenger, receive side (all OSDs) =============================== */
+
+uprobe:$1:_ZN10ProtocolV231handle_read_frame_preamble_mainE*
+/@t0 && @isosd[pid]/
+{ @rx_pre[tid] = nsecs; }
+
+uprobe:$1:_ZN3OSD16ms_fast_dispatchE*
+/@t0 && @isosd[pid]/
+{
+  $type  = *(uint16*)(arg1 + 40);
+  $mtid  = *(uint64*)(arg1 + 32);
+  $front = *(uint32*)(arg1 + 46);
+  $mid   = *(uint32*)(arg1 + 50);
+  $data  = *(uint32*)(arg1 + 54);
+  $rx = (uint64)0;
+  if (@rx_pre[tid]) { $rx = (nsecs - @rx_pre[tid]) / 1000; delete(@rx_pre[tid]); }
+  if ($type == 42) {
+    printf("%10lld %7d  %-7s %-16s %-38s osd_op tid=%lld arrives, front+middle+data=%u+%u+%u B (frame rx+decode %lld us)\n",
+           (nsecs-@t0)/1000, tid, @procname[pid], comm, "OSD::ms_fast_dispatch",
+           $mtid, $front, $mid, $data, $rx);
+  } else if ($type == 108) {
+    printf("%10lld %7d  %-7s %-16s %-38s ec_sub_write arrives, front+middle+data=%u+%u+%u B (frame rx+decode %lld us)\n",
+           (nsecs-@t0)/1000, tid, @procname[pid], comm, "OSD::ms_fast_dispatch",
+           $front, $mid, $data, $rx);
+  } else if ($type == 109) {
+    printf("%10lld %7d  %-7s %-16s %-38s ec_sub_write_reply arrives, %u B (frame rx+decode %lld us)\n",
+           (nsecs-@t0)/1000, tid, @procname[pid], comm, "OSD::ms_fast_dispatch",
+           $front, $rx);
+  } else if ($type == 110 || $type == 111) {
+    printf("%10lld %7d  %-7s %-16s %-38s %s tid=%lld arrives, %u+%u+%u B\n",
+           (nsecs-@t0)/1000, tid, @procname[pid], comm, "OSD::ms_fast_dispatch",
+           $type == 110 ? "ec_sub_read" : "ec_sub_read_reply", $mtid, $front, $mid, $data);
+  } else {
+    @other_rx[@procname[pid], $type] = count();
+  }
+}
+
+uretprobe:$1:_ZN9OpTracker14create_request*
+/@t0 && @isosd[pid]/
+{ @req_start[*(uint64*)retval] = nsecs; }
+
+uprobe:$1:_ZN3OSD10enqueue_opE*
+/@t0 && @isosd[pid]/
+{ printf("%10lld %7d  %-7s %-16s %-38s epoch %lld -> shard queue\n",
+         (nsecs-@t0)/1000, tid, @procname[pid], comm, "OSD::enqueue_op", arg2); }
+
+uprobe:$1:_ZN3OSD10dequeue_opE*
+/@t0 && @isosd[pid]/
+{ printf("%10lld %7d  %-7s %-16s %-38s worker picks op\n",
+         (nsecs-@t0)/1000, tid, @procname[pid], comm, "OSD::dequeue_op"); }
+
+/* ==== primary: the RMW pipeline ======================================== */
+
+uprobe:$1:_ZN12PrimaryLogPG11issue_repopE*
+/@t0 && @isosd[pid]/
+{ printf("%10lld %7d  %-7s %-16s %-38s rep_tid=%lld -> backend\n",
+         (nsecs-@t0)/1000, tid, @procname[pid], comm, "PrimaryLogPG::issue_repop",
+         *(uint64*)(arg1 + 200)); }
+
+/* ECBackendL::submit_transaction(hoid, ...) -- builds the Op and its write
+ * plan (which stripes to write, whether anything must be read first) */
+uprobe:$1:_ZN8ECLegacy10ECBackendL18submit_transactionE*
+/@t0 && @isosd[pid]/
+{ printf("%10lld %7d  %-7s %-16s %-38s obj=%s pool=%lld: build Op + write plan\n",
+         (nsecs-@t0)/1000, tid, @procname[pid], comm, "ECBackendL::submit_transaction",
+         str(*(uint64*)arg1), *(int64*)(arg1 + 56)); }
+
+/* RMWPipeline::start_rmw(OpRef) -- op enters waiting_state; check_ops()
+ * then drives try_state_to_reads -> try_reads_to_commit -> try_finish_rmw */
+uprobe:$1:_ZN8ECLegacy9ECCommonL11RMWPipeline9start_rmwE*
+/@t0 && @isosd[pid]/
+{ printf("%10lld %7d  %-7s %-16s %-38s op -> waiting_state; check_ops()\n",
+         (nsecs-@t0)/1000, tid, @procname[pid], comm, "RMWPipeline::start_rmw"); }
+
+/* ECTransactionL::generate_transactions -- called from
+ * RMWPipeline::try_reads_to_commit once the op's reads (if any) are in:
+ * turn the PGTransaction into one ObjectStore::Transaction per shard,
+ * encoding the stripes on the way (ECUtilL::encode below).
+ * (try_reads_to_commit itself is not probed: check_ops() calls it after
+ * every pipeline event and it usually finds nothing to do.) */
+uprobe:$1:_ZN8ECLegacy14ECTransactionL21generate_transactionsE*
+/@t0 && @isosd[pid]/
+{ printf("%10lld %7d  %-7s %-16s %-38s PGTransaction -> one transaction per shard\n",
+         (nsecs-@t0)/1000, tid, @procname[pid], comm, "ECTransactionL::generate_transactions"); }
+
+/* ECUtilL::encode(sinfo, ec_impl, in=arg2, want, out) -- a free
+ * function (no `this`): the erasure code proper, stripe by stripe,
+ * k data chunks + m parity chunks */
+uprobe:$1:_ZN8ECLegacy7ECUtilL6encodeE*
+/@t0 && @isosd[pid]/
+{ printf("%10lld %7d  %-7s %-16s %-38s %u B logical -> k data + m parity chunks\n",
+         (nsecs-@t0)/1000, tid, @procname[pid], comm, "ECUtilL::encode",
+         *(uint32*)(arg2 + 24)); }
+
+/* OSDService::send_message_osd_cluster(vector<pair<int,Message*>>&, epoch)
+ * -- the EC pipeline sends all sub-writes in one call */
+uprobe:$1:_ZN10OSDService24send_message_osd_clusterERSt6vector*
+/@t0 && @isosd[pid]/
+{ printf("%10lld %7d  %-7s %-16s %-38s %lld MOSDECSubOpWrite -> peers (encode, queue to msgr-workers)\n",
+         (nsecs-@t0)/1000, tid, @procname[pid], comm, "OSDService::send_message_osd_cluster",
+         (*(uint64*)(arg1 + 8) - *(uint64*)arg1) / 16); }
+
+/* OSDService::send_message_osd_cluster(int peer, Message*, epoch) -- the
+ * shards' replies (and anything else sent one at a time) */
+uprobe:$1:_ZN10OSDService24send_message_osd_clusterEiP*
+/@t0 && @isosd[pid]/
+{
+  $type = *(uint16*)(arg2 + 40);
+  if ($type == 109) {
+    printf("%10lld %7d  %-7s %-16s %-38s MOSDECSubOpWriteReply -> osd.%d (encode, queue to msgr-worker)\n",
+           (nsecs-@t0)/1000, tid, @procname[pid], comm, "OSDService::send_message_osd_cluster",
+           arg1);
+  } else {
+    @other_tx[@procname[pid], $type] = count();
+  }
+}
+
+uprobe:$1:_ZN10ProtocolV213write_messageE*
+/@t0 && @isosd[pid]/
+{
+  $type  = *(uint16*)(arg1 + 40);
+  $mtid  = *(uint64*)(arg1 + 32);
+  $front = *(uint32*)(arg1 + 46);
+  $mid   = *(uint32*)(arg1 + 50);
+  $data  = *(uint32*)(arg1 + 54);
+  if ($type == 108) {
+    printf("%10lld %7d  %-7s %-16s %-38s MOSDECSubOpWrite -> socket, front+middle+data=%u+%u+%u B\n",
+           (nsecs-@t0)/1000, tid, @procname[pid], comm, "ProtocolV2::write_message",
+           $front, $mid, $data);
+  } else if ($type == 109) {
+    printf("%10lld %7d  %-7s %-16s %-38s MOSDECSubOpWriteReply -> socket, %u B\n",
+           (nsecs-@t0)/1000, tid, @procname[pid], comm, "ProtocolV2::write_message",
+           $front);
+  } else if ($type == 43) {
+    printf("%10lld %7d  %-7s %-16s %-38s MOSDOpReply tid=%lld -> socket, %u B\n",
+           (nsecs-@t0)/1000, tid, @procname[pid], comm, "ProtocolV2::write_message",
+           $mtid, $front);
+  } else if ($type == 110 || $type == 111) {
+    printf("%10lld %7d  %-7s %-16s %-38s %s tid=%lld -> socket, %u+%u+%u B\n",
+           (nsecs-@t0)/1000, tid, @procname[pid], comm, "ProtocolV2::write_message",
+           $type == 110 ? "MOSDECSubOpRead" : "MOSDECSubOpReadReply", $mtid, $front, $mid, $data);
+  } else {
+    @other_tx[@procname[pid], $type] = count();
+  }
+}
+
+/* ==== every shard: the sub-write ====================================== */
+
+/* ECBackendL::handle_sub_write(from=arg1, msg=arg2, op&, trace, listener)
+ * -- decode the shipped transaction, add this shard's own pg-log
+ * transaction, queue both.  The primary calls this directly for its own
+ * shard (from == self, msg = the client op); the others get here from
+ * an MOSDECSubOpWrite via the shard queue. */
+uprobe:$1:_ZN8ECLegacy10ECBackendL16handle_sub_writeE*
+/@t0 && @isosd[pid]/
+{ printf("%10lld %7d  %-7s %-16s %-38s sub-write from osd.%d shard %lld: txn + log -> queue_transactions\n",
+         (nsecs-@t0)/1000, tid, @procname[pid], comm, "ECBackendL::handle_sub_write",
+         (int32)(arg1 & 0xffffffff), (arg1 >> 32) & 0xff); }
+
+/* ECBackendL::sub_write_committed(tid=arg1, ...) -- this shard's store
+ * committed; the primary feeds its own reply straight into
+ * handle_sub_write_reply, the others send an MOSDECSubOpWriteReply */
+uprobe:$1:_ZN8ECLegacy10ECBackendL19sub_write_committedE*
+/@t0 && @isosd[pid]/
+{ printf("%10lld %7d  %-7s %-16s %-38s tid=%lld shard committed -> reply to primary\n",
+         (nsecs-@t0)/1000, tid, @procname[pid], comm, "ECBackendL::sub_write_committed", arg1); }
+
+/* ==== primary: collecting the shard commits ============================ */
+
+/* ECBackendL::handle_sub_write_reply(from=arg1, reply&, trace) --
+ * pending_commit.erase(from); when the set is empty, on_all_commit fires */
+uprobe:$1:_ZN8ECLegacy10ECBackendL22handle_sub_write_replyE*
+/@t0 && @isosd[pid]/
+{ printf("%10lld %7d  %-7s %-16s %-38s commit from osd.%d shard %lld -> pending_commit.erase\n",
+         (nsecs-@t0)/1000, tid, @procname[pid], comm, "ECBackendL::handle_sub_write_reply",
+         (int32)(arg1 & 0xffffffff), (arg1 >> 32) & 0xff); }
+
+/* RMWPipeline::try_finish_rmw (return) -- true only when the op at the
+ * head of waiting_commit has no write in progress: it leaves the pipeline */
+uretprobe:$1:_ZN8ECLegacy9ECCommonL11RMWPipeline14try_finish_rmwE*
+/@t0 && @isosd[pid] && retval == 1/
+{ printf("%10lld %7d  %-7s %-16s %-38s all shards committed: op leaves the pipeline\n",
+         (nsecs-@t0)/1000, tid, @procname[pid], comm, "RMWPipeline::try_finish_rmw"); }
+
+uprobe:$1:_ZN12PrimaryLogPG19repop_all_committedE*
+/@t0 && @isosd[pid]/
+{ printf("%10lld %7d  %-7s %-16s %-38s rep_tid=%lld -> eval_repop -> reply\n",
+         (nsecs-@t0)/1000, tid, @procname[pid], comm, "PrimaryLogPG::repop_all_committed",
+         *(uint64*)(arg1 + 200)); }
+
+uprobe:$1:_ZN12PrimaryLogPG12log_op_statsE*
+/@t0 && @req_start[arg1]/
+{ printf("%10lld %7d  %-7s %-16s %-38s reply -> client (in osd %lld us)\n",
+         (nsecs-@t0)/1000, tid, @procname[pid], comm, "PrimaryLogPG::log_op_stats",
+         (nsecs-@req_start[arg1])/1000);
+  delete(@req_start[arg1]); }
+
+/* ==== BlueStore, thin (all OSDs) ======================================= */
+
+uprobe:$1:_ZN9BlueStore*queue_transactionsE*
+/@t0 && @isosd[pid]/
+{ printf("%10lld %7d  %-7s %-16s %-38s transaction arrives\n",
+         (nsecs-@t0)/1000, tid, @procname[pid], comm, "BlueStore::queue_transactions"); }
+
+uprobe:$1:_ZN12KernelDevice*aio_writeE*
+/@t0 && @isosd[pid]/
+{
+  $node = *(uint64*)arg2;
+  printf("%10lld %7d  %-7s %-16s %-38s bdev=%p off=0x%lx len=0x%x src_off=%u\n",
+         (nsecs-@t0)/1000, tid, @procname[pid], comm, "KernelDevice::aio_write",
+         arg0, arg1, *(uint32*)(arg2 + 24), *(uint32*)($node + 16));
+}
+
+uprobe:$1:_ZN4ceph6buffer7v15_2_04list7rebuildESt10unique_ptr*
+/@t0 && @isosd[pid] && *(uint32*)(arg0 + 24) >= 4096/
+{ printf("%10lld %7d  %-7s %-16s %-38s memcpy %u B into a fresh aligned buffer\n",
+         (nsecs-@t0)/1000, tid, @procname[pid], comm, "buffer::list::rebuild",
+         *(uint32*)(arg0 + 24)); }
+
+uprobe:$1:_ZN12KernelDevice*flushE*
+/@t0 && @isosd[pid]/
+{ @ts_fl[tid] = nsecs; @fl_dev[tid] = arg0; }
+uretprobe:$1:_ZN12KernelDevice*flushE*
+/@ts_fl[tid]/
+{ printf("%10lld %7d  %-7s %-16s %-38s fdatasync bdev=%p %lld us\n",
+         (nsecs-@t0)/1000, tid, @procname[pid], comm, "KernelDevice::flush",
+         @fl_dev[tid], (nsecs-@ts_fl[tid])/1000);
+  delete(@ts_fl[tid]); delete(@fl_dev[tid]); }
+
+uprobe:$1:_ZN12RocksDBStore*submit_transaction_syncE*
+/@t0 && @isosd[pid]/
+{ @ts_kv[tid] = nsecs; }
+uretprobe:$1:_ZN12RocksDBStore*submit_transaction_syncE*
+/@ts_kv[tid]/
+{ printf("%10lld %7d  %-7s %-16s %-38s kv commit done (%lld us): metadata durable\n",
+         (nsecs-@t0)/1000, tid, @procname[pid], comm, "RocksDBStore::submit_transaction_sync",
+         (nsecs-@ts_kv[tid])/1000);
+  delete(@ts_kv[tid]); }
+
+uprobe:$1:_ZN9BlueStore*_txc_committed_kvE*
+/@t0 && @isosd[pid]/
+{ printf("%10lld %7d  %-7s %-16s %-38s txc %p committed -> commit callbacks to shard queue\n",
+         (nsecs-@t0)/1000, tid, @procname[pid], comm, "BlueStore::_txc_committed_kv", arg1); }
+
+END
+{
+  print(@other_rx);
+  print(@other_tx);
+  clear(@other_rx); clear(@other_tx);
+  clear(@t0); clear(@client); clear(@procname); clear(@isosd);
+  clear(@rx_pre); clear(@req_start); clear(@ts_fl); clear(@fl_dev); clear(@ts_kv);
+}

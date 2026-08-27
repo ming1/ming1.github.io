@@ -2501,6 +2501,371 @@ replicated write. §7.4 has the copy census at 128 KiB and 4 KiB
 deferred; the [tracker-notes post]({% post_url 2026-08-12-ceph-tracker-notes %})
 (§5) the root cause and the fix's safety argument.
 
+## 3.4 One 16 KiB write to an erasure-coded pool
+
+§3.3 replicated a write: the primary shipped its transaction to one
+peer and waited for two commits. An erasure-coded pool changes what
+the primary *computes* before it ships anything — the object is cut
+into stripes, each stripe into k data + m parity chunks, and every
+shard gets a different 8 KiB — and how many commits it waits for
+(k+m). This case study traces the same `rados put o48 /root/16k` into
+a k=2 m=2 pool on four OSDs, so every OSD holds exactly one shard and
+one of them is also the primary. The script is `wec.bt`; its lanes
+are `client` and `osd.0`–`osd.3` (by pid, as in §3.3), the BlueStore
+lane is kept thin (§3.1 owns it), and the dispatch/messenger lines
+are the ones §3.3 already explained. What is new here: the encode,
+the one-shot fan-out to k+m−1 peers, the k+m-way commit collection,
+and a second, empty write round that follows every EC write.
+
+The lab is the §3.3 VM with the 1 GiB disk dropped:
+
+| | |
+|---|---|
+| osd.0 / osd.1 | `/dev/sda` 12 GiB, `/dev/sdb` 4 GiB (QEMU SCSI) |
+| osd.2 / osd.3 | `/dev/vdb` 8 GiB (virtio), `/dev/nvme0n1` 8 GiB (emulated NVMe) |
+| profile `ec22` | `k=2 m=2 crush-failure-domain=osd` (plugin `isa`, `reed_sol_van`, stripe unit 4 KiB) |
+| pool `ecl` | 32 PGs, `allow_ec_overwrites true`, autoscaler off, default (legacy) EC pipeline |
+| object `o48` | pg `2.2`, `up [3,1,0,2]` — shard 0 = osd.3 (**primary**), shard 1 = osd.1, shards 2/3 (parity) = osd.0, osd.2 |
+
+```bash
+MON=1 OSD=4 MGR=1 MDS=0 ../src/vstart.sh -n --without-dashboard \
+    --bluestore-devs /dev/sda,/dev/sdb,/dev/vdb,/dev/nvme0n1
+bin/ceph osd erasure-code-profile set ec22 k=2 m=2 crush-failure-domain=osd
+bin/ceph osd pool create ecl 32 32 erasure ec22
+bin/ceph osd pool set ecl allow_ec_overwrites true
+bin/ceph osd pool set ecl pg_autoscale_mode off
+```
+
+Two lab notes. The SCSI disks report themselves rotational, and
+BlueStore would send their 8 KiB shard writes down the deferred path
+(`bluestore_prefer_deferred_size_hdd = 65536`) while the other two
+went direct; `ceph config set osd bluestore_prefer_deferred_size_hdd 0`
+keeps all four shards on the direct path traced below. And with k+m
+equal to the OSD count, CRUSH needs equal weights to place all four
+shards of every PG — `osd crush reweight` the odd-sized disks to a
+common value, or some PGs stay `undersized` with a `NONE` shard.
+`weccollect.sh` next to the script does the warmup write and the
+traced one, as in §3.3.
+
+The pool runs the **legacy** EC backend (namespace `ECLegacy`,
+`ECBackendL`/`ECCommonL` — the default; `allow_ec_optimizations` selects
+a rewritten pipeline with the same shape, not traced here). Timings are
+this VM's; read the shape.
+
+### 3.4.1 The workload and the trace
+
+```bash
+rados -p ecl put o48 /root/16k        # warmup (first write into the pg)
+rados -p ecl put o48 /root/16k        # traced
+```
+
+Seventy lines are shown of the 139 events the script printed: the
+fan-out in full, then the commit phase with the `send_message` /
+`write_message` / `enqueue_op` / `dequeue_op` lines of the three
+replies dropped (they are §3.3's #30, #31, #33, #34, three times), and
+the 57 lines of the post-reply round — one of which, the dummy op's
+send at +24 846 µs, actually precedes #70 — summarized in §3.4.6.
+Event text is lightly abbreviated for width.
+
+```
+ #       us     tid  proc    thread           function                               event
+ 1        3   21505  client  rados            Objecter::_op_submit                   obj=o48 pool=2 -> MOSDOp
+ 2      384   21508  client  msgr-worker-0    ProtocolV2::write_message              MOSDOp tid=1 -> socket, 219+0+16384 B
+ 3      449   18950  osd.3   msgr-worker-0    OSD::ms_fast_dispatch                  osd_op tid=1 arrives, 219+0+16384 B (frame rx+decode 28 us)
+ 4      468   18950  osd.3   msgr-worker-0    OSD::enqueue_op                        epoch 473 -> shard queue
+ 5      501   19572  osd.3   tp_osd_tp        OSD::dequeue_op                        worker picks op
+ 6      591   19572  osd.3   tp_osd_tp        PrimaryLogPG::issue_repop              rep_tid=17 -> backend
+ 7      605   19572  osd.3   tp_osd_tp        ECBackendL::submit_transaction         obj=o48 pool=2: build Op + write plan
+ 8      628   19572  osd.3   tp_osd_tp        RMWPipeline::start_rmw                 op -> waiting_state; check_ops()
+ 9      639   19572  osd.3   tp_osd_tp        ECTransactionL::generate_transactions  PGTransaction -> one transaction per shard
+10      665   19572  osd.3   tp_osd_tp        ECUtilL::encode                        16384 B logical -> k data + m parity chunks
+11      703   19572  osd.3   tp_osd_tp        OSDService::send_message_osd_cluster   3 MOSDECSubOpWrite -> peers
+12      743   19572  osd.3   tp_osd_tp        ECBackendL::handle_sub_write           sub-write from osd.3 shard 0
+13      743   18950  osd.3   msgr-worker-0    ProtocolV2::write_message              MOSDECSubOpWrite -> socket, 1741+0+8572 B
+14      743   18952  osd.3   msgr-worker-2    ProtocolV2::write_message              MOSDECSubOpWrite -> socket, 1741+0+8572 B
+15      757   18951  osd.3   msgr-worker-1    ProtocolV2::write_message              MOSDECSubOpWrite -> socket, 1741+0+8572 B
+16      773   19572  osd.3   tp_osd_tp        BlueStore::queue_transactions          transaction arrives
+17      834   18965  osd.0   msgr-worker-0    OSD::ms_fast_dispatch                  ec_sub_write arrives, 1741+0+8572 B (frame rx+decode 47 us)
+18      845   18965  osd.0   msgr-worker-0    OSD::enqueue_op                        epoch 473 -> shard queue
+19      853   19572  osd.3   tp_osd_tp        KernelDevice::aio_write                bdev=0x..54a400 off=0xb3000 len=0x2000 src_off=0
+20      885   20435  osd.0   tp_osd_tp        OSD::dequeue_op                        worker picks op
+21      893   18956  osd.1   msgr-worker-0    OSD::ms_fast_dispatch                  ec_sub_write arrives, 1741+0+8572 B (frame rx+decode 68 us)
+22      898   20435  osd.0   tp_osd_tp        ECBackendL::handle_sub_write           sub-write from osd.3 shard 0
+23      911   18956  osd.1   msgr-worker-0    OSD::enqueue_op                        epoch 473 -> shard queue
+24      934   20435  osd.0   tp_osd_tp        BlueStore::queue_transactions          transaction arrives
+25      985   20994  osd.1   tp_osd_tp        OSD::dequeue_op                        worker picks op
+26     1004   20994  osd.1   tp_osd_tp        ECBackendL::handle_sub_write           sub-write from osd.3 shard 0
+27     1006   20435  osd.0   tp_osd_tp        KernelDevice::aio_write                bdev=0x..1ba400 off=0x4416000 len=0x2000 src_off=329
+28     1008   20435  osd.0   tp_osd_tp        buffer::list::rebuild                  memcpy 8192 B
+29     1044   20994  osd.1   tp_osd_tp        BlueStore::queue_transactions          transaction arrives
+30     1140   20994  osd.1   tp_osd_tp        KernelDevice::aio_write                bdev=0x..b08400 off=0x5e58000 len=0x2000 src_off=329
+31     1148   20994  osd.1   tp_osd_tp        buffer::list::rebuild                  memcpy 8192 B
+32     1160   18941  osd.2   msgr-worker-2    OSD::ms_fast_dispatch                  ec_sub_write arrives, 1741+0+8572 B (frame rx+decode 33 us)
+33     1169   18941  osd.2   msgr-worker-2    OSD::enqueue_op                        epoch 473 -> shard queue
+34     1199   20476  osd.2   tp_osd_tp        OSD::dequeue_op                        worker picks op
+35     1210   20476  osd.2   tp_osd_tp        ECBackendL::handle_sub_write           sub-write from osd.3 shard 0
+36     1237   20476  osd.2   tp_osd_tp        BlueStore::queue_transactions          transaction arrives
+37     1303   20476  osd.2   tp_osd_tp        KernelDevice::aio_write                bdev=0x..ac6400 off=0xe9000 len=0x2000 src_off=329
+38     1308   20476  osd.2   tp_osd_tp        buffer::list::rebuild                  memcpy 8192 B
+39     7292   20441  osd.2   bstore_kv_sync   KernelDevice::flush                    fdatasync bdev=0x..ac6400 4256 us
+40    11375   20408  osd.0   bstore_kv_sync   KernelDevice::flush                    fdatasync bdev=0x..1ba400 8242 us
+41    11410   19537  osd.3   bstore_kv_sync   KernelDevice::flush                    fdatasync bdev=0x..54a400 8220 us
+42    15251   20441  osd.2   bstore_kv_sync   KernelDevice::flush                    fdatasync bdev=0x..ac7c00 7076 us
+43    15263   20441  osd.2   bstore_kv_sync   RocksDBStore::submit_transaction_sync  kv commit done (7909 us)
+44    15316   20442  osd.2   bstore_kv_final  BlueStore::_txc_committed_kv           txc 0x..edc900 committed
+45    15349   20468  osd.2   tp_osd_tp        ECBackendL::sub_write_committed        tid=17 committed -> reply
+46    15521   18951  osd.3   msgr-worker-1    OSD::ms_fast_dispatch                  ec_sub_write_reply arrives, 95 B (frame rx+decode 17 us)
+47    15563   19564  osd.3   tp_osd_tp        ECBackendL::handle_sub_write_reply     commit from osd.2 shard 3 -> pending_commit.erase
+48    15848   20969  osd.1   bstore_kv_sync   KernelDevice::flush                    fdatasync bdev=0x..b08400 12046 us
+49    19478   20408  osd.0   bstore_kv_sync   KernelDevice::flush                    fdatasync bdev=0x..1bac00 4197 us
+50    19498   20408  osd.0   bstore_kv_sync   RocksDBStore::submit_transaction_sync  kv commit done (8023 us)
+51    19529   20409  osd.0   bstore_kv_final  BlueStore::_txc_committed_kv           txc 0x..195800 committed
+52    19568   20433  osd.0   tp_osd_tp        ECBackendL::sub_write_committed        tid=17 committed -> reply
+53    19687   18952  osd.3   msgr-worker-2    OSD::ms_fast_dispatch                  ec_sub_write_reply arrives, 95 B (frame rx+decode 12 us)
+54    19730   19564  osd.3   tp_osd_tp        ECBackendL::handle_sub_write_reply     commit from osd.0 shard 2 -> pending_commit.erase
+55    24038   19537  osd.3   bstore_kv_sync   KernelDevice::flush                    fdatasync bdev=0x..54b800 8650 us
+56    24050   19537  osd.3   bstore_kv_sync   RocksDBStore::submit_transaction_sync  kv commit done (12602 us)
+57    24084   19538  osd.3   bstore_kv_final  BlueStore::_txc_committed_kv           txc 0x..ea6300 committed
+58    24109   19564  osd.3   tp_osd_tp        ECBackendL::sub_write_committed        tid=17 committed -> reply
+59    24113   19564  osd.3   tp_osd_tp        ECBackendL::handle_sub_write_reply     commit from osd.3 shard 0 -> pending_commit.erase
+60    24603   20969  osd.1   bstore_kv_sync   KernelDevice::flush                    fdatasync bdev=0x..b08c00 6761 us
+61    24614   20969  osd.1   bstore_kv_sync   RocksDBStore::submit_transaction_sync  kv commit done (8712 us)
+62    24633   20970  osd.1   bstore_kv_final  BlueStore::_txc_committed_kv           txc 0x..9b3200 committed
+63    24663   20994  osd.1   tp_osd_tp        ECBackendL::sub_write_committed        tid=17 committed -> reply
+64    24755   18950  osd.3   msgr-worker-0    OSD::ms_fast_dispatch                  ec_sub_write_reply arrives, 95 B (frame rx+decode 9 us)
+65    24781   19564  osd.3   tp_osd_tp        ECBackendL::handle_sub_write_reply     commit from osd.1 shard 1 -> pending_commit.erase
+66    24784   19564  osd.3   tp_osd_tp        PrimaryLogPG::repop_all_committed      rep_tid=17 -> eval_repop -> reply
+67    24789   19564  osd.3   tp_osd_tp        PrimaryLogPG::log_op_stats             reply -> client (in osd 24325 us)
+68    24804   18950  osd.3   msgr-worker-0    ProtocolV2::write_message              MOSDOpReply tid=1 -> socket, 147 B
+69    24830   19564  osd.3   tp_osd_tp        RMWPipeline::try_finish_rmw            all shards committed: op leaves the pipeline
+70    24864   21508  client  msgr-worker-0    Objecter::handle_osd_op_reply          MOSDOpReply tid=1 <- primary, write is durable
+```
+
+### 3.4.2 The map — one primary, four stores, one set
+
+```
+ client            primary  osd.3  (shard 0)                          remote shards  osd.0 / osd.1 / osd.2  (shard 2 / 1 / 3)
+ ──────            ──────────────────────────                          ──────────────────────────────────────────────────
+ #1  _op_submit
+ #2  MOSDOp ─────► #3   msgr-worker   fast_dispatch (rx 28 us)
+     16 KiB        #4-5    └► shard queue → tp_osd_tp
+                   #6   issue_repop                   rep_tid=17
+                   #7   ECBackendL::submit_transaction   Op + write plan: two whole stripes, nothing to read
+                   #8   RMWPipeline::start_rmw → check_ops()
+                   #9      generate_transactions       PGTransaction → 4 ObjectStore::Transactions
+                   #10        ECUtilL::encode           16 KiB = 2 stripes → per stripe 2 data + 2 parity chunks
+                   #11     send_message_osd_cluster   3 × MOSDECSubOpWrite  ─────────────────► #17 #21 #32  fast_dispatch (rx 47 / 68 / 33 us)
+                   #12     handle_sub_write(own shard 0)                                        #20 #25 #34     └► shard queue → tp_osd_tp
+                   #13-15  msgr-worker ×3: write_message, 1741+0+8572 B each                   #22 #26 #35  handle_sub_write: decode txn + pg-log txn
+                   #16     queue_transactions                                                   #24 #29 #36  queue_transactions
+                   #19     aio_write 8 KiB   src_off=0                                          #27 #30 #37  aio_write 8 KiB   src_off=329
+                   ┆ §3.1's pipeline, shard 0 ┆                                                 #28 #31 #38  memcpy 8 KiB  (O_DIRECT realign)
+                                                                                                ┆ §3.1's pipeline, ×3 ┆
+                   #41  flush data   8.2 ms                                                     #40 #48 #39  flush data   8.2 / 12.0 / 4.3 ms
+                   #55  flush WAL    8.7 ms                                                     #49 #60 #42  flush WAL    4.2 /  6.8 / 7.1 ms
+                   #56  kv commit    @24.05 ms                                                  #50 #61 #43  kv commit    @19.50 / 24.61 / 15.26 ms
+                   #58  sub_write_committed ─┐                                                  #52 #63 #45  sub_write_committed
+                   #59  handle_sub_write_reply ◄┘ direct call      ◄── MOSDECSubOpWriteReply 95 B ── #53 #64 #46  (three replies, via msgr)
+                   #47 #54 #59 #65  pending_commit: {0,1,2,3} → {0,1,2} → {0,1} → {1} → {}
+                   #66  repop_all_committed → #67 log_op_stats (in osd 24.3 ms)
+ #70 reply ◄────── #68  MOSDOpReply 147 B
+                   #69  try_finish_rmw: op leaves the pipeline — and a second, empty round begins (§3.4.6)
+```
+
+Structurally this is §3.3.2 with two changes. The fan-out is
+**one call for all peers** (#11) instead of one message per peer, and
+the primary's own shard is written by the same function the peers run
+(#12 `handle_sub_write`, called directly), so all four stores start
+their §3.1 pipeline within 450 µs (#19 → #37). And the set the
+primary waits on has **k+m = 4** members instead of 2 — `pending_commit`
+in the EC `Op`, emptied by one `handle_sub_write_reply` per shard
+(#47, #54, #59, #65) exactly as §3.3.6's `waiting_for_commit`, with the
+primary's own commit fed in by a direct call rather than a message
+(#58 → #59). Everything between — dispatch, the thin BlueStore lane,
+the reply chain from `repop_all_committed` to the client — is
+line-for-line §3.3.
+
+### 3.4.3 Lines 5–19, the primary: plan, encode, ship, then write its own shard
+
+```
+#6   PrimaryLogPG::issue_repop            PLP:11696   → pgbackend->submit_transaction
+#7   ECBackendL::submit_transaction       ECB:1499    Op{PGTransaction, log entries, on_all_commit}
+       └► op->get_write_plan              ECB:1538    which stripes to write, what to read first:
+                                                      16 KiB at offset 0 = two whole 8 KiB stripes → to_read empty
+#8     └► RMWPipeline::start_rmw          ECC:785     waiting_state.push_back; check_ops()  ECC:1097
+          └► try_state_to_reads           ECC:796     remote_read empty: no MOSDECSubOpRead, straight to
+          └► try_reads_to_commit          ECC:870
+#9           ├► generate_transactions     ECC:911 → ECTransactionL.cc:99
+             │  └► encode_and_write       ECT:39
+#10          │     └► ECUtilL::encode     ECT:59 → ECUtilL.cc:142   per 8 KiB stripe: ec_impl->encode → 4 chunks × 4 KiB
+             │        per shard: t.write(chunk)  ECT:88   + setattr(hinfo_key)  ECT:652
+             ├► ECSubWrite per shard      ECC:971     {from, tid, reqid, soid, pg_stat_t, the shard's Transaction, log entries, …}
+             ├► MOSDECSubOpWrite ×3       ECC:1003
+#11          ├► send_message_osd_cluster(vector)  ECC:1013 → OSD.cc:1142   encode ×3, poke three msgr-workers
+#12          └► handle_sub_write(self)    ECC:1017    the primary is shard 0: same code path as the peers, no message
+#16             └► queue_transactions     ECB:1016
+#19                └► aio_write           src_off=0
+```
+
+**The primary does the arithmetic once.** Line #10 is the only place
+the payload is touched: `ECUtilL::encode` walks the 16 KiB in two
+8 KiB stripes and, for each, hands the `isa` plugin the two 4 KiB data
+chunks and receives two 4 KiB parity chunks; the four per-shard
+bufferlists are assembled by `claim_append` (`ECUtilL.cc:170`) — the
+data chunks are *views* onto the client's page-aligned receive buffer
+(`ErasureCode::encode_prepare`, `substr_of`), the parity chunks fresh
+SIMD-aligned allocations. 38 µs later (#11) the three `MOSDECSubOpWrite`s are
+built and handed to the messenger in one call — the vector overload
+of `send_message_osd_cluster` ([`OSD.cc:1142`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L1142))
+— and three msgr-workers (one per peer connection) put them on their
+sockets within 14 µs of each other (#13–#15). From dequeue to the
+last socket write is 256 µs; from dequeue to the primary's own
+`aio_write`, 352 µs.
+
+**What travels.** Each sub-write is `1741+0+8572` bytes. The front
+is the `ECSubWrite` header — routing, `pg_stat_t`, the pg-log entry
+— *plus* the shard transaction's op list: `ECSubWrite::encode` v5
+([`ECMsgTypes.cc:33`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ECMsgTypes.cc#L33))
+calls `t.encode(p_bl, d_bl, features)` with the message payload as
+`p_bl`, so there is no middle segment. The data segment is
+`[325 B xattrs + 4 B length word][8192 B chunk][51 B hinfo xattr]`:
+the same op order and legacy `encode()` as §3.3.3, with the EC hash
+info (`hinfo_key`, one crc per shard — how EC detects a bad chunk)
+appended after the write. That layout is why the chunk starts at byte
+329 of every remote shard's receive buffer.
+
+**Nothing to read, this time.** `get_write_plan` (#7) found two
+whole stripes at offset 0 and left `to_read` empty, so
+`try_state_to_reads` (ECC:796) went straight through. A partial-stripe
+overwrite would instead issue `MOSDECSubOpRead`s for the stripe's other
+chunks and park the op in `waiting_reads` until they return — the
+read-modify-write that gives the pipeline its name, and a round trip
+this trace never pays. Enable it by writing less than a stripe.
+
+### 3.4.4 Lines 17–38, four shards, one function
+
+Each remote shard's leg is §3.3.4 with `ECBackendL` in place of
+`ReplicatedBackend`: `ms_fast_dispatch` (type 108) → shard queue →
+`do_request` → `pgbackend->handle_message` → `_handle_message`
+([`ECB:815`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ECBackendL.cc#L815))
+→ `handle_sub_write`
+([`ECB:942`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ECBackendL.cc#L942)):
+decode the shipped transaction (views onto the receive buffer), build
+`localt` with this shard's pg-log entry via `log_operation`, register
+`SubWriteCommitted` (ECB:1008), `queue_transactions([op.t, localt])`
+(ECB:1016). 77–151 µs from arrival to the store on each. Then the
+familiar pair: `aio_write … src_off=329` and a **memcpy of the 8 KiB
+chunk** on every remote shard (#28, #31, #38) — the O_DIRECT realignment
+of §7.4, caused here by `try_reads_to_commit` value-initializing its
+per-shard transactions (`trans[i->shard]`,
+[`ECC:905`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ECCommonL.cc#L905)),
+the EC twin of `ReplicatedBackend.cc:612`. The primary's own shard
+(#19) reads `src_off=0`: its chunk is the encoder's own buffer, not a
+receive buffer. A replicated pool pays this copy once per replica (§3.3: one copy at
+size 2); k=2 m=2 pays it three times, each 1/k = half the object —
+k+m−1 copies of 1/k of the object, parity shards included.
+
+### 3.4.5 Lines 39–70, four commits into one set
+
+| | shard 3 = osd.2 (vdb) | shard 2 = osd.0 (sda) | shard 0 = osd.3 (nvme, primary) | shard 1 = osd.1 (sdb) |
+|---|---|---|---|---|
+| `aio_write` submitted | #37 +1.30 | #27 +1.01 | #19 +0.85 | #30 +1.14 |
+| barrier #1, data flush | #39 +7.29 (4.3 ms) | #40 +11.38 (8.2) | #41 +11.41 (8.2) | #48 +15.85 (12.0) |
+| barrier #2, WAL flush | #42 +15.25 (7.1) | #49 +19.48 (4.2) | #55 +24.04 (8.7) | #60 +24.60 (6.8) |
+| kv commit done | #43 +15.26 | #50 +19.50 | #56 +24.05 | #61 +24.61 |
+| `sub_write_committed` | #45 +15.35 | #52 +19.57 | #58 +24.11 | #63 +24.66 |
+| commit reaches the primary | #47 +15.56 (msgr, 210 µs) | #54 +19.73 (msgr, 160 µs) | #59 +24.11 (direct call, 4 µs) | #65 +24.78 (msgr, 120 µs) |
+
+Four §3.1 pipelines, each with its own two barriers, each started
+within half a millisecond of the others, finishing 9.4 ms apart. The
+mechanics are §3.3.6's exactly — `sub_write_committed`
+([`ECB:910`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ECBackendL.cc#L910))
+sends a 95-byte `MOSDECSubOpWriteReply` from a peer (ECB:937) or, on
+the primary, calls `handle_sub_write_reply` directly (ECB:920);
+`handle_sub_write_reply`
+([`ECB:1174`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ECBackendL.cc#L1174))
+erases the shard from `pending_commit` (:1184) and fires
+`on_all_commit` when the set is empty (:1200; `pending_apply` too,
+erased in the same call — the reply carries both flags); that is the
+`C_OSD_RepopCommit` → `repop_all_committed` → `eval_repop` →
+`log_op_stats` → `MOSDOpReply` chain of §3.1.6 / §3.3.6, unchanged
+(#66–#68). The last member out was osd.1 — the 4 GiB SCSI disk with
+the slowest data flush — and the client saw 24.9 ms.
+
+What EC changes in the latency picture is the **order of the
+maximum**: §3.3 waited for the slower of two stores; this write waited
+for the slowest of four, and with k+m shards every write is exposed to
+the tail of every one of them. Each shard wrote 8 KiB instead of
+16 KiB — but as §3.1.5 showed, the barriers do not scale with bytes,
+so the per-shard cost is the same ~11–19 ms of `fdatasync` it always
+is. The saving erasure coding buys is capacity, not write latency.
+
+### 3.4.6 Lines 69 →, the second round nobody asked for
+
+`try_finish_rmw`
+([`ECC:1048`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ECCommonL.cc#L1048))
+retires the op (#69, 41 µs after `log_op_stats`) — and immediately
+starts another: when the finished op's version is newer than the log's
+`can_rollback_to` and the pipeline is otherwise idle, it queues an
+`ECDummyOp` (ECC:1071), a write with an *empty* transaction, "to kick
+the rollforward". The 56 lines after #70 are that op going round the
+whole machine: three `MOSDECSubOpWrite`s of `965+0+0` bytes and a local
+`handle_sub_write`, a log-only `queue_transactions` on every shard (no
+`aio_write` anywhere), four kv commits of 5.7–13.7 ms, four commits
+collected (three replies over the messenger, the primary's direct call),
+and a second `try_finish_rmw` at +39.2 ms:
+
+```
+24830  osd.3  try_finish_rmw            op leaves the pipeline → ECDummyOp queued
+24846  osd.3  send_message_osd_cluster  3 MOSDECSubOpWrite (965+0+0 B: no transaction data)
+24871  osd.3  handle_sub_write          own shard — pg-log only
+24977… osd.0/1/2 handle_sub_write → queue_transactions   (no aio_write follows)
+30749  osd.0  kv commit (5.7 ms)  → sub_write_committed → reply
+35045  osd.2  kv commit (10.0 ms) → reply       35106  osd.3  kv commit (10.1 ms)
+38907  osd.1  kv commit (13.7 ms) → reply
+39187  osd.3  try_finish_rmw            dummy op done: pg_committed_to advanced, rollback clone trimmed, on all shards
+```
+
+Why it exists: an EC overwrite keeps the stripe's previous chunks as
+a rollback clone until every shard knows the write is committed
+everywhere; that knowledge travels as `pg_committed_to` in the *next*
+sub-write, and the shard that receives it rolls its log forward and
+trims the clone — the dummy's "log-only" transaction is really
+pg-log plus that trim. Under load the next client write *to the same
+PG* carries it for free. At queue depth 1 there is no next write, so
+the pipeline fabricates one — and every shard pays a second kv commit
+(barrier #2, no data flush) per client write. It is off *this* write's
+critical path, but not off the disks': the shards' single
+`bstore_kv_sync` thread is inside the dummy's `fdatasync` from +25 ms
+to as late as +38.9 ms here, and a qd=1 client's next write, arriving
+half a millisecond after the reply, queues its own commit behind it.
+A qd=1 EC benchmark therefore does two kv commits per client write per
+shard where `wstats.bt`'s op count would predict one (§2.2's
+`@d_kv_commit_sync` would show it).
+
+### 3.4.7 The same write with the aligned format engaged
+
+Construct the per-shard transactions with the peer features
+(`trans.try_emplace(shard, min_peer_features())` at ECC:905, and the
+same in the optimized pipeline), rebuild, and re-run the four puts of
+`ecalign.bt`'s census on this lab:
+
+```
+   us   proc   thread      function                 event
+    4   osd.1  tp_osd_tp   KernelDevice::aio_write  off=0x4a5000 len=0x2000 src_off=0
+  160   osd.2  tp_osd_tp   KernelDevice::aio_write  off=0xd1000  len=0x2000 src_off=0
+  202   osd.0  tp_osd_tp   KernelDevice::aio_write  off=0x450000 len=0x2000 src_off=0
+  349   osd.3  tp_osd_tp   KernelDevice::aio_write  off=0xa0000  len=0x2000 src_off=0
+        (16 of 16 shard writes at offset 0; no list::rebuild line on any OSD)
+```
+
+`ECSubWrite`'s v5 encoding was built for exactly this — the shard
+transaction's aligned bufferlist first in the data segment — and, as
+in §3.3.8, engaging it removes one line from every remote shard's lane
+and changes nothing else in the trace. The measurement behind this
+paragraph, on both EC pipelines, is in §7.4's companion
+[tracker-notes post]({% post_url 2026-08-12-ceph-tracker-notes %}).
+
 # 4. Code analysis
 
 The trace sections answer *what happened*; this section reads the code

@@ -1,0 +1,48 @@
+#!/usr/bin/env bpftrace
+/*
+ * ecalign.bt -- per-OSD view of data-write alignment: for every
+ * KernelDevice::aio_write of >= 4 KiB issued from a PG worker, print the
+ * payload's offset inside its backing buffer (src_off), and every
+ * payload-sized list::rebuild (the O_DIRECT realignment memcpy).  Counts
+ * per pid at the end.  Works with any number of OSDs on the host: every
+ * ceph-osd process exec'd from the given binary is probed.
+ *
+ * Usage: bpftrace ecalign.bt <ceph-osd>   (resolve to addresses with
+ *        btaddr.py on optimized builds)
+ *
+ * Offsets: bufferlist first ptr_node at +0, _len at +24; ptr_node offset
+ * into its raw at +16 (gdb ptype /o on the binary).
+ */
+BEGIN
+{
+  printf("%10s %7s %-16s %-24s %s\n", "us", "pid", "thread", "function", "event");
+}
+
+uprobe:$1:_ZN12KernelDevice*aio_writeE*
+/comm == "tp_osd_tp" && *(uint32*)(arg2 + 24) >= 4096/
+{
+  if (@t0 == 0) { @t0 = nsecs; }
+  $node = *(uint64*)arg2;
+  $off = *(uint32*)($node + 16);
+  printf("%10lld %7d %-16s %-24s off=0x%lx len=0x%x src_off=%u%s\n",
+         (nsecs-@t0)/1000, pid, comm, "KernelDevice::aio_write",
+         arg1, *(uint32*)(arg2 + 24), $off, ($off % 4096) ? "  <-- misaligned" : "");
+  @writes[pid] = count();
+  if ($off % 4096) { @misaligned[pid] = count(); }
+}
+
+uprobe:$1:_ZN4ceph6buffer7v15_2_04list7rebuildESt10unique_ptr*
+/@t0 && *(uint32*)(arg0 + 24) >= 4096/
+{
+  printf("%10lld %7d %-16s %-24s memcpy %u B\n",
+         (nsecs-@t0)/1000, pid, comm, "buffer::list::rebuild", *(uint32*)(arg0 + 24));
+  @rebuild_bytes[pid] = sum(*(uint32*)(arg0 + 24));
+  @rebuild_n[pid] = count();
+}
+
+END
+{
+  printf("\nper pid: data aio_writes / misaligned / rebuild copies (bytes)\n");
+  print(@writes); print(@misaligned); print(@rebuild_n); print(@rebuild_bytes);
+  clear(@writes); clear(@misaligned); clear(@rebuild_n); clear(@rebuild_bytes); clear(@t0);
+}
