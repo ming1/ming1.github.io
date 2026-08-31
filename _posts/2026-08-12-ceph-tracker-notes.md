@@ -1,7 +1,7 @@
 ---
 title: "Ceph Tracker Notes"
 category: storage
-tags: [ceph, bluestore, bluefs, tracker, debugging, wal, ebpf]
+tags: [ceph, bluestore, bluefs, tracker, debugging, wal, ebpf, network, tcp]
 ---
 
 * TOC
@@ -1186,3 +1186,338 @@ cluster-wide from every client write.
 - Removing `header.data_off` and adding the split in one commit left
   no overlap: for msgr2 rep ops there was no interval in which *any*
   alignment mechanism was active on the hot path.
+
+# 6. OSDs that froze for minutes — TCP retransmits, PG read leases, and where they meet
+
+Found in a field diagnostics collection, not a bug report · affects any
+cluster whose cluster network drops packets · component OSD
+(PeeringState / AsyncMessenger) plus the fabric under it · fix: none
+upstream — configuration and topology · Status: chain measured end to
+end; fabric-vs-host localisation still open
+
+A 4-node ARM64 cluster (2 sockets × 64 cores/node, 100 GbE, 32 NVMe
+OSDs, 3× replication) under an RBD benchmark: 18 GiB/s of 4 MiB
+`writefull`. Health looked almost clean. It was not.
+
+Every figure below comes from the collection **except** the core count,
+the link speed and the statement that both VLANs share one bond — those
+are environment facts from outside it. A standard Ceph collection carries no usable CPU or interface detail —
+`orch host ls --detail` reports CPU as `N/A` and the NIC column as a bare
+count — which turns out to matter in §6.4. The ~40 bluestore/kv/finisher
+threads in §6.4 are an estimate too.
+
+## 6.1 Symptom
+
+`ceph health detail` reported three warnings, all cosmetic — a failed
+prometheus placement, four dead node-exporters, one old crash. The real
+fault was not latched at collection time and only showed in the history:
+
+```
+SLOW_OPS   first 10:05   last 17:11   count 26   active Yes
+```
+
+`ceph pg dump` had 2 of 1025 PGs in `active+clean+laggy`. Individual
+OSDs were freezing solid for **1.5 to 16 minutes**, one or two at a
+time, roving across all four hosts every few minutes.
+
+## 6.2 The chain, measured end to end
+
+### 6.2.1 Where the time goes
+
+`cds historic_ops group-by-event-intervals -s` aggregates every
+daemon's op tracker by pipeline stage — the single most useful command
+here, and it points straight at the answer:
+
+```
+AVG_DURATION  TOTAL_DURATION  COUNT  INTERVAL
+     247.783       14619.170     59  waiting for readable -> reached_pg
+      88.622       36512.229    412  header_read -> throttled
+      37.485       25002.702    667  sub_op_commit_rec -> sub_op_commit_rec
+```
+
+Meanwhile every layer below the PG was fast: `txc_commit_lat`
+1.1–1.9 ms, `kv_sync_lat` 0.13–0.44 ms, device commit 2–4 ms,
+`op_w_prepare_latency` 0.9 ms. Client-visible `op_w_latency` was 20–275 ms. All of the damage
+is queueing above the object store.
+
+### 6.2.2 What "waiting for readable" means
+
+Two op-tracker marks bracket the stall. `reached_pg` is stamped in
+`OSD::dequeue_op()` when a shard worker pulls the op off the scheduler.
+`waiting for readable` is `mark_delayed()` from `PrimaryLogPG::check_laggy()`
+— the op is parked on the PG's `waiting_for_readable` list and the
+worker thread moves on. `reached_pg` then appears a *second* time,
+because the release path re-queues the op through `dequeue_op()`.
+
+"Readable" is the Octopus-era **PG read lease**, not object I/O. A
+primary may only serve while it can prove it is still primary, and its
+lease is the minimum across the acting set:
+
+```c
+/* PeeringState::recalc_readable_until() */
+ceph::signedspan min = readable_until_ub_sent;
+for (unsigned i = 0; i < acting.size(); ++i)
+    if (acting_readable_until_ub[i] < min) min = acting_readable_until_ub[i];
+readable_until = min;          /* the slowest replica sets the lease */
+```
+
+`check_laggy()` runs from `do_op_impl()` for **every** op, immediately
+before the caps check — writes included, despite the name. One slow
+replica revokes the whole PG.
+
+The amplification is what turns a lease blip into an outage. With 4 MiB
+objects and `osd_client_message_size_cap` at 500 MiB, only ~125 client
+ops fit in flight. Once those are parked on one laggy PG, the OSD stops
+reading *any* client message off the socket. Observed in-flight counts:
+124, 126, 123. The release is all-at-once: on osd.28 all 20 tracked ops
+completed inside **1.09 s** after a 15m42s stall, 11 of them carrying a
+`waiting for readable` event. That simultaneity is what distinguishes a
+lease stall from ordinary congestion. (osd.5's 9m42s stall looks similar
+but is mostly throttle backlog — only 1 of its 20 ops ever waited on the
+lease, and its release spread over 6.7 s.)
+
+### 6.2.3 The socket that killed the lease
+
+The collector captures per-connection `getsockopt(SOL_TCP, TCP_INFO)`
+via `ceph daemon <d> messenger dump <msgr> --tcp-info` (field reference:
+[the TCP_INFO section of the network post]({% post_url 2026-05-09-network-diagnostics %})).
+Across the cluster network:
+
+| Network | Conns | Total retrans | Bytes moved | Retrans / TB |
+|---|---|---|---|---|
+| cluster | 764 | 166,361,880 | 277.9 TB | **598,550** |
+| public | 2,006 | 7,084 | 138.9 TB | 51 |
+| same-host (lo) | 65 | 0 | — | — |
+
+Same hosts, same 21-hour window, same workload: an 11,700× difference.
+And exactly two sockets in the whole cluster were in RTO backoff — the
+two directions between the acting pair of both laggy PGs:
+
+```
+osd.16 -> osd.28    retransmits=11  backoff=6  rto=13.056s
+                    unacked=471     last_data_sent=24,256 ms
+osd.28 -> osd.16    retransmits=3   backoff=3  rto=1.632s
+                    unacked=1       last_ack_recv=10,820 ms
+```
+
+Nothing left that socket for **24.3 seconds**. The read lease is
+`osd_pool_default_read_lease_ratio` × `osd_heartbeat_grace` = 0.8 × 20 =
+**16 seconds**. Lease renewal could not get through; `readable_until`
+expired; the PG went `LAGGY`.
+
+`retransmits` exceeding `backoff` is its own signal. In
+`tcp_retransmit_timer()` the kernel bumps `icsk_retransmits` on the RTO
+path but skips `icsk_backoff` when the retry is dropped locally (v6.18
+below; on the 6.6 kernel these hosts run it is an open-coded
+`icsk->icsk_retransmits++`, same behaviour):
+
+```
+tcp_update_rto_stats()        icsk_retransmits++
+if (tcp_retransmit_skb() > 0)          /* NET_XMIT_DROP */
+        /* "Retransmission failed because of local congestion" */
+        goto out                       /* skips the backoff bump */
+```
+
+11 against 6 means ~5 retries never left the host — so at least one
+sender was also dropping locally. Both counters are instantaneous and
+reset on an ACK of new data, so this is one snapshot of one socket; the
+166 M cumulative retransmits carry no fabric-vs-local attribution at all.
+
+Two details tie the numbers together. MTU is 9000 with `snd_mss` 8948 on
+both VLANs, so 598,550 retrans/TB is a loss rate of **~0.5%**. And
+`unacked=471` is almost exactly one 4 MiB message at that MSS
+(4 MiB / 8948 = 469) — the stalled socket was sitting on a single
+outstanding repop.
+
+## 6.3 Why every built-in check stayed silent
+
+The OSD map had not changed in 21 hours, so no OSD was marked down in
+the entire window under study. `OSD_SLOW_PING_TIME_*` never fired, and
+`dump_osd_network` reported zero peers above its 1 s threshold on all 32
+OSDs — and that check averages over at most 15 minutes
+(`OSD.cc` compares the 1/5/15-minute means), so it was looking at a
+window that contained stalls. Over the whole tracked span **26 of the 32 OSDs** recorded slow ops,
+with more than a dozen stall episodes past 100 s and the longest single
+op at **15m42s**. (Episode counts depend on how you cluster ops into
+episodes — anywhere from 35 to 85 depending on the grouping rule — so
+treat the count as a range and the per-op durations as the hard
+numbers.)
+
+Heartbeats and leases diverge inside the OSD:
+
+```
+MSG_OSD_PING       -> heartbeat_dispatch() -> handle_osd_ping()
+                      dedicated messengers, own sockets, handled inline,
+                      no PG lock, tiny packets -> never enters backoff
+
+MSG_OSD_PG_LEASE   -> enqueue_peering_evt() -> op scheduler -> PG lock
+                      shared cluster messenger, over the backed-off sockets
+```
+
+Heartbeats are not loss-free — the heartbeat messengers took ~8,800
+retransmits between them. What saves them is a dedicated socket, one
+small message per ping, and 20 s of grace, so they never accumulate
+enough consecutive loss to enter backoff. Healthy heartbeats prove the
+*wire* is up; they say nothing about whether leases are arriving.
+**This failure mode is invisible to every built-in network health
+check.**
+
+One more measured item: `tcpi_options` shows `sack, timestamps, wscale`
+on all 4,391 connections and `ecn` on none. A switch cannot ECN-mark a
+packet that was never ECT-marked, so under congestion its only option is
+to drop — which is what the retransmit counters record. Linux defaults
+to `net.ipv4.tcp_ecn=2` ("accept if asked, never ask"), so two default
+hosts never negotiate it.
+
+## 6.4 Fabric or host? The evidence does not separate them
+
+A sender's `tcp_info` records that a segment was lost, never *where*. A
+switch buffer, a NIC receive ring and the receiver's socket queue all
+produce the same signature.
+
+The 11,700× VLAN split rules out a *load-independent* shared fault — a
+bad optic, a dead switch queue — since both VLANs are believed to share
+the bond. It does **not** rule out buffer exhaustion, because the two
+VLANs are not comparable loads: the cluster side moves 364 GB per socket
+against the public side's 69 GB, and its traffic is synchronous fan-out,
+two 4 MiB messages emitted at once per client write. Switch-buffer loss
+is strongly superlinear in per-flow burst rate, so incast remains a fully
+adequate explanation on its own.
+
+The thread budget makes a host-side drain the leading *host-side*
+candidate, alongside incast rather than instead of it:
+
+| Per node | Threads | Source |
+|---|---|---|
+| OSD op threads | 128 | 8 shards × 2, × 8 OSDs |
+| messenger workers | **24** | `ms_async_op_threads=3` — all TCP rides these |
+| bluestore / kv / finishers | ~40 | kv_sync, kv_finalize, aio |
+| **total vs 128 cores** | **~192** | **1.5× oversubscribed** |
+
+Those 24 workers carry 155 Gbps of cluster traffic alone — 6.4 Gbps
+each, every byte also `crc32c`'d (`ms_crc_data=true`); with public
+ingress it is nearer 8 Gbps per worker. The mechanism is *not* a full
+socket receive queue: that produces a zero window, i.e. flow control,
+not loss — and the zero-window branch of `tcp_retransmit_timer()` never
+bumps `icsk_retransmits`, so this socket's `retransmits=11` proves the
+window was open and the segments were genuinely lost. What survives is
+softirq starvation: NIC ring overflow, `softnet` backlog drops, or the
+qdisc — which is what the four commands below probe.
+`osd_numa_auto_affinity` is `true` but inert: the metadata lists
+`network_numa_unknown_ifaces`, so Ceph never resolved the interface (a
+bond defeats its `/sys/class/net` walk) and `osd_numa_node` stays `-1`.
+
+Four commands settle it, run while `SLOW_OPS` is firing — nothing in a
+standard collection answers it:
+
+```bash
+nstat -az | grep -iE 'TCPRcvQDrop|PruneCalled|RcvPruned|TCPBacklogDrop'
+awk '{print NR-1, $2, $3}' /proc/net/softnet_stat   # dropped, time_squeeze
+ethtool -S <if> | grep -iE 'rx_no_buffer|rx_missed|rx_fifo|tx_dropped'
+tc -s qdisc show dev <bond>
+```
+
+## 6.5 Working around it from the Ceph side
+
+Topology can cut offered load and CPU pressure. It cannot make an
+oversubscribed fabric stop dropping. At ~0.5% loss the cluster is just
+past the cliff, not far past it, so headroom may be enough.
+
+**Cut bytes on the cluster network.** Per-node cluster egress at 18 GiB/s
+of client writes:
+
+| Scheme | Cluster egress | Raw used | Note |
+|---|---|---|---|
+| replication size=3 | 77.3 Gbps | 3.0× | current |
+| replication size=2 | 38.7 Gbps | 2.0× | −50% network |
+| EC 2+2 | 58.0 Gbps | 2.0× | −25% network, 2 MiB chunks |
+
+EC also halves the per-message burst, which may help incast granularity
+(caveat below), and `writefull` is the ideal EC case — full-object
+overwrite, no read-modify-write. But the failure domain count is a hard wall:
+
+```
+EC 4+2 needs 6 domains -> impossible on 4 hosts
+EC 3+2 needs 5         -> impossible
+EC 2+2 needs 4         -> exactly fits
+```
+
+Two operational caveats before anyone tries it: RBD on an EC data pool
+needs `allow_ec_overwrites`, and with 4 hosts EC 2+2 consumes every
+failure domain — one host down leaves the pool degraded with nowhere to
+recover into until it comes back. EC also halves the per-*message* size
+but raises fan-out from 2 peers to 3, so whether incast improves depends
+on per-port buffering; that one is plausible, not shown.
+
+And EC costs CPU, which is the resource already suspected. **EC is a bet
+on the fabric hypothesis; cutting CRC and op shards is a bet on the host
+one.** They pull against each other — hence §6.4 first.
+
+**The experiment worth running first.** A test pool with a CRUSH rule
+placing all three replicas on the *same host* puts replication on
+loopback and takes the fabric out of the path. Two conditions make or
+break it: the pool has to carry comparable per-OSD load, or a quiet pool
+simply will not reproduce a load-driven failure; and co-locating three
+replicas triples that host's NVMe and CPU load, so "stalls persist"
+does not cleanly imply CPU — it may just be the new I/O load. Read a
+*negative* result (stalls vanish) as strong and a positive one as
+inconclusive. Note the existing loopback sockets prove nothing here: the
+CRUSH rule is `chooseleaf firstn 0 type host`, so replicas are never
+co-resident and those sockets carry no replication traffic.
+
+**The change that actually stops the freezes.** The outage was not caused
+by loss but by loss outlasting a 16-second lease. The obvious move —
+raising `osd_pool_default_read_lease_ratio` — is the wrong one. Upstream
+is explicit:
+
+> This should be <= 1.0 so that the read lease will have expired by the
+> time we decide to mark a peer OSD down.
+> — `src/common/options/global.yaml.in`
+
+Push the ratio above 1.0 and a dead OSD's lease outlives the decision to
+mark it down, which is the exact hazard leases exist to prevent. Widen
+the grace instead and leave the ratio alone:
+
+```bash
+ceph config set global osd_heartbeat_grace 40          # lease 0.8 x 40 = 32s
+ceph config set global mon_warn_on_slow_ping_time 1000  # pin, see below
+```
+
+A 32-second lease survives a 24.3-second silent socket. Loss continues
+and costs throughput, but the OSD does not freeze — and because the
+ratio is untouched, the cost is the honest one: a genuinely dead peer
+takes twice as long to be declared down.
+
+The second line matters. `osd_heartbeat_grace` is also the base of the
+slow-ping warning: the threshold is `mon_warn_on_slow_ping_ratio` (0.05)
+× grace, which is exactly the 1000 ms `dump_osd_network` reports. Double
+the grace and that check silently doubles to 2 s — making the health
+check §6.3 already showed to be blind blinder still. A non-zero
+`mon_warn_on_slow_ping_time` overrides the ratio and pins it. Both go in
+`global`, not `osd` — upstream requires the grace to be readable by the
+mon as well as the OSDs, and `OSDMonitor` does read it.
+
+## 6.6 Takeaways
+
+- **`ceph health detail` reported three cosmetic warnings and missed a
+  cluster freezing for minutes.** The real signal was in
+  `healthcheck history ls` — active, 26 occurrences — and in two PGs
+  carrying a `laggy` flag nothing else surfaced.
+- **Healthy heartbeats do not mean a healthy path.** Heartbeats run on
+  dedicated sockets with no PG lock and never entered backoff, so no OSD
+  was marked down and no ping-time warning fired, while the sockets
+  carrying leases were silent for 24 seconds. Any diagnosis that reasons
+  "no OSD flapped, so the network is fine" is reasoning from the wrong
+  evidence.
+- **One laggy PG takes an entire OSD offline for clients.** 4 MiB
+  objects against a 500 MiB throttle means ~125 ops in flight; parked on
+  one PG, they pin the throttle and the OSD stops reading its sockets.
+  The blast radius is set by throttle ÷ object size, not by the PG.
+- **`tcp_info` localises loss to a connection, never to a hop.** Switch,
+  NIC ring and socket queue are indistinguishable from the sender. A
+  second VLAN on the same wire narrows it for free — but only if the two
+  carry comparable per-socket load, which here they did not.
+- **`retransmits > backoff` is a host-side drop detector**, and it is
+  printed by plain `ss -i`. Given enough samples it distinguishes "the fabric
+  dropped it" from "we never got it out of the box", with no switch
+  access at all.
