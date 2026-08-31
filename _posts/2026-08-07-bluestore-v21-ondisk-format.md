@@ -1091,9 +1091,11 @@ O  <ghobject key>'o' 00 1f 00 00 'x'          shard 1: logical 0x1f0000, 500 B
 O  <ghobject key>'o' 00 3e 00 00 'x'          shard 2: logical 0x3e0000, 212 B
 ```
 
-Each shard record's key is the full onode key plus the shard's logical
+**Each shard record's key is the full onode key plus the shard's logical
 start offset as a BE u32 plus `'x'` (§4.5); its value is the bare §6.3
-payload encoding the extents of [its offset, the next shard's offset).
+payload encoding the extents of [its offset, the next shard's offset)** 
+
+
 A shard boundary is referred to below as a *cut*: the logical offset at
 which reshard divided the extent map, so extents below it encode into one
 shard record and extents at or above it into the next. A cut is therefore
@@ -1219,8 +1221,8 @@ extents.
 
 ## 7.3 Spanning blobs: 256 KiB cloned object, 8 KiB-stride overwrites
 
-This specimen captures a populated spanning section: one blob promoted
-because it is referenced from two shards and cannot be split. Promotion
+This specimen captures a populated spanning section: **one blob promoted
+because it is referenced from two shards and cannot be split.** Promotion
 requires an unsplittable blob (§6.2), so the object is cloned — a clone
 marks blobs `FLAG_SHARED`, the cheapest way to produce one.
 
@@ -1321,7 +1323,7 @@ a le32 value length per attr), and 30 of BlueStore's own fields — nid 2,
 size 3, flags 1, the 17 shard_info bytes shown above, three hint varints,
 and the zone_offset_refs count.
 
-Spanning section, decoded in full — every one of the 235 bytes, with
+**Spanning section(shared blobs)**, decoded in full — every one of the 235 bytes, with
 235 = 2 header + 233 entry:
 
 ```
