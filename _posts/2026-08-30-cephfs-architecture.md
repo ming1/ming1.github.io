@@ -56,11 +56,11 @@ metadata lookup ever happens, which is why the MDS is not on the data path.
 
 | Channel | Messages | Purpose |
 |---|---|---|
-| Client ↔ MON | `MMonSubscribe`, `MOSDMap`, `MMDSMap`, cephx auth | maps, keys, blocklist state |
-| Client ↔ MDS | `MClientSession`, `MClientRequest` / `MClientReply`, `MClientCaps`, `MClientCapRelease`, `MClientLease`, `MClientSnap`, `MClientReconnect` | lookup, open, create, rename, readdir, cap grant/revoke/flush |
-| Client ↔ OSD | `MOSDOp` / `MOSDOpReply` | read, sparse-read, write, truncate, per-object atomic transactions |
-| MDS ↔ MDS | `MExportDir*`, `MMDSPeerRequest`, `MDentryLink/Unlink` | subtree migration, multi-rank ops such as cross-rank rename |
-| MDS ↔ OSD | `MOSDOp` | journal append, dirfrag flush |
+| Client&nbsp;↔&nbsp;MON | `MMonSubscribe`, `MOSDMap`, `MMDSMap`, cephx auth | maps, keys, blocklist state |
+| Client&nbsp;↔&nbsp;MDS | `MClientSession`, `MClientRequest` / `MClientReply`, `MClientCaps`, `MClientCapRelease`, `MClientLease`, `MClientSnap`, `MClientReconnect` | lookup, open, create, rename, readdir, cap grant/revoke/flush |
+| Client&nbsp;↔&nbsp;OSD | `MOSDOp` / `MOSDOpReply` | read, sparse-read, write, truncate, per-object atomic transactions |
+| MDS&nbsp;↔&nbsp;MDS | `MExportDir*`, `MMDSPeerRequest`, `MDentryLink/Unlink` | subtree migration, multi-rank ops such as cross-rank rename |
+| MDS&nbsp;↔&nbsp;OSD | `MOSDOp` | journal append, dirfrag flush |
 
 `MClientRequest` carries an op code (`CEPH_MDS_OP_LOOKUP`, `OPEN`, `CREATE`, `SETATTR`, `UNLINK`,
 `RENAME`, `READDIR`…) plus the path or an inode+dentry pair; the reply carries a trace of the
