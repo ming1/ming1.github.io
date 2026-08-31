@@ -1858,8 +1858,7 @@ unchanged — still `08`, still two 32 KiB checksums. The first data range is
 checksum, and no such thing exists. That is the assert. In bytes the whole
 difference is: the extent count reads `03` instead of `02`, and one 5-byte
 pextent record becomes two. Nothing is malformed — the record has no field
-that ties the ranges to the checksums, and the function that decides whether
-to merge never checks it.
+that ties the ranges to the checksums.
 
 Two things the record does *not* contain, which is why no consistency check
 on disk could have caught this:
@@ -1892,11 +1891,11 @@ clone aborts inside merge_blob
            the object carried a SEQUENTIAL_READ + IMMUTABLE alloc hint, so
            _choose_write_options() set csum_order from
            ctz(expected_write_size) instead of block_size_order
-                                                    (BlueStore.cc:17866)
+                                                    (BlueStore.cc:17876)
  └─ why did that produce split extents?
            _do_alloc_write() stores the allocator's PExtentVector as-is;
            on fragmented free space 32K comes back as 0x3000 + 0x5000
-                                                    (BlueStore.cc:17536)
+                                                    (BlueStore.cc:17645)
  └─ why was the merge attempted at all?
            can_merge_blob() accepts any pair with the same csum order, the
            same tracker au_size and disjoint extents — it never checks that
@@ -2031,6 +2030,7 @@ needed a stricter member of the same family, and grew none.
 object it creates:
 
 ```cpp
+boost::uniform_int<> u(17, 22);
 boost::uniform_int<> v(12, 17);
 t.set_alloc_hint(cid, new_obj, 1ull << u(*rng), 1ull << v(*rng),
                  get_random_alloc_hints());
@@ -2060,6 +2060,7 @@ and absent on a fresh one, which is why this survived years of qa.
 + // csum chunk alignment
 + // merge_blob() relocates csum data in whole csum chunk units, therefore
 + // every pextent it moves must start and end on a csum chunk boundary.
++ // ... (comment condensed; the commit carries the full why)
 + if (xb.has_csum()) {
 +   uint32_t csum_chunk_size = xb.get_csum_chunk_size();
 +   auto csum_aligned = [csum_chunk_size](const PExtentVector& extents) {
@@ -2134,8 +2135,8 @@ The last row is the honest one. Instrumenting the guard shows the qa
 workload does build blobs whose csum chunk exceeds `min_alloc_size`
 (`csum_chunk=0x2000, min_alloc=0x1000`) — but never a fragmented one, so the
 guard was never asked to refuse anything in 68 minutes. A clean qa run does
-not exercise this fix, for the same reason the store-level reproducer in
-7.1.2 cannot abort. The mechanism is pinned by the unit test; the qa run
+not exercise this fix, for the same reason the end-to-end reproducer in
+§7.1.2 cannot abort. The mechanism is pinned by the unit test; the qa run
 only establishes that the guard costs nothing.
 
 ### 7.3.4 Takeaways
@@ -2157,8 +2158,6 @@ only establishes that the guard costs nothing.
   crash into a checksum that describes the wrong data — an unreadable
   extent in the object and in every clone of it, instead of an abort.
 - **A knob named "force small allocations" does not force small
-  allocations.** `bluestore_debug_small_allocations` is honoured only by
-  `StupidAllocator`, not the default `hybrid`, and even there `allocate()`
-  coalesces adjacent `allocate_int()` results — so the injector is inert
-  until the free space is already fragmented. Worth knowing before trusting
-  it in a reproducer.
+  allocations.** It is honoured only by `StupidAllocator` — not the default
+  `hybrid` — and even there coalescing undoes it on unfragmented free space
+  (§7.1.2). Worth knowing before trusting it in a reproducer.
