@@ -1201,12 +1201,15 @@ OSDs, 3× replication) under an RBD benchmark: 18 GiB/s of 4 MiB
 
 Every figure below comes from the collection **except** the core count,
 the link speed and the statement that both VLANs share one bond — those
-are environment facts from outside it. A standard Ceph collection carries no usable CPU or interface detail —
+are environment facts from outside it. A standard Ceph collection
+carries no usable CPU or interface detail —
 `orch host ls --detail` reports CPU as `N/A` and the NIC column as a bare
 count — which turns out to matter in §6.4. The ~40 bluestore/kv/finisher
 threads in §6.4 are an estimate too.
 
-## 6.1 Symptom
+## 6.1 Report
+
+### 6.1.1 The observation
 
 `ceph health detail` reported three warnings, all cosmetic — a failed
 prometheus placement, four dead node-exporters, one old crash. The real
@@ -1220,9 +1223,31 @@ SLOW_OPS   first 10:05   last 17:11   count 26   active Yes
 OSDs were freezing solid for **1.5 to 16 minutes**, one or two at a
 time, roving across all four hosts every few minutes.
 
-## 6.2 The chain, measured end to end
+### 6.1.2 Reproducing it
 
-### 6.2.1 Where the time goes
+Nothing here needs a live cluster — every figure below comes out of a
+`ceph_diagnostics` collection, provided it was captured with `--tcp-info`
+(the collector passes it by default):
+
+```bash
+cds ceph healthcheck history ls                 # the SLOW_OPS health detail misses
+cds ceph pg dump | grep laggy                   # PGs whose read lease has expired
+cds historic_ops group-by-event-intervals -s    # where op time actually goes
+cds historic_ops show -s -T -d osd.N            # per-op event timelines
+```
+
+The TCP side is one `getsockopt` per connection, stored by the collector
+as `osd_info-osd.N-messenger_dump_<msgr>`. Summarising it per network
+takes a short script — retransmits normalised by bytes moved, plus any
+socket currently in RTO backoff:
+
+```bash
+./ceph-net-retrans.py <collection-dir> --pairs --backoff
+```
+
+## 6.2 Analysis
+
+### 6.2.1 Root cause, top to bottom
 
 `cds historic_ops group-by-event-intervals -s` aggregates every
 daemon's op tracker by pipeline stage — the single most useful command
@@ -1237,7 +1262,8 @@ AVG_DURATION  TOTAL_DURATION  COUNT  INTERVAL
 
 Meanwhile every layer below the PG was fast: `txc_commit_lat`
 1.1–1.9 ms, `kv_sync_lat` 0.13–0.44 ms, device commit 2–4 ms,
-`op_w_prepare_latency` 0.9 ms. Client-visible `op_w_latency` was 20–275 ms. All of the damage
+`op_w_prepare_latency` 0.9 ms. Client-visible `op_w_latency` was 20–275
+ms. All of the damage
 is queueing above the object store.
 
 ### 6.2.2 What "waiting for readable" means
@@ -1329,19 +1355,19 @@ both VLANs, so 598,550 retrans/TB is a loss rate of **~0.5%**. And
 (4 MiB / 8948 = 469) — the stalled socket was sitting on a single
 outstanding repop.
 
-## 6.3 Why every built-in check stayed silent
+### 6.2.4 Why every built-in check stayed silent
 
 The OSD map had not changed in 21 hours, so no OSD was marked down in
 the entire window under study. `OSD_SLOW_PING_TIME_*` never fired, and
 `dump_osd_network` reported zero peers above its 1 s threshold on all 32
 OSDs — and that check averages over at most 15 minutes
 (`OSD.cc` compares the 1/5/15-minute means), so it was looking at a
-window that contained stalls. Over the whole tracked span **26 of the 32 OSDs** recorded slow ops,
-with more than a dozen stall episodes past 100 s and the longest single
-op at **15m42s**. (Episode counts depend on how you cluster ops into
-episodes — anywhere from 35 to 85 depending on the grouping rule — so
-treat the count as a range and the per-op durations as the hard
-numbers.)
+window that contained stalls. Over the whole tracked span **26 of the
+32 OSDs** recorded slow ops, with more than a dozen stall episodes past
+100 s and the longest single op at **15m42s**. (Episode counts depend
+on how you cluster ops into episodes — anywhere from 35 to 85 depending
+on the grouping rule — so treat the count as a range and the per-op
+durations as the hard numbers.)
 
 Heartbeats and leases diverge inside the OSD:
 
@@ -1369,7 +1395,7 @@ to drop — which is what the retransmit counters record. Linux defaults
 to `net.ipv4.tcp_ecn=2` ("accept if asked, never ask"), so two default
 hosts never negotiate it.
 
-## 6.4 Fabric or host? The evidence does not separate them
+### 6.2.5 What the evidence cannot separate
 
 A sender's `tcp_info` records that a segment was lost, never *where*. A
 switch buffer, a NIC receive ring and the receiver's socket queue all
@@ -1407,17 +1433,50 @@ qdisc — which is what the four commands below probe.
 `network_numa_unknown_ifaces`, so Ceph never resolved the interface (a
 bond defeats its `/sys/class/net` walk) and `osd_numa_node` stays `-1`.
 
-Four commands settle it, run while `SLOW_OPS` is firing — nothing in a
-standard collection answers it:
+## 6.3 Proposed solution
+
+### 6.3.1 The fix
+
+The outage was not caused by loss but by loss outlasting a 16-second
+lease. The obvious move —
+raising `osd_pool_default_read_lease_ratio` — is the wrong one. Upstream
+is explicit:
+
+> This should be <= 1.0 so that the read lease will have expired by the
+> time we decide to mark a peer OSD down.
+> — `src/common/options/global.yaml.in`
+
+Push the ratio above 1.0 and a dead OSD's lease outlives the decision to
+mark it down, which is the exact hazard leases exist to prevent. Widen
+the grace instead and leave the ratio alone:
 
 ```bash
-nstat -az | grep -iE 'TCPRcvQDrop|PruneCalled|RcvPruned|TCPBacklogDrop'
-awk '{print NR-1, $2, $3}' /proc/net/softnet_stat   # dropped, time_squeeze
-ethtool -S <if> | grep -iE 'rx_no_buffer|rx_missed|rx_fifo|tx_dropped'
-tc -s qdisc show dev <bond>
+ceph config set global osd_heartbeat_grace 40          # lease 0.8 x 40 = 32s
+ceph config set global mon_warn_on_slow_ping_time 1000  # pin, see 6.3.2
 ```
 
-## 6.5 Working around it from the Ceph side
+A 32-second lease survives a 24.3-second silent socket. Loss continues
+and costs throughput, but the OSD does not freeze.
+
+### 6.3.2 Why it is safe
+
+Keeping the ratio at 0.8 preserves the invariant upstream asks for: the
+lease still expires before the mark-down decision, so the ordering the
+lease exists to guarantee is untouched. What the wider grace does change
+is honest and bounded — a genuinely dead peer takes 40 s rather than
+20 s to be declared down.
+
+The second command is there because of a coupling that is easy to miss.
+`osd_heartbeat_grace` is also the base of the slow-ping warning: the
+threshold is `mon_warn_on_slow_ping_ratio` (0.05) × grace, which is
+exactly the 1000 ms `dump_osd_network` reports. Double the grace and
+that check silently doubles to 2 s — making the health check §6.2.4
+already showed to be blind blinder still. A non-zero
+`mon_warn_on_slow_ping_time` overrides the ratio and pins it. Both go in
+`global`, not `osd` — upstream requires the grace to be readable by the
+mon as well as the OSDs, and `OSDMonitor` does read it.
+
+### 6.3.3 Cutting the load instead
 
 Topology can cut offered load and CPU pressure. It cannot make an
 oversubscribed fabric stop dropping. At ~0.5% loss the cluster is just
@@ -1453,9 +1512,9 @@ And EC costs CPU, which is the resource already suspected. **EC is a bet
 on the fabric hypothesis; cutting CRC and op shards is a bet on the host
 one.** They pull against each other — hence §6.4 first.
 
-**The experiment worth running first.** A test pool with a CRUSH rule
+**A test pool that takes the fabric out of the path.** A CRUSH rule
 placing all three replicas on the *same host* puts replication on
-loopback and takes the fabric out of the path. Two conditions make or
+loopback. Two conditions make or
 break it: the pool has to carry comparable per-OSD load, or a quiet pool
 simply will not reproduce a load-driven failure; and co-locating three
 replicas triples that host's NVMe and CPU load, so "stalls persist"
@@ -1465,39 +1524,32 @@ inconclusive. Note the existing loopback sockets prove nothing here: the
 CRUSH rule is `chooseleaf firstn 0 type host`, so replicas are never
 co-resident and those sockets carry no replication traffic.
 
-**The change that actually stops the freezes.** The outage was not caused
-by loss but by loss outlasting a 16-second lease. The obvious move —
-raising `osd_pool_default_read_lease_ratio` — is the wrong one. Upstream
-is explicit:
+### 6.3.4 Validation
 
-> This should be <= 1.0 so that the read lease will have expired by the
-> time we decide to mark a peer OSD down.
-> — `src/common/options/global.yaml.in`
-
-Push the ratio above 1.0 and a dead OSD's lease outlives the decision to
-mark it down, which is the exact hazard leases exist to prevent. Widen
-the grace instead and leave the ratio alone:
+The fix is not validated on this cluster, and the Status line says why:
+nothing here separates a fabric drop from a host-side one, and the two
+lead to different work. That localisation comes first, on a node
+**while** `SLOW_OPS` is firing:
 
 ```bash
-ceph config set global osd_heartbeat_grace 40          # lease 0.8 x 40 = 32s
-ceph config set global mon_warn_on_slow_ping_time 1000  # pin, see below
+nstat -az | grep -iE 'TCPRcvQDrop|PruneCalled|RcvPruned|TCPBacklogDrop'
+awk '{print NR-1, $2, $3}' /proc/net/softnet_stat   # dropped, time_squeeze
+ethtool -S <if> | grep -iE 'rx_no_buffer|rx_missed|rx_fifo|tx_dropped'
+tc -s qdisc show dev <bond>
 ```
 
-A 32-second lease survives a 24.3-second silent socket. Loss continues
-and costs throughput, but the OSD does not freeze — and because the
-ratio is untouched, the cost is the honest one: a genuinely dead peer
-takes twice as long to be declared down.
+Host counters clean and switch discards high → the fabric, and §6.3.3's
+ranking applies. The reverse → the drops never left the node, and no
+switch work will help.
 
-The second line matters. `osd_heartbeat_grace` is also the base of the
-slow-ping warning: the threshold is `mon_warn_on_slow_ping_ratio` (0.05)
-× grace, which is exactly the 1000 ms `dump_osd_network` reports. Double
-the grace and that check silently doubles to 2 s — making the health
-check §6.3 already showed to be blind blinder still. A non-zero
-`mon_warn_on_slow_ping_time` overrides the ratio and pins it. Both go in
-`global`, not `osd` — upstream requires the grace to be readable by the
-mon as well as the OSDs, and `OSDMonitor` does read it.
+Then confirm rather than assume: re-run `ceph-net-retrans.py --backoff`
+and watch the per-TB retransmit rate, and re-check `healthcheck history
+ls` for `SLOW_OPS`. The §6.3.1 lease change should stop the freezes
+while loss continues, so the two signals move independently —
+retransmits flat while `SLOW_OPS` goes quiet is the expected outcome,
+not a contradiction.
 
-## 6.6 Takeaways
+### 6.3.5 Takeaways
 
 - **`ceph health detail` reported three cosmetic warnings and missed a
   cluster freezing for minutes.** The real signal was in
