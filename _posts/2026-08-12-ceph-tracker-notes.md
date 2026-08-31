@@ -1599,12 +1599,38 @@ BlueStore.cc: 2835: FAILED ceph_assert((len % (1 << csum_chunk_order)) == 0)
 11: StoreTestBase::doSyntheticTest(...)+0x560
 ```
 
-One occurrence, in the randomised synthetic workload. `dup_esb` is the
-elastic-shared-blob clone path (`bluestore_elastic_shared_blobs`, default
-`true`): before duplicating an extent map it converts the source blobs to
-shared, and while doing so it tries to *merge* a new blob into a shared
-neighbour instead of minting another shared blob. So the abort is not in
-cloning as such — it is in an optimisation the clone reaches through.
+One occurrence, in the randomised synthetic workload. The abort is not in
+cloning as such. `dup_esb` is the elastic-shared-blob clone path
+(`bluestore_elastic_shared_blobs`, default `true`), and before it can
+duplicate an extent map it has to make every source blob shared — taking an
+optional shortcut whenever it finds a mergeable neighbour:
+
+```
+_clone -> _do_clone_range -> dup_esb              (elastic shared blobs)
+                                │
+                 make_range_shared_maybe_merge()  (frame 3)
+                                │
+     for every blob in the cloned range not already shared:
+                                │
+                    find_mergable_companion()
+                                │   (an already-shared blob
+                                │    at the same blob_start)
+              ┌─────────────────┴─────────────────┐
+      no candidate, or                    can_merge_blob()
+  can_merge_blob() says no                    says yes
+              │                                   │
+     make_blob_shared()                     merge_blob()
+    one more shared blob,                         │
+       always correct             move_data() per allocated pextent
+                                                  │
+                                 ceph_assert(len % csum_chunk == 0)
+                                              -> abort
+```
+
+The left branch is the fallback and always works. The right branch is the
+optimisation, and the assert sits at the bottom of it. That shape is already
+half the fix: `can_merge_blob()` is the gate between the two, so a `false`
+from it lands on a path BlueStore takes constantly anyway.
 
 ### 7.1.2 Reproducing it
 
@@ -1670,7 +1696,8 @@ clone aborts inside merge_blob
                                                     (BlueStore.cc:2845)
  └─ why was it handed an unaligned one?
            merge_blob's main loop walks the blob's PExtentVector and calls
-           move_data(src_pos, src_it->length) once per pextent — pextents
+           move_data(src_pos, src_it->length) once per allocated
+           pextent — pextents
            are min_alloc_size granular, csum items are not
  └─ why is the csum chunk coarser than the pextents?
            the object carried a SEQUENTIAL_READ + IMMUTABLE alloc hint, so
@@ -1692,18 +1719,28 @@ The bottom of the chain is a missing precondition, not a broken computation.
 
 ### 7.2.2 Three granularities, and what anchors each
 
-A blob describes the same logical range three times:
+A blob describes the same logical range three times, at three granularities.
+Here is the blob that aborts:
 
 ```
-blob: logical length 0x10000, csum chunk 0x8000, min_alloc 0x1000
+the blob being dissolved: logical length 0x10000, csum chunk 0x8000, min_alloc 0x1000
 
-  csum_data    [ item 0              ][ item 1              ]  1 << csum_chunk_order
-  pextents     [0x3000][0x5000       ][ ...                 ]  min_alloc_size
-  use tracker  [ au 0                ][ au 1                ]  max(csum chunk, min_alloc)
+               0                               0x8000      0xb000       0x10000
+  csum_data    [====== item 0: no data =======][====== item 1: the data ======]
+  pextents     [========== invalid ===========][= 0x3000 =][===== 0x5000 =====]
+  use tracker  [============ au 0 ============][============ au 1 ============]
+                                                           ^
+                                                           `-- a pextent boundary
+                                                               inside csum item 1
 ```
 
-`merge_blob()` moves all three from the dissolved blob to the survivor,
-iterating the **pextent** row while copying the **csum** row in whole items:
+Two of the three rows agree on every boundary. The pextent row does not: the
+allocator split the blob's 0x8000 of data into 0x3000 + 0x5000, and that
+seam falls in the middle of csum item 1.
+
+`merge_blob()` has to move all three rows into the survivor, and it walks
+the **pextent** row while copying the **csum** row in whole items — so it
+asks to move 0x3000 of an item that is 0x8000 wide:
 
 ```cpp
 auto move_data = [&](uint32_t pos, uint32_t len) {
@@ -1770,7 +1807,7 @@ placed at *blob offset* 32K of a 64K blob starting at logical 0, so it
 aligns with `max_blob_size`.
 
 ```
-logical   0            0x8000          0x10000
+logical   0              0x8000   0x10000
 blob A    |==== data ====|                        shared, csum chunk 0x8000, blob_start 0
 blob B    |    (hole)    |==== data ====|         new,    csum chunk 0x8000, blob_start 0
                           \__ allocated as 0x3000 + 0x5000
