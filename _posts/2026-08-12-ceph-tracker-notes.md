@@ -1691,9 +1691,8 @@ clone(a, c2, 2 * csum_chunk);                                   // -> merge
 Only `{0x3000, 0x5000}` carries the bug: with `{0x8000}` the same four
 calls are the aligned control case the committed test keeps alongside — same
 sequence, opposite expectations (one merged blob instead of two surviving
-ones). The committed test wraps each call in assertions; the one that
-matters here is `ASSERT_FALSE(can_merge_blob(...))`, just before the second
-clone.
+ones). The test wraps each call in assertions; the one that matters is
+`ASSERT_FALSE(can_merge_blob(...))`, just before the second clone.
 
 **Step 3 — build and run**, with the test commit from
 `wip-72848-merge-blob-csum` applied:
@@ -1740,10 +1739,9 @@ _do_alloc_write initialize csum setting for new blob ... csum_order 15 csum_leng
 make_range_shared_maybe_merge merging to: ...          (32 of 32 iterations)
 ```
 
-Order 17 capped to 15, a 32 KiB csum chunk over a 4 KiB `min_alloc_size`,
-and the second blob shifted to `csum_length 0x10000` — every ingredient of
-§7.2.2 except the fragmentation. `StupidAllocator::allocate()` is why it is
-missing:
+Order 17 capped to 15, the second blob shifted to `csum_length 0x10000` —
+every ingredient of §7.2.2 except the fragmentation, and
+`StupidAllocator::allocate()` explains that:
 
 ```cpp
 if (last_extent.end() == offset) {
@@ -1755,9 +1753,8 @@ if (last_extent.end() == offset) {
 The knob shortens each `allocate_int()` result, but on a fresh device the
 next result is physically adjacent and is coalesced straight back into one
 pextent: 103 shortenings in one run, 64 of 64 preallocs still contiguous.
-The injector can only fragment a blob once the free space is *already*
-fragmented, which on a 9.5 GB scratch device it never is. Which is a fair
-model of production: this bug needs a genuinely aged OSD.
+The injector only works on free space that is *already* fragmented — a fair
+model of production (§7.2.3): this bug needs a genuinely aged OSD.
 
 ### 7.1.3 The two blobs on disk
 
@@ -1774,8 +1771,7 @@ keys (format reference:
 | shared blob | `X` + BE u64 `00 00 00 00 00 00 00 01` | 11 B |
 
 The 94-byte head value is 31 B onode + 2 B empty spanning section + 4 + 57 B
-inline extent map. The onode struct itself is where the alloc hint of §7.2.2
-is on the record:
+inline extent map. The onode struct is where the alloc hint lands on disk:
 
 ```
 02 01 19 00 00 00   DENC frame: struct_v 2, compat 1, payload 0x19 (25)
@@ -1829,11 +1825,11 @@ The 57 inline bytes are the two blobs, annotated in full:
    b1 41 77 79             chunk 1 — the data
 ```
 
-Read back by BlueStore, that is
-`blob([0x822000~8000] llen=0x8000 csum+shared crc32c/0x8000/4)` and
-`blob([!~8000,0x82a000~8000] llen=0x10000 csum crc32c/0x8000/8)`, the second
-with `use_tracker(0x2*0x8000 0x[0,8000])` — two AUs of 32 KiB, the first
-holding no references.
+BlueStore's own readback agrees with this decode:
+`blob([0x822000~8000] ... crc32c/0x8000/4)`,
+`blob([!~8000,0x82a000~8000] ... crc32c/0x8000/8)` — plus
+`use_tracker(0x2*0x8000 0x[0,8000])`, the ref map that is not encoded inline
+but rebuilt from the lextents: two 32 KiB AUs, the first unreferenced.
 
 **The facts, read off the disk.** Two blobs, both starting at logical 0.
 Blob A has one allocated range, 32 KiB at `0x822000`, and one checksum
@@ -1883,10 +1879,9 @@ clone aborts inside merge_blob
            asserts the pextent it was handed is chunk-aligned
                                                     (BlueStore.cc:2845)
  └─ why was it handed an unaligned one?
-           merge_blob's main loop walks the blob's PExtentVector and calls
-           move_data(src_pos, src_it->length) once per allocated
-           pextent — pextents
-           are min_alloc_size granular, csum items are not
+           merge_blob's main loop calls move_data(src_pos, src_it->length)
+           once per allocated pextent — pextents are min_alloc_size
+           granular, csum items are not
  └─ why is the csum chunk coarser than the pextents?
            the object carried a SEQUENTIAL_READ + IMMUTABLE alloc hint, so
            _choose_write_options() set csum_order from
@@ -1922,9 +1917,8 @@ the blob being dissolved: logical length 0x10000, csum chunk 0x8000, min_alloc 0
                                                                inside csum item 1
 ```
 
-Two of the three rows agree on every boundary. The pextent row does not: the
-allocator split the blob's 0x8000 of data into 0x3000 + 0x5000, and that
-seam falls in the middle of csum item 1.
+Two rows agree on every boundary; the pextent row carries one extra seam,
+because the allocator split the blob's 0x8000 of data into 0x3000 + 0x5000.
 
 `merge_blob()` has to move all three rows into the survivor, and it walks
 the **pextent** row while copying the **csum** row in whole items — so it
@@ -2111,10 +2105,8 @@ path that only triggers under an uncommon hint.
 
 ### 7.3.3 Validation
 
-The regression test carries both directions in one case: chunk-aligned blobs
-must still merge (`can_merge_blob() == true`, and after the clone both
-extents resolve to the same `Blob*`), and the fragmented pair must be
-refused and end up as two shared blobs with its csum item intact.
+The regression test carries both directions in one case: the aligned pair
+must still merge into one blob, the fragmented pair must be refused.
 
 | | without the fix | with the fix |
 |---|---|---|
