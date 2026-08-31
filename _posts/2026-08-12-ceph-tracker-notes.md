@@ -1685,6 +1685,106 @@ It can only fragment a blob once the free space is *already* fragmented,
 which on a 9.5 GB scratch device it never is. That is a fair model of
 production: this bug needs a genuinely aged OSD.
 
+### 7.1.3 The two blobs on disk
+
+The pair that merge are ordinary records; nothing about them is malformed.
+A real BlueStore (`min_alloc_size` 4096, crc32c, `max_blob_size` 64 KiB)
+holding exactly the objects of 7.1.2 — hint, 32 KiB write, clone, 32 KiB
+write at 0x8000 — carries three keys (format reference:
+[§7 of the on-disk format post]({% post_url 2026-08-07-bluestore-v21-ondisk-format %})):
+
+| Record | Key | Value |
+|---|---|---|
+| onode, head | `<ghobject>'o'` | 94 B |
+| onode, clone | `<ghobject>'o'` | 58 B |
+| shared blob | `X` + BE u64 `00 00 00 00 00 00 00 01` | 11 B |
+
+The 94-byte head value is 31 B onode + 2 B empty spanning section + 4 + 57 B
+inline extent map. The onode struct itself is where the alloc hint of §7.2.2
+is on the record:
+
+```
+02 01 19 00 00 00   DENC frame: struct_v 2, compat 1, payload 0x19 (25)
+01                  nid = 1
+80 80 04            size = 0x10000                          (varint)
+00 00 00 00         attrs: le32 count = 0
+00                  flags = 0x00
+00 00 00 00         extent_map_shards: le32 count = 0        (map is inline)
+80 80 80 02         expected_object_size = 4 MiB             (varint)
+80 80 08            expected_write_size  = 128 KiB           (varint)
+24                  alloc_hint_flags = 0x24
+                      = SEQUENTIAL_READ (0x04) | IMMUTABLE (0x20)
+00 00 00 00         zone_offset_refs: 0
+```
+
+That one byte, `24`, is the whole precondition. It is what made
+`_choose_write_options()` take `ctz(expected_write_size)` instead of
+`block_size_order`, and the consequence shows up two records later as
+`csum_chunk_order = 15`.
+
+The 57 inline bytes are the two blobs, annotated in full:
+
+```
+02                       struct_v 2
+02                       n = 2 extents
+-- extent 0: logical 0x0~0x8000, blob_offset 0 --
+03                       CONTIGUOUS | ZEROOFFSET, inline blob follows
+23                       length = 0x8000                     (varint_lowz)
+   01                    extents: 1
+   44 10 00 00           lba 0x822000
+   23                    length = 0x8000
+   14                    flags = FLAG_SHARED | FLAG_CSUM
+   04                    csum_type = crc32c
+   0f                    csum_chunk_order = 15  -> 32 KiB chunks
+   04                    csum_data: 4 B = ONE crc32c item
+   0b 59 88 63             chunk 0
+   01 00 00 00 00 00 00 00  le64 sbid = 1        (-> the X record)
+-- extent 1: logical 0x8000~0x8000, blob_offset 0x8000 --
+05                       CONTIGUOUS | SAMELENGTH, blob_offset follows
+23                       blob_offset = 0x8000
+   02                    extents: 2
+   ff ff ff ff ff ff ff ff ff 01   lba INVALID_OFFSET (hole)
+   23                    length = 0x8000
+   54 10 00 00           lba 0x82a000
+   23                    length = 0x8000
+   04                    flags = FLAG_CSUM        (not shared yet)
+   04                    csum_type = crc32c
+   0f                    csum_chunk_order = 15  -> 32 KiB chunks
+   08                    csum_data: 8 B = TWO crc32c items
+   00 00 00 00             chunk 0 — never computed, the hole
+   b1 41 77 79             chunk 1 — the data
+```
+
+Read back by BlueStore, that is
+`blob([0x822000~8000] llen=0x8000 csum+shared crc32c/0x8000/4)` and
+`blob([!~8000,0x82a000~8000] llen=0x10000 csum crc32c/0x8000/8)`, the second
+with `use_tracker(0x2*0x8000 0x[0,8000])` — two AUs of 32 KiB, the first
+holding no references. Both blobs start at logical 0, both carry
+`csum_chunk_order = 15`, and their allocated ranges are disjoint: every
+condition `can_merge_blob()` tests is satisfied on these bytes.
+
+Three things this record does *not* contain:
+
+* **A logical length.** For an uncompressed blob it is not encoded at all —
+  the decoder recomputes it as the sum of the pextent lengths
+  (`get_ondisk_capacity()`). Blob B's `llen=0x10000` is 0x8000 of hole plus
+  0x8000 of data, inferred.
+* **A chunk count.** The number of csum items is `csum_data.length() /
+  get_csum_value_size()` — 8 / 4 = 2. The `08` and the `02` extent count are
+  independent fields written by independent code paths.
+* **Anything relating the two.** No field says a pextent boundary must land
+  on a multiple of `1 << csum_chunk_order`. The invariant `merge_blob()`
+  depends on is nowhere in the format; it is an emergent property of the
+  three mechanisms in §7.2.2.
+
+This specimen is the *safe* version of the pair — its 32 KiB of data got one
+contiguous extent, so `merge_blob()` would move it without complaint. The
+aborting variant differs in exactly two ways: the extent count byte reads
+`03` instead of `02`, and one 5-byte pextent record becomes two
+(`0x3000` + `0x5000` in place of `0x8000`). `csum_data` stays byte-for-byte
+identical at `08` plus two items. Five bytes elsewhere in the record, and
+the merge asserts.
+
 ## 7.2 Analysis
 
 ### 7.2.1 Root cause, top to bottom
