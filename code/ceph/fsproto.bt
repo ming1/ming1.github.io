@@ -89,6 +89,7 @@ BEGIN
   @osdop[0x2209] = "trimtrunc";   /* what Filer::truncate() emits */
   @osdop[0x220d] = "create";      @osdop[0x2223] = "set-alloc-hint";
   @osdop[0x2301] = "setxattr";    @osdop[0x1300] = "getxattr";
+  @osdop[0x222e] = "copy-from2"; /* ceph_copy_file_range() */
 
   /* cap groups: two bits each, shared / exclusive.  Missing key -> "" */
   @A[1] = "As"; @A[2] = "Ax"; @A[3] = "Asx";
