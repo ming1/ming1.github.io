@@ -5,6 +5,7 @@
 #   ./fsprotocollect.sh setup           # (re)build the cluster and both mounts
 #   ./fsprotocollect.sh all             # run every workload
 #   ./fsprotocollect.sh one <name>      # run one of them
+#   ./fsprotocollect.sh mount           # the mount/umount lifecycle
 #
 # Needs: a ceph source tree with a built vstart cluster, two spare block
 # devices, bpftrace, and root.  Output: $OUT/<name>.out (raw) and
@@ -102,6 +103,19 @@ prep_unlink() { mv -f /mnt/cephfs/d1/f5r /mnt/cephfs/d1/f5 2>/dev/null
                 head -c 4096 /dev/urandom > /mnt/cephfs/d1/f5; }
 wl_unlink() {   mv /mnt/cephfs/d1/f5 /mnt/cephfs/d1/f5r; sleep 1
                 rm -f /mnt/cephfs/d1/f4; }
+# a whole mount lifecycle, on a third mountpoint so the other two are
+# undisturbed.  Traced with fsmount.bt, not fsproto.bt.
+prep_mount() { umount /mnt/cephfs3 2>/dev/null; mkdir -p /mnt/cephfs3; }
+wl_mount() {
+  . "$OUT/mountenv"
+  mount -t ceph "two@$FSID.a=/" /mnt/cephfs3 \
+      -o mon_addr=$V2,secret=$K2,ms_mode=crc
+  sleep 1
+  stat /mnt/cephfs3/rfile > /dev/null
+  sleep 2
+  umount /mnt/cephfs3
+}
+
 prep_revoke() { head -c 16384 /dev/urandom > /mnt/cephfs/shared; }
 wl_revoke() {   # client A buffers; client B opens the same file -> revoke
   exec 3> /mnt/cephfs/shared
@@ -111,16 +125,16 @@ wl_revoke() {   # client A buffers; client B opens the same file -> revoke
 
 # ----------------------------------------------------------------- run ----
 run_one() {
-  local name=$1 quiet=${2:-15}
+  local name=$1 quiet=${2:-15} bt=${3:-fsproto.bt}
   cd "$CEPH/build" || exit 1
   local MDS LIB MDSPID RAW=$OUT/$name.raw
   MDS=$(realpath bin/ceph-mds); LIB=$(realpath lib/libceph-common.so.2)
   MDSPID=$(pgrep -x ceph-mds | head -1)
   : > /var/tmp/fsproto.mark; rm -f "$RAW" "$OUT/$name.out"
 
-  python3 "$HERE/fsprun.py" "$HERE/fsproto.bt" "$MDS" "$LIB" \
-          "$OUT/fsproto-addr.bt" 2>/dev/null || exit 1
-  nohup bpftrace "$OUT/fsproto-addr.bt" "$MDS" "$LIB" "$MDSPID" \
+  python3 "$HERE/fsprun.py" "$HERE/$bt" "$MDS" "$LIB" \
+          "$OUT/$name-addr.bt" 2>/dev/null || exit 1
+  nohup bpftrace "$OUT/$name-addr.bt" "$MDS" "$LIB" "$MDSPID" \
         > "$RAW" 2>&1 &
   local BT=$! i
   for i in $(seq 1 180); do grep -q '^ *us ' "$RAW" && break; sleep 1; done
@@ -145,9 +159,11 @@ run_one() {
 
 case "${1:-all}" in
   setup) setup ;;
-  one)   run_one "$2" "${3:-15}" ;;
+  one)   run_one "$2" "${3:-15}" "${4:-fsproto.bt}" ;;
+  mount) run_one mount "${2:-15}" fsmount.bt ;;
   all)   for w in create session readdir read revoke trunc unlink; do
            run_one "$w"; sleep 10
-         done ;;
+         done
+         sleep 10; run_one mount 15 fsmount.bt ;;
   *)     echo "usage: $0 {setup|all|one <name>}"; exit 1 ;;
 esac
