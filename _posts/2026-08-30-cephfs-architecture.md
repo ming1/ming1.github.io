@@ -140,8 +140,8 @@ all pools `size=2 min_size=1`. Pool 2 is `cephfs.a.meta`, pool 3 is
 `cephfs.a.data`. Two kernel mounts with **two different cephx identities**, so
 they are two independent clients with two independent sessions:
 `/mnt/cephfs` (`client.admin`, global id 4168 throughout) and `/mnt/cephfs2`
-(`client.two`, whose id changes on every remount — 4169, 4186, 4187 and 4240
-across the traces below). One host means one monotonic clock, so client, MDS and
+(`client.two`, whose id changes on every remount — 4169, 4186, 4187, 4240 and,
+in §3's own run on a third mountpoint, 4251). One host means one monotonic clock, so client, MDS and
 OSD events sort onto a single timeline with no correlation machinery.
 
 Read the shapes, not the microseconds: `osd.0` is an emulated spinning disk, so
@@ -1033,7 +1033,7 @@ umount /mnt/cephfs3
 Neither line names an MDS or an OSD. The client is handed one monitor address
 and one identity; everything else it has to ask for. The mountpoint is a third
 one, so the two mounts §2 used stay undisturbed — which is why the client id
-below is `client.4250` and not one of §2.1's.
+below is `client.4251` and not one of §2.1's.
 
 ```
   mount -t ceph two@<fsid>.a=/ /mnt/cephfs3 -o mon_addr=..,secret=..,ms_mode=crc
@@ -1146,7 +1146,7 @@ value from [`struct fs_parameter`](https://github.com/torvalds/linux/blob/v7.2/i
 fs_context callback that turns parsed options into a superblock. It builds a
 [`struct ceph_fs_client`](https://github.com/torvalds/linux/blob/v7.2/fs/ceph/super.h#L146), which owns a libceph client ([`ceph_create_client()`](https://github.com/torvalds/linux/blob/v7.2/net/ceph/ceph_common.c#L706) — `ceph_monc_init()`
 then `ceph_osdc_init()`) plus an MDS client ([`ceph_mdsc_init()`](https://github.com/torvalds/linux/blob/v7.2/fs/ceph/mds_client.c#L6256)). At line 7 this client has no
-identity: the `global_id` that names it — `client.4250` from line 13 on — is
+identity: the `global_id` that names it — `client.4251` from line 13 on — is
 handed out by the monitor during authentication, decoded from the AUTH_DONE
 frame.
 
@@ -1169,7 +1169,7 @@ read the gaps as well as the lines — the 786 µs between lines 12 and 14 is th
      │ ── HELLO ───────────────────────────────────────►  │
      │ ◄─ HELLO: peer type, and my own addr as seen ────  │  process_hello()
      │ ── AUTH_REQUEST: cephx, entity client.two ──────►  │
-     │ ◄─ AUTH_DONE: global_id 4250 + session key ──────  │  process_auth_done()
+     │ ◄─ AUTH_DONE: global_id 4251 + session key ──────  │  process_auth_done()
      │ ── AUTH_SIGNATURE ──────────────────────────────►  │   \ not probed:
      │ ◄─ AUTH_SIGNATURE ───────────────────────────────  │   / the 463 us gap
      │ ── CLIENT_IDENT: my addrs, features ────────────►  │  prepare_client_ident()
