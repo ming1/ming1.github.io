@@ -1,7 +1,7 @@
 ---
 title: "Ceph Tracker Notes"
 category: storage
-tags: [ceph, bluestore, bluefs, tracker, debugging, wal, ebpf, network, tcp, checksum, clone]
+tags: [ceph, bluestore, bluefs, tracker, debugging, wal, ebpf, network, tcp, checksum, clone, libaio, containers]
 ---
 
 * TOC
@@ -2194,3 +2194,263 @@ are what pin the mechanism.
   allocations.** It is honoured only by `StupidAllocator` — not the default
   `hybrid` — and even there coalescing undoes it on unfragmented free space
   (§7.1.2). Worth knowing before trusting it in a reproducer.
+
+# 8. Tracker #78144 — a unit test that aborts because a syscall was denied
+
+[Issue](https://tracker.ceph.com/issues/78144) · `unittest_bluefs_ex` under
+`make check` on Ubuntu 24.04 · component BlueStore (test) · one of five
+tickets from one environment defect · Status: probe-and-skip patch local and
+validated, not submitted; the sibling ticket's PR does not cover this one
+
+## 8.1 Report
+
+### 8.1.1 The observation
+
+`unittest_bluefs_ex` fails on noble and passes everywhere else. The test
+never gets to run: BlueFS opens a block device, the device's polling thread
+calls `io_getevents(2)`, the container's syscall filter denies it with
+`EPERM`, and `KernelDevice::_aio_thread()` treats every error it does not
+recognise as fatal.
+
+```
+BlueFS_ex.test_interrupted_compaction
+KernelDevice.cc: 718: ceph_abort_msg("got unexpected error from io_getevents")
+ 3: KernelDevice::_aio_thread()
+ 4: KernelDevice::AioCompletionThread::entry()
+...
+test_bluefs_ex.cc:180: Failure
+Value of: (((stat) & 0xff00) >> 8) == 0
+```
+
+(line 718 is the reporter's tree; the same abort is at 699-701 on main today.)
+
+Those two halves are three processes apart, which is most of why the report
+is hard to read. The test forks twice, and the abort lands in the innermost
+process:
+
+```
+unittest_bluefs_ex                        (gtest, outer)
+ └─ fork_for_test
+     │   parent: waitpid -> WIFEXITED && WEXITSTATUS == 0   <- line 180 fails here
+     │
+     └─ child: create the bdev, fork again
+         │   parent: waitpid -> expects exit code 107
+         │
+         └─ grandchild: add_block_device -> KernelDevice::open -> _aio_start
+                        bstore_aio: io_getevents -> -EPERM -> ceph_abort
+                        SIGABRT, instead of the _exit(107) it was going to do
+```
+
+The grandchild is supposed to kill itself mid-compaction with `_exit(107)` —
+that is the whole point of the test, which checks that BlueFS recovers from
+an interrupted log compaction. It never reaches the compaction. Opening the
+device starts the polling thread, and the very first `io_getevents()` is
+denied — so it dies before even `mkfs()`. The middle process sees
+`WIFEXITED` false, exits 107 itself, and the outer process reports a bad
+exit status at line 180. Nothing in that last message mentions aio.
+
+### 8.1.2 Reproducing it
+
+The denial is environmental, so on any working machine you inject it. libaio
+returns `-errno`, so the whole shim is one function:
+
+```c
+/* deny_aio.c — what the noble container's syscall filter does */
+#define _GNU_SOURCE
+#include <libaio.h>
+#include <errno.h>
+int io_getevents(io_context_t ctx, long min_nr, long nr,
+                 struct io_event *events, struct timespec *timeout)
+{
+    return -EPERM;
+}
+```
+
+```bash
+gcc -shared -fPIC -o deny_aio.so deny_aio.c
+LD_PRELOAD=$PWD/deny_aio.so bin/unittest_bluefs_ex
+```
+
+That reproduces the ticket exactly on a machine where aio works — the same
+abort, then the same `Actual: false` at line 180. Fedora 42 without the
+shim: 8 runs, 8 passes, ~50 s each. The test is fine; the environment is
+not.
+
+## 8.2 Analysis
+
+### 8.2.1 Root cause, top to bottom
+
+```
+unittest_bluefs_ex reports a bad exit status at line 180
+ └─ why?   the grandchild died of SIGABRT rather than _exit(107), so
+           WIFEXITED is false and the middle process exits 107 itself
+ └─ why did it abort?
+           get_next_completed() retries -EINTR internally (aio.cc:105);
+           _aio_thread() treats every other negative return as fatal
+                                              (KernelDevice.cc:699-701)
+ └─ what did it get?
+           -EPERM from io_getevents(2), on the first poll after the
+           device was opened
+ └─ why EPERM?
+           the kernel's io_getevents has no EPERM of its own — its errors
+           are EINVAL, EFAULT, EINTR, ENOSYS — so it came from a syscall
+           filter (seccomp, or an AppArmor/LSM policy) in the noble
+           build container
+
+#78144's own log does not carry the errno: the fixture sets
+`log_to_stderr false`. `EPERM` is proven for #78148 — `_aio_thread got (1)
+Operation not permitted`, same builder run 24 seconds earlier — and inferred
+here from the identical abort site. The shim of 8.1.2 reproduces #78144's
+output exactly, which is as close to proof as the log allows.
+ └─ why does every poll hit it?
+           BlueStore polls with bdev_aio_poll_ms = 250, and any non-zero
+           timeout issues the syscall (8.2.2)
+```
+
+### 8.2.2 Which call is denied, and which is not
+
+The sibling ticket describes this as the kernel having two paths, one of
+them policy-checked. It is simpler than that, and the split is in userspace.
+Disassembling libaio 0.3.111 (Fedora 42):
+
+```
+io_getevents@@LIBAIO_0.4:
+   cmpl  $0xa10a10a1,0x10(%rdi)   ; ring->magic == AIO_RING_MAGIC ?
+   cmpq  $0x0,(%r8)               ; timeout->tv_sec  == 0 ?
+   cmpq  $0x0,0x8(%r8)            ; timeout->tv_nsec == 0 ?
+   mov   0xc(%rdi),%eax
+   cmp   %eax,0x8(%rdi)           ; ring->head == ring->tail ?
+   je    -> xor %eax,%eax ; ret   ; all yes: return 0, no syscall at all
+   jmp   -> syscall
+```
+
+```
+io_getevents(ctx, min_nr, nr, events, timeout)
+   │
+   ├── timeout == {0,0} AND ring empty ──> return 0   no syscall issued, so
+   │                                                  a zero-timeout probe
+   │                                                  reports aio as healthy
+   │
+   └── anything else ────────────────────> syscall ─> denied, -EPERM, so every
+                                                      250 ms BlueStore poll dies
+```
+
+Hence the probe in 8.3.1 uses a 1 ms timeout rather than the cheaper zero.
+
+**A zero-timeout poll loop is not a workaround.** The left branch cannot
+harvest anything — it only answers "the ring is empty". I checked by
+submitting a write, waiting for it to land, and then polling with a zero
+timeout: it returned the completion, which means it took the syscall. So
+such a loop would work only while there is nothing to collect.
+
+### 8.2.3 One cause, five tickets, two fixes
+
+`io_setup(2)` succeeds and `io_getevents(2)` does not, so every test that
+opens a BlueStore block device dies the same way. Five were filed separately
+on the same day, and #78144 and #78148 are 24 seconds apart in one builder
+run:
+
+| ticket | test | project | needs |
+|---|---|---|---|
+| #78148 | `safe-to-destroy.sh` | RADOS | shell-level skip — has [PR #70572](https://github.com/ceph/ceph/pull/70572) |
+| #78144 | `unittest_bluefs_ex` | bluestore | gtest-level skip — **this section** |
+| #78145/6/7 | `run-rbd-unit-tests-*.sh` | rbd | same abort, unaddressed |
+| #77592 | umbrella: `unittest_bluefs`, `unittest_bdev`, and more | Dashboard | filed 2026-06-23; also lists tox failures with other causes |
+
+PR #70572 fixes #78148, and it improves #78144 without fixing it: its probe
+in `aio_queue_t::init()` turns the abort into an error return, so
+`KernelDevice::open()` fails and `add_block_device()` fails. The grandchild
+then reports `test_bluefs_ex.cc:140: Failure` and exits 0 instead of 107, the
+middle process still `exit(107)`s, and the outer `ASSERT_TRUE` still fails at
+line 180. Better diagnostics — a named source line and a new
+`io_getevents(2) is not permitted` message instead of a `SIGABRT` — and the
+same red test. Its CTest skip is an `exit 77` in a shell script; a gtest
+binary gets nothing from it. So #78144 shares a cause with #78148 but not a fix, and closing it
+as a duplicate would mark it resolved while it still fails.
+
+## 8.3 Proposed solution
+
+### 8.3.1 The fix
+
+Probe once, in the outer process, before either fork — a skip decided in the
+grandchild cannot be reported, it can only change an exit code:
+
+```cpp
+static int probe_libaio()
+{
+#if defined(HAVE_LIBAIO)
+  io_context_t ctx = 0;
+  int r = io_setup(1, &ctx);
+  if (r < 0) {
+    return r;
+  }
+  io_event event;
+  struct timespec timeout = {0, 1000 * 1000}; // 1ms — must be non-zero
+  r = io_getevents(ctx, 1, 1, &event, &timeout);
+  io_destroy(ctx);
+  if (r < 0) {
+    return r;
+  }
+#endif
+  return 0;
+}
+```
+
+```cpp
+TEST_F(BlueFS_ex, test_interrupted_compaction)
+{
+  int aio_probe = probe_libaio();
+  if (aio_probe < 0) {
+    GTEST_SKIP() << "libaio is unusable in this environment ("
+                 << cpp_strerror(aio_probe)
+                 << "); BlueFS cannot open a block device here";
+  }
+```
+
+`GTEST_SKIP` exits 0, so CTest records a pass and the skip shows up in the
+test's own output. That is deliberate: `exit 77` only reads as a skip when
+the test carries CMake's `SKIP_RETURN_CODE` property, and `SKIP_RETURN_CODE`
+appears nowhere in Ceph's build — `safe-to-destroy.sh` is registered with a
+plain `add_ceph_test`, so PR #70572's `exit 77` would currently be reported
+as a failure.
+
+### 8.3.2 What was ruled out
+
+**`bdev_aio = false`.** The option exists, is documented `advanced`, and
+`KernelDevice::open()` answers it with
+`ceph_abort_msg("non-aio not supported")` (KernelDevice.cc:227). Verified by
+running it: the test dies on that abort instead. The option is a trap.
+
+**A zero-timeout poll loop.** Ruled out in 8.2.2 — it cannot collect
+completions.
+
+**Waiting for PR #70572.** Ruled out in 8.2.3 — it leaves this test failing.
+
+### 8.3.3 Validation
+
+With the shim standing in for the noble policy:
+
+| scenario | result |
+|---|---|
+| unpatched + shim | `ceph_abort_msg(...)`, then `Actual: false` at line 180 — the ticket, exactly |
+| patched + shim | `[ SKIPPED ]` with the reason, exit 0 |
+| patched, no shim | `[ OK ] ... (48620 ms)`, exit 0 — the test still really runs |
+| unpatched, no shim | 8 runs, 8 passes |
+
+### 8.3.4 Takeaways
+
+- **The fix is a skip, and a skip is not a fix.** A green `make check` on
+  noble then means BlueStore was never tested there. The environment is the
+  thing to repair; skipping only stops one broken environment from looking
+  like a code bug.
+- **`EPERM` from a syscall that has no `EPERM` is a filter, not a bug.**
+  The kernel's `io_getevents` returns EINVAL, EFAULT, EINTR or ENOSYS.
+  Reading the man page's error list ruled out the whole aio subsystem in one
+  step and pointed straight at seccomp/AppArmor.
+- **A probe has to take the same branch as the real caller.** libaio answers
+  a zero timeout without a syscall, so the natural cheap probe is exactly
+  the one that cannot detect this.
+- **Fork depth hides the cause.** The abort was two `fork()`s below the
+  assertion that reported it, and by the time it surfaced it was an integer.
+  Probing before the fork is not just tidier — it is the only place a
+  diagnosis can be printed.
