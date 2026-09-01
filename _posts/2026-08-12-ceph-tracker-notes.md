@@ -2000,52 +2000,32 @@ is where the bug lives:
 | `wctx->csum_order = block_size_order` | csum chunk ≤ `min_alloc_size`, so any `min_alloc` boundary is also a chunk boundary | **no — this is the door** |
 | `can_merge_blob()` | — | **never checked it at all** |
 
-The third row is `_choose_write_options()`:
-
-```cpp
-if ((alloc_hints & CEPH_OSD_ALLOC_HINT_FLAG_SEQUENTIAL_READ) &&
-    (alloc_hints & CEPH_OSD_ALLOC_HINT_FLAG_RANDOM_READ) == 0 &&
-    (alloc_hints & (CEPH_OSD_ALLOC_HINT_FLAG_IMMUTABLE |
-                    CEPH_OSD_ALLOC_HINT_FLAG_APPEND_ONLY)) &&
-    (alloc_hints & CEPH_OSD_ALLOC_HINT_FLAG_RANDOM_WRITE) == 0) {
-  ...
-  if (o->onode.expected_write_size) {
-    wctx->csum_order = std::max(min_alloc_size_order,
-                                (uint8_t)std::countr_zero(o->onode.expected_write_size));
-```
-
-With that hint the csum chunk can go *above* `min_alloc_size`, up to
+`_choose_write_options()` opens the third row. An object hinted
+`SEQUENTIAL_READ` without `RANDOM_READ`, carrying `IMMUTABLE` or
+`APPEND_ONLY`, and not `RANDOM_WRITE`, gets
+`csum_order = max(min_alloc_size_order, ctz(expected_write_size))` instead of
+`block_size_order` — so its csum chunk can go *above* `min_alloc_size`, up to
 `expected_write_size`. (Compressed blobs take their order from
 `ctz(compressed length)` and can exceed `min_alloc_size` too, but they are
 excluded from this merge on both sides — `scan_shared_blobs()` skips them as
 candidates and `make_range_shared_maybe_merge()` never offers them.)
 
-`_do_alloc_write()` allocates first, then caps each blob's own order at the
-write length, and stores what the allocator returned as-is, slicing only the
-tail extent at the blob boundary:
-
-```cpp
-prealloc_left = alloc->allocate(need, min_alloc_size, need, ..., &prealloc);
-...
-csum_order = std::min<unsigned>(wctx->csum_order, std::countr_zero(l->length()));
-...
-dblob.allocated(p2align(b_off, min_alloc_size), final_length, extents);
-```
-
-The last ingredient is that both blobs must share a `blob_start`, which the
-`suggested_boff` logic hands over for free: a 32K write at logical 32K is
-placed at *blob offset* 32K of a 64K blob starting at logical 0, so it
-aligns with `max_blob_size`.
+`_do_alloc_write()` caps each blob's own order at `ctz(write length)` and
+then stores what the allocator returned as-is, slicing only the tail extent
+at the blob boundary — which is how a chunk-sized write ends up in two
+pieces. The last ingredient is that both blobs share a `blob_start`, handed
+over for free by `suggested_boff`: a 32K write at logical 32K goes to *blob
+offset* 32K of a 64K blob starting at logical 0, to align with
+`max_blob_size`.
 
 ```
 logical   0              0x8000   0x10000
-blob A    |==== data ====|                        shared, csum chunk 0x8000, blob_start 0
-blob B    |    (hole)    |==== data ====|         new,    csum chunk 0x8000, blob_start 0
-                          \__ allocated as 0x3000 + 0x5000
+blob A    |==== data ====|                    shared,     csum chunk 0x8000
+blob B    |    (hole)    |==== data ====|     not shared, csum chunk 0x8000
+                          \__ 0x3000 + 0x5000   (both blobs start at logical 0)
 
 can_merge_blob(A, B) -> true   (disjoint, same csum order, same au size)
-merge_blob(A <- B)   -> move_data(0x8000, 0x3000)
-                        0x3000 % 0x8000 != 0      -> abort
+merge_blob(A <- B)   -> move_data(0x8000, 0x3000) -> 0x3000 % 0x8000 -> abort
 ```
 
 The near-miss is instructive. `can_reuse_blob()`, the sibling gate on the
@@ -2135,23 +2115,31 @@ already has the branch — `find_mergable_companion()` returning `nullptr` is
 the normal case for the first blob at any `blob_start`. A `false` from
 `can_merge_blob()` reaches exactly that path.
 
-**Relaxing the assert instead would be wrong twice over.** Copying a whole
-csum chunk out of the dissolved blob would overwrite the survivor's checksum
-for the part of that chunk *it* owns; every later read of that region then
-fails `_verify_csum()` and returns `-EIO`, on the source object and on every
-clone of it. And the use-tracker loop underneath rounds the same way, so two
-fragments inside one AU would add `src_tracker_aus[i]` twice.
+**Relaxing the assert instead is not free.** The use-tracker loop under it
+rounds the same way, and one invariant decides both halves of what happens
+next. Because a sub-AU hole cannot exist, two fragments at `0x3000` and
+`0x5000` inside one AU must *both* be valid — so both are visited and each
+adds `src_tracker_aus[i]`, leaving a count that `put()` can never drive to
+zero and an AU that is never released. The csum copy is subtler. Rounding to whole items would actually copy the
+right item, because a chunk that any of the dissolved blob's bytes touch is
+entirely its own: writes into a csummed blob are chunk-aligned, and
+`get_release_size()` forbids sub-chunk holes, so no chunk is ever co-owned.
+`Blob::copy_from()` already relies on exactly that — it copies csum items
+with the same `p2align`/`p2roundup` rounding, and is correct for the same
+reason. But the invariant is written down nowhere, which is the shape of
+this bug; a crash fix is the wrong place to start leaning on it.
 
 **The cost is bounded and rare.** It gives up the elastic-shared-blob win
 only when the blob being dissolved is chunk-split — which requires the
 alloc hint *and* fragmentation, i.e. the ~9% of objects above on an aged
 device. Everything else still merges; the regression test pins that down.
 
-**The stricter alternative was considered and deferred.** Checking
-disjointness at chunk granularity and rewriting `move_data()` to walk
-csum-chunk *runs* instead of individual pextents would keep the win, but
-needs an AU dedup guard in the tracker loop and far more test surface for a
-path that only triggers under an uncommon hint.
+**The alternative was worked out and deferred.** `move_data()` could keep
+the win instead: copy each csum item at most once behind a watermark, and
+move the tracker as a single whole-array add rather than per call. That is
+about fifteen lines and deletes both asserts — but it is precisely the
+change that leans on the never-co-owned invariant above, so it wants its own
+guardrail and test surface, not a ride on a crash fix.
 
 ### 7.3.3 Validation
 
@@ -2177,8 +2165,8 @@ pre-existing and unrelated.
 The last row is the honest one. Instrumenting the guard shows the qa
 workload does build blobs whose csum chunk exceeds `min_alloc_size`
 (`csum_chunk=0x2000, min_alloc=0x1000`) — but never a fragmented one, so the
-guard was never asked to refuse anything in 68 minutes. Nothing in the suite drains its
-scratch device, so chunk-split blobs stay rare — the tracker's abort was one
+guard was never asked to refuse anything. Nothing in the suite drains its
+scratch device, so chunk-split blobs stay rare: the tracker's abort was one
 occurrence across many such runs, and 68 minutes did not buy another. What
 this run establishes is that the guard costs nothing; the two reproducers
 are what pin the mechanism.
@@ -2198,9 +2186,10 @@ are what pin the mechanism.
   consumer of a shared representation, the first consumer's guards are the
   checklist — even when the second consumer needs a stricter version of the
   same guard.
-- **An assert is not a fix.** Deleting these two would have converted a
-  crash into a checksum that describes the wrong data — an unreadable
-  extent in the object and in every clone of it, instead of an abort.
+- **An assert is not a fix.** Deleting these two would have turned a crash
+  into an inflated use tracker — the same AU counted once per fragment, so
+  it is never released. No crash, no error returned to the client, just
+  space that does not come back: far harder to attribute than an abort.
 - **A knob named "force small allocations" does not force small
   allocations.** It is honoured only by `StupidAllocator` — not the default
   `hybrid` — and even there coalescing undoes it on unfragmented free space
