@@ -31,9 +31,12 @@
  * ceph_mdsc_pre_umount are all *static*.  If one is inlined away on your
  * kernel it vanishes from kallsyms and the failed attach aborts the whole
  * script -- drop that probe rather than the run.  And whether a `mount(2)`
- * appears at all depends on the mount helper: util-linux 2.40 and the
- * mount.ceph shipped with it use fsopen()/fsconfig(), so the option lines
- * come from ceph_parse_mount_param and there is no mount(2) to see.
+ * appears at all depends on whether ceph's own /sbin/mount.ceph helper is
+ * installed: it calls mount(2) (src/mount/mount.ceph.c).  With no helper to
+ * exec, mount(8) falls back to libmount's fd-based path -- fsopen() plus one
+ * fsconfig() per option -- and there is no mount(2) to see.  Either way the
+ * options arrive through ceph_parse_mount_param, which is why that is the
+ * anchor here.
  */
 
 /* struct fs_parameter keeps its value in an anonymous union and names one
@@ -92,9 +95,10 @@ tracepoint:syscalls:sys_enter_mount
          tid, "vfs", comm, "mount(2)", str(args->dev_name),
          str(args->dir_name), str(args->type)); }
 
-/* umount uses fstatfs(2) on an fd, not statfs(2) on the path -- a path
- * filter never matches, and the only statfs(2) calls util-linux makes are
- * selinux probes on /sys/fs/selinux. */
+/* umount uses fstatfs(2) on an fd, not statfs(2) on a path, so the
+ * path-filtered statfs probe below never fires for it.  Both are kept: the
+ * fd one is what a CephFS umount actually uses, the path one catches df(1)
+ * and friends. */
 tracepoint:syscalls:sys_enter_fstatfs
 /@t0 && (comm == "umount" || comm == "mount" || comm == "df")/
 { printf("%10lld %7d  %-9s %-15s %-27s fd=%d\n", (nsecs-@t0)/1000, tid,
@@ -140,7 +144,12 @@ kfunc:ceph:ceph_parse_mount_param
   } else {
     printf("%10lld %7d  %-9s %-15s %-27s %s%s%s\n", (nsecs-@t0)/1000, tid,
            "fs", comm, "ceph_parse_mount_param", $k,
-           $p->type == 2 ? "=" : " type=", $p->type == 2 ? str($p->sval) : "1");
+           $p->type == 2 ? "=" : "", $p->type == 2 ? str($p->sval) : "");
+    if ($p->type != 2) {
+      printf("%10lld %7d  %-9s %-15s %-27s %s (fs_value_type %d, not a string)\n",
+             (nsecs-@t0)/1000, tid, "fs", comm, "ceph_parse_mount_param",
+             $k, $p->type);
+    }
   }
 }
 
@@ -223,14 +232,14 @@ kfunc:libceph:ceph_con_send
            $m->front.iov_len);
   } else if ($t == 22) {
     $s = (struct ceph_mds_session_head *)$m->front.iov_base;
-    printf("%10lld %7d  cli.%-5lld %-15s %-27s %s seq=%lld\n",
+    printf("%10lld %7d  cli.%-5lld %-15s %-27s %s(%d) seq=%lld\n",
            (nsecs-@t0)/1000, tid, $g, comm, "C->MDS client_session",
-           @sessop[$s->op], $s->seq);
+           @sessop[$s->op], $s->op, $s->seq);
   } else if ($t == 24) {
     $h = (struct ceph_mds_request_head *)$m->front.iov_base;
-    printf("%10lld %7d  cli.%-5lld %-15s %-27s tid=%lld op=%s\n",
+    printf("%10lld %7d  cli.%-5lld %-15s %-27s tid=%lld op=%s(0x%x)\n",
            (nsecs-@t0)/1000, tid, $g, comm, "C->MDS client_request",
-           $m->hdr.tid, @mdsop[$h->op]);
+           $m->hdr.tid, @mdsop[$h->op], $h->op);
   } else if ($t == 29) {
     printf("%10lld %7d  cli.%-5lld %-15s %-27s (periodic, %d B)\n",
            (nsecs-@t0)/1000, tid, $g, comm, "C->MDS client_metrics",
@@ -263,14 +272,14 @@ kfunc:ceph:mds_dispatch
 
   if ($t == 22) {
     $s = (struct ceph_mds_session_head *)$m->front.iov_base;
-    printf("%10lld %7d  cli.%-5lld %-15s %-27s %s seq=%lld\n",
+    printf("%10lld %7d  cli.%-5lld %-15s %-27s %s(%d) seq=%lld\n",
            (nsecs-@t0)/1000, tid, $g, comm, "MDS->C client_session",
-           @sessop[$s->op], $s->seq);
+           @sessop[$s->op], $s->op, $s->seq);
   } else if ($t == 26) {
     $h = (struct ceph_mds_reply_head *)$m->front.iov_base;
-    printf("%10lld %7d  cli.%-5lld %-15s %-27s tid=%lld op=%s result=%d %s\n",
+    printf("%10lld %7d  cli.%-5lld %-15s %-27s tid=%lld op=%s(0x%x) result=%d %s\n",
            (nsecs-@t0)/1000, tid, $g, comm, "MDS->C client_reply",
-           $m->hdr.tid, @mdsop[$h->op], (int32)$h->result,
+           $m->hdr.tid, @mdsop[$h->op], $h->op, (int32)$h->result,
            $h->safe ? "SAFE" : "unsafe");
   } else if ($t == 21) {
     printf("%10lld %7d  cli.%-5lld %-15s %-27s (new epoch)\n",
@@ -321,7 +330,7 @@ uprobe:$1:_ZN6Server21handle_client_sessionE*
 
 uprobe:$1:_ZN5MDLog13_submit_entryE*
 /@t0/
-{ printf("%10lld %7d  %-9s %-15s %-27s ESession queued\n", (nsecs-@t0)/1000,
+{ printf("%10lld %7d  %-9s %-15s %-27s queued\n", (nsecs-@t0)/1000,
          tid, "mds", comm, "MDLog::_submit_entry"); }
 
 uprobe:$2:_ZN8Objecter10_op_submitE*
