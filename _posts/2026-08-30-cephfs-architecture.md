@@ -57,15 +57,22 @@ metadata lookup ever happens, which is why the MDS is not on the data path.
 | Channel | Messages | Purpose |
 |---|---|---|
 | Client&nbsp;↔&nbsp;MON | `MMonSubscribe`, `MOSDMap`, `MMDSMap`, cephx auth | maps, keys, blocklist state |
-| Client&nbsp;↔&nbsp;MDS | `MClientSession`, `MClientRequest` / `MClientReply`, `MClientCaps`, `MClientCapRelease`, `MClientLease`, `MClientSnap`, `MClientReconnect` | lookup, open, create, rename, readdir, cap grant/revoke/flush |
-| Client&nbsp;↔&nbsp;OSD | `MOSDOp` / `MOSDOpReply` | read, sparse-read, write, truncate, per-object atomic transactions |
+| Client&nbsp;↔&nbsp;MDS | `MClientSession`, `MClientRequest` / `MClientReply`, `MClientCaps`, [`MClientCapRelease`](https://github.com/ceph/ceph/blob/v21.3.0/src/messages/MClientCapRelease.h#L22), `MClientLease`, `MClientSnap`, `MClientReconnect` | lookup, open, create, rename, readdir, cap grant/revoke/flush |
+| Client&nbsp;↔&nbsp;OSD | `MOSDOp` / [`MOSDOpReply`](https://github.com/ceph/ceph/blob/v21.3.0/src/messages/MOSDOpReply.h#L36) | read, sparse-read, write, truncate, per-object atomic transactions |
 | MDS&nbsp;↔&nbsp;MDS | `MExportDir*`, `MMDSPeerRequest`, `MDentryLink/Unlink` | subtree migration, multi-rank ops such as cross-rank rename |
-| MDS&nbsp;↔&nbsp;OSD | `MOSDOp` | journal append, dirfrag flush, inode backtrace, data-pool truncate |
+| MDS&nbsp;↔&nbsp;OSD | [`MOSDOp`](https://github.com/ceph/ceph/blob/v21.3.0/src/messages/MOSDOp.h#L41) | journal append, dirfrag flush, inode backtrace, data-pool truncate |
 
 The next two subsections take the two client-facing rows apart, message by
 message: what each one exists for, when it goes on the wire, what it carries,
 and what each side does with it. Everything shown is decoded from a live
 cluster.
+
+Every structure and function named below links to its definition, pinned so the
+line numbers stay true: userspace to [ceph
+v21.3.0](https://github.com/ceph/ceph/tree/v21.3.0), kernel client to [linux
+v7.2](https://github.com/torvalds/linux/tree/v7.2). The lab runs a build a
+little ahead of both, so a line may have drifted by the time you read this — the
+symbol names have not.
 
 ## 2.1 Watching the wire
 
@@ -75,17 +82,17 @@ only four probes:
 
 | Probe | Catches |
 |---|---|
-| `kfunc:libceph:ceph_con_send` | everything the client sends, filtered to its MDS connection |
-| `kfunc:ceph:mds_dispatch` | everything the MDS sends the client |
-| `kfunc:libceph:send_request` | the client's OSD ops |
-| `kfunc:libceph:__complete_request` | their replies |
+| [`kfunc:libceph:ceph_con_send`](https://github.com/torvalds/linux/blob/v7.2/net/ceph/messenger.c#L1732) | everything the client sends, filtered to its MDS connection |
+| [`kfunc:ceph:mds_dispatch`](https://github.com/torvalds/linux/blob/v7.2/fs/ceph/mds_client.c#L7126) | everything the MDS sends the client |
+| [`kfunc:libceph:send_request`](https://github.com/torvalds/linux/blob/v7.2/net/ceph/osd_client.c#L2316) | the client's OSD ops |
+| [`kfunc:libceph:__complete_request`](https://github.com/torvalds/linux/blob/v7.2/net/ceph/osd_client.c#L2518) | their replies |
 
 Two context lanes ride along, and they are the rest of the script: a `posix`
 lane of syscall tracepoints filtered to paths under the mount, so each message
 can be pinned to the call that caused it, and a deliberately thin `mds` lane of
 uprobes (`Server`, `Locker`, `MDLog`, `Objecter`) showing what the server did
 between a request and its reply. The MDS internals behind that lane —
-journaling, and the BlueStore commit every `Objecter::_op_submit` turns into —
+journaling, and the BlueStore commit every [`Objecter::_op_submit`](https://github.com/ceph/ceph/blob/v21.3.0/src/osdc/Objecter.cc#L2566) turns into —
 are dissected in §3.2 of
 [BlueStore I/O Path Analysis]({{ site.baseurl }}/storage/bluestore-io-analysis).
 
@@ -101,7 +108,7 @@ kfunc:ceph:mds_dispatch
     ...   /* op, ino, seq, caps, wanted, size/max_size, truncate_seq */
 ```
 
-Cap bitmasks are rendered the way `ccap_string()` renders them — three map
+Cap bitmasks are rendered the way [`ccap_string()`](https://github.com/ceph/ceph/blob/v21.3.0/src/mds/mdstypes.h#L103) renders them — three map
 lookups for the `A`/`L`/`X` groups plus eight bit tests for the `F` group — so
 `caps=pAsxLsXsxFsxcrwb` in the trace is the same string the MDS logs. The whole
 script is [`fsproto.bt`]({{ site.baseurl }}/code/ceph/fsproto.bt), with
@@ -114,14 +121,14 @@ lab and collects every trace quoted below. Two notes for anyone re-running it:
 
 - The probes are `kfunc`, not `kprobe`, because `fs/ceph` and `libceph` are
   modules and only `kfunc` reads their types from module BTF; and
-  `ceph_osd_req_op` hides the extent fields in an anonymous union bpftrace
+  [`ceph_osd_req_op`](https://github.com/torvalds/linux/blob/v7.2/include/linux/ceph/osd_client.h#L140) hides the extent fields in an anonymous union bpftrace
   cannot walk, so the script mirrors that struct's prefix in its own
   declaration. Both are explained where they bite, in the script's header.
 - Recent kernels also carry real tracepoints under
-  `/sys/kernel/tracing/events/ceph/` — `ceph_mdsc_submit_request`,
-  `ceph_mdsc_send_request`, `ceph_mdsc_complete_request`, `ceph_handle_caps`.
+  `/sys/kernel/tracing/events/ceph/` — [`ceph_mdsc_submit_request`](https://github.com/torvalds/linux/blob/v7.2/fs/ceph/mds_client.c#L3845),
+  [`ceph_mdsc_send_request`](https://github.com/torvalds/linux/blob/v7.2/include/trace/events/ceph.h#L138), [`ceph_mdsc_complete_request`](https://github.com/torvalds/linux/blob/v7.2/include/trace/events/ceph.h#L162), `ceph_handle_caps`.
   They need no casts and no BTF, and they are the right tool if the op code and
-  tid are all you want. They cannot do the job below: `ceph_handle_caps` carries
+  tid are all you want. They cannot do the job below: [`ceph_handle_caps`](https://github.com/torvalds/linux/blob/v7.2/fs/ceph/caps.c#L4351) carries
   `mds/op/vino/seq/mseq/issue_seq` and **not** `caps`, `wanted`, `dirty`,
   `size` or `truncate_seq` — which is most of what §2.2.3 and §2.3.5 are about —
   and nothing traces what the client *sends*, or any OSD op at all.
@@ -157,12 +164,12 @@ flowchart LR
     M -->|"<b>MClientSnap</b>, <b>MClientQuota</b><br/><i>realm and limit updates</i>"| C
 ```
 
-Two facts shape everything below. First, only `MClientRequest` is a *request*
+Two facts shape everything below. First, only [`MClientRequest`](https://github.com/ceph/ceph/blob/v21.3.0/src/messages/MClientRequest.h#L89) is a *request*
 in the RPC sense — everything else is one-way notification, sometimes acked.
-Second, the MDS is the only party that ever initiates a `MClientCaps` grant or
+Second, the MDS is the only party that ever initiates a [`MClientCaps`](https://github.com/ceph/ceph/blob/v21.3.0/src/messages/MClientCaps.h#L23) grant or
 revoke; the client can only ask, by setting `wanted`.
 
-### 2.2.1 `MClientSession` — the right to hold anything
+### 2.2.1 [`MClientSession`](https://github.com/ceph/ceph/blob/v21.3.0/src/messages/MClientSession.h#L23) — the right to hold anything
 
 **Why.** Caps and leases are state the MDS remembers *per client*. A session is
 the container for that state, and the thing that expires when a client dies —
@@ -170,10 +177,10 @@ which is what makes the delegation safe rather than merely cooperative.
 
 **When.** Mount, unmount, periodically while idle (`RENEWCAPS`, every
 `m_session_timeout >> 2` — a quarter of the session timeout,
-`mds_client.c:6325`), and whenever the MDS wants something from the client as a
+[`mds_client.c:6211`](https://github.com/torvalds/linux/blob/v7.2/fs/ceph/mds_client.c#L6211)), and whenever the MDS wants something from the client as a
 whole (`RECALL_STATE`, `FORCE_RO`, `STALE`).
 
-**On the wire.** `struct ceph_mds_session_head` is five fields — `op`, `seq`,
+**On the wire.** [`struct ceph_mds_session_head`](https://github.com/ceph/ceph/blob/v21.3.0/src/include/ceph_fs.h#L379) is five fields — `op`, `seq`,
 `stamp`, `max_caps`, `max_leases` — plus, on newer versions, the client's
 metadata map on `REQUEST_OPEN` and the MDS's cap-auth list on `OPEN`. The `op`
 space is a set of paired requests and answers:
@@ -216,7 +223,7 @@ the remount (4169 → 4186): a session is not resumable, it is replaced. The
 first thing the new session does is `getattr` on the root inode — a mount is a
 session plus one `stat` of `/`.
 
-### 2.2.2 `MClientRequest` / `MClientReply` — the namespace RPC
+### 2.2.2 `MClientRequest` / [`MClientReply`](https://github.com/ceph/ceph/blob/v21.3.0/src/messages/MClientReply.h#L343) — the namespace RPC
 
 **Why.** Every POSIX operation that touches names, or attributes the client has
 no cap for, is one of these. This is the only place the MDS mutates the
@@ -228,7 +235,7 @@ namespace.
 header also documents `& 0x010000` as "follow symlink", but no op in the current
 enum sets it.)
 
-**On the wire.** `struct ceph_mds_request_head` then five variable pieces:
+**On the wire.** [`struct ceph_mds_request_head`](https://github.com/ceph/ceph/blob/v21.3.0/src/include/ceph_fs.h#L667) then five variable pieces:
 
 ```
  ceph_mds_request_head          version, oldest_client_tid, mdsmap_epoch,
@@ -251,7 +258,7 @@ and leases the client no longer wants, in the same message that asks for
 something new: the `releases=1` in the traces below is one dentry lease going
 home.
 
-**The reply.** `struct ceph_mds_reply_head` is `op`, `result`, `mdsmap_epoch`,
+**The reply.** [`struct ceph_mds_reply_head`](https://github.com/ceph/ceph/blob/v21.3.0/src/include/ceph_fs.h#L718) is `op`, `result`, `mdsmap_epoch`,
 and three flags — `safe`, `is_dentry`, `is_target` — followed by three
 length-prefixed blobs: the **trace**, the **extra** payload, and the
 **snapblob**. The trace is the whole point:
@@ -261,16 +268,16 @@ length-prefixed blobs: the **trace**, the **extra** payload, and the
          [ if is_target:  targeti (InodeStat) ]
 ```
 
-An `InodeStat` (`struct ceph_mds_reply_inode`) is a complete stat buffer —
+An [`InodeStat`](https://github.com/ceph/ceph/blob/v21.3.0/src/messages/MClientReply.h#L118) (`struct ceph_mds_reply_inode`) is a complete stat buffer —
 ino, version, layout, ctime/mtime/atime, size/`max_size`/`truncate_size`/
 `truncate_seq`, mode/uid/gid/nlink, dir rstats, fragtree — **plus an embedded
-`ceph_mds_reply_cap`**: `caps`, `wanted`, `cap_id`, `seq`, `mseq`, `realm`.
+[`ceph_mds_reply_cap`](https://github.com/ceph/ceph/blob/v21.3.0/src/include/ceph_fs.h#L741)**: `caps`, `wanted`, `cap_id`, `seq`, `mseq`, `realm`.
 So one reply populates the client's dcache, its inode cache, its cap state and
-its dentry lease at once. `parse_reply_info_extra()` handles the per-op tail:
+its dentry lease at once. [`parse_reply_info_extra()`](https://github.com/torvalds/linux/blob/v7.2/fs/ceph/mds_client.c#L771) handles the per-op tail:
 the dentry list for `readdir`, the created-inode info for `create`, the lock
 state for `getfilelock`.
 
-**Who does what.** `Server::handle_client_request()` (`Server.cc:2614`):
+**Who does what.** [`Server::handle_client_request()`](https://github.com/ceph/ceph/blob/v21.3.0/src/mds/Server.cc#L2605) ([`Server.cc:2605`](https://github.com/ceph/ceph/blob/v21.3.0/src/mds/Server.cc#L2605)):
 
 ```
   session open?  ──no──► drop the message (no reply)
@@ -301,7 +308,7 @@ The reply leaves **before** the journal entry is durable:
 ```
 
 1.6 ms, one round trip, and the file exists as far as `openat` is concerned —
-but the reply says `unsafe`, and `MDLog::_submit_entry` only *queued* the
+but the reply says `unsafe`, and [`MDLog::_submit_entry`](https://github.com/ceph/ceph/blob/v21.3.0/src/mds/MDLog.cc#L393) only *queued* the
 journal entry. Nothing was written to RADOS. The client must remember the
 request until a second reply says `SAFE`, and be able to replay it if the rank
 dies. How lazy that is depends entirely on whether anyone asks; `rename` and
@@ -344,7 +351,7 @@ returning a dentry lease and an `InodeStat`. Repeat the same `stat` a second lat
 trace is **empty**: the leases and the `Fs` cap answer it locally. That gap is
 the protocol working.
 
-`MClientRequestForward` completes the picture on a multi-rank filesystem: if the
+[`MClientRequestForward`](https://github.com/ceph/ceph/blob/v21.3.0/src/messages/MClientRequestForward.h#L22) completes the picture on a multi-rank filesystem: if the
 inode is not on this rank, the MDS replies with a forward instead of a result,
 and the client re-sends to the named rank, bumping `num_fwd`.
 
@@ -361,7 +368,7 @@ can; a standalone `MClientCaps` is sent whenever the MDS changes its mind
 report (`UPDATE`, `FLUSH`, `FLUSHSNAP`), plus the two acks (`FLUSH_ACK`,
 `FLUSHSNAP_ACK`).
 
-**On the wire.** `struct ceph_mds_caps_head` + a body. The head carries the
+**On the wire.** [`struct ceph_mds_caps_head`](https://github.com/ceph/ceph/blob/v21.3.0/src/include/ceph_fs.h#L926) + a body. The head carries the
 identity and the three bitmasks; the body carries the fields the bitmasks
 license:
 
@@ -380,10 +387,10 @@ license:
 
 That last one is the safety interlock: after a blocklist, the MDS stamps a
 barrier into cap messages so a client cannot keep writing with a stale osdmap.
-`ceph_osdc_update_epoch_barrier()` on the client side stalls its Objecter until
+[`ceph_osdc_update_epoch_barrier()`](https://github.com/torvalds/linux/blob/v7.2/net/ceph/osd_client.c#L2627) on the client side stalls its Objecter until
 it catches up.
 
-**Who does what — MDS.** `Locker::issue_caps()` (`Locker.cc:2573`) walks the
+**Who does what — MDS.** [`Locker::issue_caps()`](https://github.com/ceph/ceph/blob/v21.3.0/src/mds/Locker.cc#L2573) ([`Locker.cc:2573`](https://github.com/ceph/ceph/blob/v21.3.0/src/mds/Locker.cc#L2573)) walks the
 inode's `client_caps` map and, **for each client independently**, computes
 
 ```
@@ -392,9 +399,9 @@ inode's `client_caps` map and, **for each client independently**, computes
   op      = (pending & ~new) ? REVOKE : GRANT
 ```
 
-No client's mask is compared against another's — `get_allowed_caps()` reads only
+No client's mask is compared against another's — [`get_allowed_caps()`](https://github.com/ceph/ceph/blob/v21.3.0/src/mds/Locker.h#L189) reads only
 the lock state and whether *this* client is the inode's loner
-(`Locker.cc:2550`), and choosing the loner is the one place clients are weighed
+([`Locker.cc:2522`](https://github.com/ceph/ceph/blob/v21.3.0/src/mds/Locker.cc#L2522)), and choosing the loner is the one place clients are weighed
 against each other. §5 has why exclusivity is emergent rather than enforced. The important consequence for the wire: each *lock*
 transition triggers its own `issue_caps()` pass, so one conflicting open
 produces a *staircase* of revokes rather than one. Two clients, one file —
@@ -478,7 +485,7 @@ happens when it never comes).
 
 **Who does what — client.** `ceph_handle_caps()` (`fs/ceph/caps.c`) dispatches
 on `op`, and the first thing to notice is that `GRANT` and `REVOKE` land in the
-**same function**, `handle_cap_grant()`. The op is only a hint; what the client
+**same function**, [`handle_cap_grant()`](https://github.com/torvalds/linux/blob/v7.2/fs/ceph/caps.c#L3501). The op is only a hint; what the client
 acts on is the diff between the new `caps` mask and what it holds:
 
 ```
@@ -513,20 +520,20 @@ It costs one message for many inodes and needs no reply:
  27 5387756 mds      ms_dispatch  Locker::issue_caps            recompute + send grants
 ```
 
-### 2.2.4 `MClientLease` — names, on their own
+### 2.2.4 [`MClientLease`](https://github.com/ceph/ceph/blob/v21.3.0/src/messages/MClientLease.h#L24) — names, on their own
 
 **Why.** A cap covers an *inode*. `lookup` results are about a *name*, including
 names that do not exist. A lease on a dentry is what lets a client answer a
 repeated `stat` — or a repeated `ENOENT` — without the MDS.
 
 **When.** Leases are normally *issued inside a reply* — that is what
-`Locker::issue_client_lease` is doing in the traces above. A
-`ceph_mds_reply_lease` rides the reply's **trace** blob for a lookup, and its
+[`Locker::issue_client_lease`](https://github.com/ceph/ceph/blob/v21.3.0/src/mds/Locker.cc#L4526) is doing in the traces above. A
+[`ceph_mds_reply_lease`](https://github.com/ceph/ceph/blob/v21.3.0/src/include/ceph_fs.h#L753) rides the reply's **trace** blob for a lookup, and its
 **extra** blob for a readdir, one per entry (`parse_reply_info_readdir`). A standalone `MClientLease`
 is only sent for the exceptions: the MDS revoking one early, the client acking
 that revoke, and a renewal.
 
-**On the wire.** `struct ceph_mds_lease` is `action`, `mask`, `ino`, snap range,
+**On the wire.** [`struct ceph_mds_lease`](https://github.com/ceph/ceph/blob/v21.3.0/src/include/ceph_fs.h#L981) is `action`, `mask`, `ino`, snap range,
 `seq`, `duration_ms`, plus the dentry name. Four actions:
 
 | Action | Direction |
@@ -552,7 +559,7 @@ shows both halves of a revoke:
   9    2751 cli.4168 kworker/1:1  C->MDS client_lease           revoke_ack ino=0x1 seq=32
 ```
 
-`ino=0x1` is the **parent**, not the subject: `Locker::revoke_client_leases()`
+`ino=0x1` is the **parent**, not the subject: [`Locker::revoke_client_leases()`](https://github.com/ceph/ceph/blob/v21.3.0/src/mds/Locker.cc#L4576)
 builds the message from `diri->ino()` plus `dn->get_name()`, and the kernel does
 the same (`lease->ino = ceph_ino(dir)`). What is revoked is the lease on the
 *name* being created inside `/`. 4 µs to ack, and only then does the create
@@ -584,24 +591,24 @@ costs nothing; and if the client reads every entry it may set the directory's
 
 ### 2.2.5 The remaining three
 
-**`MClientSnap`** (MDS → client) keeps the client's snap-realm tree in step:
+**[`MClientSnap`](https://github.com/ceph/ceph/blob/v21.3.0/src/messages/MClientSnap.h#L21)** (MDS → client) keeps the client's snap-realm tree in step:
 `op` is `UPDATE`/`CREATE`/`DESTROY`/`SPLIT`, plus a `split` inode, the inodes
 and realms moving into a new child realm, and a trace blob of
-`ceph_mds_snap_realm` records. The client needs this because it, not the MDS,
+[`ceph_mds_snap_realm`](https://github.com/ceph/ceph/blob/v21.3.0/src/include/ceph_fs.h#L1043) records. The client needs this because it, not the MDS,
 attaches the right `snapc` to every data write — a write into a snapshotted
 subtree must carry the snap context the OSD uses to decide whether to clone.
 
-**`MClientQuota`** (MDS → client) pushes an inode's `rstat` and `quota`
+**[`MClientQuota`](https://github.com/ceph/ceph/blob/v21.3.0/src/messages/MClientQuota.h#L7)** (MDS → client) pushes an inode's `rstat` and `quota`
 (`max_bytes`, `max_files`) so the client can return `EDQUOT` locally instead of
 discovering the limit at writeback time.
 
-**`MClientReconnect`** (client → MDS) is the recovery message: after a rank
+**[`MClientReconnect`](https://github.com/ceph/ceph/blob/v21.3.0/src/messages/MClientReconnect.h#L24)** (client → MDS) is the recovery message: after a rank
 restarts, each client sends its whole held state — one
-`ceph_mds_cap_reconnect` per cap (`cap_id`, `wanted`, `issued`, `snaprealm`,
+[`ceph_mds_cap_reconnect`](https://github.com/ceph/ceph/blob/v21.3.0/src/include/ceph_fs.h#L992) per cap (`cap_id`, `wanted`, `issued`, `snaprealm`,
 `pathbase`, flock blob) plus its snap realms — and the new rank rebuilds its
 cache from what the clients say they have, rather than flushing everything.
 
-**`MClientMetrics`** shows up uninvited in every trace: each client ships
+**[`MClientMetrics`](https://github.com/ceph/ceph/blob/v21.3.0/src/messages/MClientMetrics.h#L12)** shows up uninvited in every trace: each client ships
 latency and cache counters to the MDS once a second (`metric_schedule_delayed`,
 a flat `HZ`, 328 B). Pure telemetry — noted here so you know to filter it out.
 
@@ -658,8 +665,8 @@ legal, and `Fw` plus a `max_size` lets the client extend the file to 16384
 locally. That `max_size` is not visible here — this tracer does not decode the
 reply's embedded cap, and the first standalone grant showing
 `size=16384/4194304` is line 29, long after the write. It comes from
-`Locker::issue_new_caps()`, which ends in `check_inode_max_size()`
-(`Locker.cc:2721`). The cluster only hears about it because line 17 asks it to.
+[`Locker::issue_new_caps()`](https://github.com/ceph/ceph/blob/v21.3.0/src/mds/Locker.cc#L2434), which ends in [`check_inode_max_size()`](https://github.com/ceph/ceph/blob/v21.3.0/src/mds/Locker.h#L204)
+([`Locker.cc:2722`](https://github.com/ceph/ceph/blob/v21.3.0/src/mds/Locker.cc#L2722)). The cluster only hears about it because line 17 asks it to.
 
 The fsync then runs two serial phases — the question the next paragraphs answer
 is which of them it actually waits for:
@@ -680,8 +687,8 @@ is which of them it actually waits for:
 ```
 
 Data first, then metadata — but that order is the kernel's, not the protocol's.
-`ceph_fsync()` (`fs/ceph/caps.c`) calls `file_write_and_wait_range()`, then
-`try_flush_caps()`, then `flush_mdlog_and_wait_inode_unsafe_requests()`, in that
+[`ceph_fsync()`](https://github.com/torvalds/linux/blob/v7.2/fs/ceph/caps.c#L2480) (`fs/ceph/caps.c`) calls `file_write_and_wait_range()`, then
+[`try_flush_caps()`](https://github.com/torvalds/linux/blob/v7.2/fs/ceph/caps.c#L2285), then [`flush_mdlog_and_wait_inode_unsafe_requests()`](https://github.com/torvalds/linux/blob/v7.2/fs/ceph/caps.c#L2363), in that
 order. Nothing on the wire requires it: §2.2.3's trace has a new size reaching
 the MDS while its bytes are still dirty, and §3 says the two are unordered.
 
@@ -762,7 +769,7 @@ writeback runs or `Fb` is not held, and on `O_DIRECT` inside `write(2)`.
  header.tid                          the client's op id, echoed in the reply
 ```
 
-Each `OSDOp` is a `ceph_osd_op`: a 16-bit opcode, flags, and a union. For the
+Each `OSDOp` is a [`ceph_osd_op`](https://github.com/ceph/ceph/blob/v21.3.0/src/include/rados.h#L599): a 16-bit opcode, flags, and a union. For the
 extent family the union is `{offset, length, truncate_size, truncate_seq}`. The
 opcode itself is structured — `mode | type | nr`, so `0x2201` is
 `WR | DATA | 1` = write, `0x1201` is `RD | DATA | 1` = read — which is why the
@@ -772,7 +779,7 @@ trace can name them from a table of a dozen entries.
 each op's `rval` and output data, an overall `result`, `replay_version` /
 `user_version`, and flags saying how durable the answer is (`ack` /
 `onnvram` / `ondisk`). Every libceph request carries `ONDISK` —
-`account_request()` (`net/ceph/osd_client.c`) sets it unconditionally, reads
+[`account_request()`](https://github.com/torvalds/linux/blob/v7.2/net/ceph/osd_client.c#L2474) (`net/ceph/osd_client.c`) sets it unconditionally, reads
 included — which is why the tracer prints it on everything:
 
 ```
@@ -817,17 +824,17 @@ Of the 81 RADOS ops in `rados.h`, a CephFS client uses a handful:
 
 | Op | Issued by | Note |
 |---|---|---|
-| `read` | readahead, `ceph_sync_read`, `O_DIRECT` | short read means hole; the client zero-fills |
+| `read` | readahead, [`ceph_sync_read`](https://github.com/torvalds/linux/blob/v7.2/fs/ceph/file.c#L1279), `O_DIRECT` | short read means hole; the client zero-fills |
 | `sparse-read` | the same paths, with `-o sparseread` or on an encrypted inode | returns an extent map instead of a byte count |
-| `write` | writeback, `ceph_sync_write`, `O_DIRECT` | `truncate_seq`/`truncate_size` ride along |
-| `zero` | `fallocate(PUNCH_HOLE)`, partial object | `ceph_zero_partial_object`, `file.c:2654` |
+| `write` | writeback, [`ceph_sync_write`](https://github.com/torvalds/linux/blob/v7.2/fs/ceph/file.c#L1760), `O_DIRECT` | `truncate_seq`/`truncate_size` ride along |
+| `zero` | `fallocate(PUNCH_HOLE)`, partial object | [`ceph_zero_partial_object`](https://github.com/torvalds/linux/blob/v7.2/fs/ceph/file.c#L2631), [`file.c:2631`](https://github.com/torvalds/linux/blob/v7.2/fs/ceph/file.c#L2631) |
 | `truncate` / `delete` | `fallocate(PUNCH_HOLE)`, whole object | `truncate` to 0 for object 0, `delete` for the rest |
-| `trimtrunc` | the **MDS**, for `ftruncate` | `MDCache::_truncate_inode` → `Filer::truncate` (`Filer.cc:534`) — a truncate that also carries the new `truncate_seq`, §2.3.5 |
+| `trimtrunc` | the **MDS**, for `ftruncate` | `MDCache::_truncate_inode` → [`Filer::truncate`](https://github.com/ceph/ceph/blob/v21.3.0/src/osdc/Filer.cc#L518) ([`Filer.cc:534`](https://github.com/ceph/ceph/blob/v21.3.0/src/osdc/Filer.cc#L534)) — a truncate that also carries the new `truncate_seq`, §2.3.5 |
 | `stat` | the pool-permission probe | not for `stat(2)` — that is a cap or a `getattr` |
 | `create` (EXCL) | the pool-permission probe | see below |
 | `copy-from2` | `copy_file_range(2)` | server-side copy offload, whole objects only; falls back to VFS if the OSDs lack it |
-| `assert-version`, `create`(EXCL) | the fscrypt read-modify-write path | `file.c:2110` — make the RMW fail rather than clobber a concurrent change |
-| `create`, `write`, `cmpxattr`, `setxattr` | `ceph_uninline_data()` | `addr.c:2402` — one atomic transaction that moves inline data out to its object |
+| `assert-version`, `create`(EXCL) | the fscrypt read-modify-write path | [`file.c:2087`](https://github.com/torvalds/linux/blob/v7.2/fs/ceph/file.c#L2087) — make the RMW fail rather than clobber a concurrent change |
+| `create`, `write`, `cmpxattr`, `setxattr` | [`ceph_uninline_data()`](https://github.com/torvalds/linux/blob/v7.2/fs/ceph/addr.c#L2216) | [`addr.c:2285`](https://github.com/torvalds/linux/blob/v7.2/fs/ceph/addr.c#L2285) — one atomic transaction that moves inline data out to its object |
 | `delete` | the MDS's purge queue, after unlink | file removal is asynchronous |
 
 Note what is absent: there is **no CephFS op for "get the file size"**. Size
@@ -882,10 +889,10 @@ One pair of ops in the read trace is not I/O at all:
  15   24405 cli.4240 kworker/9:2  OSD->C osd_op_reply           tid=3 result=16384 [read rval=0 outdata=16384]
 ```
 
-`ceph_pool_perm_check()` is reached from `ceph_try_get_caps()` and
-`__ceph_get_caps()` — so on the first read or write, not at `open`. The excerpt
+[`ceph_pool_perm_check()`](https://github.com/torvalds/linux/blob/v7.2/fs/ceph/addr.c#L2567) is reached from [`ceph_try_get_caps()`](https://github.com/torvalds/linux/blob/v7.2/fs/ceph/caps.c#L3012) and
+[`__ceph_get_caps()`](https://github.com/torvalds/linux/blob/v7.2/fs/ceph/caps.c#L3043) — so on the first read or write, not at `open`. The excerpt
 shows exactly that: `read(2)` on line 9, with the open reply already back at
-2608 µs. `__ceph_pool_perm_get()` (`fs/ceph/addr.c:2509`) then runs once per
+2608 µs. [`__ceph_pool_perm_get()`](https://github.com/torvalds/linux/blob/v7.2/fs/ceph/addr.c#L2392) then runs once per
 (pool, namespace) per mount: a `stat` to prove the cephx key can
 read the pool, and a `create` with `CEPH_OSD_OP_FLAG_EXCL` to prove it can
 write. `-EEXIST` (`-17`) is the *success* answer for the write probe — the
@@ -931,7 +938,7 @@ things worth pulling out:
 1. `ftruncate` is an `MClientRequest setattr`, not an OSD op — size is metadata,
    and the client holding `Fx` must hand that authority back first (line 9's
    revoke, line 10's `dirty=Fxw size=65536`).
-2. **Line 24: the MDS writes to the data pool.** `MDCache::truncate_inode()` →
+2. **Line 24: the MDS writes to the data pool.** [`MDCache::truncate_inode()`](https://github.com/ceph/ceph/blob/v21.3.0/src/mds/MDCache.cc#L6526) →
    `_truncate_inode()` → `Filer::truncate()` issues the object truncate itself,
    through the MDS's own Objecter, on
    `10000000200.00000000` in pool 3. The MDS is off the *client's* data path,
@@ -947,7 +954,7 @@ things worth pulling out:
    `(u64)-1`.
 
 The OSD's rule closes the loop, and it has two halves. On a write
-(`PrimaryLogPG.cc:6928`, where `seq` is the object's own `oi.truncate_seq`):
+([`PrimaryLogPG.cc:6915`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L6915), where `seq` is the object's own `oi.truncate_seq`):
 
 ```
  seq && seq > op.truncate_seq && op.offset + op.length > oi.size
@@ -964,7 +971,7 @@ The OSD's rule closes the loop, and it has two halves. On a write
       record the new seq and size.
 ```
 
-And symmetrically on a read (`PrimaryLogPG.cc:5962`), where what gets clamped is
+And symmetrically on a read ([`PrimaryLogPG.cc:5949`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L5949)), where what gets clamped is
 the answer rather than the request:
 
 ```
