@@ -397,9 +397,18 @@ the lock state and whether *this* client is the inode's loner
 ([`Locker.cc:2522`](https://github.com/ceph/ceph/blob/v21.3.0/src/mds/Locker.cc#L2522)), and choosing the loner is the one place clients are weighed
 against each other. §6 has why exclusivity is emergent rather than enforced. The important consequence for the wire: each *lock*
 transition triggers its own `issue_caps()` pass, so one conflicting open
-produces a *staircase* of revokes rather than one. Two clients, one file —
-abridged to the events the ladder below cannot carry, the gaps in the `#`
-column being the elisions:
+produces a *staircase* of revokes rather than one.
+
+Two fields carry the argument, and both are easy to misread. **`caps=` is never
+what is being taken** — going out it is what the client may hold from here on,
+coming back it is what the client still holds, and the two matching is the ack.
+**`wanted=` is not affected by a revoke**: it is what the client would still
+like, so it stays put while `caps` walks down. Watch them against each other
+below: across A's eight messages `caps` falls step by step and `wanted` never
+moves. (The one `wanted=pFscr` at the end belongs to B, not A.)
+
+Two clients, one file — abridged to the events the ladder below cannot carry,
+the gaps in the `#` column being the elisions:
 
 ```
  42 1064015 posix    cat          openat(2)                     /mnt/cephfs2/shared flags=00
