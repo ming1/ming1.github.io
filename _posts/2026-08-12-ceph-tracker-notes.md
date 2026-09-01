@@ -1717,11 +1717,12 @@ BlueStore.cc: FAILED ceph_assert((len % (1 << csum_chunk_order)) == 0)
 Same assert, same call chain, the `dup_esb+0x12f` frame offset even
 matching. With the fix: `[ OK ]`.
 
-**Why the end-to-end version cannot abort.** The same sequence through
-`queue_transactions()` — a real BlueStore, real allocator, real write path —
-never fires, and the reason is worth knowing before writing any
-fragmentation reproducer. With `min_alloc_size` 4096, crc32c and
-`max_blob_size` 64 KiB, plus the only knob that injects fragmentation:
+**Why the end-to-end version needs an aged store.** The same sequence
+through `queue_transactions()` — a real BlueStore, real allocator, real
+write path — does not fire on a fresh store, and the reason is worth knowing
+before writing any fragmentation reproducer. With `min_alloc_size` 4096,
+crc32c and `max_blob_size` 64 KiB, plus the only knob that injects
+fragmentation:
 
 ```
 bluestore_allocator                stupid   # the only one honouring the next knob
@@ -1753,15 +1754,46 @@ if (last_extent.end() == offset) {
 The knob shortens each `allocate_int()` result, but on a fresh device the
 next result is physically adjacent and is coalesced straight back into one
 pextent: 103 shortenings in one run, 64 of 64 preallocs still contiguous.
-The injector only works on free space that is *already* fragmented — a fair
-model of production (§7.2.3): this bug needs a genuinely aged OSD.
+The injector only works on free space that is *already* fragmented.
+
+So fragment it for real, and skip the knob entirely. On a 2 GiB data device
+(RocksDB on its own `block.db`, so draining the data device does not starve
+it):
+
+0. on the still-fresh store, write the hinted `0~0x8000` and clone it —
+   blob A has to be shared before there is anything to merge into.
+1. write 1 MiB objects until under 5 MiB free, then 64 KiB objects, then
+   32 KiB — stop under 32 KiB free. No contiguous 32 KiB run can exist
+   anywhere on the device.
+2. zero a 16 KiB-punched / 4 KiB-kept checkerboard into 32 of the 64 KiB
+   fillers. Every run it frees is under one csum chunk.
+3. then the hinted `0x8000~0x8000` write, and the clone.
+
+The write is satisfied from two fragments, and the clone aborts on an
+unfixed tree — through the production path, no debug knob involved:
+
+```
+BlueStore.cc: 2845: FAILED ceph_assert((len % (1 << csum_chunk_order)) == 0)
+ 2: BlueStore::ExtentMap::make_range_shared_maybe_merge(...)
+ 3: BlueStore::ExtentMap::dup_esb(...)
+ 4: BlueStore::_do_clone_range(...)
+ 5: BlueStore::_clone(...)
+ 7: BlueStore::queue_transactions(...)
+```
+
+Every frame there appears in the tracker's own backtrace; only what sits
+below `queue_transactions()` differs, a test of its own instead of the
+synthetic workload. It costs 82 seconds against the unit case's
+milliseconds, which is why the unit case is the one in the test suite — but
+it settles that the bug is reachable by ordinary means, and the store it
+leaves behind is the fragmented record at the end of §7.1.3.
 
 ### 7.1.3 The two blobs on disk
 
 The pair that merge are ordinary records; nothing about them is malformed.
 A real BlueStore (`min_alloc_size` 4096, crc32c, `max_blob_size` 64 KiB)
-holding exactly the objects of the end-to-end run in §7.1.2 carries three
-keys (format reference:
+holding exactly the objects of the *fresh-store* run in §7.1.2 carries
+three keys (format reference:
 [§7 of the on-disk format post]({% post_url 2026-08-07-bluestore-v21-ondisk-format %})):
 
 | Record | Key | Value |
@@ -1846,15 +1878,31 @@ on a 32 KiB boundary — otherwise there is no whole checksum to move. In this
 specimen it does: the single data range starts at blob offset `0x8000` and
 is `0x8000` long. The merge is legal here, and succeeds.
 
-**What goes wrong on a real OSD.** Same object, aged store: the allocator
-has no 32 KiB of contiguous free space left, so it returns 12 KiB + 20 KiB.
-Blob B now has three ranges instead of two, while its checksum array is
-unchanged — still `08`, still two 32 KiB checksums. The first data range is
-12 KiB long, so `merge_blob()` is asked to move 12 KiB of a 32 KiB
-checksum, and no such thing exists. That is the assert. In bytes the whole
-difference is: the extent count reads `03` instead of `02`, and one 5-byte
-pextent record becomes two. Nothing is malformed — the record has no field
-that ties the ranges to the checksums.
+**What goes wrong on a real OSD.** Age the store until no 32 KiB run is left
+(§7.1.2) and the same write comes back fragmented. Blob B's record, captured
+from that store, is five bytes longer:
+
+```
+   03                    extents: 3                          (was 02)
+   ff ff ff ff ff ff ff ff ff 01   lba INVALID_OFFSET (hole)
+   23                    length = 0x8000
+   52 ff 07 00           lba 0x3ffa9000
+   17                    length = 0x5000                     (varint_lowz)
+   34 ff 07 00           lba 0x3ff9a000
+   0f                    length = 0x3000
+   04 04 0f              FLAG_CSUM, crc32c, csum_chunk_order 15
+   08                    csum_data: 8 B = TWO items          (unchanged)
+   00 00 00 00 b1 41 77 79
+```
+
+The count byte goes `02` → `03` and one 5-byte pextent record becomes two.
+`csum_data` is byte-for-byte what it was: two 32 KiB checksums for data that
+now lives in two pieces, 20 KiB and 12 KiB (the order is whatever the
+allocator returned — the unit case in §7.1.2 builds the mirror image). The
+first piece is `0x5000` long, so `merge_blob()` is asked to move `0x5000` of
+a `0x8000` checksum, and no such thing exists. That is the assert. Nothing
+is malformed — the record has no field that ties the ranges to the
+checksums.
 
 Two things the record does *not* contain, which is why no consistency check
 on disk could have caught this:
@@ -1889,7 +1937,8 @@ clone aborts inside merge_blob
                                                     (BlueStore.cc:17876)
  └─ why did that produce split extents?
            _do_alloc_write() stores the allocator's PExtentVector as-is;
-           on fragmented free space 32K comes back as 0x3000 + 0x5000
+           on fragmented free space 32K comes back as two fragments —
+           0x5000 + 0x3000 in the captured store
                                                     (BlueStore.cc:17645)
  └─ why was the merge attempted at all?
            can_merge_blob() accepts any pair with the same csum order, the
@@ -2049,34 +2098,35 @@ and absent on a fresh one, which is why this survived years of qa.
 
 ### 7.3.1 The fix
 
+`can_merge_blob()` already walks the dissolved blob's valid extents once,
+with each extent's blob offset in hand, for the disjointness test. The
+alignment check rides that loop — two compares per valid extent
+(`csum_chunk_size` is 0 when the dissolved blob has no csum), and only for
+the dissolved blob, since `merge_blob()` never moves the survivor's
+extents:
+
 ```cpp
-  if (xtr.au_size != ytr.au_size) return false;
-+ // csum chunk alignment
-+ // merge_blob() relocates csum data in whole csum chunk units, therefore
-+ // every pextent it moves must start and end on a csum chunk boundary.
-+ // ... (comment condensed; the commit carries the full why)
-+ if (xb.has_csum()) {
-+   uint32_t csum_chunk_size = xb.get_csum_chunk_size();
-+   auto csum_aligned = [csum_chunk_size](const PExtentVector& extents) {
-+     uint32_t pos = 0;
-+     for (const auto& e : extents) {
-+       if (e.is_valid() &&
-+           (((pos % csum_chunk_size) != 0) ||
-+            ((e.length % csum_chunk_size) != 0))) {
-+         return false;
-+       }
-+       pos += e.length;
+  while (xi != xe.end() && yi != ye.end()) {
+    if (xp <= yp) {
+      if (yp < xp + xi->length) {
+        // collision
+        can_merge = false;
+        break;
+      }
++     if (csum_chunk_size != 0 &&
++         ((xp % csum_chunk_size) != 0 ||
++          (xi->length % csum_chunk_size) != 0)) {
++       // x's extent splits a csum chunk; move_data() could not move it
++       can_merge = false;
++       break;
 +     }
-+     return true;
-+   };
-+   if (!csum_aligned(xb.get_extents()) || !csum_aligned(yb.get_extents())) {
-+     return false;
-+   }
-+ }
+      xp += xi->length;
+      ++xi;
 ```
 
-Merging is only an optimisation, so the gatekeeper may refuse: the caller
-falls back to `make_blob_shared()`, which is always correct.
+(plus the same test in the trailing loop that scans x's extents y never
+reached). Merging is only an optimisation, so the gatekeeper may refuse: the
+caller falls back to `make_blob_shared()`, which is always correct.
 
 ### 7.3.2 Why it is safe
 
@@ -2093,7 +2143,7 @@ clone of it. And the use-tracker loop underneath rounds the same way, so two
 fragments inside one AU would add `src_tracker_aus[i]` twice.
 
 **The cost is bounded and rare.** It gives up the elastic-shared-blob win
-only for csummed blobs whose extents are chunk-split — which requires the
+only when the blob being dissolved is chunk-split — which requires the
 alloc hint *and* fragmentation, i.e. the ~9% of objects above on an aged
 device. Everything else still merges; the regression test pins that down.
 
@@ -2117,6 +2167,7 @@ must still merge into one blob, the fragmented pair must be refused.
 | of which synthetic matrix tests | — | **61/61 passed** (44 min) |
 | aborts / signals in that run | — | **0** |
 | guard rejections in that run | — | **0** |
+| aged-store end-to-end clone (§7.1.2) | abort in `queue_transactions()` | clone succeeds, data verified |
 
 Four `ceph_test_objectstore` tests fail on that branch (`CompressionTest`,
 `BlueStoreReconstructAllocationsTest`, `BluestoreStatFSTest`,
@@ -2126,10 +2177,11 @@ pre-existing and unrelated.
 The last row is the honest one. Instrumenting the guard shows the qa
 workload does build blobs whose csum chunk exceeds `min_alloc_size`
 (`csum_chunk=0x2000, min_alloc=0x1000`) — but never a fragmented one, so the
-guard was never asked to refuse anything in 68 minutes. A clean qa run does
-not exercise this fix, for the same reason the end-to-end reproducer in
-§7.1.2 cannot abort. The mechanism is pinned by the unit test; the qa run
-only establishes that the guard costs nothing.
+guard was never asked to refuse anything in 68 minutes. Nothing in the suite drains its
+scratch device, so chunk-split blobs stay rare — the tracker's abort was one
+occurrence across many such runs, and 68 minutes did not buy another. What
+this run establishes is that the guard costs nothing; the two reproducers
+are what pin the mechanism.
 
 ### 7.3.4 Takeaways
 
