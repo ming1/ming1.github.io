@@ -402,7 +402,7 @@ inode's `client_caps` map and, **for each client independently**, computes
 No client's mask is compared against another's — [`get_allowed_caps()`](https://github.com/ceph/ceph/blob/v21.3.0/src/mds/Locker.h#L189) reads only
 the lock state and whether *this* client is the inode's loner
 ([`Locker.cc:2522`](https://github.com/ceph/ceph/blob/v21.3.0/src/mds/Locker.cc#L2522)), and choosing the loner is the one place clients are weighed
-against each other. §5 has why exclusivity is emergent rather than enforced. The important consequence for the wire: each *lock*
+against each other. §6 has why exclusivity is emergent rather than enforced. The important consequence for the wire: each *lock*
 transition triggers its own `issue_caps()` pass, so one conflicting open
 produces a *staircase* of revokes rather than one. Two clients, one file —
 abridged to the events the ladder below cannot carry, the gaps in the `#`
@@ -480,7 +480,7 @@ message:
 Four revokes, four acks, one 27 ms writeback in the middle. The first `update`
 is the interesting one: `dirty=Fw size=16384` is the size the MDS did not know,
 travelling home *because* the cap was taken away. The MDS does not wait for a
-timeout — it waits for that ack, and cannot proceed without it (§5 covers what
+timeout — it waits for that ack, and cannot proceed without it (§6 covers what
 happens when it never comes).
 
 **Who does what — client.** `ceph_handle_caps()` (`fs/ceph/caps.c`) dispatches
@@ -690,7 +690,7 @@ Data first, then metadata — but that order is the kernel's, not the protocol's
 [`ceph_fsync()`](https://github.com/torvalds/linux/blob/v7.2/fs/ceph/caps.c#L2480) (`fs/ceph/caps.c`) calls `file_write_and_wait_range()`, then
 [`try_flush_caps()`](https://github.com/torvalds/linux/blob/v7.2/fs/ceph/caps.c#L2285), then [`flush_mdlog_and_wait_inode_unsafe_requests()`](https://github.com/torvalds/linux/blob/v7.2/fs/ceph/caps.c#L2363), in that
 order. Nothing on the wire requires it: §2.2.3's trace has a new size reaching
-the MDS while its bytes are still dirty, and §3 says the two are unordered.
+the MDS while its bytes are still dirty, and §4 says the two are unordered.
 
 The second commit cycle is not the size, either. fsync waits on the cap flush
 only
@@ -1008,14 +1008,272 @@ epoch barrier — are the *taking back*, and they are the entire reason the fast
 paths are allowed to be silent.
 
 Which is also where the costs live. Two clients writing one file turn every
-`write(2)` into a synchronous RADOS round trip (§5's `LOCK_MIX`). An `fsync`
+`write(2)` into a synchronous RADOS round trip (§6's `LOCK_MIX`). An `fsync`
 costs a second, metadata commit cycle for as long as anything on the inode is
 still unsafe. And a workload that keeps
 millions of caps alive will meet `RECALL_STATE`. The next sections follow those
 paths in order: the write path, the read path, and the lock states that decide
 what `Locker::issue_caps()` is allowed to hand out.
 
-# 3. Write path
+# 3. Mount and umount
+
+§2 traced a filesystem that was already mounted. This is the step before: how a
+command line becomes three clients, four cluster maps and one MDS session — and
+how all of it is handed back. Same link convention as §2, same trace format, a
+different script — [`fsmount.bt`]({{ site.baseurl }}/code/ceph/fsmount.bt) adds a monitor
+lane and a VFS lane, because a mount is mostly a conversation with the
+**monitor**, which §2 never needed.
+
+## 3.1 The two command lines
+
+```bash
+# the "new" device syntax: <cephx user>@<fsid>.<fs name>=<subdir>
+mount -t ceph two@cbb0602c-69e6-45db-807b-cd6991393925.a=/ /mnt/cephfs3 \
+      -o mon_addr=10.0.0.28:40232,secret=<key>,ms_mode=crc
+
+umount /mnt/cephfs3
+```
+
+Neither line names an MDS or an OSD. The client is handed one monitor address
+and one identity; everything else it has to ask for. That is the shape of the
+whole section:
+
+```
+  mount -t ceph two@<fsid>.a=/ /mnt/cephfs3 -o mon_addr=..,secret=..,ms_mode=crc
+                 │      │    │ │               │           │        │
+   cephx entity ─┘      │    │ └ mountpoint    │           │        └ msgr2 mode
+   cluster fsid ────────┘    │                 │           └ cephx key
+   fs name + subdir ─────────┘                 └ the one address given
+                                 │
+                 one option at a time, through ceph_parse_mount_param()
+                                 ▼
+        struct ceph_options         mon_addr, key, ms_mode
+        struct ceph_mount_options   subdir, rasize, caps_max, ...
+                                 ▼
+      MON ──"the maps, and am I allowed?"──►  monmap osdmap mdsmap fsmap
+      MDS ──"may I hold state?"───────────►  a Session, journaled
+      OSD ──(nothing at all)──────────────►
+```
+
+## 3.2 Mounting
+
+The whole thing in one trace. `vfs` is the mounting process, `msgr2` the
+handshake stages, `cli.N` the messages, `mds` the server:
+
+```
+  2    1578 vfs      mount        ceph_parse_mount_param        source=two@cbb0602c-69e6-45db-807b-cd6991393925.a=/
+  3    1595 vfs      mount        ceph_parse_mount_param        mon_addr=10.0.0.28:40232
+  4    1598 vfs      mount        ceph_parse_mount_param        secret=<redacted>
+  5    1600 vfs      mount        ceph_parse_mount_param        ms_mode=crc
+  6    1603 vfs      mount        ceph_get_tree                 options parsed, build the sb
+  7    1605 vfs      mount        ceph_create_client            monc + osdc, global_id still 0
+  8    2603 mon      mount        ceph_monc_want_map            fsmap epoch>=0
+  9    2637 vfs      mount        ceph_mdsc_init                the MDS client
+ 10    2688 mon      mount        ceph_monc_open_session        pick a mon, connect
+ 11    3043 msgr2    kworker/7:2  process_hello                 peer named itself
+ 12    3603 msgr2    kworker/7:2  process_auth_done             cephx accepted
+ 13    3623 cli.4246 kworker/7:2  C->MON                        mon_subscribe type=15 (65 B)
+ 14    4428 msgr2    kworker/7:2  prepare_client_ident          send my entity name + features
+ 15    4614 msgr2    kworker/1:0  process_server_ident          session established
+ 16    4842 cli.4246 kworker/9:0  MON->C                        fsmap_user type=103 (37 B)
+ 17    4858 mon      kworker/9:0  ceph_monc_want_map            mdsmap epoch>=0 continuous
+ 18    4863 cli.4246 kworker/9:0  C->MON                        mon_subscribe type=15 (63 B)
+ 19    4870 cli.4246 kworker/9:0  MON->C                        mon_map type=4 (213 B)
+ 20    4881 cli.4246 kworker/9:0  MON->C                        osdmap type=41 (3052 B)
+ 21    5215 cli.4246 kworker/1:0  MON->C                        mdsmap type=21 (1235 B)
+ 22    5227 vfs      kworker/1:0  ceph_mdsc_handle_mdsmap       which ranks are active
+ 23    5234 cli.4246 kworker/1:0  MON->C                        mon_map type=4 (213 B)
+ 24    5237 cli.4246 kworker/1:0  MON->C                        osdmap type=41 (3052 B)
+ 25    5393 vfs      mount        mdsc                          __open_session -> MClientSession(request_open)
+ 26    5404 cli.4246 mount        C->MDS client_session         request_open seq=0
+ 27    5559 msgr2    kworker/11:0 process_hello                 peer named itself
+ 28    6259 msgr2    kworker/11:0 process_auth_done             cephx accepted
+ 29    6272 msgr2    kworker/11:0 prepare_client_ident          send my entity name + features
+ 30    6671 msgr2    kworker/6:0  process_server_ident          session established
+ 31    6737 mds      ms_dispatch  Server::handle_client_session
+ 32    6763 mds      ms_dispatch  MDLog::_submit_entry          ESession queued
+ 33    6810 mds      mds-log-subm Objecter::_op_submit          obj=200.00000001 pool=2
+ 34    6836 mds      mds-log-subm Objecter::_op_submit          obj=200.00000000 pool=2
+ 35   19758 cli.4246 kworker/11:0 MDS->C client_session         open seq=0
+ 36   19773 cli.4246 kworker/11:0 C->MDS client_request         tid=1 op=getattr
+ 37   20089 cli.4246 kworker/11:0 MDS->C client_reply           tid=1 op=getattr result=0 SAFE
+```
+
+No `mount(2)` appears anywhere in the trace, and that is not a gap in the
+tracer: util-linux 2.40 uses the new mount API, so the command line arrives as
+`fsopen()` plus one `fsconfig()` per option. Which is why the anchor below is
+the filesystem's own option callback rather than a syscall.
+
+**Lines 2–5, the command line becomes a struct.** One [`ceph_parse_mount_param()`](https://github.com/torvalds/linux/blob/v7.2/fs/ceph/super.c#L404) per option,
+each landing in one of two places: [`struct ceph_options`](https://github.com/torvalds/linux/blob/v7.2/include/linux/ceph/libceph.h#L47) for what libceph needs, and
+[`struct ceph_mount_options`](https://github.com/torvalds/linux/blob/v7.2/fs/ceph/super.h#L80) for what fs/ceph needs. `source=` is the device string itself,
+parsed for entity, fsid, fs name and subdirectory. The tracer prints key and
+value from [`struct fs_parameter`](https://github.com/torvalds/linux/blob/v7.2/include/linux/fs_context.h#L63) — except `secret=` and `key=`, which it redacts.
+
+**Lines 6–9, three clients and no connections yet.** [`ceph_get_tree()`](https://github.com/torvalds/linux/blob/v7.2/fs/ceph/super.c#L1299) is the
+fs_context callback that turns parsed options into a superblock. It builds a
+[`struct ceph_fs_client`](https://github.com/torvalds/linux/blob/v7.2/fs/ceph/super.h#L146), which owns a libceph client ([`ceph_create_client()`](https://github.com/torvalds/linux/blob/v7.2/net/ceph/ceph_common.c#L706) — a monitor client and
+an OSD client) plus an MDS client ([`ceph_mdsc_init()`](https://github.com/torvalds/linux/blob/v7.2/fs/ceph/mds_client.c#L6256)). At line 7 this client has no
+identity: the `global_id` that names it — `client.4246` from line 13 on — is
+handed out by the monitor during authentication.
+
+**Lines 10–24, the monitor conversation, which is most of a mount.** [`ceph_monc_open_session()`](https://github.com/torvalds/linux/blob/v7.2/net/ceph/mon_client.c#L529)
+picks a monitor and connects. Four msgr2 stages follow, and they are **not
+messages** — they are protocol frames, so nothing reaches `ceph_con_send` and the
+script has to probe them directly:
+
+```
+   client                                              monitor
+     │ ── banner, then hello ─────────────────────────►  │
+     │ ◄─ hello: peer type + addr ──────────────────────  │  process_hello()
+     │ ── AUTH_REQUEST: cephx, entity client.two ──────►  │
+     │ ◄─ AUTH_DONE: global_id 4246 + session key ──────  │  process_auth_done()
+     │ ── CLIENT_IDENT: my addrs, features ────────────►  │  prepare_client_ident()
+     │ ◄─ SERVER_IDENT ────────────────────────────────   │  process_server_ident()
+     ▼                                                    ▼
+   connected -- only now can a ceph_msg be sent
+```
+
+Lines 13–15 show the client *queueing* `mon_subscribe` before the handshake
+finishes; [`__send_subscribe()`](https://github.com/torvalds/linux/blob/v7.2/net/ceph/mon_client.c#L334) does not wait, the messenger sends it once the connection
+comes up. Then the client declares what it wants to track — [`ceph_monc_want_map()`](https://github.com/torvalds/linux/blob/v7.2/net/ceph/mon_client.c#L443), once per
+map (`fsmap` line 8, `mdsmap` line 17, `monmap`/`osdmap` implicitly) — and the
+monitor pushes them in: `fsmap_user`, `mon_map`, `osdmap`, `mdsmap`, then
+`mon_map` and `osdmap` again as the subscription is renewed at the new epochs.
+[`mon_dispatch()`](https://github.com/torvalds/linux/blob/v7.2/net/ceph/mon_client.c#L1446) is the single inbound switch, the monitor-side twin of §2's
+`mds_dispatch`.
+
+The `mdsmap` at line 21 is what the mount was actually waiting for: it names the
+ranks and their addresses, so `ceph_mdsc_handle_mdsmap` can pick one.
+
+**Lines 25–35, one MDS session, and it costs a journal write.** [`__open_session()`](https://github.com/torvalds/linux/blob/v7.2/fs/ceph/mds_client.c#L1710)
+sends `MClientSession(request_open)` carrying the client's metadata — hostname,
+kernel version, mount path. Lines 27–30 are the MDS connection handshaking
+*after* the message was queued: the same lazy pattern as the monitor.
+
+On the MDS, [`Server::handle_client_session()`](https://github.com/ceph/ceph/blob/v21.3.0/src/mds/Server.cc#L596) does not answer straight away:
+
+```
+   MClientSession(request_open)
+         │
+    check: fs joinable? entity allowed? metadata sane? not a duplicate uuid?
+         │
+    sessionmap.add_session()          a Session enters the SessionMap
+    sessionmap.set_state(STATE_OPENING)
+         │
+    mdlog->submit_entry(new ESession(inst, open=true, pv, metadata))
+    mdlog->flush()                    ──►  200.00000001 + header, pool 2
+         │   ... 13 ms ...
+    Server::_session_logged()          set_state(STATE_OPEN)
+         └────────────────────────────►  MClientSession(open)
+```
+
+That is the 13 ms between lines 32 and 35, and the reason a mount is not
+instant: **the MDS will not admit a client it has not recorded durably**, because
+after a restart it must know who was holding what. Session open and close are the
+only client-driven operations in this post that are journaled *synchronously* —
+§4 shows file creates deliberately not doing that.
+
+**Lines 36–37, the first metadata operation.** [`ceph_real_mount()`](https://github.com/torvalds/linux/blob/v7.2/fs/ceph/super.c#L1148) finishes through
+[`open_root_dentry()`](https://github.com/torvalds/linux/blob/v7.2/fs/ceph/super.c#L1055), which issues a plain `getattr` on the subdirectory from the device
+string (`/` here, ino 1). 316 µs, and the mount is done — 18.5 ms from the first
+option parsed to the root's reply, 13 of them that one ESession commit.
+
+**And nothing went to an OSD** — not one `C->OSD` line in the trace's 82 events.
+The client fetched the osdmap so that it *can* address objects; a mount reads no
+data and writes none.
+
+## 3.3 Unmounting
+
+```
+U  2    1578 vfs      mount        ceph_parse_mount_param        source=two@cbb0602c-69e6-45db-807b-cd6991393925.a=/
+  3    1595 vfs      mount        ceph_parse_mount_param        mon_addr=10.0.0.28:40232
+  4    1598 vfs      mount        ceph_parse_mount_param        secret=<redacted>
+  5    1600 vfs      mount        ceph_parse_mount_param        ms_mode=crc
+  6    1603 vfs      mount        ceph_get_tree                 options parsed, build the sb
+  7    1605 vfs      mount        ceph_create_client            monc + osdc, global_id still 0
+  8    2603 mon      mount        ceph_monc_want_map            fsmap epoch>=0
+  9    2637 vfs      mount        ceph_mdsc_init                the MDS client
+ 10    2688 mon      mount        ceph_monc_open_session        pick a mon, connect
+ 11    3043 msgr2    kworker/7:2  process_hello                 peer named itself
+ 12    3603 msgr2    kworker/7:2  process_auth_done             cephx accepted
+ 13    3623 cli.4246 kworker/7:2  C->MON                        mon_subscribe type=15 (65 B)
+ 14    4428 msgr2    kworker/7:2  prepare_client_ident          send my entity name + features
+ 15    4614 msgr2    kworker/1:0  process_server_ident          session established
+ 16    4842 cli.4246 kworker/9:0  MON->C                        fsmap_user type=103 (37 B)
+ 17    4858 mon      kworker/9:0  ceph_monc_want_map            mdsmap epoch>=0 continuous
+ 18    4863 cli.4246 kworker/9:0  C->MON                        mon_subscribe type=15 (63 B)
+ 19    4870 cli.4246 kworker/9:0  MON->C                        mon_map type=4 (213 B)
+ 20    4881 cli.4246 kworker/9:0  MON->C                        osdmap type=41 (3052 B)
+ 21    5215 cli.4246 kworker/1:0  MON->C                        mdsmap type=21 (1235 B)
+ 22    5227 vfs      kworker/1:0  ceph_mdsc_handle_mdsmap       which ranks are active
+ 23    5234 cli.4246 kworker/1:0  MON->C                        mon_map type=4 (213 B)
+ 24    5237 cli.4246 kworker/1:0  MON->C                        osdmap type=41 (3052 B)
+ 25    5393 vfs      mount        mdsc                          __open_session -> MClientSession(request_open)
+ 26    5404 cli.4246 mount        C->MDS client_session         request_open seq=0
+ 27    5559 msgr2    kworker/11:0 process_hello                 peer named itself
+ 28    6259 msgr2    kworker/11:0 process_auth_done             cephx accepted
+ 29    6272 msgr2    kworker/11:0 prepare_client_ident          send my entity name + features
+ 30    6671 msgr2    kworker/6:0  process_server_ident          session established
+ 31    6737 mds      ms_dispatch  Server::handle_client_session
+ 32    6763 mds      ms_dispatch  MDLog::_submit_entry          ESession queued
+ 33    6810 mds      mds-log-subm Objecter::_op_submit          obj=200.00000001 pool=2
+ 34    6836 mds      mds-log-subm Objecter::_op_submit          obj=200.00000000 pool=2
+ 35   19758 cli.4246 kworker/11:0 MDS->C client_session         open seq=0
+ 36   19773 cli.4246 kworker/11:0 C->MDS client_request         tid=1 op=getattr
+ 37   20089 cli.4246 kworker/11:0 MDS->C client_reply           tid=1 op=getattr result=0 SAFE
+```
+
+**Line 48: `umount` calls `statfs(2)` first**, and the kernel client answers it
+from the **monitor** — `statfs` / `statfs_reply` on the mon connection, not a
+word to the MDS. Free space is a cluster property, not a filesystem one.
+
+**Lines 50–56, the teardown order is forced:**
+
+```
+   ceph_kill_sb()                       the last superblock reference is gone
+      └─ ceph_mdsc_pre_umount        stop delayed work, flush dirty caps, and
+         │                           MClientSession(request_flush_mdlog)   [53]
+         └─ ceph_put_super()
+            └─ ceph_mdsc_close_sessions()
+               └─ MClientSession(request_close), one per session           [56]
+```
+
+`request_flush_mdlog` *before* `request_close` is the whole point: the client
+makes the MDS commit its journal while the session is still open, because a
+closed session can no longer be asked for anything.
+
+The MDS then journals the close exactly as it journaled the open — [`Server::handle_client_session()`](https://github.com/ceph/ceph/blob/v21.3.0/src/mds/Server.cc#L596)
+again, another [`ESession`](https://github.com/ceph/ceph/blob/v21.3.0/src/mds/events/ESession.h#L24), this time `open=false` — and [`Server::_session_logged()`](https://github.com/ceph/ceph/blob/v21.3.0/src/mds/Server.cc#L922) sends
+`MClientSession(close)` and calls [`SessionMap::remove_session()`](https://github.com/ceph/ceph/blob/v21.3.0/src/mds/SessionMap.cc#L756). 16 ms at line 65, again almost
+entirely the commit. [`ceph_monc_stop()`](https://github.com/torvalds/linux/blob/v7.2/net/ceph/mon_client.c#L1241) closes the monitor session last, and that order
+matters in one direction: the MDS session has to be gone first, since losing the
+monitor means losing the ability to be told anything has moved.
+
+(Lines 61–64 of the raw trace are systemd unmounting its own credential mounts,
+unrelated and clipped here.)
+
+## 3.4 The shape of it
+
+```
+                       mount                            umount
+   MON    6-frame msgr2 handshake,             statfs + reply        2 msgs
+          then 8 messages: 2 subscribes
+          and 6 map pushes            8 msgs
+   MDS    request_open  → open        2 msgs      request_flush_mdlog  1 msg
+          getattr(root) → reply       2 msgs      request_close → close 2 msgs
+   OSD    ---                         0 msgs      ---                  0 msgs
+   cost   18.5 ms, 13 of them one                 17 ms, 16 of them the
+          ESession commit                         matching ESession commit
+```
+
+Both halves are the trade §2 kept turning up. The client is given the least
+possible — one address, one key — and asks for the rest, caches it, and gives it
+back explicitly. The monitor supplies identity and topology; the MDS supplies a
+durable record of what this client holds, which is why it is the only part that
+costs a disk write; and the OSDs are not involved until there are bytes to move.
+
+# 4. Write path
 
 ```mermaid
 flowchart TD
@@ -1058,7 +1316,7 @@ Two guards sit around this path:
   and a truncate that went to the MDS cannot corrupt each other whichever order they land in —
   §2.3.5 traces both halves.
 
-# 4. Read path
+# 5. Read path
 
 The mirror image, and shorter:
 
@@ -1077,7 +1335,7 @@ cached *size* is a separate matter: `CEPH_STAT_CAP_SIZE` and `_MTIME` are both `
 loss of `Fs` — not of `Fc` — that forces the client to refresh size and mtime from the MDS.
 `LOCK_MIX` happens to drop both at once, which is why the two are easy to conflate.
 
-# 5. Capabilities: how coherence is enforced
+# 6. Capabilities: how coherence is enforced
 
 The MDS hands each client a per-inode **capability** bitmask and remembers exactly who holds what.
 
@@ -1166,7 +1424,7 @@ throughput and must be requested explicitly.
 The other three — dentry leases, directory completeness, and cache rebuild after an MDS restart —
 are message-level mechanisms, traced in §2.2.4 and §2.2.5.
 
-# 6. The transferable mental model
+# 7. The transferable mental model
 
 Capabilities are the same idea as SMB oplocks or NFSv4 delegations, but split into independent
 bits per metadata field, and with the data path deliberately routed around the server that

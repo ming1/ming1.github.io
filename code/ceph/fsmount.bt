@@ -1,0 +1,292 @@
+#!/usr/bin/env bpftrace
+/*
+ * fsmount.bt -- what a CephFS mount and umount put on the wire, and the
+ * kernel work between the messages.
+ *
+ * Usage:  bpftrace fsmount.bt <ceph-mds> <libceph-common.so.2> <mds-pid>
+ *
+ * Companion to fsproto.bt, which traces steady-state file operations.  This
+ * one covers session establishment and teardown, so it adds two lanes
+ * fsproto.bt does not have:
+ *
+ *   the MONITOR conversation -- libceph:ceph_con_send (peer type 1) and
+ *   libceph:mon_dispatch, plus the four msgr2 handshake stages, which are
+ *   protocol *frames* and never appear as messages;
+ *
+ *   the VFS lane -- the mount(2)/umount2(2) syscalls, one
+ *   ceph_parse_mount_param() per -o option, and the fs_context callbacks.
+ *
+ * Nothing prints until openat("/var/tmp/fsproto.mark"), which zeroes the
+ * clock.  Same column format as fsproto.bt, so fsfold.py narrows it too.
+ *
+ * Secrets are never printed: the value of a `secret=` or `key=` mount
+ * option is replaced with <redacted>.
+ */
+
+/* struct fs_parameter keeps its value in an anonymous union and names one
+ * member `string`, which bpftrace cannot spell.  BTF says key@0,
+ * type:8@byte 8, union@byte 16 -- natural alignment reproduces that. */
+struct fsp_param {
+  const char *key;
+  unsigned char type;          /* fs_value_type: 2 == fs_value_is_string */
+  char *sval;
+};
+
+BEGIN
+{
+  /* client <-> monitor message types (src/include/ceph_fs.h) */
+  @monmsg[2]  = "ping";              @monmsg[4]  = "mon_map";
+  @monmsg[5]  = "mon_get_map";       @monmsg[6]  = "mon_get_osdmap";
+  @monmsg[7]  = "mon_metadata";      @monmsg[15] = "mon_subscribe";
+  @monmsg[16] = "mon_subscribe_ack"; @monmsg[17] = "auth";
+  @monmsg[18] = "auth_reply";        @monmsg[19] = "mon_get_version";
+  @monmsg[20] = "mon_get_version_reply";
+  @monmsg[21] = "mdsmap";            @monmsg[41] = "osdmap";
+  @monmsg[13] = "statfs";            @monmsg[14] = "statfs_reply";
+  @monmsg[45] = "fsmap";             @monmsg[103] = "fsmap_user";
+  @monmsg[29] = "client_metrics";
+
+  /* CEPH_SUB_* (include/linux/ceph/mon_client.h) */
+  @sub[0] = "monmap"; @sub[1] = "osdmap"; @sub[2] = "fsmap"; @sub[3] = "mdsmap";
+
+  /* the two client<->MDS types a mount uses */
+  @sessop[0] = "request_open";      @sessop[1] = "open";
+  @sessop[2] = "request_close";     @sessop[3] = "close";
+  @sessop[4] = "request_renewcaps"; @sessop[5] = "renewcaps";
+  @sessop[12] = "request_flush_mdlog";
+  @mdsop[0x00101] = "getattr";      @mdsop[0x00100] = "lookup";
+
+  printf("%10s %7s  %-9s %-15s %-27s %s\n",
+         "us", "tid", "lane", "thread", "message", "detail");
+}
+
+END
+{
+  clear(@monmsg); clear(@sub); clear(@sessop); clear(@mdsop);
+  clear(@t0);
+}
+
+tracepoint:syscalls:sys_enter_openat
+/str(args->filename) == "/var/tmp/fsproto.mark"/
+{ @t0 = nsecs;
+  printf("%10d %7d  %-9s %-15s %-27s\n", 0, 0, "-", "-", "---- mark ----"); }
+
+/* ==== VFS lane: the command line ====================================== */
+
+tracepoint:syscalls:sys_enter_mount
+/@t0/
+{ printf("%10lld %7d  %-9s %-15s %-27s %s -> %s type=%s\n", (nsecs-@t0)/1000,
+         tid, "vfs", comm, "mount(2)", str(args->dev_name),
+         str(args->dir_name), str(args->type)); }
+
+tracepoint:syscalls:sys_enter_umount
+/@t0/
+{ printf("%10lld %7d  %-9s %-15s %-27s %s flags=0x%x\n", (nsecs-@t0)/1000, tid,
+         "vfs", comm, "umount2(2)", str(args->name), args->flags); }
+
+tracepoint:syscalls:sys_exit_mount
+/@t0/
+{ printf("%10lld %7d  %-9s %-15s %-27s ret=%d\n", (nsecs-@t0)/1000, tid,
+         "vfs", comm, "mount(2)", args->ret); }
+
+tracepoint:syscalls:sys_exit_umount
+/@t0/
+{ printf("%10lld %7d  %-9s %-15s %-27s ret=%d\n", (nsecs-@t0)/1000, tid,
+         "vfs", comm, "umount2(2)", args->ret); }
+
+/* one call per -o option: this is the command line becoming a struct.
+ * fs_parameter carries the key and, for a string value, the string. */
+kfunc:ceph:ceph_parse_mount_param
+/@t0/
+{
+  $p = (struct fsp_param *)args.param;
+  $k = str($p->key);
+  if (strncmp($k, "secret", 6) == 0 || strncmp($k, "key", 3) == 0) {
+    printf("%10lld %7d  %-9s %-15s %-27s %s=<redacted>\n", (nsecs-@t0)/1000,
+           tid, "vfs", comm, "ceph_parse_mount_param", $k);
+  } else {
+    printf("%10lld %7d  %-9s %-15s %-27s %s%s%s\n", (nsecs-@t0)/1000, tid,
+           "vfs", comm, "ceph_parse_mount_param", $k,
+           $p->type == 2 ? "=" : "", $p->type == 2 ? str($p->sval) : "");
+  }
+}
+
+kprobe:ceph:ceph_get_tree
+/@t0/
+{ printf("%10lld %7d  %-9s %-15s %-27s options parsed, build the sb\n",
+         (nsecs-@t0)/1000, tid, "vfs", comm, "ceph_get_tree"); }
+
+kprobe:ceph:ceph_kill_sb
+/@t0/
+{ printf("%10lld %7d  %-9s %-15s %-27s last ref: tear it down\n",
+         (nsecs-@t0)/1000, tid, "vfs", comm, "ceph_kill_sb"); }
+
+kprobe:ceph:ceph_put_super
+/@t0/
+{ printf("%10lld %7d  %-9s %-15s %-27s flush + drop caps\n",
+         (nsecs-@t0)/1000, tid, "vfs", comm, "ceph_put_super"); }
+
+/* ==== the three clients inside one mount ============================== */
+
+kprobe:libceph:ceph_create_client
+/@t0/
+{ printf("%10lld %7d  %-9s %-15s %-27s monc + osdc, global_id still 0\n",
+         (nsecs-@t0)/1000, tid, "vfs", comm, "ceph_create_client"); }
+
+kprobe:ceph:ceph_mdsc_init
+/@t0/
+{ printf("%10lld %7d  %-9s %-15s %-27s the MDS client\n", (nsecs-@t0)/1000,
+         tid, "vfs", comm, "ceph_mdsc_init"); }
+
+kprobe:libceph:ceph_monc_open_session
+/@t0/
+{ printf("%10lld %7d  %-9s %-15s %-27s pick a mon, connect\n",
+         (nsecs-@t0)/1000, tid, "mon", comm, "ceph_monc_open_session"); }
+
+kfunc:libceph:ceph_monc_want_map
+/@t0/
+{ printf("%10lld %7d  %-9s %-15s %-27s %s epoch>=%d%s\n", (nsecs-@t0)/1000,
+         tid, "mon", comm, "ceph_monc_want_map", @sub[args.sub], args.epoch,
+         args.continuous ? " continuous" : ""); }
+
+kprobe:libceph:ceph_monc_stop
+/@t0/
+{ printf("%10lld %7d  %-9s %-15s %-27s\n", (nsecs-@t0)/1000, tid,
+         "mon", comm, "ceph_monc_stop"); }
+
+/* ==== msgr2 handshake: frames, not messages =========================== */
+
+kprobe:libceph:process_hello
+/@t0/
+{ printf("%10lld %7d  %-9s %-15s %-27s peer named itself\n", (nsecs-@t0)/1000,
+         tid, "msgr2", comm, "process_hello"); }
+
+kprobe:libceph:process_auth_done
+/@t0/
+{ printf("%10lld %7d  %-9s %-15s %-27s cephx accepted\n", (nsecs-@t0)/1000,
+         tid, "msgr2", comm, "process_auth_done"); }
+
+kprobe:libceph:prepare_client_ident
+/@t0/
+{ printf("%10lld %7d  %-9s %-15s %-27s send my entity name + features\n",
+         (nsecs-@t0)/1000, tid, "msgr2", comm, "prepare_client_ident"); }
+
+kprobe:libceph:process_server_ident
+/@t0/
+{ printf("%10lld %7d  %-9s %-15s %-27s session established\n",
+         (nsecs-@t0)/1000, tid, "msgr2", comm, "process_server_ident"); }
+
+/* ==== client -> monitor / MDS ========================================= */
+
+kfunc:libceph:ceph_con_send
+/@t0 && (args.con->peer_name.type == 1 || args.con->peer_name.type == 2)/
+{
+  $m = args.msg; $t = $m->hdr.type;
+  $g = args.con->msgr->inst.name.num;
+
+  if (args.con->peer_name.type == 1) {
+    printf("%10lld %7d  cli.%-5lld %-15s %-27s %s type=%d (%d B)\n",
+           (nsecs-@t0)/1000, tid, $g, comm, "C->MON", @monmsg[$t], $t,
+           $m->front.iov_len);
+  } else if ($t == 22) {
+    $s = (struct ceph_mds_session_head *)$m->front.iov_base;
+    printf("%10lld %7d  cli.%-5lld %-15s %-27s %s seq=%lld\n",
+           (nsecs-@t0)/1000, tid, $g, comm, "C->MDS client_session",
+           @sessop[$s->op], $s->seq);
+  } else if ($t == 24) {
+    $h = (struct ceph_mds_request_head *)$m->front.iov_base;
+    printf("%10lld %7d  cli.%-5lld %-15s %-27s tid=%lld op=%s\n",
+           (nsecs-@t0)/1000, tid, $g, comm, "C->MDS client_request",
+           $m->hdr.tid, @mdsop[$h->op]);
+  } else if ($t == 29) {
+    printf("%10lld %7d  cli.%-5lld %-15s %-27s (periodic, %d B)\n",
+           (nsecs-@t0)/1000, tid, $g, comm, "C->MDS client_metrics",
+           $m->front.iov_len);
+  } else {
+    printf("%10lld %7d  cli.%-5lld %-15s %-27s type=%d (%d B)\n",
+           (nsecs-@t0)/1000, tid, $g, comm, "C->MDS (other)", $t,
+           $m->front.iov_len);
+  }
+}
+
+/* ==== monitor -> client =============================================== */
+
+kfunc:libceph:mon_dispatch
+/@t0/
+{
+  $m = args.msg; $t = $m->hdr.type;
+  printf("%10lld %7d  cli.%-5lld %-15s %-27s %s type=%d (%d B)\n",
+         (nsecs-@t0)/1000, tid, args.con->msgr->inst.name.num, comm, "MON->C",
+         @monmsg[$t], $t, $m->front.iov_len);
+}
+
+/* ==== MDS -> client ================================================== */
+
+kfunc:ceph:mds_dispatch
+/@t0/
+{
+  $m = args.msg; $t = $m->hdr.type;
+  $g = args.con->msgr->inst.name.num;
+
+  if ($t == 22) {
+    $s = (struct ceph_mds_session_head *)$m->front.iov_base;
+    printf("%10lld %7d  cli.%-5lld %-15s %-27s %s seq=%lld\n",
+           (nsecs-@t0)/1000, tid, $g, comm, "MDS->C client_session",
+           @sessop[$s->op], $s->seq);
+  } else if ($t == 26) {
+    $h = (struct ceph_mds_reply_head *)$m->front.iov_base;
+    printf("%10lld %7d  cli.%-5lld %-15s %-27s tid=%lld op=%s result=%d %s\n",
+           (nsecs-@t0)/1000, tid, $g, comm, "MDS->C client_reply",
+           $m->hdr.tid, @mdsop[$h->op], (int32)$h->result,
+           $h->safe ? "SAFE" : "unsafe");
+  } else if ($t == 21) {
+    printf("%10lld %7d  cli.%-5lld %-15s %-27s (new epoch)\n",
+           (nsecs-@t0)/1000, tid, $g, comm, "MDS->C mdsmap");
+  } else {
+    printf("%10lld %7d  cli.%-5lld %-15s %-27s type=%d (%d B)\n",
+           (nsecs-@t0)/1000, tid, $g, comm, "MDS->C (other)", $t,
+           $m->front.iov_len);
+  }
+}
+
+kprobe:ceph:ceph_mdsc_handle_mdsmap
+/@t0/
+{ printf("%10lld %7d  %-9s %-15s %-27s which ranks are active\n",
+         (nsecs-@t0)/1000, tid, "vfs", comm, "ceph_mdsc_handle_mdsmap"); }
+
+kprobe:ceph:__open_session
+/@t0/
+{ printf("%10lld %7d  %-9s %-15s %-27s -> MClientSession(request_open)\n",
+         (nsecs-@t0)/1000, tid, "vfs", comm, "mdsc __open_session"); }
+
+kprobe:ceph:ceph_mdsc_close_sessions
+/@t0/
+{ printf("%10lld %7d  %-9s %-15s %-27s -> MClientSession(request_close)\n",
+         (nsecs-@t0)/1000, tid, "vfs", comm, "ceph_mdsc_close_sessions"); }
+
+/* ==== the OSD side, if a mount touches it at all ====================== */
+
+kfunc:libceph:send_request
+/@t0/
+{ printf("%10lld %7d  %-9s %-15s %-27s tid=%lld %s pool=%lld -> osd%d\n",
+         (nsecs-@t0)/1000, tid, "cli", comm, "C->OSD osd_op",
+         args.req->r_tid, str(args.req->r_t.base_oid.name),
+         args.req->r_t.base_oloc.pool, args.req->r_t.osd); }
+
+/* ==== MDS server side ================================================ */
+
+uprobe:$1:_ZN6Server21handle_client_sessionE*
+/@t0/
+{ printf("%10lld %7d  %-9s %-15s %-27s\n", (nsecs-@t0)/1000, tid,
+         "mds", comm, "Server::handle_client_session"); }
+
+uprobe:$1:_ZN5MDLog13_submit_entryE*
+/@t0/
+{ printf("%10lld %7d  %-9s %-15s %-27s ESession queued\n", (nsecs-@t0)/1000,
+         tid, "mds", comm, "MDLog::_submit_entry"); }
+
+uprobe:$2:_ZN8Objecter10_op_submitE*
+/@t0 && pid == $3/
+{ printf("%10lld %7d  %-9s %-15s %-27s obj=%s pool=%lld\n", (nsecs-@t0)/1000,
+         tid, "mds", comm, "Objecter::_op_submit",
+         str(*(uint64 *)(arg1 + 48)), *(int64 *)(arg1 + 80)); }
