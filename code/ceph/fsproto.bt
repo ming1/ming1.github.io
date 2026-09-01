@@ -1,0 +1,446 @@
+#!/usr/bin/env bpftrace
+/*
+ * fsproto.bt -- every CephFS protocol message, both directions, decoded
+ * from the wire buffer, plus a thin MDS lane showing what the server
+ * did between a request and its reply.
+ *
+ * Usage:  bpftrace fsproto.bt <ceph-mds> <libceph-common.so.2> <mds-pid>
+ *
+ * Four probes catch every message a kernel CephFS client exchanges:
+ *
+ *   libceph:ceph_con_send   everything the client sends the MDS
+ *   ceph:mds_dispatch       everything the MDS sends the client
+ *   libceph:send_request    the client's OSD ops
+ *   libceph:__complete_request  their replies
+ *
+ * The first two decode msg->front.iov_base with the very struct the
+ * peer will decode it with, so the "detail" column is literally the
+ * message's fields.  The OSD pair reads the request struct instead --
+ * same numbers, before/after encoding.
+ *
+ * Nothing prints until openat("/var/tmp/fsproto.mark"), which zeroes
+ * the clock; background session renewals stay out of the trace.  The
+ * POSIX lane follows any path under /mnt/cephfs.
+ *
+ * fs/ceph and libceph are assumed to be modules -- kfunc reads their
+ * types from module BTF, which a kprobe cast cannot see.  Built in
+ * (CONFIG_CEPH_FS=y)?  Use kfunc:vmlinux: throughout.
+ *
+ * On an optimized (RelWithDebInfo) ceph build, run fsprun.py first: it
+ * rewrites the uprobe symbols to out-of-line addresses, because
+ * bpftrace expands a symbolic uprobe to every inlined instance and
+ * some of those refuse to attach.
+ */
+
+/* The kernel's ceph_osd_req_op keeps the extent fields in an anonymous
+ * union, which bpftrace cannot walk.  This mirrors the struct's prefix
+ * exactly -- natural alignment puts the union at +24 -- so the extent
+ * reads without a single magic offset.  r_ops[] is the flexible array
+ * at the end of ceph_osd_request, hence the sizeof(). */
+struct fsp_req_op {
+  unsigned short op; unsigned int flags; unsigned int indata_len;
+  unsigned int outdata_len; int rval;
+  unsigned long long offset, length, truncate_size;
+  unsigned int truncate_seq;
+};
+
+BEGIN
+{
+  /* CEPH_MDS_OP_* -- src/include/ceph_fs.h */
+  @mdsop[0x00100] = "lookup";       @mdsop[0x00101] = "getattr";
+  @mdsop[0x00103] = "lookupparent"; @mdsop[0x00104] = "lookupino";
+  @mdsop[0x00105] = "lookupname";   @mdsop[0x00106] = "getvxattr";
+  @mdsop[0x01105] = "setxattr";     @mdsop[0x01106] = "rmxattr";
+  @mdsop[0x01107] = "setlayout";    @mdsop[0x01108] = "setattr";
+  @mdsop[0x01109] = "setfilelock";  @mdsop[0x00110] = "getfilelock";
+  @mdsop[0x01201] = "mknod";        @mdsop[0x01202] = "link";
+  @mdsop[0x01203] = "unlink";       @mdsop[0x01204] = "rename";
+  @mdsop[0x01220] = "mkdir";        @mdsop[0x01221] = "rmdir";
+  @mdsop[0x01222] = "symlink";      @mdsop[0x01301] = "create";
+  @mdsop[0x00302] = "open";         @mdsop[0x00305] = "readdir";
+  @mdsop[0x01400] = "mksnap";       @mdsop[0x01401] = "rmsnap";
+  @mdsop[0x00402] = "lssnap";       @mdsop[0x01502] = "flush";
+
+  /* CEPH_CAP_OP_* */
+  @capop[0] = "grant";      @capop[1] = "revoke";   @capop[2] = "trunc";
+  @capop[3] = "export";     @capop[4] = "import";   @capop[5] = "update";
+  @capop[6] = "drop";       @capop[7] = "flush";    @capop[8] = "flush_ack";
+  @capop[9] = "flushsnap";  @capop[10] = "flushsnap_ack";
+  @capop[11] = "release";   @capop[12] = "renew";
+
+  /* CEPH_SESSION_* */
+  @sessop[0] = "request_open";      @sessop[1] = "open";
+  @sessop[2] = "request_close";     @sessop[3] = "close";
+  @sessop[4] = "request_renewcaps"; @sessop[5] = "renewcaps";
+  @sessop[6] = "stale";             @sessop[7] = "recall_state";
+  @sessop[8] = "flushmsg";          @sessop[9] = "flushmsg_ack";
+  @sessop[10] = "force_ro";         @sessop[11] = "reject";
+  @sessop[12] = "request_flush_mdlog";
+
+  /* CEPH_MDS_LEASE_* */
+  @leaseop[1] = "revoke"; @leaseop[2] = "release";
+  @leaseop[3] = "renew";  @leaseop[4] = "revoke_ack";
+
+  /* CEPH_OSD_OP_* -- mode | type | nr, src/include/rados.h */
+  @osdop[0x1201] = "read";        @osdop[0x1202] = "stat";
+  @osdop[0x1205] = "sparse-read"; @osdop[0x2201] = "write";
+  @osdop[0x2202] = "writefull";   @osdop[0x2203] = "truncate";
+  @osdop[0x2204] = "zero";        @osdop[0x2205] = "delete";
+  @osdop[0x2209] = "trimtrunc";   /* what Filer::truncate() emits */
+  @osdop[0x220d] = "create";      @osdop[0x2223] = "set-alloc-hint";
+  @osdop[0x2301] = "setxattr";    @osdop[0x1300] = "getxattr";
+
+  /* cap groups: two bits each, shared / exclusive.  Missing key -> "" */
+  @A[1] = "As"; @A[2] = "Ax"; @A[3] = "Asx";
+  @L[1] = "Ls"; @L[2] = "Lx"; @L[3] = "Lsx";
+  @X[1] = "Xs"; @X[2] = "Xx"; @X[3] = "Xsx";
+
+  printf("%10s %7s  %-9s %-15s %-27s %s\n",
+         "us", "tid", "lane", "thread", "message", "detail");
+}
+
+END
+{
+  clear(@mdsop); clear(@capop); clear(@sessop); clear(@leaseop);
+  clear(@osdop); clear(@A); clear(@L); clear(@X);
+  clear(@t0); clear(@posix); clear(@fs); clear(@rpath); clear(@rino);
+}
+
+/* the gate: zeroes the clock; nothing above prints before it */
+tracepoint:syscalls:sys_enter_openat
+/str(args->filename) == "/var/tmp/fsproto.mark"/
+{ @t0 = nsecs;
+  printf("%10d %7d  %-9s %-15s %-27s\n", 0, 0, "-", "-", "---- mark ----"); }
+
+/* ==== POSIX lane ====================================================== */
+
+tracepoint:syscalls:sys_enter_openat
+/@t0 && strncmp(str(args->filename), "/mnt/cephfs", 11) == 0/
+{ @posix[tid] = 1;
+  printf("%10lld %7d  %-9s %-15s %-27s %s flags=0%o\n", (nsecs-@t0)/1000, tid,
+         "posix", comm, "openat(2)", str(args->filename), args->flags); }
+
+tracepoint:syscalls:sys_enter_newfstatat
+/@t0 && strncmp(str(args->filename), "/mnt/cephfs", 11) == 0/
+{ @posix[tid] = 1;
+  printf("%10lld %7d  %-9s %-15s %-27s %s\n", (nsecs-@t0)/1000, tid,
+         "posix", comm, "newfstatat(2)", str(args->filename)); }
+
+tracepoint:syscalls:sys_enter_unlinkat
+/@t0 && strncmp(str(args->pathname), "/mnt/cephfs", 11) == 0/
+{ @posix[tid] = 1;
+  printf("%10lld %7d  %-9s %-15s %-27s %s\n", (nsecs-@t0)/1000, tid,
+         "posix", comm, "unlinkat(2)", str(args->pathname)); }
+
+tracepoint:syscalls:sys_enter_renameat2
+/@t0 && strncmp(str(args->oldname), "/mnt/cephfs", 11) == 0/
+{ @posix[tid] = 1;
+  printf("%10lld %7d  %-9s %-15s %-27s %s -> %s\n", (nsecs-@t0)/1000, tid,
+         "posix", comm, "renameat2(2)", str(args->oldname), str(args->newname)); }
+
+tracepoint:syscalls:sys_enter_getdents64
+/@t0 && @posix[tid]/
+{ printf("%10lld %7d  %-9s %-15s %-27s fd=%d\n", (nsecs-@t0)/1000, tid,
+         "posix", comm, "getdents64(2)", args->fd); }
+
+tracepoint:syscalls:sys_enter_write
+/@t0 && @posix[tid] && args->fd != 2/
+{ printf("%10lld %7d  %-9s %-15s %-27s fd=%d len=%lld\n", (nsecs-@t0)/1000, tid,
+         "posix", comm, "write(2)", args->fd, args->count); }
+
+tracepoint:syscalls:sys_enter_read
+/@t0 && @posix[tid] && args->fd != 2/
+{ printf("%10lld %7d  %-9s %-15s %-27s fd=%d len=%lld\n", (nsecs-@t0)/1000, tid,
+         "posix", comm, "read(2)", args->fd, args->count); }
+
+tracepoint:syscalls:sys_enter_ftruncate
+/@t0 && @posix[tid]/
+{ printf("%10lld %7d  %-9s %-15s %-27s fd=%d len=%lld\n", (nsecs-@t0)/1000, tid,
+         "posix", comm, "ftruncate(2)", args->fd, args->length); }
+
+tracepoint:syscalls:sys_enter_fsync
+/@t0 && @posix[tid]/
+{ @fs[tid] = nsecs;
+  printf("%10lld %7d  %-9s %-15s %-27s fd=%d\n", (nsecs-@t0)/1000, tid,
+         "posix", comm, "fsync(2)", args->fd); }
+
+tracepoint:syscalls:sys_exit_fsync
+/@fs[tid]/
+{ printf("%10lld %7d  %-9s %-15s %-27s returned, %lld us\n", (nsecs-@t0)/1000,
+         tid, "posix", comm, "fsync(2)", (nsecs-@fs[tid])/1000);
+  delete(@fs[tid]); }
+
+/* the path is built here, not carried in a field the wire decoder can
+ * reach cheaply; stash it for the client_request line, same thread */
+kfunc:ceph:ceph_mdsc_submit_request
+/@t0/
+{ @rpath[tid] = args.req->r_path1 != 0 ? str(args.req->r_path1)
+                : (args.req->r_dentry != 0
+                   ? str(args.req->r_dentry->d_name.name) : "");
+  /* setattr and friends carry neither a path nor a dentry, only the inode.
+   * On 64-bit i_ino *is* the ceph ino (ceph_set_ino_cb, fs/ceph/inode.c).
+   * Keyed by tid because submit and send are the same thread on the normal
+   * path; a request re-sent from a workqueue (forward, reconnect replay)
+   * finds no entry and prints ino=0x0 -- visibly empty, not silently wrong. */
+  @rino[tid] = args.req->r_inode != 0 ? args.req->r_inode->i_ino : 0; }
+
+/* ==== client -> MDS =================================================== */
+
+kfunc:libceph:ceph_con_send
+/@t0 && args.con->peer_name.type == 2/           /* CEPH_ENTITY_TYPE_MDS */
+{
+  $m = args.msg; $t = $m->hdr.type;
+  $g = args.con->msgr->inst.name.num;            /* this client's global id */
+
+  if ($t == 24) {                                /* MClientRequest */
+    $h = (struct ceph_mds_request_head *)$m->front.iov_base;
+    if (@rpath[tid] != "") {
+      printf("%10lld %7d  cli.%-5lld %-15s %-27s tid=%lld op=%s /%s releases=%d\n",
+        (nsecs-@t0)/1000, tid, $g, comm, "C->MDS client_request",
+        $m->hdr.tid, @mdsop[$h->op], @rpath[tid], $h->num_releases);
+    } else {
+      printf("%10lld %7d  cli.%-5lld %-15s %-27s tid=%lld op=%s ino=0x%llx releases=%d\n",
+        (nsecs-@t0)/1000, tid, $g, comm, "C->MDS client_request",
+        $m->hdr.tid, @mdsop[$h->op], @rino[tid], $h->num_releases);
+    }
+    delete(@rpath[tid]); delete(@rino[tid]);
+  } else if ($t == 784) {                        /* MClientCaps */
+    $c = (struct ceph_mds_caps *)$m->front.iov_base;
+    $i = $c->caps; $d = $c->dirty; $w = $c->wanted;
+    $F = ($i >> 8) & 255; $G = ($d >> 8) & 255; $H = ($w >> 8) & 255;
+    printf("%10lld %7d  cli.%-5lld %-15s %-27s %s ino=0x%llx seq=%d caps=%s%s%s%s%s%s%s%s%s%s%s%s%s%s dirty=%s%s%s%s%s%s%s%s%s%s%s%s%s%s wanted=%s%s%s%s%s%s%s%s%s%s%s%s%s%s size=%llu\n",
+      (nsecs-@t0)/1000, tid, $g, comm, "C->MDS client_caps",
+      @capop[$c->op], $c->ino, $c->seq,
+      $i ? "" : "-", ($i & 1) ? "p" : "", @A[($i>>2)&3], @L[($i>>4)&3], @X[($i>>6)&3],
+      $F ? "F" : "", ($F&1)?"s":"", ($F&2)?"x":"", ($F&4)?"c":"",
+      ($F&8)?"r":"", ($F&16)?"w":"", ($F&32)?"b":"",
+      ($F&64)?"a":"", ($F&128)?"l":"",
+      $d ? "" : "-", ($d & 1) ? "p" : "", @A[($d>>2)&3], @L[($d>>4)&3], @X[($d>>6)&3],
+      $G ? "F" : "", ($G&1)?"s":"", ($G&2)?"x":"", ($G&4)?"c":"",
+      ($G&8)?"r":"", ($G&16)?"w":"", ($G&32)?"b":"",
+      ($G&64)?"a":"", ($G&128)?"l":"",
+      $w ? "" : "-", ($w & 1) ? "p" : "", @A[($w>>2)&3], @L[($w>>4)&3], @X[($w>>6)&3],
+      $H ? "F" : "", ($H&1)?"s":"", ($H&2)?"x":"", ($H&4)?"c":"",
+      ($H&8)?"r":"", ($H&16)?"w":"", ($H&32)?"b":"",
+      ($H&64)?"a":"", ($H&128)?"l":"",
+      $c->size);
+  } else if ($t == 22) {                         /* MClientSession */
+    $s = (struct ceph_mds_session_head *)$m->front.iov_base;
+    printf("%10lld %7d  cli.%-5lld %-15s %-27s %s seq=%lld\n",
+      (nsecs-@t0)/1000, tid, $g, comm, "C->MDS client_session",
+      @sessop[$s->op], $s->seq);
+  } else if ($t == 787) {                        /* MClientCapRelease */
+    $r = (struct ceph_mds_cap_release *)$m->front.iov_base;
+    printf("%10lld %7d  cli.%-5lld %-15s %-27s num=%d\n",
+      (nsecs-@t0)/1000, tid, $g, comm, "C->MDS client_cap_release", $r->num);
+  } else if ($t == 785) {                        /* MClientLease */
+    $l = (struct ceph_mds_lease *)$m->front.iov_base;
+    printf("%10lld %7d  cli.%-5lld %-15s %-27s %s ino=0x%llx seq=%d\n",
+      (nsecs-@t0)/1000, tid, $g, comm, "C->MDS client_lease",
+      @leaseop[$l->action], $l->ino, $l->seq);
+  } else if ($t == 29) {
+    printf("%10lld %7d  cli.%-5lld %-15s %-27s (periodic, %d B)\n",
+      (nsecs-@t0)/1000, tid, $g, comm, "C->MDS client_metrics",
+      $m->front.iov_len);
+  } else if ($t == 23) {
+    printf("%10lld %7d  cli.%-5lld %-15s %-27s (%d B of held caps)\n",
+      (nsecs-@t0)/1000, tid, $g, comm, "C->MDS client_reconnect",
+      $m->front.iov_len);
+  } else {
+    printf("%10lld %7d  cli.%-5lld %-15s %-27s type=%d front=%d\n",
+      (nsecs-@t0)/1000, tid, $g, comm, "C->MDS (other)", $t, $m->front.iov_len);
+  }
+}
+
+/* ==== MDS -> client =================================================== */
+
+kfunc:ceph:mds_dispatch
+/@t0/
+{
+  $m = args.msg; $t = $m->hdr.type;
+  $g = args.con->msgr->inst.name.num;
+
+  if ($t == 26) {                                /* MClientReply */
+    $h = (struct ceph_mds_reply_head *)$m->front.iov_base;
+    printf("%10lld %7d  cli.%-5lld %-15s %-27s tid=%lld op=%s result=%d %s trace=[%s%s]\n",
+      (nsecs-@t0)/1000, tid, $g, comm, "MDS->C client_reply",
+      $m->hdr.tid, @mdsop[$h->op], (int32)$h->result,
+      $h->safe ? "SAFE" : "unsafe",
+      $h->is_dentry ? "dentry " : "", $h->is_target ? "target" : "");
+  } else if ($t == 784) {                        /* MClientCaps */
+    $c = (struct ceph_mds_caps *)$m->front.iov_base;
+    $i = $c->caps; $w = $c->wanted;
+    $F = ($i >> 8) & 255; $G = ($w >> 8) & 255;
+    printf("%10lld %7d  cli.%-5lld %-15s %-27s %s ino=0x%llx seq=%d caps=%s%s%s%s%s%s%s%s%s%s%s%s%s%s wanted=%s%s%s%s%s%s%s%s%s%s%s%s%s%s size=%llu/%llu tseq=%d\n",
+      (nsecs-@t0)/1000, tid, $g, comm, "MDS->C client_caps",
+      @capop[$c->op], $c->ino, $c->seq,
+      $i ? "" : "-", ($i & 1) ? "p" : "", @A[($i>>2)&3], @L[($i>>4)&3], @X[($i>>6)&3],
+      $F ? "F" : "", ($F&1)?"s":"", ($F&2)?"x":"", ($F&4)?"c":"",
+      ($F&8)?"r":"", ($F&16)?"w":"", ($F&32)?"b":"",
+      ($F&64)?"a":"", ($F&128)?"l":"",
+      $w ? "" : "-", ($w & 1) ? "p" : "", @A[($w>>2)&3], @L[($w>>4)&3], @X[($w>>6)&3],
+      $G ? "F" : "", ($G&1)?"s":"", ($G&2)?"x":"", ($G&4)?"c":"",
+      ($G&8)?"r":"", ($G&16)?"w":"", ($G&32)?"b":"",
+      ($G&64)?"a":"", ($G&128)?"l":"",
+      $c->size, $c->max_size, $c->truncate_seq);
+  } else if ($t == 22) {                         /* MClientSession */
+    $s = (struct ceph_mds_session_head *)$m->front.iov_base;
+    printf("%10lld %7d  cli.%-5lld %-15s %-27s %s seq=%lld\n",
+      (nsecs-@t0)/1000, tid, $g, comm, "MDS->C client_session",
+      @sessop[$s->op], $s->seq);
+  } else if ($t == 785) {                        /* MClientLease */
+    $l = (struct ceph_mds_lease *)$m->front.iov_base;
+    printf("%10lld %7d  cli.%-5lld %-15s %-27s %s ino=0x%llx seq=%d dur=%dms\n",
+      (nsecs-@t0)/1000, tid, $g, comm, "MDS->C client_lease",
+      @leaseop[$l->action], $l->ino, $l->seq, $l->duration_ms);
+  } else if ($t == 786) {                        /* MClientSnap */
+    $s = (struct ceph_mds_snap_head *)$m->front.iov_base;
+    printf("%10lld %7d  cli.%-5lld %-15s %-27s op=%d split=0x%llx tracelen=%d\n",
+      (nsecs-@t0)/1000, tid, $g, comm, "MDS->C client_snap",
+      $s->op, $s->split, $s->trace_len);
+  } else if ($t == 25) {                         /* MClientRequestForward */
+    printf("%10lld %7d  cli.%-5lld %-15s %-27s tid=%lld\n",
+      (nsecs-@t0)/1000, tid, $g, comm, "MDS->C request_forward", $m->hdr.tid);
+  } else if ($t == 788) {                        /* MClientQuota */
+    printf("%10lld %7d  cli.%-5lld %-15s %-27s (%d B)\n",
+      (nsecs-@t0)/1000, tid, $g, comm, "MDS->C client_quota",
+      $m->front.iov_len);
+  } else if ($t == 21) {
+    printf("%10lld %7d  cli.%-5lld %-15s %-27s (new epoch)\n",
+      (nsecs-@t0)/1000, tid, $g, comm, "MDS->C mdsmap");
+  } else {
+    printf("%10lld %7d  cli.%-5lld %-15s %-27s type=%d front=%d\n",
+      (nsecs-@t0)/1000, tid, $g, comm, "MDS->C (other)", $t, $m->front.iov_len);
+  }
+}
+
+/* ==== client <-> OSD ================================================== */
+
+/* send_request(), not ceph_osdc_start_request(): the tid, the PG and the
+ * target OSD are filled in by calc_target() further down, so the earlier
+ * probe would print tid=0 pg=0.0 osd-1.  Fires again on a resend.
+ *
+ * Two pg-ish fields, and they are not the same thing: r_t.pgid is the *raw*
+ * pg ("last raw pg we mapped to") whose seed is the full 32-bit
+ * ceph_str_hash() of the object name, while r_t.spgid is the actual PG, seed =
+ * ceph_stable_mod(hash, pg_num).  Print the real PG and keep the hash beside
+ * it -- the two together are the whole of the client's placement arithmetic. */
+kfunc:libceph:send_request
+/@t0/
+{
+  $o = (struct fsp_req_op *)((uint64)args.req + sizeof(struct ceph_osd_request));
+  $f = args.req->r_t.flags;
+  /* only the extent ops carry offset/length/truncate_*: for the others
+   * that part of the union holds something else entirely */
+  $ext = $o->op == 0x1201 || $o->op == 0x1205 || $o->op == 0x2201 ||
+         $o->op == 0x2202 || $o->op == 0x2203 || $o->op == 0x2204;
+  if ($ext) {
+    printf("%10lld %7d  cli.%-5lld %-15s %-27s tid=%lld %s pool=%lld pg=%lld.%x (hash %08x) -> osd%d [%s %llu~%llu tseq=%d/%lld] %s%s ops=%d try=%d\n",
+      (nsecs-@t0)/1000, tid, args.req->r_osdc->client->msgr.inst.name.num, comm,
+      "C->OSD osd_op", args.req->r_tid,
+      str(args.req->r_t.base_oid.name), args.req->r_t.base_oloc.pool,
+      args.req->r_t.spgid.pgid.pool, args.req->r_t.spgid.pgid.seed,
+      args.req->r_t.pgid.seed,                 /* the raw object hash */
+      args.req->r_t.osd,
+      @osdop[$o->op], $o->offset, $o->length,
+      $o->truncate_seq, (int64)$o->truncate_size,
+      ($f & 0x20) ? "WRITE" : (($f & 0x10) ? "READ" : "?"),
+      ($f & 0x4) ? "|ONDISK" : "",
+      args.req->r_num_ops, args.req->r_attempts);
+  } else {
+    printf("%10lld %7d  cli.%-5lld %-15s %-27s tid=%lld %s pool=%lld pg=%lld.%x (hash %08x) -> osd%d [%s] %s%s ops=%d try=%d\n",
+      (nsecs-@t0)/1000, tid, args.req->r_osdc->client->msgr.inst.name.num, comm,
+      "C->OSD osd_op", args.req->r_tid,
+      str(args.req->r_t.base_oid.name), args.req->r_t.base_oloc.pool,
+      args.req->r_t.spgid.pgid.pool, args.req->r_t.spgid.pgid.seed,
+      args.req->r_t.pgid.seed,                 /* the raw object hash */
+      args.req->r_t.osd,
+      @osdop[$o->op],
+      ($f & 0x20) ? "WRITE" : (($f & 0x10) ? "READ" : "?"),
+      ($f & 0x4) ? "|ONDISK" : "",
+      args.req->r_num_ops, args.req->r_attempts);
+  }
+}
+
+kfunc:libceph:__complete_request
+/@t0/
+{
+  $o = (struct fsp_req_op *)((uint64)args.req + sizeof(struct ceph_osd_request));
+  printf("%10lld %7d  cli.%-5lld %-15s %-27s tid=%lld result=%d [%s rval=%d outdata=%d]\n",
+    (nsecs-@t0)/1000, tid, args.req->r_osdc->client->msgr.inst.name.num, comm,
+    "OSD->C osd_op_reply", args.req->r_tid, args.req->r_result,
+    @osdop[$o->op], $o->rval, $o->outdata_len);
+}
+
+/* ==== MDS lane: what the server did in between ========================= */
+
+/* The only build-specific number in this script: MClientRequest::head.op at
+ * +398 (head at +376, op at +22 inside), from this tree's DWARF, x86-64.
+ * Re-derive with `gdb -batch -ex "ptype /o MClientRequest" ceph-mds` if your
+ * build differs -- a stale offset prints a WRONG op name, it does not fail.
+ * The client's own client_request line carries the same op, ~500 us earlier,
+ * so the two disagreeing is the tell. */
+uprobe:$1:_ZN6Server21handle_client_requestE*
+/@t0/
+{ $q = *(uint64 *)arg1;                          /* cref_t is one pointer */
+  printf("%10lld %7d  %-9s %-15s %-27s op=%s\n", (nsecs-@t0)/1000, tid,
+         "mds", comm, "Server::handle_client_request",
+         @mdsop[*(uint32 *)($q + 398)]); }
+
+uprobe:$1:_ZN6Server21handle_client_sessionE*
+/@t0/
+{ printf("%10lld %7d  %-9s %-15s %-27s\n", (nsecs-@t0)/1000, tid,
+         "mds", comm, "Server::handle_client_session"); }
+
+uprobe:$1:_ZN6Server11early_replyE*
+/@t0/
+{ printf("%10lld %7d  %-9s %-15s %-27s unsafe reply\n", (nsecs-@t0)/1000, tid,
+         "mds", comm, "Server::early_reply"); }
+
+uprobe:$1:_ZN6Server20reply_client_requestE*
+/@t0/
+{ printf("%10lld %7d  %-9s %-15s %-27s reply\n", (nsecs-@t0)/1000, tid,
+         "mds", comm, "Server::reply_client_request"); }
+
+uprobe:$1:_ZN6Locker18handle_client_capsE*
+/@t0/
+{ printf("%10lld %7d  %-9s %-15s %-27s\n", (nsecs-@t0)/1000, tid,
+         "mds", comm, "Locker::handle_client_caps"); }
+
+uprobe:$1:_ZN6Locker10issue_capsEP6CInodeP10Capability*
+/@t0/
+{ printf("%10lld %7d  %-9s %-15s %-27s recompute + send grants\n",
+         (nsecs-@t0)/1000, tid, "mds", comm, "Locker::issue_caps"); }
+
+uprobe:$1:_ZN6Locker14_do_cap_updateE*
+/@t0/
+{ printf("%10lld %7d  %-9s %-15s %-27s journal size/mtime\n", (nsecs-@t0)/1000,
+         tid, "mds", comm, "Locker::_do_cap_update"); }
+
+uprobe:$1:_ZN6Locker18file_update_finishE*
+/@t0/
+{ printf("%10lld %7d  %-9s %-15s %-27s journaled -> flush_ack\n",
+         (nsecs-@t0)/1000, tid, "mds", comm, "Locker::file_update_finish"); }
+
+uprobe:$1:_ZN6Locker18issue_client_leaseE*
+/@t0/
+{ printf("%10lld %7d  %-9s %-15s %-27s dentry lease into reply\n",
+         (nsecs-@t0)/1000, tid, "mds", comm, "Locker::issue_client_lease"); }
+
+uprobe:$1:_ZN6Locker20revoke_client_leasesE*
+/@t0/
+{ printf("%10lld %7d  %-9s %-15s %-27s\n", (nsecs-@t0)/1000, tid,
+         "mds", comm, "Locker::revoke_client_leases"); }
+
+uprobe:$1:_ZN5MDLog13_submit_entryE*
+/@t0/
+{ printf("%10lld %7d  %-9s %-15s %-27s queued\n", (nsecs-@t0)/1000, tid,
+         "mds", comm, "MDLog::_submit_entry"); }
+
+/* Objecter lives in libceph-common, mapped by every daemon: gate to the
+ * MDS pid.  These are the MDS's own RADOS writes -- journal, dir objects. */
+uprobe:$2:_ZN8Objecter10_op_submitE*
+/@t0 && pid == $3/
+{ printf("%10lld %7d  %-9s %-15s %-27s obj=%s pool=%lld\n", (nsecs-@t0)/1000,
+         tid, "mds", comm, "Objecter::_op_submit",
+         str(*(uint64 *)(arg1 + 48)), *(int64 *)(arg1 + 80)); }
