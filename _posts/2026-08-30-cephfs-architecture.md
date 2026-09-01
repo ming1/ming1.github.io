@@ -70,7 +70,8 @@ cluster.
 Every structure and function named below links to its definition, pinned so the
 line numbers stay true: userspace to [ceph
 v21.3.0](https://github.com/ceph/ceph/tree/v21.3.0), kernel client to [linux
-v7.2](https://github.com/torvalds/linux/tree/v7.2). The lab runs a build a
+v7.2](https://github.com/torvalds/linux/tree/v7.2). The lab runs `7.2.0_next`,
+a little past the kernel tag, so a trace may show a line the tag does not. The lab runs a build a
 little ahead of both, so a line may have drifted by the time you read this — the
 symbol names have not.
 
@@ -1190,7 +1191,7 @@ client subscribes to, and what it does with each answer:
 
 | Map | Asked for by | Arrives | The client needs it to |
 |---|---|---|---|
-| `fsmap_user` | [`ceph_monc_want_map(FSMAP)`](https://github.com/torvalds/linux/blob/v7.2/net/ceph/mon_client.c#L443), line 8 | line 16 | know this filesystem exists and is joinable |
+| `fsmap_user` | [`ceph_monc_want_map(FSMAP)`](https://github.com/torvalds/linux/blob/v7.2/net/ceph/mon_client.c#L443), line 8. The trace prints the enum name, `fsmap`; the wire name is `fsmap.user`, which is what the reply is called | line 16 | know this filesystem exists and is joinable |
 | `mon_map` | `ceph_monc_open_session()` sets it (via the `__`-prefixed inner call, so it is not on the trace); `__send_subscribe` asserts `BUG_ON(num < 1); /* monmap sub is always there */` | lines 19, 23 | find another monitor when this one goes away |
 | `osdmap` | same, set in `ceph_monc_open_session()` | lines 20, 24 | do §2.3.1's placement arithmetic locally |
 | `mdsmap` | `ceph_monc_want_map(MDSMAP)`, line 17 | line 21 | know which ranks are active, and their addresses |
@@ -1342,8 +1343,8 @@ neither excerpt.)
 
 | Channel | mount | umount |
 |---|---|---|
-| MON | a 6-frame msgr2 handshake, then 8 messages: 2 subscribes and 6 map pushes | `statfs` + reply, 2 messages |
-| MDS | a second 6-frame handshake; `request_open` → `open`, then `getattr(/)` → reply — 4 messages | `request_flush_mdlog`, then `request_close` → `close` — 3 messages |
+| MON | an 8-frame msgr2 handshake, then 8 messages: 2 subscribes and 6 map pushes | `statfs` + reply, 2 messages |
+| MDS | a second 8-frame handshake; `request_open` → `open`, then `getattr(/)` → reply — 4 messages | `request_flush_mdlog`, then `request_close` → `close` — 3 messages |
 | OSD (client's) | nothing | nothing |
 | OSD (MDS's) | 2 RADOS writes: the ESession entry (event 33) and the journal header (34) | 1: the entry only (event 67) — the header rewrite depends on journal state, not on the event |
 | cost | 15 ms, 11 of them that one ESession commit | 17 ms, 16 of them the matching commit |
