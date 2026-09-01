@@ -818,7 +818,7 @@ Of the 81 RADOS ops in `rados.h`, a CephFS client uses a handful:
 | Op | Issued by | Note |
 |---|---|---|
 | `read` | readahead, `ceph_sync_read`, `O_DIRECT` | short read means hole; the client zero-fills |
-| `sparse-read` | the same paths, with `-o sparseread` | returns an extent map instead of a byte count |
+| `sparse-read` | the same paths, with `-o sparseread` or on an encrypted inode | returns an extent map instead of a byte count |
 | `write` | writeback, `ceph_sync_write`, `O_DIRECT` | `truncate_seq`/`truncate_size` ride along |
 | `zero` | `fallocate(PUNCH_HOLE)`, partial object | `ceph_zero_partial_object`, `file.c:2654` |
 | `truncate` / `delete` | `fallocate(PUNCH_HOLE)`, whole object | `truncate` to 0 for object 0, `delete` for the rest |
@@ -826,6 +826,8 @@ Of the 81 RADOS ops in `rados.h`, a CephFS client uses a handful:
 | `stat` | the pool-permission probe | not for `stat(2)` — that is a cap or a `getattr` |
 | `create` (EXCL) | the pool-permission probe | see below |
 | `copy-from2` | `copy_file_range(2)` | server-side copy offload, whole objects only; falls back to VFS if the OSDs lack it |
+| `assert-version`, `create`(EXCL) | the fscrypt read-modify-write path | `file.c:2110` — make the RMW fail rather than clobber a concurrent change |
+| `create`, `write`, `cmpxattr`, `setxattr` | `ceph_uninline_data()` | `addr.c:2402` — one atomic transaction that moves inline data out to its object |
 | `delete` | the MDS's purge queue, after unlink | file removal is asynchronous |
 
 Note what is absent: there is **no CephFS op for "get the file size"**. Size
@@ -1031,7 +1033,9 @@ flowchart TD
 
 Teal steps are the MDS metadata path; coral steps are the direct OSD data path.
 
-Steps 4 and 5 are **not** ordered against each other. `Client::_write_success()` sets `in->size`
+Steps 4 and 5 are **not** ordered against each other. (This paragraph is the
+**userspace** client — `libcephfs`/`ceph-fuse`; §2.2.6 traces the kernel client,
+whose `ceph_fsync` orders and waits differently.) `Client::_write_success()` sets `in->size`
 and marks the caps dirty as soon as the write lands in the page cache, so a cap flush can carry
 the new size to the MDS while the data is still sitting in the ObjectCacher — the MDS's recorded
 size routinely runs ahead of what is durable in RADOS. That is safe because a read of a region
