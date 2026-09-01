@@ -62,7 +62,10 @@ BEGIN
   @monmsg[45] = "fsmap";             @monmsg[103] = "fsmap_user";
   @monmsg[29] = "client_metrics";
 
-  /* CEPH_SUB_* (include/linux/ceph/mon_client.h) */
+  /* CEPH_SUB_* index -> enum name (include/linux/ceph/mon_client.h).  The
+   * wire name for FSMAP is "fsmap.user" (mon_client.c:326), which is why the
+   * map itself comes back as fsmap_user; the enum name is kept here so the
+   * want line matches the constant you would grep for. */
   @sub[0] = "monmap"; @sub[1] = "osdmap"; @sub[2] = "fsmap"; @sub[3] = "mdsmap";
 
   /* the two client<->MDS types a mount uses */
