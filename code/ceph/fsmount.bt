@@ -21,6 +21,19 @@
  *
  * Secrets are never printed: the value of a `secret=` or `key=` mount
  * option is replaced with <redacted>.
+ *
+ * Lanes: `vfs` is syscalls, `fs` is fs/ceph and libceph internals, `msgr2`
+ * the handshake stages, `cli.<global_id>` the messages, `mds` the server.
+ * (fsproto.bt has no `fs` lane -- its client lane is syscalls only.)
+ *
+ * Portability: process_hello, process_auth_done, prepare_client_ident,
+ * process_server_ident, ceph_parse_mount_param, __open_session and
+ * ceph_mdsc_pre_umount are all *static*.  If one is inlined away on your
+ * kernel it vanishes from kallsyms and the failed attach aborts the whole
+ * script -- drop that probe rather than the run.  And whether a `mount(2)`
+ * appears at all depends on the mount helper: util-linux 2.40 and the
+ * mount.ceph shipped with it use fsopen()/fsconfig(), so the option lines
+ * come from ceph_parse_mount_param and there is no mount(2) to see.
  */
 
 /* struct fs_parameter keeps its value in an anonymous union and names one
@@ -79,6 +92,26 @@ tracepoint:syscalls:sys_enter_mount
          tid, "vfs", comm, "mount(2)", str(args->dev_name),
          str(args->dir_name), str(args->type)); }
 
+/* umount uses fstatfs(2) on an fd, not statfs(2) on the path -- a path
+ * filter never matches, and the only statfs(2) calls util-linux makes are
+ * selinux probes on /sys/fs/selinux. */
+tracepoint:syscalls:sys_enter_fstatfs
+/@t0 && (comm == "umount" || comm == "mount" || comm == "df")/
+{ printf("%10lld %7d  %-9s %-15s %-27s fd=%d\n", (nsecs-@t0)/1000, tid,
+         "vfs", comm, "fstatfs(2)", args->fd); }
+
+tracepoint:syscalls:sys_enter_statfs
+/@t0 && strncmp(str(args->pathname), "/mnt/cephfs", 11) == 0/
+{ printf("%10lld %7d  %-9s %-15s %-27s %s\n", (nsecs-@t0)/1000, tid,
+         "vfs", comm, "statfs(2)", str(args->pathname)); }
+
+/* the ->statfs superblock op: this is what turns a statfs(2) on a CephFS
+ * mount into a question for the MONITOR rather than the MDS */
+kprobe:ceph:ceph_statfs
+/@t0/
+{ printf("%10lld %7d  %-9s %-15s %-27s ask the mon, not the mds\n",
+         (nsecs-@t0)/1000, tid, "fs", comm, "ceph_statfs"); }
+
 tracepoint:syscalls:sys_enter_umount
 /@t0/
 { printf("%10lld %7d  %-9s %-15s %-27s %s flags=0x%x\n", (nsecs-@t0)/1000, tid,
@@ -103,40 +136,40 @@ kfunc:ceph:ceph_parse_mount_param
   $k = str($p->key);
   if (strncmp($k, "secret", 6) == 0 || strncmp($k, "key", 3) == 0) {
     printf("%10lld %7d  %-9s %-15s %-27s %s=<redacted>\n", (nsecs-@t0)/1000,
-           tid, "vfs", comm, "ceph_parse_mount_param", $k);
+           tid, "fs", comm, "ceph_parse_mount_param", $k);
   } else {
     printf("%10lld %7d  %-9s %-15s %-27s %s%s%s\n", (nsecs-@t0)/1000, tid,
-           "vfs", comm, "ceph_parse_mount_param", $k,
-           $p->type == 2 ? "=" : "", $p->type == 2 ? str($p->sval) : "");
+           "fs", comm, "ceph_parse_mount_param", $k,
+           $p->type == 2 ? "=" : " type=", $p->type == 2 ? str($p->sval) : "1");
   }
 }
 
 kprobe:ceph:ceph_get_tree
 /@t0/
 { printf("%10lld %7d  %-9s %-15s %-27s options parsed, build the sb\n",
-         (nsecs-@t0)/1000, tid, "vfs", comm, "ceph_get_tree"); }
+         (nsecs-@t0)/1000, tid, "fs", comm, "ceph_get_tree"); }
 
 kprobe:ceph:ceph_kill_sb
 /@t0/
 { printf("%10lld %7d  %-9s %-15s %-27s last ref: tear it down\n",
-         (nsecs-@t0)/1000, tid, "vfs", comm, "ceph_kill_sb"); }
+         (nsecs-@t0)/1000, tid, "fs", comm, "ceph_kill_sb"); }
 
 kprobe:ceph:ceph_put_super
 /@t0/
 { printf("%10lld %7d  %-9s %-15s %-27s flush + drop caps\n",
-         (nsecs-@t0)/1000, tid, "vfs", comm, "ceph_put_super"); }
+         (nsecs-@t0)/1000, tid, "fs", comm, "ceph_put_super"); }
 
 /* ==== the three clients inside one mount ============================== */
 
 kprobe:libceph:ceph_create_client
 /@t0/
 { printf("%10lld %7d  %-9s %-15s %-27s monc + osdc, global_id still 0\n",
-         (nsecs-@t0)/1000, tid, "vfs", comm, "ceph_create_client"); }
+         (nsecs-@t0)/1000, tid, "fs", comm, "ceph_create_client"); }
 
 kprobe:ceph:ceph_mdsc_init
 /@t0/
 { printf("%10lld %7d  %-9s %-15s %-27s the MDS client\n", (nsecs-@t0)/1000,
-         tid, "vfs", comm, "ceph_mdsc_init"); }
+         tid, "fs", comm, "ceph_mdsc_init"); }
 
 kprobe:libceph:ceph_monc_open_session
 /@t0/
@@ -252,24 +285,30 @@ kfunc:ceph:mds_dispatch
 kprobe:ceph:ceph_mdsc_handle_mdsmap
 /@t0/
 { printf("%10lld %7d  %-9s %-15s %-27s which ranks are active\n",
-         (nsecs-@t0)/1000, tid, "vfs", comm, "ceph_mdsc_handle_mdsmap"); }
+         (nsecs-@t0)/1000, tid, "fs", comm, "ceph_mdsc_handle_mdsmap"); }
 
 kprobe:ceph:__open_session
 /@t0/
 { printf("%10lld %7d  %-9s %-15s %-27s -> MClientSession(request_open)\n",
-         (nsecs-@t0)/1000, tid, "vfs", comm, "mdsc __open_session"); }
+         (nsecs-@t0)/1000, tid, "fs", comm, "mdsc::__open_session"); }
+
+kprobe:ceph:ceph_mdsc_pre_umount
+/@t0/
+{ printf("%10lld %7d  %-9s %-15s %-27s flush_mdlog, then dirty caps\n",
+         (nsecs-@t0)/1000, tid, "fs", comm, "ceph_mdsc_pre_umount"); }
 
 kprobe:ceph:ceph_mdsc_close_sessions
 /@t0/
 { printf("%10lld %7d  %-9s %-15s %-27s -> MClientSession(request_close)\n",
-         (nsecs-@t0)/1000, tid, "vfs", comm, "ceph_mdsc_close_sessions"); }
+         (nsecs-@t0)/1000, tid, "fs", comm, "ceph_mdsc_close_sessions"); }
 
 /* ==== the OSD side, if a mount touches it at all ====================== */
 
 kfunc:libceph:send_request
 /@t0/
-{ printf("%10lld %7d  %-9s %-15s %-27s tid=%lld %s pool=%lld -> osd%d\n",
-         (nsecs-@t0)/1000, tid, "cli", comm, "C->OSD osd_op",
+{ printf("%10lld %7d  cli.%-5lld %-15s %-27s tid=%lld %s pool=%lld -> osd%d\n",
+         (nsecs-@t0)/1000, tid,
+         args.req->r_osdc->client->msgr.inst.name.num, comm, "C->OSD osd_op",
          args.req->r_tid, str(args.req->r_t.base_oid.name),
          args.req->r_t.base_oloc.pool, args.req->r_t.osd); }
 
