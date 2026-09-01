@@ -168,12 +168,13 @@ revoke; the client can only ask, by setting `wanted`.
 the container for that state, and the thing that expires when a client dies —
 which is what makes the delegation safe rather than merely cooperative.
 
-**When.** Mount, unmount, periodically while idle (`RENEWCAPS`, at a third of
-`mds_session_timeout`), and whenever the MDS wants
-something from the client as a whole (`RECALL_STATE`, `FORCE_RO`, `STALE`).
+**When.** Mount, unmount, periodically while idle (`RENEWCAPS`, every
+`m_session_timeout >> 2` — a quarter of the session timeout,
+`mds_client.c:6325`), and whenever the MDS wants something from the client as a
+whole (`RECALL_STATE`, `FORCE_RO`, `STALE`).
 
-**On the wire.** `struct ceph_mds_session_head` is four fields — `op`, `seq`,
-`stamp`, `max_caps`/`max_leases` — plus, on newer versions, the client's
+**On the wire.** `struct ceph_mds_session_head` is five fields — `op`, `seq`,
+`stamp`, `max_caps`, `max_leases` — plus, on newer versions, the client's
 metadata map on `REQUEST_OPEN` and the MDS's cap-auth list on `OPEN`. The `op`
 space is a set of paired requests and answers:
 
@@ -185,6 +186,7 @@ space is a set of paired requests and answers:
 | `REQUEST_FLUSH_MDLOG` | — | "make your journal durable now" — an `fsync` primitive |
 | — | `STALE` | your caps are no longer valid; stop using them |
 | — | `RECALL_STATE` | you hold too many caps; give some back (`max_caps`) |
+| `FLUSHMSG_ACK` | `FLUSHMSG` | the one pair the MDS initiates: "acknowledge everything I have sent you so far" |
 | — | `FORCE_RO` | go read-only (the filesystem was marked down) |
 
 **Who does what.** Open and close are *journaled*: the MDS records the session
@@ -207,8 +209,9 @@ why they are not instant.
  18 2045789 cli.4186 kworker/1:3  C->MDS client_request         tid=1 op=getattr / releases=0
 ```
 
-Unmount costs 14 ms and a mount 14 ms, and in both cases the cost is one
-metadata-pool journal write, not the message. Note the client id changes across
+Unmount costs 14 ms and a mount 14 ms, and in both cases the cost is a
+metadata-pool journal flush — the entry object and, on the unmount, the header
+too — not the message. Note the client id changes across
 the remount (4169 → 4186): a session is not resumable, it is replaced. The
 first thing the new session does is `getattr` on the root inode — a mount is a
 session plus one `stat` of `/`.
@@ -221,15 +224,17 @@ namespace.
 
 **When.** `lookup`, `getattr`, `open`, `create`, `mkdir`, `unlink`, `rename`,
 `readdir`, `setattr`, `setxattr`, `setfilelock`, `mksnap`… — 40-odd op codes in
-`ceph_fs.h`. The encoding is a hint: `op & 0x001000` marks a write op,
-`op & 0x010000` "follow symlink".
+`ceph_fs.h`. The encoding is a hint: `op & 0x001000` marks a write op. (The
+header also documents `& 0x010000` as "follow symlink", but no op in the current
+enum sets it.)
 
 **On the wire.** `struct ceph_mds_request_head` then five variable pieces:
 
 ```
  ceph_mds_request_head          version, oldest_client_tid, mdsmap_epoch,
-                                flags, num_releases, op, caller_uid/gid,
-                                ino, union args[op], owner_uid/gid
+                                flags, num_retry, num_fwd, num_releases, op,
+                                caller_uid/gid, ino, union args[op],
+                                ext_num_retry, ext_num_fwd, owner_uid/gid
  path, path2                    filepath = (base ino, string) x2
  releases[num_releases]         cap and dentry-lease releases, piggybacked
  stamp, gid_list                client clock, supplementary groups
@@ -239,9 +244,9 @@ namespace.
 Three details carry real weight. **`union args`** is why one message type covers
 40 operations: `args.open` holds flags/mode/layout/`mask`, `args.setattr` holds
 mode/uid/gid/mtime/size/`mask`, `args.readdir` holds frag/`max_entries`/
-`max_bytes`. **`filepath` is (parent ino, name)**, not a string path — the
-client resolves the parent itself and asks only about the last component; the
-MDS log shows it as `#0x1/dbgf`. And **`releases`** lets a request return caps
+`max_bytes`. **`filepath` is (base ino, string)**, not an absolute path — the client resolves
+what it can and names a base inode plus the rest, usually the parent plus one
+component; the MDS log renders it `#0x1/dbgf`. And **`releases`** lets a request return caps
 and leases the client no longer wants, in the same message that asks for
 something new: the `releases=1` in the traces below is one dentry lease going
 home.
@@ -272,9 +277,9 @@ state for `getfilelock`.
         │yes
   retry of a completed request?  ──yes──► re-send the stored reply, done
         │no
-  process head.releases  ──►  Locker::process_request_cap_release()
-        │
   mdcache->request_start()  ──►  an MDRequestImpl, tracked in the session
+        │
+  process head.releases  ──►  Locker::process_request_cap_release()
         │
   dispatch_client_request()  ──►  take locks, project the change
         │                          into the cache
@@ -328,13 +333,16 @@ Read ops skip all of it — no journal, no early reply, one `SAFE` reply:
  27 3049911 cli.4186 kworker/1:3  MDS->C client_reply           tid=2 op=lookup result=0 SAFE trace=[dentry
                                                                  target]
  28 3050039 cli.4186 stat         C->MDS client_request         tid=3 op=lookup /f3 releases=0
+ 29 3050240 mds      ms_dispatch  Server::handle_client_request op=lookup
  31 3050273 mds      ms_dispatch  Locker::issue_client_lease    dentry lease into reply
+ 32 3050307 cli.4186 kworker/6:0  MDS->C client_reply           tid=3 op=lookup result=0 SAFE trace=[dentry
+                                                                 target]
 ```
 
-One `lookup` per path component, ~700 µs each, each returning a dentry lease
-and an `InodeStat`. Repeat the same `stat` a second later and the trace is
-**empty** — the leases and the `Fs` cap answer it locally. That gap is the
-protocol working.
+One `lookup` per path component — 663 µs for `d1`, 268 µs for `f3` — each
+returning a dentry lease and an `InodeStat`. Repeat the same `stat` a second later and the
+trace is **empty**: the leases and the `Fs` cap answer it locally. That gap is
+the protocol working.
 
 `MClientRequestForward` completes the picture on a multi-rank filesystem: if the
 inode is not on this rank, the MDS replies with a forward instead of a result,
@@ -384,8 +392,10 @@ inode's `client_caps` map and, **for each client independently**, computes
   op      = (pending & ~new) ? REVOKE : GRANT
 ```
 
-There is no cross-client comparison anywhere — see §5 for why exclusivity is
-nevertheless emergent. The important consequence for the wire: each *lock*
+No client's mask is compared against another's — `get_allowed_caps()` reads only
+the lock state and whether *this* client is the inode's loner
+(`Locker.cc:2550`), and choosing the loner is the one place clients are weighed
+against each other. §5 has why exclusivity is emergent rather than enforced. The important consequence for the wire: each *lock*
 transition triggers its own `issue_caps()` pass, so one conflicting open
 produces a *staircase* of revokes rather than one. Two clients, one file —
 abridged to the events the ladder below cannot carry, the gaps in the `#`
@@ -426,7 +436,7 @@ The whole exchange, drawn as the ladder it is:
 
 ```
    client 4168 (buffering)              MDS                        client 4187
-   pAsxLsxXsxFsxcrwb                     │                       open("shared") ──►
+   pAsxLsXsxFsxcrwb                      │                       open("shared") ──►
         │                                │ iauth  excl -> sync         │
         │ ◄─── revoke  pAsLsXsxFsxcrwb ──┤        (Ax gone)            │
         ├──── update   dirty=Fw ─────────►   size=16384 journaled      │
@@ -448,7 +458,10 @@ The whole exchange, drawn as the ladder it is:
 
 The four lock transitions in the middle column are not guesswork. Re-run the
 same workload with `debug_mds 20` and they appear in the MDS's own inode dump,
-in that order (a different inode, same two clients, same cap strings):
+in that order (a different inode, same two clients, same cap strings). The third
+line also carries `iauth sync->excl`, the auth lock bouncing back because 4168
+still wants `Asx` — churn the cap ladder does not show, since it costs no
+message:
 
 ```
 (iauth excl->sync) (ifile excl) (ixattr excl)     ...  caps={4168=pAsLsXsxFsxcrwb/...}
@@ -473,9 +486,12 @@ acts on is the diff between the new `caps` mask and what it holds:
                    will delay ack" (caps.c), which is why the ack in the
                    trace above lands 27 ms later
   Fc gone     ──►  invalidate the page cache
-  Fs/Fx gone  ──►  stop trusting the cached size and mtime; with the excl
-                   bits no longer in `issued`, ceph_fill_file_size() and
-                   ceph_fill_file_time() take the values from this message
+  Fs gone     ──►  the client can no longer answer a stat locally:
+                   CEPH_STAT_CAP_SIZE and _MTIME are both CEPH_CAP_FILE_SHARED,
+                   so the next stat becomes a getattr to the MDS.  (The message's
+                   own size/mtime are applied on a different test entirely --
+                   ceph_fill_file_size() on truncate_seq, ceph_fill_file_time()
+                   guarded by whichever excl bits are still in `issued`.)
       └───────►  then ack: UPDATE, or FLUSH if metadata is dirty
 ```
 
@@ -503,11 +519,12 @@ It costs one message for many inodes and needs no reply:
 names that do not exist. A lease on a dentry is what lets a client answer a
 repeated `stat` — or a repeated `ENOENT` — without the MDS.
 
-**When.** Leases are normally *issued inside a reply* (that is what
-`Locker::issue_client_lease` is doing in the traces above, and
-`ceph_mds_reply_lease` is part of the reply trace). A standalone `MClientLease`
+**When.** Leases are normally *issued inside a reply* — that is what
+`Locker::issue_client_lease` is doing in the traces above. A
+`ceph_mds_reply_lease` rides the reply's **trace** blob for a lookup, and its
+**extra** blob for a readdir, one per entry (`parse_reply_info_readdir`). A standalone `MClientLease`
 is only sent for the exceptions: the MDS revoking one early, the client acking
-that revoke or returning a lease it no longer wants, and a renewal.
+that revoke, and a renewal.
 
 **On the wire.** `struct ceph_mds_lease` is `action`, `mask`, `ino`, snap range,
 `seq`, `duration_ms`, plus the dentry name. Four actions:
@@ -519,9 +536,14 @@ that revoke or returning a lease it no longer wants, and a renewal.
 | `RENEW` | either |
 | `REVOKE_ACK` | client → MDS |
 
-**Who does what.** Unlike a cap, a lease has a **fixed duration** — 30 s here — so the MDS can forget about it rather than track it forever; and
-no lease is issued at all when the client already holds `Fs`/`Fx` on the parent
-directory, because the directory caps already cover the name. The create trace
+**Who does what.** Unlike a cap, a lease has a **fixed duration** — 30 s here —
+so it lapses on its own if nothing renews it. The MDS still tracks it
+(`dn->add_client_lease(session)` plus a per-pool expiry list in the MDCache) and
+can revoke early. No lease is issued at all when the client already holds
+`Fs`/`Fx` on the parent directory, because the directory caps already cover the
+name. Of the four actions the kernel client sends only two — `RENEW` and
+`REVOKE_ACK`; `RELEASE` exists in the protocol but the kernel drops leases
+silently instead. The create trace
 shows both halves of a revoke:
 
 ```
@@ -530,9 +552,13 @@ shows both halves of a revoke:
   9    2751 cli.4168 kworker/1:1  C->MDS client_lease           revoke_ack ino=0x1 seq=32
 ```
 
-Creating a file in `/` invalidates the client's lease on `/` — 4 µs to ack,
-and only then does the create proceed. And the renewal, on a `readdir`, is one
-message each way:
+`ino=0x1` is the **parent**, not the subject: `Locker::revoke_client_leases()`
+builds the message from `diri->ino()` plus `dn->get_name()`, and the kernel does
+the same (`lease->ino = ceph_ino(dir)`). What is revoked is the lease on the
+*name* being created inside `/`. 4 µs to ack, and only then does the create
+proceed. (The tracer prints only the ino, never the dname, so which name it is
+has to come from the workload.) A renewal is one message each way — here on the
+name `d1`, while `ls` revalidates the path:
 
 ```
   2    4361 cli.4186 ls           C->MDS client_lease           renew ino=0x1 seq=2
@@ -628,8 +654,12 @@ messages, `mds` is what the server did in between.
 
 Eleven messages, and the `write(2)` is not one of them. Line 16 puts 16 KiB in
 the page cache and returns: the create reply granted `Fb`, so buffering is
-legal, and `Fw` plus the `max_size` in the same grant lets the client extend the
-file to 16384 locally. The cluster only hears about it because line 17 asks it to.
+legal, and `Fw` plus a `max_size` lets the client extend the file to 16384
+locally. That `max_size` is not visible here — this tracer does not decode the
+reply's embedded cap, and the first standalone grant showing
+`size=16384/4194304` is line 29, long after the write. It comes from
+`Locker::issue_new_caps()`, which ends in `check_inode_max_size()`
+(`Locker.cc:2721`). The cluster only hears about it because line 17 asks it to.
 
 The fsync then runs two serial phases — the question the next paragraphs answer
 is which of them it actually waits for:
@@ -712,17 +742,18 @@ objects directly — and to do that it needs no lookup, only arithmetic.
 **When.** Whenever a read misses the page cache or `Fc` is not held, whenever
 writeback runs or `Fb` is not held, and on `O_DIRECT` inside `write(2)`.
 
-**On the wire.**
+**On the wire** — grouped by purpose, not in `encode_payload`'s v9 order:
 
 ```
  MOSDOp                              what it is for
  ─────────────────────────────────── ───────────────────────────────────────
+ object_locator_t oloc               which pool (and namespace)
  hobject_t hobj                      the object; CephFS names it
                                      "<ino-hex>.<block-hex>"
  spg_t pgid                          the PG the *client* computed
  __u32 osdmap_epoch                  which map that computation used
- __u32 flags                         READ | WRITE | ONDISK | ... (0x14, 0x24
-                                     in the traces below)
+ __u32 flags                         READ | WRITE | ONDISK | ...; the tracer
+                                     renders these, not the raw value
  utime_t mtime                       the write's timestamp (client's clock)
  int32_t retry_attempt               resend counter
  snapid_t snap_seq; vector snaps     the snap context (from MClientSnap)
@@ -740,7 +771,9 @@ trace can name them from a table of a dozen entries.
 **The reply.** `MOSDOpReply` carries `oid`, `pgid`, the `ops` vector back with
 each op's `rval` and output data, an overall `result`, `replay_version` /
 `user_version`, and flags saying how durable the answer is (`ack` /
-`onnvram` / `ondisk`). CephFS always asks for `ONDISK`:
+`onnvram` / `ondisk`). Every libceph request carries `ONDISK` —
+`account_request()` (`net/ceph/osd_client.c`) sets it unconditionally, reads
+included — which is why the tracer prints it on everything:
 
 ```
  18    3708 cli.4168 dd           C->OSD osd_op                 tid=28 10000000207.00000000 pool=3 pg=3.7 (hash
@@ -780,7 +813,7 @@ takes that 22 ms apart).
 
 ### 2.3.2 The ops CephFS actually issues
 
-Of the ~60 RADOS ops, a CephFS client uses a handful:
+Of the 81 RADOS ops in `rados.h`, a CephFS client uses a handful:
 
 | Op | Issued by | Note |
 |---|---|---|
@@ -792,6 +825,7 @@ Of the ~60 RADOS ops, a CephFS client uses a handful:
 | `trimtrunc` | the **MDS**, for `ftruncate` | `MDCache::_truncate_inode` → `Filer::truncate` (`Filer.cc:534`) — a truncate that also carries the new `truncate_seq`, §2.3.5 |
 | `stat` | the pool-permission probe | not for `stat(2)` — that is a cap or a `getattr` |
 | `create` (EXCL) | the pool-permission probe | see below |
+| `copy-from2` | `copy_file_range(2)` | server-side copy offload, whole objects only; falls back to VFS if the OSDs lack it |
 | `delete` | the MDS's purge queue, after unlink | file removal is asynchronous |
 
 Note what is absent: there is **no CephFS op for "get the file size"**. Size
@@ -846,15 +880,18 @@ One pair of ops in the read trace is not I/O at all:
  15   24405 cli.4240 kworker/9:2  OSD->C osd_op_reply           tid=3 result=16384 [read rval=0 outdata=16384]
 ```
 
-`__ceph_pool_perm_get()` (`fs/ceph/addr.c:2509`) fires once per (pool,
-namespace) per mount, before the first I/O: a `stat` to prove the cephx key can
+`ceph_pool_perm_check()` is reached from `ceph_try_get_caps()` and
+`__ceph_get_caps()` — so on the first read or write, not at `open`. The excerpt
+shows exactly that: `read(2)` on line 9, with the open reply already back at
+2608 µs. `__ceph_pool_perm_get()` (`fs/ceph/addr.c:2509`) then runs once per
+(pool, namespace) per mount: a `stat` to prove the cephx key can
 read the pool, and a `create` with `CEPH_OSD_OP_FLAG_EXCL` to prove it can
 write. `-EEXIST` (`-17`) is the *success* answer for the write probe — the
 object is already there, so the create would have worked. The result is cached
 in `mdsc->pool_perm_tree`, which is why the pair never appears again. Its point
 is honest error reporting: a client whose MDS caps allow a path but whose OSD
-caps do not gets `EPERM` at `open`, rather than a mysterious failure at
-writeback.
+caps do not gets `EPERM` on its first read or write, rather than a mysterious
+failure at writeback.
 
 ### 2.3.5 `truncate_seq` — the one field both channels share
 
@@ -907,19 +944,35 @@ things worth pulling out:
    `tseq=1/-1` instead: sequence 1, no truncate ever, `truncate_size` =
    `(u64)-1`.
 
-The OSD's rule closes the loop (`PrimaryLogPG.cc:6928`, in the `WRITE` case):
+The OSD's rule closes the loop, and it has two halves. On a write
+(`PrimaryLogPG.cc:6928`, where `seq` is the object's own `oi.truncate_seq`):
 
 ```
- seq > op.extent.truncate_seq   "old write, arrived after trimtrunc"
-                                -> clamp length to the object's current size;
-                                   it cannot re-extend the truncated object
- op.extent.truncate_seq > seq   "write arrives before trimtrunc"
-                                -> t->truncate(truncate_size) first,
-                                   then apply the write
+ seq && seq > op.truncate_seq && op.offset + op.length > oi.size
+      "old write, arrived after trimtrunc"
+   -> length = (op.offset > oi.size ? 0 : oi.size - op.offset)
+      It cannot re-extend the truncated object.  Note the third conjunct:
+      a stale-seq write lying entirely below oi.size is applied unchanged,
+      and one starting past oi.size is dropped, not merely shortened.
+
+ op.truncate_seq > seq
+      "write arrives before trimtrunc"
+   -> if (obs.exists && !oi.is_whiteout()) t->truncate(op.truncate_size)
+      first, then the write; for an object that does not exist yet, just
+      record the new seq and size.
 ```
 
-Trimmed, not rejected, in the first case; reordered, not lost, in the second.
-Either arrival order gives the same object, and the two channels never have to
+And symmetrically on a read (`PrimaryLogPG.cc:5962`), where what gets clamped is
+the answer rather than the request:
+
+```
+ seq < op.truncate_seq && op.offset + op.length > op.truncate_size
+                       && oi.size > op.truncate_size
+   -> size = op.truncate_size, and the read is trimmed to it
+```
+
+Trimmed or dropped on the write side, short rather than stale on the read side.
+Either arrival order leaves the same object, and the two channels never have to
 lock against each other.
 
 ## 2.4 What the two channels add up to
@@ -1032,7 +1085,7 @@ The MDS hands each client a per-inode **capability** bitmask and remembers exact
 The letters are emitted in a fixed order per group — `s x c r w b a l` in `gcap_string()` — so a
 cap string is read left to right as pin, then the `A`, `L`, `X` and `F` groups.
 
-A cap set is written like `pAsLsXsFscr` (shared reader) or `pAsxLsxXsxFsxcrwb` (exclusive writer
+A cap set is written like `pAsLsXsFscr` (shared reader) or `pAsxLsXsxFsxcrwb` (exclusive writer
 — `set_loner_cap` drives all four cap locks together, so the loner gets the `X` group too).
 The two bits that make coherence work are `Fc` and `Fb`: **they are the licence to keep data
 outside RADOS** — along with `Fl`, the LazyIO escape hatch described below, which exists precisely
