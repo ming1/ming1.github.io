@@ -1013,8 +1013,8 @@ what `Locker::issue_caps()` is allowed to hand out.
 command line becomes three clients, four cluster maps and one MDS session — and
 how all of it is handed back. Same link convention as §2, same trace format, a
 different script. §2's opening table has a Client↔MON row it never took apart;
-this is where that happens, because a mount is mostly a conversation with the
-**monitor**. [`fsmount.bt`]({{ site.baseurl }}/code/ceph/fsmount.bt) is a separate
+this is where that happens: by message count a mount is mostly a conversation
+with the **monitor**, even though by time it is mostly one journal write. [`fsmount.bt`]({{ site.baseurl }}/code/ceph/fsmount.bt) is a separate
 script rather than a switch on `fsproto.bt` for a mechanical reason: bpftrace has
 no way to include a fragment, and folding in the monitor lane would also push its
 handful of *static* probe targets — one failed attach aborts a whole script — into
@@ -1033,7 +1033,7 @@ umount /mnt/cephfs3
 Neither line names an MDS or an OSD. The client is handed one monitor address
 and one identity; everything else it has to ask for. The mountpoint is a third
 one, so the two mounts §2 used stay undisturbed — which is why the client id
-below is `client.4246` and not one of §2.1's.
+below is `client.4250` and not one of §2.1's.
 
 ```
   mount -t ceph two@<fsid>.a=/ /mnt/cephfs3 -o mon_addr=..,secret=..,ms_mode=crc
@@ -1044,8 +1044,9 @@ below is `client.4246` and not one of §2.1's.
                                  │
                  one option at a time, through ceph_parse_mount_param()
                                  ▼
-        struct ceph_options         mon_addr, key, ms_mode
-        struct ceph_mount_options   subdir, rasize, caps_max, ...
+        struct ceph_options         parsed mon addrs, key, ms_mode
+        struct ceph_mount_options   subdir, the raw mon_addr string,
+                                    rasize, caps_max, ...
 ```
 
 ## 3.2 Mounting
@@ -1067,11 +1068,12 @@ bottom. Bracketed numbers are event numbers in the trace below:
   [10]   connect ──► msgr2 handshake ────► mon.a
                      [13] subscribe ─────►
                      [16-21] ◄─ fsmap, monmap, osdmap, mdsmap ─┘
-  [23]   pick a rank from the mdsmap
-  [24]   request_open ──────────────────────────────► [31] handle_client_
+  [22]   handle_mdsmap: which ranks are active
+  [25]   mdsc::__open_session
+  [26]   request_open ──────────────────────────────► [31] handle_client_
                      [27-30] msgr2 handshake ───────►      session
-                                                      [32] ESession ──► [33,34]
-                                                           ... 16 ms ...
+                                                      [32] submit_entry ► [33,34]
+                                                           ... 11 ms ...
                      [35] ◄──────── open ──────────── [commit]
   [36]   getattr(/) ────────────────────────────────► [37] reply
   ══════════════════════ mounted ═══════════════════════════════════════════
@@ -1081,52 +1083,52 @@ bottom. Bracketed numbers are event numbers in the trace below:
                      [55] pre_umount
                      [56] request_flush_mdlog ──────►
                      [58] close_sessions
-                     [59] request_close ────────────► [60] handle_client_
+                     [59] request_close ────────────► [64] handle_client_
                                                            session
-                                                      [62] ESession ──► [67]
-                                                           ... 14 ms ...
+                                                      [66] submit_entry ► [67]
+                                                           ... 16 ms ...
                      [68] ◄──────── close ─────────── [commit]
                      [69] monc_stop ──► mon session gone
 ```
 
 ```
   #      us lane     thread       message                       detail
-  2    1191 fs       mount        ceph_parse_mount_param        source=two@cbb0602c-69e6-45db-807b-cd6991393925.a=/
-  3    1209 fs       mount        ceph_parse_mount_param        mon_addr=10.0.0.28:40232
-  4    1212 fs       mount        ceph_parse_mount_param        secret=<redacted>
-  5    1215 fs       mount        ceph_parse_mount_param        ms_mode=crc
-  6    1220 fs       mount        ceph_get_tree                 options parsed, build the sb
-  7    1222 fs       mount        ceph_create_client            monc + osdc, global_id still 0
-  8    1883 mon      mount        ceph_monc_want_map            fsmap epoch>=0
-  9    1906 fs       mount        ceph_mdsc_init                the MDS client
- 10    1966 mon      mount        ceph_monc_open_session        pick a mon, connect
- 11    2464 msgr2    kworker/7:2  process_hello                 peer named itself
- 12    2948 msgr2    kworker/7:2  process_auth_done             cephx accepted
- 13    2962 cli.4250 kworker/7:2  C->MON                        mon_subscribe type=15 (65 B)
- 14    3411 msgr2    kworker/7:1  prepare_client_ident          send my entity name + features
- 15    3741 msgr2    kworker/8:1  process_server_ident          session established
- 16    4272 cli.4250 kworker/9:1  MON->C                        fsmap_user type=103 (37 B)
- 17    4297 mon      kworker/9:1  ceph_monc_want_map            mdsmap epoch>=0 continuous
- 18    4302 cli.4250 kworker/9:1  C->MON                        mon_subscribe type=15 (63 B)
- 19    4307 cli.4250 kworker/9:1  MON->C                        mon_map type=4 (213 B)
- 20    4319 cli.4250 kworker/9:1  MON->C                        osdmap type=41 (3052 B)
- 21    5477 cli.4250 kworker/8:1  MON->C                        mdsmap type=21 (1235 B)
- 22    5498 fs       kworker/8:1  ceph_mdsc_handle_mdsmap       which ranks are active
- 23    5508 fs       kworker/8:1  mdsc::__open_session          -> MClientSession(request_open)
- 24    5511 cli.4250 kworker/8:1  C->MDS client_session         request_open seq=0
- 25    5516 cli.4250 kworker/8:1  MON->C                        mon_map type=4 (213 B)
- 26    5519 cli.4250 kworker/8:1  MON->C                        osdmap type=41 (3052 B)
- 27    5745 msgr2    kworker/6:2  process_hello                 peer named itself
- 28    6353 msgr2    kworker/6:2  process_auth_done             cephx accepted
- 29    6367 msgr2    kworker/6:2  prepare_client_ident          send my entity name + features
- 30    6454 msgr2    kworker/8:1  process_server_ident          session established
- 31    6643 mds      ms_dispatch  Server::handle_client_session
- 32    6682 mds      ms_dispatch  MDLog::_submit_entry          ESession queued
- 33    6801 mds      mds-log-subm Objecter::_op_submit          obj=200.00000001 pool=2
- 34    6836 mds      mds-log-subm Objecter::_op_submit          obj=200.00000000 pool=2
- 35   23024 cli.4250 kworker/6:2  MDS->C client_session         open seq=0
- 36   23044 cli.4250 kworker/6:2  C->MDS client_request         tid=1 op=getattr
- 37   23204 cli.4250 kworker/8:1  MDS->C client_reply           tid=1 op=getattr result=0 SAFE
+  2    1276 fs       mount        ceph_parse_mount_param        source=two@cbb0602c-69e6-45db-807b-cd6991393925.a=/
+  3    1292 fs       mount        ceph_parse_mount_param        mon_addr=10.0.0.28:40232
+  4    1296 fs       mount        ceph_parse_mount_param        secret=<redacted>
+  5    1299 fs       mount        ceph_parse_mount_param        ms_mode=crc
+  6    1304 fs       mount        ceph_get_tree                 options parsed, build the sb
+  7    1307 fs       mount        ceph_create_client            monc + osdc, global_id still 0
+  8    1764 mon      mount        ceph_monc_want_map            fsmap epoch>=0
+  9    1784 fs       mount        ceph_mdsc_init                the MDS client
+ 10    1842 mon      mount        ceph_monc_open_session        pick a mon, connect
+ 11    2128 msgr2    kworker/10:0 process_hello                 peer named itself
+ 12    2521 msgr2    kworker/10:0 process_auth_done             cephx accepted
+ 13    2537 cli.4251 kworker/10:0 C->MON                        mon_subscribe type=15 (65 B)
+ 14    3307 msgr2    kworker/10:0 prepare_client_ident          send my entity name + features
+ 15    3512 msgr2    kworker/4:0  process_server_ident          session established
+ 16    3762 cli.4251 kworker/11:1 MON->C                        fsmap_user type=103 (37 B)
+ 17    3788 mon      kworker/11:1 ceph_monc_want_map            mdsmap epoch>=0 continuous
+ 18    3793 cli.4251 kworker/11:1 C->MON                        mon_subscribe type=15 (63 B)
+ 19    3796 cli.4251 kworker/11:1 MON->C                        mon_map type=4 (213 B)
+ 20    3800 cli.4251 kworker/11:1 MON->C                        osdmap type=41 (3052 B)
+ 21    4311 cli.4251 kworker/0:0  MON->C                        mdsmap type=21 (1235 B)
+ 22    4321 fs       kworker/0:0  ceph_mdsc_handle_mdsmap       which ranks are active
+ 23    4327 cli.4251 kworker/0:0  MON->C                        mon_map type=4 (213 B)
+ 24    4329 cli.4251 kworker/0:0  MON->C                        osdmap type=41 (3052 B)
+ 25    4681 fs       mount        mdsc::__open_session          -> MClientSession(request_open)
+ 26    4695 cli.4251 mount        C->MDS client_session         request_open(0) seq=0
+ 27    4816 msgr2    kworker/3:2  process_hello                 peer named itself
+ 28    5044 msgr2    kworker/3:2  process_auth_done             cephx accepted
+ 29    5076 msgr2    kworker/3:2  prepare_client_ident          send my entity name + features
+ 30    5105 msgr2    kworker/3:2  process_server_ident          session established
+ 31    5154 mds      ms_dispatch  Server::handle_client_session
+ 32    5173 mds      ms_dispatch  MDLog::_submit_entry          queued
+ 33    5239 mds      mds-log-subm Objecter::_op_submit          obj=200.00000001 pool=2
+ 34    5268 mds      mds-log-subm Objecter::_op_submit          obj=200.00000000 pool=2
+ 35   16547 cli.4251 kworker/3:2  MDS->C client_session         open(1) seq=0
+ 36   16560 cli.4251 kworker/3:2  C->MDS client_request         tid=1 op=getattr(0x101)
+ 37   16652 cli.4251 kworker/3:2  MDS->C client_reply           tid=1 op=getattr(0x101) result=0 SAFE
 ```
 
 No `mount(2)` appears anywhere in the trace, and that is not a gap in the
@@ -1144,27 +1146,41 @@ value from [`struct fs_parameter`](https://github.com/torvalds/linux/blob/v7.2/i
 fs_context callback that turns parsed options into a superblock. It builds a
 [`struct ceph_fs_client`](https://github.com/torvalds/linux/blob/v7.2/fs/ceph/super.h#L146), which owns a libceph client ([`ceph_create_client()`](https://github.com/torvalds/linux/blob/v7.2/net/ceph/ceph_common.c#L706) — `ceph_monc_init()`
 then `ceph_osdc_init()`) plus an MDS client ([`ceph_mdsc_init()`](https://github.com/torvalds/linux/blob/v7.2/fs/ceph/mds_client.c#L6256)). At line 7 this client has no
-identity: the `global_id` that names it — `client.4246` from line 13 on — is
-handed out by the monitor during authentication.
+identity: the `global_id` that names it — `client.4250` from line 13 on — is
+handed out by the monitor during authentication, decoded from the AUTH_DONE
+frame.
 
-**Lines 10–26, the monitor conversation, which is most of a mount.** [`ceph_monc_open_session()`](https://github.com/torvalds/linux/blob/v7.2/net/ceph/mon_client.c#L529)
+**Lines 10–24, the monitor conversation — most of the messages, little of the
+time.** Eight of the mount's twelve messages, but 1842→5105 µs is 3.3 ms of the 15;
+the journal commit below dwarfs it. [`ceph_monc_open_session()`](https://github.com/torvalds/linux/blob/v7.2/net/ceph/mon_client.c#L529)
 picks a monitor and connects.
 
-**The msgr2 handshake — six frames, once per peer.** It runs at lines 11–15 for
-the monitor and again at lines 27–30 for the MDS, and it is **not** messages:
-these are protocol frames, so nothing reaches `ceph_con_send` and the script has
-to probe the stages directly.
+**The msgr2 handshake — eight frames, once per peer.** It runs at lines 11–15
+for the monitor and again at lines 27–30 for the MDS, and it is **not**
+messages: these are protocol frames, so nothing reaches `ceph_con_send` and the
+script has to probe the stages directly. Only four of the eight are probed, so
+read the gaps as well as the lines — the 786 µs between lines 12 and 14 is the
+`AUTH_SIGNATURE` exchange, which the trace does not show.
 
 ```
    client                                              monitor
-     │ ── banner, then hello ─────────────────────────►  │
-     │ ◄─ hello: peer type + addr ──────────────────────  │  process_hello()
+     │ ── banner ──────────────────────────────────────►  │   (banners, not
+     │ ◄─ banner ───────────────────────────────────────  │    frames)
+     │ ── HELLO ───────────────────────────────────────►  │
+     │ ◄─ HELLO: peer type, and my own addr as seen ────  │  process_hello()
      │ ── AUTH_REQUEST: cephx, entity client.two ──────►  │
-     │ ◄─ AUTH_DONE: global_id 4246 + session key ──────  │  process_auth_done()
+     │ ◄─ AUTH_DONE: global_id 4250 + session key ──────  │  process_auth_done()
+     │ ── AUTH_SIGNATURE ──────────────────────────────►  │   \ not probed:
+     │ ◄─ AUTH_SIGNATURE ───────────────────────────────  │   / the 463 us gap
      │ ── CLIENT_IDENT: my addrs, features ────────────►  │  prepare_client_ident()
      │ ◄─ SERVER_IDENT ────────────────────────────────   │  process_server_ident()
      ▼                                                    ▼
    connected -- only now can a ceph_msg be sent
+
+   process_auth_done() ends in prepare_auth_signature(), and it is
+   process_auth_signature() -- not AUTH_DONE -- that calls
+   prepare_client_ident().  Eight frames minimum, ten if the monitor
+   answers AUTH_REPLY_MORE.
 ```
 
 Lines 13–15 show the client *queueing* `mon_subscribe` before the handshake
@@ -1175,21 +1191,22 @@ client subscribes to, and what it does with each answer:
 | Map | Asked for by | Arrives | The client needs it to |
 |---|---|---|---|
 | `fsmap_user` | [`ceph_monc_want_map(FSMAP)`](https://github.com/torvalds/linux/blob/v7.2/net/ceph/mon_client.c#L443), line 8 | line 16 | know this filesystem exists and is joinable |
-| `mon_map` | implicit — `__send_subscribe` asserts `BUG_ON(num < 1); /* monmap sub is always there */` | lines 19, 25 | find another monitor when this one goes away |
-| `osdmap` | implicit | lines 20, 26 | do §2.3.1's placement arithmetic locally |
+| `mon_map` | `ceph_monc_open_session()` sets it (via the `__`-prefixed inner call, so it is not on the trace); `__send_subscribe` asserts `BUG_ON(num < 1); /* monmap sub is always there */` | lines 19, 23 | find another monitor when this one goes away |
+| `osdmap` | same, set in `ceph_monc_open_session()` | lines 20, 24 | do §2.3.1's placement arithmetic locally |
 | `mdsmap` | `ceph_monc_want_map(MDSMAP)`, line 17 | line 21 | know which ranks are active, and their addresses |
 
-Each map arrives twice because the subscription is renewed at the new epochs once
-the first copies land. [`mon_dispatch()`](https://github.com/torvalds/linux/blob/v7.2/net/ceph/mon_client.c#L1446)
+Only `mon_map` and `osdmap` arrive twice: the second subscribe (line 18) goes out
+because of the `mdsmap` want on line 17, and the monitor re-sends monmap and
+osdmap on any subscribe it handles. [`mon_dispatch()`](https://github.com/torvalds/linux/blob/v7.2/net/ceph/mon_client.c#L1446)
 is the single inbound switch, the monitor-side twin of §2's `mds_dispatch`.
 
 The `mdsmap` on line 21 is what the mount was actually waiting for: without it
 `ceph_mdsc_handle_mdsmap` has no rank to open a session on.
 
-**Lines 23–35, one MDS session, and it costs a journal write.** [`__open_session()`](https://github.com/torvalds/linux/blob/v7.2/fs/ceph/mds_client.c#L1710)
-sends `MClientSession(request_open)` carrying the client's metadata — hostname,
-kernel version, mount path. Lines 27–30 are the MDS connection handshaking
-*after* the message was queued on line 24: the same lazy pattern as the monitor.
+**Lines 25–35, one MDS session, and it costs a journal write.** [`__open_session()`](https://github.com/torvalds/linux/blob/v7.2/fs/ceph/mds_client.c#L1710)
+sends `MClientSession(request_open)` carrying the client's metadata —
+`hostname`, `kernel_version`, `entity_id`, `root`. Lines 27–30 are the MDS connection handshaking
+*after* the message was queued on line 26: the same lazy pattern as the monitor.
 
 On the MDS, [`Server::handle_client_session()`](https://github.com/ceph/ceph/blob/v21.3.0/src/mds/Server.cc#L596) does not answer straight away:
 
@@ -1201,9 +1218,10 @@ On the MDS, [`Server::handle_client_session()`](https://github.com/ceph/ceph/blo
     sessionmap.add_session()          a Session enters the SessionMap
     sessionmap.set_state(STATE_OPENING)
          │
-    mdlog->submit_entry(new ESession(inst, open=true, pv, metadata))
+    mdlog->submit_entry(new ESession(inst, open=true, pv, metadata,
+                                     session->info.auth_name))
     mdlog->flush()                    ──►  200.00000001 + header, pool 2
-         │   ... 16 ms ...
+         │   ... 11 ms ...
     Server::_session_logged()          set_state(STATE_OPEN)
          └────────────────────────────►  MClientSession(open)
 ```
@@ -1230,7 +1248,7 @@ Both ends run the same state machine, one step apart —
 ```
 
 The two `"journaling ..."` strings are the MDS's own comments on those enum
-values. That is the 16 ms between lines 32 and 35, and the reason a mount is not
+values. That is the 11 ms between lines 32 and 35, and the reason a mount is not
 instant: **the MDS will not admit a client it has not recorded durably**, because
 after a restart it must know who was holding what. Session open and close are the
 only client-driven operations in this post that are journaled *synchronously* —
@@ -1238,8 +1256,8 @@ only client-driven operations in this post that are journaled *synchronously* �
 
 **Lines 36–37, the first metadata operation.** [`ceph_real_mount()`](https://github.com/torvalds/linux/blob/v7.2/fs/ceph/super.c#L1148) finishes through
 [`open_root_dentry()`](https://github.com/torvalds/linux/blob/v7.2/fs/ceph/super.c#L1055), which issues a plain `getattr` on the subdirectory from the device
-string (`/` here, ino 1). 160 µs, and the mount is done — 22 ms from the first
-option parsed to the root's reply, 16 of them that one ESession commit.
+string (`/` here, ino 1). 92 µs, and the mount is done — 15 ms from the first
+option parsed to the root's reply, 11 of them that one ESession commit.
 
 **The client's OSD channel stays silent** — not one `C->OSD` line in the trace.
 The client fetched the osdmap so that it *can* address objects, but a mount reads
@@ -1251,31 +1269,31 @@ connection. The bytes a mount writes are somebody else's.
 
 ```
   #      us lane     thread       message                       detail
- 48 3030155 vfs      umount       fstatfs(2)                    fd=3
- 49 3030185 fs       umount       ceph_statfs                   ask the mon, not the mds
- 50 3030190 cli.4250 umount       C->MON                        statfs type=13 (43 B)
- 51 3030486 cli.4250 kworker/8:1  MON->C                        statfs_reply type=14 (56 B)
- 52 3030718 vfs      umount       umount2(2)                    /mnt/cephfs3 flags=0x0
- 53 3030942 vfs      umount       umount2(2)                    ret=0
- 54 3030959 fs       umount       ceph_kill_sb                  last ref: tear it down
- 55 3030962 fs       umount       ceph_mdsc_pre_umount          flush_mdlog, then dirty caps
- 56 3030966 cli.4250 umount       C->MDS client_session         request_flush_mdlog seq=0
- 57 3031049 fs       umount       ceph_put_super                flush + drop caps
- 58 3031052 fs       umount       ceph_mdsc_close_sessions      -> MClientSession(request_close)
- 59 3031055 cli.4250 umount       C->MDS client_session         request_close seq=0
- 60 3031316 mds      ms_dispatch  Server::handle_client_session
- 61 3031353 mds      ms_dispatch  Server::handle_client_session
- 62 3031387 mds      ms_dispatch  MDLog::_submit_entry          ESession queued
- 67 3031660 mds      mds-log-subm Objecter::_op_submit          obj=200.00000001 pool=2
- 68 3045074 cli.4250 kworker/3:2  MDS->C client_session         close seq=0
- 69 3045829 mon      umount       ceph_monc_stop
+ 48 3023087 vfs      umount       fstatfs(2)                    fd=3
+ 49 3023100 fs       umount       ceph_statfs                   ask the mon, not the mds
+ 50 3023103 cli.4251 umount       C->MON                        statfs type=13 (43 B)
+ 51 3037034 cli.4251 kworker/11:1 MON->C                        statfs_reply type=14 (56 B)
+ 52 3037263 vfs      umount       umount2(2)                    /mnt/cephfs3 flags=0x0
+ 53 3037482 vfs      umount       umount2(2)                    ret=0
+ 54 3037490 fs       umount       ceph_kill_sb                  last ref: tear it down
+ 55 3037492 fs       umount       ceph_mdsc_pre_umount          flush_mdlog, then dirty caps
+ 56 3037494 cli.4251 umount       C->MDS client_session         request_flush_mdlog(12) seq=0
+ 57 3037547 fs       umount       ceph_put_super                flush + drop caps
+ 58 3037549 fs       umount       ceph_mdsc_close_sessions      -> MClientSession(request_close)
+ 59 3037551 cli.4251 umount       C->MDS client_session         request_close(2) seq=0
+ 64 3038186 mds      ms_dispatch  Server::handle_client_session
+ 65 3038198 mds      ms_dispatch  Server::handle_client_session
+ 66 3038205 mds      ms_dispatch  MDLog::_submit_entry          queued
+ 67 3038535 mds      mds-log-subm Objecter::_op_submit          obj=200.00000001 pool=2
+ 68 3054681 cli.4251 kworker/3:2  MDS->C client_session         close(3) seq=0
+ 69 3054972 mon      umount       ceph_monc_stop
 ```
 
 **`umount` asks for free space before it tears anything down**, and the client
 answers from the **monitor**. Note *which* syscall: `fstatfs(2)` on the
-mountpoint's fd, because util-linux opens the target rather than passing a path —
-a `statfs(2)` probe filtered on the path never fires, and the only `statfs(2)`
-calls in the run are util-linux probing for selinux. It reaches
+mountpoint's fd, because util-linux opens the target rather than passing a path,
+which is why the script also probes the fd form — a `statfs(2)` probe filtered on
+the mount path would never fire. It reaches
 [`ceph_statfs()`](https://github.com/torvalds/linux/blob/v7.2/fs/ceph/super.c#L59), which sends `statfs` to the
 monitor and waits for `statfs_reply`. Not a word to the MDS: free space is a
 cluster property, not a filesystem one.
@@ -1295,22 +1313,30 @@ cluster property, not a filesystem one.
                  -> MClientSession(request_close), one per session          [59]
 ```
 
-`request_flush_mdlog` *before* `request_close` is the whole point: the client
-makes the MDS commit its journal while the session is still open, because a
-closed session can no longer be asked for anything. It goes out before the dirty
-caps are even flushed — `send_flush_mdlog` is the first thing
+`request_flush_mdlog` *before* `request_close` is the whole point, and the
+kernel says why in its own comment on `send_flush_mdlog`: it "asks each MDS to
+journal pending unsafe operations (creates, renames, setattrs)".
+`ceph_mdsc_pre_umount()` pairs it with `wait_requests()` — this client's own
+not-yet-safe requests have to reach the journal before it walks away. It is the
+umount-side counterpart of §2.2.6's unsafe reply, and it goes out before the
+dirty caps are even flushed: `send_flush_mdlog` is the first thing
 `ceph_mdsc_pre_umount()` does to each session, ahead of
 `ceph_flush_dirty_caps()`.
 
 The MDS then journals the close exactly as it journaled the open — [`Server::handle_client_session()`](https://github.com/ceph/ceph/blob/v21.3.0/src/mds/Server.cc#L596)
 again, another [`ESession`](https://github.com/ceph/ceph/blob/v21.3.0/src/mds/events/ESession.h#L24), this time `open=false` — and [`Server::_session_logged()`](https://github.com/ceph/ceph/blob/v21.3.0/src/mds/Server.cc#L922) sends
-`MClientSession(close)` and calls [`SessionMap::remove_session()`](https://github.com/ceph/ceph/blob/v21.3.0/src/mds/SessionMap.cc#L756). 14 ms at line 68, again almost
-entirely the commit. [`ceph_monc_stop()`](https://github.com/torvalds/linux/blob/v7.2/net/ceph/mon_client.c#L1241) at line 69 closes the monitor session last, and that order
-matters in one direction: the MDS session has to be gone first, since losing the
-monitor means losing the ability to be told anything has moved.
+`MClientSession(close)` and calls [`SessionMap::remove_session()`](https://github.com/ceph/ceph/blob/v21.3.0/src/mds/SessionMap.cc#L756). 16 ms at line 68, again almost
+entirely the commit. [`ceph_monc_stop()`](https://github.com/torvalds/linux/blob/v7.2/net/ceph/mon_client.c#L1241) at line 69 closes the monitor session last. Nothing enforces
+that order — it falls out of the structure: `ceph_kill_sb` → `kill_anon_super`
+→ `ceph_put_super` → `close_sessions`, and only then `destroy_fs_client` →
+`ceph_destroy_client` → `ceph_monc_stop`. By that point the client wants no
+further map updates anyway.
 
-(Events 63–66, dropped here, are systemd unmounting its own credential mounts;
-the gaps in the `#` column are the only elisions in either excerpt.)
+(Both excerpts are abridged and the gaps in the `#` column mark it: §3.2 drops
+the mark line and events 38–47, §3.3 drops events 60–63 — systemd unmounting its
+own credential mounts — and both stop before the periodic `client_metrics` that
+fill the rest of the run. The `stat` promised in the intro is events 40–41, in
+neither excerpt.)
 
 ## 3.4 The shape of it
 
@@ -1319,8 +1345,8 @@ the gaps in the `#` column are the only elisions in either excerpt.)
 | MON | a 6-frame msgr2 handshake, then 8 messages: 2 subscribes and 6 map pushes | `statfs` + reply, 2 messages |
 | MDS | a second 6-frame handshake; `request_open` → `open`, then `getattr(/)` → reply — 4 messages | `request_flush_mdlog`, then `request_close` → `close` — 3 messages |
 | OSD (client's) | nothing | nothing |
-| OSD (MDS's) | 2 RADOS writes: the ESession entry and the journal header | the same 2, for the close |
-| cost | 22 ms, 16 of them that one ESession commit | 15 ms, 14 of them the matching commit |
+| OSD (MDS's) | 2 RADOS writes: the ESession entry (event 33) and the journal header (34) | 1: the entry only (event 67) — the header rewrite depends on journal state, not on the event |
+| cost | 15 ms, 11 of them that one ESession commit | 17 ms, 16 of them the matching commit |
 
 The symmetry is the point: open and close are the same operation with a boolean
 flipped, both journaled, both costing about the same. The monitor supplies
