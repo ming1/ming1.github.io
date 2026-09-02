@@ -1044,7 +1044,7 @@ how all of it is handed back. Same link convention as §2, same trace format, a
 different script. §2's opening table has a Client↔MON row it never took apart;
 this is where that happens: by message count a mount is mostly a conversation
 with the **monitor**, even though by time it is mostly one journal write. [`fsmount.bt`]({{ site.baseurl }}/code/ceph/fsmount.bt) is a separate
-script rather than a switch on `fsproto.bt` for a mechanical reason: bpftrace has
+script rather than a switch on [`fsproto.bt`]({{ site.baseurl }}/code/ceph/fsproto.bt) for a mechanical reason: bpftrace has
 no way to include a fragment, and folding in the monitor lane would also push its
 handful of *static* probe targets — one failed attach aborts a whole script — into
 every steady-state trace.
@@ -1084,7 +1084,7 @@ One traced window covers the whole lifecycle on one clock — mount, a `stat`, a
 umount — so §3.2 and §3.3 below are two halves of the same run. Five lanes:
 `vfs` is syscalls, `fs` is fs/ceph and libceph internals, `msgr2` the handshake
 stages, `cli.<global_id>` the messages, `mds` the server. (§2's `posix` lane was
-syscalls only; `fs` is the part `fsproto.bt` had no need of.)
+syscalls only; `fs` is the part [`fsproto.bt`]({{ site.baseurl }}/code/ceph/fsproto.bt) had no need of.)
 
 The whole lifecycle first, as one map — §3.2 walks the top half, §3.3 the
 bottom. Bracketed numbers are event numbers in the trace below:
