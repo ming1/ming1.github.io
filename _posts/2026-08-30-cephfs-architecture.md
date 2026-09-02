@@ -716,23 +716,29 @@ This is the second half of §2.3.5's truncate run — same file, already existin
 nothing unsafe pending, 4 KiB written and fsynced:
 
 ```
- 50 1024352 posix    dd           fsync(2)                      fd=1
- 51 1024382 cli.4168 dd           C->OSD osd_op                 tid=30 10000000200.00000000 pool=3 pg=3.19
+  #      us lane     thread       message                       detail
+ 35 1026213 posix    dd           fsync(2)                      fd=1
+ 36 1026270 cli.4168 dd           C->OSD osd_op                 tid=31 10000000200.00000000 pool=3 pg=3.19
                                                                  (hash 62465499) -> osd1 [write 0~4096
-                                                                 tseq=6/4096] WRITE|ONDISK ops=1 try=0
- 52 1045559 cli.4168 kworker/3:2  OSD->C osd_op_reply           tid=30 result=0 [write rval=0 outdata=0]
- 53 1045895 cli.4168 dd           C->MDS client_caps            flush ino=0x10000000200 seq=9
+                                                                 tseq=8/4096] WRITE|ONDISK ops=1 try=0
+ 37 1044325 cli.4168 kworker/5:1  C->OSD osd_op                 tid=31 10000000200.00000000 pool=3 pg=3.19
+                                                                 (hash 62465499) -> osd1 [write 0~4096
+                                                                 tseq=8/4096] WRITE|ONDISK ops=1 try=1
+ 38 1060897 cli.4168 kworker/5:0  OSD->C osd_op_reply           tid=31 result=0 [write rval=0 outdata=0]
+ 39 1060933 cli.4168 dd           C->MDS client_caps            flush ino=0x10000000200 seq=9
                                                                  caps=pAsxLsXsxFsxcrwb dirty=Fw
                                                                  wanted=pAsxXsxFxcwb size=4096
- 54 1045907 posix    dd           fsync(2)                      returned, 21555 us
- 58 1046709 mds      mds-log-subm Objecter::_op_submit          obj=200.00000001 pool=2
- 62 1067076 cli.4168 kworker/11:0 MDS->C client_caps            flush_ack ino=0x10000000200 seq=9
+ 40 1060957 posix    dd           fsync(2)                      returned, 34746 us
+ 44 1061448 mds      mds-log-subm Objecter::_op_submit          obj=200.00000001 pool=2
+ 46 1076468 cli.4168 kworker/2:0  MDS->C client_caps            flush_ack ino=0x10000000200 seq=9
                                                                  caps=pAsxLsXsxFsxcrwb wanted=- size=0/0 tseq=0
 ```
 
-The cap flush leaves at 1045895 and `fsync` returns **12 µs later**. The MDS
-had not even started its journal write (line 58, 1046709), and the `flush_ack`
-came back at 1067076 — 21 ms after the application was already running again.
+The cap flush leaves at 1060933 and `fsync` returns **24 µs later**. The MDS had
+not even started its journal write (line 44, 1061448), and the `flush_ack` came
+back at 1076468 — 15 ms after the application was already running again. (Line
+37 is the same op resent, `try=1`; the OSD had not answered within the client's
+timeout. It changes nothing about the shape.)
 
 So the honest version: **an fsync on CephFS costs one data commit, plus a
 second metadata commit only while some request on that inode is still unsafe.**
@@ -913,44 +919,57 @@ the MDS. The interlock is two fields carried in every extent op —
 them. `truncate -s 4096` on a 64 KiB file:
 
 ```
-  4    1437 posix    truncate     ftruncate(2)                  fd=3 len=4096
-  5    1452 cli.4168 truncate     C->MDS client_request         tid=58 op=setattr ino=0x10000000200 releases=1
-  7    2049 mds      ms_dispatch  Server::handle_client_request op=setattr
-  9    2490 cli.4168 kworker/0:2  MDS->C client_caps            revoke ino=0x10000000200 seq=7
+  #      us lane     thread       message                       detail
+  3    1910 posix    truncate     ftruncate(2)                  fd=3 len=4096
+  4    1928 cli.4168 truncate     C->MDS client_request         tid=62 op=setattr ino=0x10000000200 releases=1
+                                                                 [65536 -> 4096 mask=SIZE 0x20]
+  5    2164 mds      ms_dispatch  Server::handle_client_request op=setattr
+  7    2618 cli.4168 kworker/8:1  MDS->C client_caps            revoke ino=0x10000000200 seq=7
                                                                  caps=pAsxLsXsxFcb wanted=pAsxXsxFxcwb
-                                                                 size=0/4194304 tseq=5
- 10    2514 cli.4168 kworker/0:2  C->MDS client_caps            update ino=0x10000000200 seq=7
+                                                                 size=0/4194304 tseq=7
+  8    2645 cli.4168 kworker/8:1  C->MDS client_caps            update ino=0x10000000200 seq=7
                                                                  caps=pAsxLsXsxFcb dirty=Fxw wanted=pAsxXsxFxwb
                                                                  size=65536
- 12    3089 mds      ms_dispatch  Locker::_do_cap_update        journal size/mtime
- 19   20004 mds      mds-rank-fin Server::early_reply           unsafe reply
- 24   35534 mds      mds-rank-fin Objecter::_op_submit          obj=10000000200.00000000 pool=3
- 27   35692 cli.4168 kworker/11:0 MDS->C client_caps            trunc ino=0x10000000200 seq=8
+ 10    2756 mds      ms_dispatch  Locker::_do_cap_update        journal size/mtime
+ 16   21349 mds      mds-rank-fin Server::early_reply           unsafe reply
+ 22   41755 mds      mds-rank-fin Objecter::_op_submit          obj=10000000200.00000000 pool=3
+ 25   41966 cli.4168 kworker/5:1  MDS->C client_caps            trunc ino=0x10000000200 seq=8
                                                                  caps=pAsxLsXsxFscb wanted=pAsxXsxFxwb
-                                                                 size=4096/4194304 tseq=6
- 28   35699 cli.4168 kworker/11:0 MDS->C client_caps            grant ino=0x10000000200 seq=9
+                                                                 size=4096/4194304 tseq=8
+ 26   42067 cli.4168 kworker/5:1  MDS->C client_caps            grant ino=0x10000000200 seq=9
                                                                  caps=pAsxLsXsxFsxcrwb wanted=pAsxXsxFxwb
-                                                                 size=4096/4194304 tseq=6
- 29   35704 cli.4168 kworker/11:0 MDS->C client_reply           tid=58 op=setattr result=0 SAFE trace=[]
+                                                                 size=4096/4194304 tseq=8
+ 27   42135 cli.4168 kworker/5:1  MDS->C client_reply           tid=62 op=setattr result=0 SAFE trace=[]
 ```
 
-(Abridged; the gaps in the `#` column are the MDS-lane journal work.) Four
+(Abridged; the gaps in the `#` column are the MDS-lane journal work.) Five
 things worth pulling out:
 
-1. `ftruncate` is an `MClientRequest setattr`, not an OSD op — size is metadata,
-   and the client holding `Fx` must hand that authority back first (line 9's
-   revoke, line 10's `dirty=Fxw size=65536`).
-2. **Line 24: the MDS writes to the data pool.** [`MDCache::truncate_inode()`](https://github.com/ceph/ceph/blob/v21.3.0/src/mds/MDCache.cc#L6526) →
-   `_truncate_inode()` → `Filer::truncate()` issues the object truncate itself,
-   through the MDS's own Objecter, on
-   `10000000200.00000000` in pool 3. The MDS is off the *client's* data path,
-   which is not the same as never touching data objects — it also writes inode
-   backtraces there.
-3. `client_caps(trunc)` (line 27) is the notification: new `size=4096` and
-   `tseq` stepped from 5 to **6**. The MDS's own op is `trimtrunc`, whose whole
-   purpose is to carry that sequence to the object (`Filer.cc:534`).
-4. The next write to that file — line 51 of §2.2.6's second excerpt, the same
-   run a second later — carries `tseq=6/4096`: the new sequence and the new
+1. **The new size travels up in the request, not in a cap message.** Line 4 is
+   an `MClientRequest setattr`, and `[65536 -> 4096 mask=SIZE]` is its args
+   union decoded — `ceph_setattr()` fills `args.setattr.size` with the new
+   size, `old_size` with the current one, and sets `CEPH_SETATTR_SIZE` in the
+   mask ([`inode.c:2803`](https://github.com/torvalds/linux/blob/v7.2/fs/ceph/inode.c#L2803)).
+   The `releases=1` on the same line is from the same code path: the client
+   attaches a cap release for `Fsxrw` in the very message that asks for the
+   truncate.
+2. Size is metadata, so `ftruncate` cannot be an OSD op, and the client holding
+   `Fx` has to hand that authority back first — line 7's revoke, line 8's
+   `dirty=Fxw size=65536`. Note *which* size that is: 65536, the old one. A cap
+   flush reports what the file **was**; it is not how the client asks for 4096.
+3. **Line 22: the MDS writes to the data pool.** [`MDCache::truncate_inode()`](https://github.com/ceph/ceph/blob/v21.3.0/src/mds/MDCache.cc#L6526) →
+   `_truncate_inode()` → [`Filer::truncate()`](https://github.com/ceph/ceph/blob/v21.3.0/src/osdc/Filer.cc#L518) issues the object truncate itself,
+   through the MDS's own Objecter, on `10000000200.00000000` in pool 3. The MDS
+   is off the *client's* data path, which is not the same as never touching data
+   objects — it also writes inode backtraces there.
+4. `client_caps(trunc)` (line 25) is how 4096 comes back **down**: new
+   `size=4096` and `tseq` stepped from 7 to **8**. That is the whole reason the
+   op exists — a size the client did not choose has to reach it somehow, along
+   with the sequence it must now stamp on every extent op. The MDS's own op is
+   `trimtrunc`, whose job is to carry that sequence to the object
+   ([`Filer.cc:534`](https://github.com/ceph/ceph/blob/v21.3.0/src/osdc/Filer.cc#L534)).
+5. The next write to that file — line 36 of §2.2.6's second excerpt, the same
+   run a second later — carries `tseq=8/4096`: the new sequence and the new
    ceiling, on every extent op from now on. Elsewhere in this post you see
    `tseq=1/-1` instead: sequence 1, no truncate ever, `truncate_size` =
    `(u64)-1`.

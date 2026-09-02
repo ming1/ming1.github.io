@@ -32,6 +32,18 @@
  * some of those refuse to attach.
  */
 
+/* union ceph_mds_request_args_ext is anonymous *and* inside a packed struct,
+ * so bpftrace can neither walk it nor mirror it with 8-byte members.  Every
+ * field here is 4 bytes, which makes natural alignment reproduce the packed
+ * layout exactly; the two 64-bit values are read as halves and rejoined.
+ * Offsets confirmed against the ceph module's BTF: args at byte 42 of
+ * ceph_mds_request_head, and within it size@28, old_size@36, mask@44. */
+struct fsp_setattr {
+  unsigned int mode, uid, gid;
+  unsigned int mtime_sec, mtime_nsec, atime_sec, atime_nsec;
+  unsigned int size_lo, size_hi, old_size_lo, old_size_hi, mask;
+};
+
 /* The kernel's ceph_osd_req_op keeps the extent fields in an anonymous
  * union, which bpftrace cannot walk.  This mirrors the struct's prefix
  * exactly -- natural alignment puts the union at +24 -- so the extent
@@ -193,7 +205,23 @@ kfunc:libceph:ceph_con_send
   $m = args.msg; $t = $m->hdr.type;
   $g = args.con->msgr->inst.name.num;            /* this client's global id */
 
-  if ($t == 24) {                                /* MClientRequest */
+  if ($t == 24 && ((struct ceph_mds_request_head *)$m->front.iov_base)->op
+                  == 0x1108) {                 /* MClientRequest: setattr */
+    $h = (struct ceph_mds_request_head *)$m->front.iov_base;
+    $sa = (struct fsp_setattr *)((uint64)$m->front.iov_base + 42);
+    $mk = $sa->mask;
+    printf("%10lld %7d  cli.%-5lld %-15s %-27s tid=%lld op=setattr ino=0x%llx releases=%d [%llu -> %llu mask=%s%s%s%s%s%s%s%s0x%x]\n",
+      (nsecs-@t0)/1000, tid, $g, comm, "C->MDS client_request",
+      $m->hdr.tid, @rino[tid], $h->num_releases,
+      ((uint64)$sa->old_size_hi << 32) | $sa->old_size_lo,
+      ((uint64)$sa->size_hi << 32) | $sa->size_lo,
+      ($mk & 0x1) ? "MODE " : "",  ($mk & 0x2) ? "UID " : "",
+      ($mk & 0x4) ? "GID " : "",   ($mk & 0x8) ? "MTIME " : "",
+      ($mk & 0x10) ? "ATIME " : "", ($mk & 0x20) ? "SIZE " : "",
+      ($mk & 0x40) ? "CTIME " : "", ($mk & 0x400) ? "KILL_SGUID " : "",
+      $mk);
+    delete(@rpath[tid]); delete(@rino[tid]);
+  } else if ($t == 24) {                         /* MClientRequest */
     $h = (struct ceph_mds_request_head *)$m->front.iov_base;
     if (@rpath[tid] != "") {
       printf("%10lld %7d  cli.%-5lld %-15s %-27s tid=%lld op=%s /%s releases=%d\n",
