@@ -1442,9 +1442,47 @@ Shard 2 is the control case: one window, no cut inside it, so no spanning
 record. Its leading record also carries the absolute gap of §7.2,
 `c3 01` = 0x30000.
 
-One encoding detail the walk adds: back-references grow with the index of
-the record they point at, from `15 0b` through `95 02 0b` to `c5 01 0b`,
-while a spanning reference stays two bytes whatever the shard.
+Each record above is one `blobid_field` (§6.3) plus whatever its flags did
+not suppress. Unpacked, with `k` = `varint >> 4` and C/Z/L for
+CONTIGUOUS/ZEROOFFSET/SAMELENGTH:
+
+| Record | Bytes | varint | k | flags | blob_offset | Resolves to |
+|---|---|---|---|---|---|---|
+| s0 `[ 0]` | `03 07 0f …` | 3 | 0 | C, Z | 0 | defines head blob → `blobs[0]` |
+| s0 `[ 1]` | `05 07 10 …` | 5 | 0 | C, L | 0x1000 | defines shared 61441 → `blobs[1]` |
+| s0 `[ 2]` | `15 0b` | 21 | 1 | C, L | 0x2000 | `blobs[0]`, record `[0]` |
+| s0 `[16]` | `07 05 f6 0b …` | 7 | 0 | C, Z, L | 0 | defines h1a → `blobs[16]` |
+| s0 `[18]` | `95 02 0b` | 277 | 17 | C, L | 0x2000 | `blobs[16]`, record `[16]` |
+| s1 `[ 0]` | `08 57 17 07` | 8 | — | SPANNING | 0x5000 | spanning id 0, gap 0x15000 |
+| s1 `[13]` | `c5 01 0b` | 197 | 12 | C, L | 0x2000 | `blobs[11]`, record `[11]` |
+
+Two-byte varints unpack as usual — `95 02` is `(0x95 & 0x7f) | (0x02 << 7)`
+= 277, so k = 17 and flags = 5 — and every `blob_offset` here is
+`varint_lowz` (§1): `0b` strips 3 nibbles, `0x0b >> 2` = 2, `2 << 12` =
+0x2000, which is where block 18 sits inside h1a (blob start, block 16).
+The decoder's table is indexed by extent position, not by blob:
+`consume_blob()` does `blobs.resize(extent_no + 1); blobs[extent_no] = b`,
+and `consume_blobid()` reads `blobs[k - 1]`
+([`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc)).
+
+Only records `[0]` and `[16]` of shard 0 start at a blob start, so nearly
+every reference pays one `blob_offset` byte, while CONTIGUOUS and
+SAMELENGTH suppress the gap and the length everywhere except each shard's
+first record. The reference itself is one byte while `k << 4 < 128` — that
+is `k ≤ 7`, a definition in records `[0]`–`[6]` — and two bytes from
+record `[7]` on:
+
+```
+15 0b      2 B   -> [0]     k = 1
+95 02 0b   3 B   -> [16]    k = 17
+c5 01 0b   3 B   -> [11]    k = 12
+0d 07      2 B   -> spanning id 0, flat whatever the shard
+```
+
+Counting extents rather than blobs also makes the ordinal sparse: shard
+1's twelfth blob-defining record is `[11]`, where a blob-ordinal scheme
+would have written k = 3 in one byte. The fourteen references in shard 1
+that point past record `[7]` cost it 14 bytes of its 583.
 
 Only one of the object's nine blobs has an id. `Blob::is_spanning()` is
 `id >= 0` ([`src/os/bluestore/BlueStore.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h)),
@@ -1480,11 +1518,11 @@ in no shard.
 The eight spanning records in that listing decode from two flag bytes.
 `0x0d` = CONTIGUOUS | SAMELENGTH | SPANNING with id `0x0d >> 4` = 0, so a
 single `varint_lowz` blob_offset byte completes the record — two bytes in
-all. Shard 1's first record instead carries `0x08`, SPANNING alone, and
-therefore spells out gap 0x15000 (absolute, since a shard's decode
-position starts at 0), blob_offset 0x5000 and length 0x1000. Block
-numbers convert to the logical offsets of §6.3 as block × 4096, so
-`[17]` at block 17 is logical 0x11000.
+all. Shard 1's first record instead carries `0x08`, SPANNING alone, so it
+spells out all three optional fields (table above); its gap is absolute
+because a shard's decode position starts at 0. Block numbers convert to
+the logical offsets of §6.3 as block × 4096, so `[17]` at block 17 is
+logical 0x11000.
 
 The `X` record for `sbid` 61442 (§5.5), key `BE u64` 0x000000000000f002:
 
