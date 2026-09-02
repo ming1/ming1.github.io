@@ -1278,10 +1278,45 @@ Both ends run the same state machine, one step apart —
 
 The two `"journaling ..."` strings are the MDS's own comments on those enum
 values. That is the 11 ms between lines 32 and 35, and the reason a mount is not
-instant: **the MDS will not admit a client it has not recorded durably**, because
-after a restart it must know who was holding what. Session open and close are the
-only client-driven operations in this post that are journaled *synchronously* —
-§2.2.6's create deliberately does the opposite.
+instant: **the MDS will not admit a client it has not recorded durably.**
+
+**What the journal write is for.** The `SessionMap` is a *persisted, versioned*
+table, and the journal is what carries its updates forward — an
+[`ESession`](https://github.com/ceph/ceph/blob/v21.3.0/src/mds/events/ESession.h#L24) is the
+write-ahead record for one version bump of it. Every field in the event exists
+to be replayed:
+
+| Field | Why it is in the record |
+|---|---|
+| `client_inst` | which client, by entity name and address |
+| `open` | one event type for both directions; a close is the same record with this false |
+| `cmapv` | the `SessionMap` version this event produces — replay is gated on it |
+| `client_metadata` | hostname, kernel version, entity id, mount root — restored so `session ls` and eviction still identify the client |
+| `auth_name` | the cephx identity, "to allow journal recreated session to be reclaimed" |
+| `inos_to_free`, `inotablev` | on close, the client's unused preallocated inode ranges, returned to the `InoTable` at that version |
+| `inos_to_purge` | inodes the closing session leaves for the purge queue |
+
+[`ESession::replay()`](https://github.com/ceph/ceph/blob/v21.3.0/src/mds/journal.cc#L1881) is the only
+consumer, and it is idempotent by version: `>= cmapv` is a no-op, and it asserts
+`version + 1 == cmapv`, so the journal has to be a contiguous version sequence.
+On an open it does `get_or_add_session()`, `set_state(STATE_OPEN)` and restores
+the metadata and auth name — after replay the rank *has* the session again, in
+the state the client believes it to be. On a close it removes the session and
+hands the preallocated inodes back.
+
+**What would break without it.** The `open` reply is the client's licence to
+hold caps. If the MDS answered before the record was durable and then restarted,
+the client would come back believing in a session the rank has no trace of — and
+`Server::handle_client_reconnect()` answers an unknown client with
+`MClientSession(REJECT)` and `error_string = "sessionless"`. The rest of the
+persisted `session_info_t` is the same argument in detail: `completed_requests`
+maps a request tid to the inode it created, which is how a replayed `create` is
+recognised instead of making a second file, and `prealloc_inos` is the range this
+client may allocate from — forget either and a restarted rank can hand the same
+ino to two clients.
+
+Session open and close are the only client-driven operations in this post that
+are journaled *synchronously*; §2.2.6's create deliberately does the opposite.
 
 **Lines 36–37, the first metadata operation.** [`ceph_real_mount()`](https://github.com/torvalds/linux/blob/v7.2/fs/ceph/super.c#L1148) finishes through
 [`open_root_dentry()`](https://github.com/torvalds/linux/blob/v7.2/fs/ceph/super.c#L1055), which issues a plain `getattr` on the subdirectory from the device
