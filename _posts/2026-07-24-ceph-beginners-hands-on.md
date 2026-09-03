@@ -2716,6 +2716,60 @@ Supporting cast, off the data path: `osd_srv_heartbt` plus dedicated
 heartbeat messengers (peer liveness, §10.5), `safe_timer` (timeouts),
 `rocksdb:low` (compaction).
 
+**How many of each.** The diagram names the groups; the counts fall out
+of config, resolved once at OSD startup. For a **non-rotational** store
+— `rotational=0`, every OSD in an all-flash cluster — at stock settings:
+
+| Thread | Count | Sized by |
+|---|---|---|
+| `msgr-worker-N` | 3 | `ms_async_op_threads`, **per process** |
+| `ms_dispatch` | 7 | one per messenger |
+| `ms_local` | 7 | one per messenger |
+| `tp_osd_tp` | **16** | `osd_op_num_shards_ssd` 8 × `..._threads_per_shard_ssd` 2 |
+| `bstore_aio` | 2 | one per `KernelDevice` |
+| `bstore_kv_sync` | 1 | fixed |
+| `bstore_kv_final` | 1 | fixed |
+| `cfin` | 1 | fixed (BlueStore commit finisher) |
+| `bstore_discard` | 0 | `bdev_async_discard_threads`, 0 by default |
+
+Three of those repay a second look.
+
+**The device class picks your op-thread count, and the fork is wide.**
+`OSD::get_num_op_threads()` reads `store_is_rotational`, set once at
+construction from `ObjectStore::is_rotational()`, and branches:
+
+```
+rotational=0 →  osd_op_num_shards_ssd 8 × threads_per_shard_ssd 2  = 16
+rotational=1 →  osd_op_num_shards_hdd 1 × threads_per_shard_hdd 5  =  5
+```
+
+Same binary, same config file, three times the op concurrency on flash.
+Both knobs also have unsuffixed forms (`osd_op_num_shards`,
+`osd_op_num_threads_per_shard`); they default to `0`, meaning "use the
+device-class value", and setting either one overrides *both* classes.
+This is the other reason the vstart device-class warning in §9.4
+matters: misdetect the class and you are measuring a 5-thread OSD.
+
+**The messenger workers are per process, not per messenger.** An OSD
+builds seven messengers, but `AsyncMessenger` pulls its `NetworkStack`
+from a CephContext singleton — so all seven share the same three event
+loops. The seven `ms_dispatch` threads do exist, one per messenger, but
+client ops never reach them: those take `ms_fast_dispatch` on the worker
+thread itself (§10.3), leaving the dispatch threads to slow-path traffic
+like MON and MGR messages.
+
+**One `bstore_kv_sync` per OSD.** Every KV commit in the process funnels
+through a single thread. It is seldom the bottleneck — sub-millisecond
+on NVMe — but it is the narrowest point on the write path, worth
+remembering before adding OSDs per host to chase parallelism.
+
+Config tells you what *should* exist; only the OS tells you what does:
+
+```bash
+ceph daemon osd.0 config show | grep -E 'osd_op_num_(shards|threads)|ms_async_op_threads'
+top -H -p $(pidof ceph-osd | cut -d' ' -f1)     # or: ps -T -p <pid>
+```
+
 ## 10.2 Shards: the queue in front of every PG
 
 ```
