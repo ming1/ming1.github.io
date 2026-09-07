@@ -1,7 +1,7 @@
 ---
 title: "Ceph Tracker Notes"
 category: storage
-tags: [ceph, bluestore, bluefs, tracker, debugging, wal, ebpf, network, tcp, checksum, clone, libaio, containers]
+tags: [ceph, bluestore, bluefs, tracker, debugging, wal, ebpf, network, tcp, checksum, clone, libaio, containers, osd, messenger, throttle, mclock, latency]
 ---
 
 * TOC
@@ -2454,3 +2454,368 @@ With the shim standing in for the noble policy:
   assertion that reported it, and by the time it surfaced it was an integer.
   Probing before the fork is not just tidier — it is the only place a
   diagnosis can be printed.
+
+# 9. One hot op-queue shard freezes the whole OSD — `osd_client_message_cap` as a cluster-wide stall amplifier
+
+Found in two field diagnostics collections of a 4K random-read benchmark,
+not a bug report · affects any replicated pool under a high-IOPS,
+many-client workload · component OSD (AsyncMessenger throttle,
+ShardedOpWQ, mClock) · fix: configuration today, a fairer admission
+control upstream · Status: chain measured on two dates with two different
+victim OSDs; mitigation not yet applied on the cluster; upstream ticket and
+PR pending
+
+A 6-node ARM64 cluster (Ceph 20.2.2, 8 NVMe OSDs per node, 3× replication,
+6 fio hosts driving 4 KiB random reads over librbd at iodepth 256) was
+expected to deliver 3.0 M read IOPS and delivered 2.1 M on the first day
+and 1.9 M on the second. The cluster is not busy: the drives answer a read
+in 120 µs, the shard threads are about a third utilised, and the network
+is clean. One OSD at a time is frozen, and every client waits for it.
+
+Every figure below comes from `ceph-collect` snapshots taken while fio ran
+(perf-counter deltas between two snapshots, `dump_ops_in_flight`,
+`dump_historic_ops`, `messenger dump --tcp-info`, `pg dump`). Source
+references are to the `tentacle-dev` tree at `20a5b81442e`.
+
+## 9.1 Report
+
+### 9.1.1 The observation
+
+Day two, taken at 15:41:17 while the reads ran (1.92 M op/s):
+
+| | osd.32 | median of the other 46 OSDs |
+|---|---|---|
+| read latency (`op_r_latency`, window average) | **8,338 µs** | 130 µs |
+| of which: preamble received → op enqueued (`op_before_queue_op_lat`) | 2,268 µs | 30–100 µs |
+| of which: enqueued → dequeued with PG lock (`op_before_dequeue_op_lat` − above) | 5,984 µs | 20–60 µs |
+| of which: processing incl. the NVMe read (`op_r_process_latency`) | 142 µs | 95 (drive A) / 144 (drive B) µs |
+| device wait (`read_wait_aio_lat`) | 119 µs | 73 / 121 µs |
+| ops inside the OSD at the snapshot | **246** | 8 |
+| queued for PG | 238, **all on shard 5**, spread over all 13 of that shard's primary PGs | — |
+| client connections in `THROTTLE_MESSAGE` | **90 of 91** | 0 |
+| throttle waits > 1 s among the 20 slowest ops of the last 10 min | 20, each 1.5–2.2 s | 0 |
+
+The drive is idle-fast; 8 ms is spent waiting *in front of* it. Day one
+showed the same shape on a different OSD (osd.38: 239 of 243 connections
+throttled, 251 ops queued on shard 0, waits of 2.6–3.9 s, 12 ms read
+latency). Between the two days that OSD had been marked `out` and the pool
+recreated — the freeze simply moved.
+
+### 9.1.2 Reproducing it — or rather, catching it
+
+There is no reproducer beyond "run enough 4 KiB reads at enough clients";
+the signature is what to look for. On a live OSD:
+
+```bash
+# 1. where are the queued ops?  PG -> shard is  ps % osd_op_num_shards  (8)
+ceph daemon osd.N dump_ops_in_flight | jq -r '.ops[] | select(.type_data.flag_point=="queued for pg")
+   | .description' | sed -E 's/.* [0-9]+\.([0-9a-f]+) .*/\1/' | while read ps; do echo $((16#$ps % 8)); done | sort | uniq -c
+
+# 2. is the client message throttle exhausted?
+ceph daemon osd.N messenger dump client | jq '[.messenger.connections[].async_connection.protocol.v2.state]
+   | group_by(.) | map({(.[0]): length}) | add'
+
+# 3. how long did the slowest ops wait at the throttle?  (header_read -> throttled)
+ceph daemon osd.N dump_historic_ops | jq -r '.ops[].type_data.events | map({(.event): .time}) | add
+   | "\(.header_read) \(.throttled)"'
+
+# 4. per-shard queue depth without parsing ops
+ceph daemon osd.N perf dump | jq '. | with_entries(select(.key|startswith("mclock-shard-queue")))
+   | map_values(.mclock_client_queue_len)'
+```
+
+A frozen OSD answers: one shard owning nearly all queued ops, nearly all
+connections in `THROTTLE_MESSAGE`, and slowest ops whose entire duration
+sits between `header_read` and `throttled`. Offline, the two collections
+were analysed with two scripts (`gen_cluster_report.py`,
+`gen_4k_randread_report.py`) that compute the tables above from any pair of
+`ceph-collect` snapshots.
+
+## 9.2 Analysis
+
+### 9.2.1 Root cause, top to bottom
+
+```
+cluster delivers 1.9 M instead of 3.0 M read IOPS
+ └─ why?   every fio session has ops parked at osd.32; with a fixed
+           iodepth those ops are queue depth the whole cluster loses
+ └─ why parked?
+           osd.32 stopped reading its client sockets: 90 of 91
+           connections in THROTTLE_MESSAGE, i.e. waiting for a slot of
+           osd_client_message_cap = 256            (ProtocolV2.cc:1593)
+ └─ why no slots?
+           246 ops were inside the OSD, 238 of them queued on shard 5;
+           a slot is held from admission until the op is finished
+           (OpRequest::_unregistered -> release_message_throttle)
+ └─ why does one shard hold all of them?
+           ops for the other 7 shards finish in ~150 µs and hand their
+           slot back at once; ops for shard 5 sit in its queue for tens
+           of ms — the slots migrate to the slow shard by themselves
+ └─ why is shard 5 slow?
+           PG -> shard is  ps % 8  (osd_types.h:633).  13 of osd.32's 43
+           primary PGs hash to shard 5: 30 % of its reads on 2 of its
+           16 threads.  Reads are synchronous (objects_read_sync ->
+           store->read), so capacity = 2 / 142 µs = 14.1 K/s against
+           12.3 K/s offered: 87 % utilisation before any disturbance
+ └─ why 142 µs?
+           this drive model (B) answers in 121 µs vs 73 µs for the other
+           model (A) in the same cluster; a model-A OSD with an even
+           worse skew (osd.11, 14 of 44) runs at 69 % and never freezes
+```
+
+Each level was measured before going down: the client idle times, the
+messenger connection states, the in-flight dump by shard, the PG map, the
+per-OSD process latency, the device wait per drive model.
+
+### 9.2.2 The two waits, in the code
+
+A read's time inside the OSD is stamped at four points. The picture is
+worth keeping in mind because the two counters in §9.1.1 both start at the
+first stamp, and the second one *includes* the PG lock:
+
+```
+  socket                messenger worker thread                   shard thread
+  ──────  ──────────────────────────────────────────  ─────────────────────────────────
+  32-byte preamble read ─┐
+                         │ recv_stamp                (ProtocolV2.cc:1168)
+   [A] wait for a slot   │  throttle_message(): get_or_fail on the ONE
+       of the message    │  throttler shared by all client connections;
+       throttle          │  on failure arm a 5 ms timer and move on
+                         │                            (ProtocolV2.cc:1584-1610)
+       read body, decode │ throttle_stamp
+       ms_fast_dispatch  │  create tracked op, enqueue_op()
+                         │  -> shard_lock, mClock enqueue, wake a thread
+                         └─ op_before_queue_op_lat  = now − recv_stamp   (OSD.cc:9874)
+                                                                   ┌─ [B] wait in the shard's
+                                                                   │      mClock queue for one
+                                                                   │      of its 2 threads
+                                                                   │  dequeue(), drop shard_lock,
+                                                                   │  pg->lock()      (OSD.cc:11217)
+                                                                   └─ op_before_dequeue_op_lat
+                                                                      = now − recv_stamp (OSD.cc:9924)
+                                                                      do_op -> do_read ->
+                                                                      objects_read_sync -> store->read
+                                                                      (aio submit + wait, 119 µs)
+                                                                      reply; op destroyed;
+                                                                      release_message_throttle()
+```
+
+**[A] preamble → enqueue.** Three things can stretch it.
+
+- *The throttle.* One `Throttle` per messenger, capacity 256, shared by
+  every client connection of the OSD. Admission is `get_or_fail()`
+  (`Throttle.cc:187`): no queue of waiters, no order. A connection that
+  fails arms one timer for `ms_client_throttle_retry_time_interval`
+  (5 ms) and the worker serves other connections; a connection that
+  succeeds reads its next message and asks again immediately. The body of
+  a throttled message is not read, so it stays in the kernel socket
+  buffer; when that fills, the client's TCP window closes and the client
+  itself stalls. The slot is returned only when the op is finished
+  (`OpRequest::_unregistered()`, `OpRequest.cc:96`).
+- *The worker's own queue.* Each `AsyncMessenger` worker is one event loop
+  doing socket reads, decoding and `ms_fast_dispatch` for ~30 client
+  connections plus cluster and heartbeat sockets. This cluster runs 3
+  workers per OSD (5 configured, never restarted) and they were busy
+  50–70 % of the time during the read run, so a frame routinely waits
+  behind other connections' work. That is the 30–100 µs seen on healthy
+  OSDs.
+- *`shard_lock` at enqueue* (`OSD.cc:11413`). Three workers push into a
+  shard whose two threads take the same lock on every dequeue; cheap while
+  the queue is short, less so at 250 entries.
+
+**[B] enqueue → dequeue.** `ShardedOpWQ::_process` (`OSD.cc:11075`):
+the two threads of a shard sleep on a condition variable while the queue
+is empty; otherwise a thread takes `shard_lock`, asks dmclock for the next
+item, releases the lock, takes the PG lock, and only then stamps the
+counter.
+
+- *Arrivals above two synchronous threads.* The read runs on the shard
+  thread itself, blocked in `store->read()` until the NVMe answers. So a
+  shard serves at most `threads / process_latency` reads per second, and
+  the queue grows the moment offered load exceeds that. This is the whole
+  story on osd.32; the OSD's other 14 threads were mostly idle.
+- *PG lock inside the shard.* If both threads dequeue ops for the same PG
+  the second waits the full read time. With 13 PGs on the shard and
+  dmclock interleaving clients this costs a few percent of capacity, but
+  it lands in this counter, not in `op_r_process_latency`.
+- *mClock's "future" sleep.* `mClockScheduler::dequeue()` returns a time
+  instead of an item when every ready request is past its limit tag, and
+  the thread sleeps until then ("dequeue future request",
+  `OSD.cc:11159`). With the `balanced` profile the client class has
+  reservation 50 %, weight 1 and limit 0 = unlimited
+  (`mClockScheduler.cc:341`), and there was no recovery traffic, so this
+  path cannot trigger here. It is the first suspect whenever [B] grows on
+  an OSD that is *not* saturated — a custom profile or a low measured
+  capacity (`osd_mclock_max_capacity_iops_ssd`, 45,810 here, split 8 ways
+  per shard) would enable it.
+- *Thread lateness.* The dequeuing thread has to be scheduled; on day one
+  the victim OSD was pinned to a NUMA node that ran every thread late
+  (155 µs process time on the same drive model that takes 142 µs
+  elsewhere). Not the case on day two.
+
+### 9.2.3 How [B] on one shard becomes [A] for everyone
+
+The message throttle does not know about shards. In steady state its 256
+slots are spread over the 8 shards in proportion to how long each shard
+keeps an op. Slow one shard down and the slots flow to it:
+
+```
+   256 slots, 8 shards            shard 5 backs up             throttle exhausted
+   ─────────────────────          ─────────────────            ──────────────────
+   sh0 ▮▮                         sh0 ▮                        sh0
+   sh1 ▮▮                         sh1 ▮                        sh1
+   sh2 ▮▮▮        each op         sh2 ▮        shard-5 ops     sh2      238 of 246
+   sh3 ▮▮         holds a slot    sh3 ▮        hold slots for  sh3      slots are
+   sh4 ▮▮         ~150 µs         sh4 ▮        ~20 ms          sh4      shard-5 ops;
+   sh5 ▮▮                         sh5 ▮▮▮▮▮▮▮▮▮▮▮▮             sh5 ▮▮▮▮▮▮▮▮▮▮▮▮▮▮▮▮▮▮▮▮▮▮▮▮
+   sh6 ▮▮                         sh6 ▮                        sh6      7 idle shards,
+   sh7 ▮▮                         sh7 ▮                        sh7      91 sockets unread
+```
+
+Once the slots are gone, every connection polls every 5 ms with no queue
+discipline. The ops that lose are not shard-5 ops but the ops that would
+have been fast: the 20 slowest ops on osd.32 were all for shards 1 and 2,
+waited 1.5–2.2 s at the throttle, and completed in under a millisecond
+once admitted.
+
+```
+   connection A  ──get_or_fail── fail ── sleep 5 ms ── fail ── sleep ── fail ── …  (2 s)
+   connection B  ──get_or_fail── ok ─ read ─ ok ─ read ─ ok ─ read ─ ok ─ …        (hogs)
+                                   ▲ a slot freed by a finishing shard-5 op is taken by
+                                     whichever connection happens to ask next
+```
+
+And from the clients' side: every fio session touches every OSD, every
+session has ops parked at osd.32, and iodepth is fixed. The cluster's
+offered load falls, shard 5 drains, the clients refill in a burst, shard 5
+backs up again. On day two the 20 retained waits spanned 38 s; on day one
+the victim had at least 58 s of freeze in a 508 s span (a lower bound —
+only 20 ops are kept).
+
+### 9.2.4 Why this OSD, and why a different one the next day
+
+Ranking every OSD by the utilisation of its busiest shard —
+`per-OSD IOPS × primary share ÷ (2 ÷ op_r_process_latency)` — reproduces
+the straggler list exactly:
+
+| OSD | drive | primaries on busiest shard | process µs | utilisation | read latency µs | connections throttled |
+|---|---|---|---|---|---|---|
+| 32 | B | 13 / 43 | 142 | **0.87** | 8,338 | 90 |
+| 42 | B | 11 / 44 | 157 | 0.80 | 2,365 | 0 |
+| 44 | B | 11 / 43 | 151 | 0.79 | 411 | 0 |
+| 25 | B | 11 / 41 | 143 | 0.78 | 233 | 0 |
+| 11 | A | **14 / 44** | 107 | 0.69 | 180 | 0 |
+| median | | | | 0.44 | | |
+
+osd.11 is the control: worse skew, faster drive, no problem. Neither the
+skew nor the drive model freezes an OSD alone; their product does. On day
+one osd.32 itself had 7 of 43 primaries on its busiest shard (51 %) and
+was healthy, while osd.38 — same host, same drive model, same NUMA node
+for the drive — had 11 of 40 (94 %) and froze. Marking osd.38 out and
+recreating the pool re-rolled the PG map and handed the worst shard to
+osd.32. The hot spot follows the map, not the hardware.
+
+### 9.2.5 What was ruled out
+
+- **Network.** On every socket of every OSD, both days: `tcpi_retransmits`,
+  `tcpi_backoff`, `tcpi_lost`, `tcpi_retrans` all 0; RTO at the 200 ms
+  floor; at most 3 unacked segments; the victim's client sockets identical
+  to its neighbours' except for holding fewer replies in flight. The
+  cluster network does lose packets under replication load (§6), but reads
+  never touch it.
+- **The drive.** 119 µs device wait on the victim, the same as every other
+  model-B OSD; the 8 ms is queueing in front of it.
+- **A hot PG or object, scrub, recovery.** The 238 queued ops covered all
+  13 PGs of the shard evenly; all PGs `active+clean`.
+- **NUMA on day two.** The victim ran on the node its drive attaches to.
+- **The clients.** 35 sessions in the queue, at most 16 ops each; a balanced
+  read policy had been configured but in the wrong section (`osd`), so no
+  client used it — reads went to primaries only, as the shard math assumes.
+
+## 9.3 Proposed solution
+
+### 9.3.1 Mitigations, in the order they act
+
+Both apply at runtime, no restart:
+
+```bash
+ceph config set osd osd_client_message_cap 4096                 # or 0: uncapped
+ceph config set osd ms_client_throttle_retry_time_interval 1000
+```
+
+The first stops a queue on one shard from taking the other seven hostage:
+with the cap far above any one shard's plausible backlog, a slow shard
+costs 1/8 of one OSD instead of a whole OSD and every client. The second
+shortens the starvation rounds while any throttling remains. Then take the
+utilisation down on the shard that backs up:
+
+- `osd_op_num_threads_per_shard_ssd = 4` (restart): halves the utilisation
+  of every shard on every OSD, 87 % → 44 % on the worst one.
+- A larger `pg_num`: flattens the per-shard primary skew, which is the
+  variance of a small sample (43 primaries into 8 buckets).
+- Restart the OSDs anyway: the messenger gets the 5 workers already in the
+  config, which lowers [A] everywhere.
+
+The memory cost of a larger cap is bounded by the byte throttle
+(`osd_client_message_size_cap`, 500 MB), which stays in place.
+
+### 9.3.2 What a code fix would look like
+
+The configuration hides the amplifier; it does not remove it. Three
+candidate changes, cheapest first:
+
+1. **Make the throttle wait fair.** Keep `get_or_fail()` non-blocking for
+   the worker, but queue failed connections and hand freed slots to the
+   head of that queue instead of to whichever poll lands first. Bounded
+   worst-case wait, no 5 ms polling storm (90 connections × 200 wakeups/s
+   on 3 workers during a freeze).
+2. **Charge the cap per shard.** Admission is at the messenger, but the
+   destination shard is known at `enqueue_op`; a per-shard budget (cap / 8,
+   or a cap that only counts ops *queued*, not ops *running*) keeps one
+   shard's backlog from consuming the others' admission.
+3. **Release the message throttle at enqueue.** The op is already
+   bounded by the shard queue once it is in it; holding the messenger slot
+   until completion conflates admission control with queue depth. The byte
+   throttle would still cap memory.
+
+Any of the three turns the observed behaviour from "one shard at 87 %
+stalls the cluster" into "one shard at 87 % has 20 ms latency".
+
+### 9.3.3 Validation
+
+Not yet done on the cluster — none of the settings had been applied
+between the two collections. The measurement plan for the next run, so
+that the outcome is not a matter of opinion:
+
+| signal | today | expected after 9.3.1 |
+|---|---|---|
+| connections in `THROTTLE_MESSAGE` at any snapshot | 90 of 91 on the victim | 0 |
+| `header_read → throttled` among the 20 slowest ops | 1.5–3.9 s | < 5 ms |
+| `op_before_queue_op_lat` on the victim | 2.3 ms | < 100 µs |
+| `mclock_client_queue_len` of the hot shard | 252 | < 50 with 4 threads |
+| cluster read IOPS | 1.9–2.1 M | to be measured; the arithmetic says the 30 % gap is this |
+
+Collect twice *inside* the fio run (about 2 min after start and 1 min
+before the end) so the counter window holds nothing but the workload and
+`dump_historic_ops` covers 600 s of it.
+
+### 9.3.4 Takeaways
+
+- **An OSD-wide cap on top of per-shard queues is a stall amplifier.**
+  Slots migrate to the slowest shard on their own, and the first thing an
+  exhausted cap does is block the shards that were idle.
+- **Non-blocking admission needs its own fairness.** `get_or_fail` plus a
+  timer is fine as a back-off; as an arbitration mechanism it starves whoever
+  is asleep when a slot frees. The ops that waited 2 s would have taken
+  150 µs.
+- **Look for the product, not the factor.** Skew alone (osd.11) and a slow
+  drive alone (nine other model-B OSDs) were both harmless. Ranking by the
+  utilisation of the busiest shard found the victim on both days from the
+  collection alone.
+- **The hot spot is a property of the PG map.** Replacing or removing the
+  "bad" OSD re-rolls the map and moves the freeze; only more shard capacity
+  or a flatter map removes it.
+- **`op_before_dequeue_op_lat` includes the PG lock**, and both `before_*`
+  counters count every op type. Read-only conclusions need
+  `op_r_latency − op_r_process_latency` for the wait and the historic-ops
+  event stamps for the split between throttle and queue.
