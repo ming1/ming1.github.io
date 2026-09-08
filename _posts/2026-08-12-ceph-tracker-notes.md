@@ -2711,6 +2711,122 @@ osd.32. The hot spot follows the map, not the hardware.
   read policy had been configured but in the wrong section (`osd`), so no
   client used it — reads went to primaries only, as the shard math assumes.
 
+### 9.2.6 Confirming each link on a live cluster
+
+Everything above came from snapshots. Before changing anything on the
+cluster, each link of the chain in §9.2.1 can be watched directly while the
+fio job runs, top down, and the first link that fails to confirm is where
+the story has to change. No configuration is touched in this sequence.
+
+**Link 1 — where is the IO?** The snapshots could not see the fio hosts;
+a busy client would explain the 96 % outside the OSDs just as well as a
+convoy. On one fio host during the run:
+
+```bash
+mpstat -P ALL 5 2                                   # any core near 100 %?  high %soft?
+top -H -b -n 1 -p $(pgrep -d, fio) | head -40       # fio threads, librbd msgr-worker / io_context threads
+ss -tino dst 192.168.120.188 | grep -B1 -E "notsent|unacked" | head    # the sockets to the suspect OSD
+```
+
+`notsent` bytes growing and `snd_wnd:0` on the sockets to one OSD mean the
+client has data the OSD refuses to read: parked, not busy. A core, or the
+librbd messenger threads, at 100 % means client-bound, and the rest of the
+chain, true or not, is not what sets the number. If a client admin socket
+is configured, `objecter_requests` per job shows the pile directly: one OSD
+with hundreds of ops, the others with fewer than ten.
+
+**Link 2 — which OSD, and freeze or merely slow.** Once a minute, from
+any admin node (`ceph tell` reaches the admin-socket commands):
+
+```bash
+for i in $(ceph osd ls); do
+  t=$(ceph tell osd.$i messenger dump client 2>/dev/null \
+      | jq '[.messenger.connections[].async_connection.protocol.v2.state | select(.=="THROTTLE_MESSAGE")] | length')
+  [ "${t:-0}" -gt 0 ] && echo "$(date +%T) osd.$i throttled_conns=$t"
+done
+```
+
+One OSD at 80–90 with every other at 0 names the victim and the mechanism.
+On the victim, split its slowest ops by event; the interval that holds the
+time is the link that is broken:
+
+```bash
+ceph daemon osd.N dump_historic_ops | jq -r '.ops[] | .duration as $d | .type_data.events
+   | map({(.event): .time}) | add
+   | "\($d) hdr=\(.header_read) thr=\(.throttled) q=\(.queued_for_pg) pg=\(.reached_pg) done=\(.done)"' | sort -rn | head
+```
+
+`header_read → throttled` is the slot wait, `queued_for_pg → reached_pg`
+the shard queue, `started → done` the read. A `ss -tin` grep for
+`retrans` and `backoff:[1-9]` on the OSD host should return 0 and closes
+the network in one line.
+
+**Link 3 — why the 256 slots are gone.** On the victim, during a freeze,
+three commands back to back:
+
+```bash
+ceph daemon osd.N dump_ops_in_flight | jq '[.ops[].type_data.flag_point] | group_by(.) | map({(.[0]): length}) | add'
+ceph daemon osd.N dump_ops_in_flight | jq -r '.ops[] | select(.type_data.flag_point=="queued for pg") | .description' \
+   | sed -E 's/.* [0-9]+\.([0-9a-f]+) .*/\1/' | while read ps; do echo $((16#$ps % 8)); done | sort | uniq -c
+ceph daemon osd.N perf dump | jq 'with_entries(select(.key|startswith("mclock-shard-queue"))) | map_values(.mclock_client_queue_len)'
+```
+
+Expected: nearly every slot is an op *queued* for a PG, all on one shard
+number, and the scheduler's own per-shard counter agrees. Two exclusions
+come from the same dump: the queued ops spread evenly over the shard's
+~13 PGs (one PG holding everything would be a PG lock, a hot object or a
+scrub), and the oldest queued op under a second with a median of tens of
+milliseconds (a queue draining at capacity; ages all growing would be a
+stuck thread).
+
+**Link 4 — why that shard is over capacity.**
+
+```bash
+ceph pg dump pgs -f json | jq -r --argjson o N '.pg_stats[] | select(.acting_primary==$o) | .pgid' \
+   | awk -F. '{print strtonum("0x"$2) % 8}' | sort | uniq -c                                  # gawk
+pidstat -t -p $(pgrep -f "ceph-osd.* osd\.N( |$)") 5 2 | awk '$NF ~ /tp_osd_tp/ && $(NF-2)+0 > 50'
+```
+
+One shard with ~13 of ~43 primaries, and exactly two `tp_osd_tp` threads
+near 100 % with fourteen idle, is the capacity limit. Two idle threads
+above a deep queue would instead be the scheduler sleeping on an mClock
+limit, and `osd_mclock_*` becomes the suspect. The control is the model-A
+OSD with the worst skew (osd.11 on 09-07): the same commands should show
+no queue and no throttling, which is what proves skew alone is not enough.
+
+**Link 5 — why the read is slow on this OSD.** Compare a model-A and a
+model-B OSD on the same host from their live counters
+(`op_r_process_latency`, `read_wait_aio_lat`), then take the drive out of
+Ceph's picture:
+
+```bash
+N0=$(cat /sys/class/nvme/nvme0/device/numa_node)
+numactl --cpunodebind=$N0 fio --name=b --filename=/dev/nvme0n1 --rw=randread --bs=4k --direct=1 \
+   --iodepth=1 --runtime=15 --time_based --ioengine=libaio | grep -E "clat|IOPS"
+numactl --cpunodebind=$(( (N0+2) % 4 )) fio ...        # same drive, remote node; then both on a model-A drive
+```
+
+B slower than A from both nodes is the drive or its firmware; B equal to A
+locally and slower remotely is the path. For the slow-NUMA-node pattern,
+`mpstat -P ALL` during the run and a before/during diff of
+`/proc/interrupts` show whether NIC or NVMe interrupts sit on the cores of
+that node.
+
+**Link 6 — the cluster runs at the victim's pace.** The victim's
+per-shard ceiling predicts the cluster number
+(`N_osd × 2/process_latency × primaries/primaries_on_worst_shard`,
+2.19 M on 09-07 against 1.92 M measured); watching the two together
+shows the cycle itself:
+
+```bash
+watch -n1 'ceph -s | grep -E "rd,|op/s"; ceph tell osd.N messenger dump client \
+   | jq "[.messenger.connections[].async_connection.protocol.v2.state|select(.==\"THROTTLE_MESSAGE\")]|length"'
+```
+
+IOPS dip each time the throttled count jumps and recover when it returns
+to zero. That is the stop-and-go cycle seen live, end to end; only then do
+the changes in §9.3 have a number they are expected to move.
+
 ## 9.3 Proposed solution
 
 ### 9.3.1 Mitigations, in the order they act
