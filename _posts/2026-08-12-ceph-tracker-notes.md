@@ -2569,89 +2569,68 @@ per-OSD process latency, the device wait per drive model.
 
 ### 9.2.2 The two waits, in the code
 
-A read's time inside the OSD is stamped at four points. The picture is
-worth keeping in mind because the two counters in §9.1.1 both start at the
-first stamp, and the second one *includes* the PG lock:
+A read passes through two threads inside the OSD: the messenger worker
+that owns the socket, then a shard thread that runs the PG. The clock
+starts when the worker has read the 32-byte frame preamble
+(`recv_stamp`); both counters from §9.1.1 measure from that stamp, and
+the second one ends only after the PG lock is taken:
 
 ```
-  socket                messenger worker thread                   shard thread
-  ──────  ──────────────────────────────────────────  ─────────────────────────────────
-  32-byte preamble read ─┐
-                         │ recv_stamp                (ProtocolV2.cc:1168)
-   [A] wait for a slot   │  throttle_message(): get_or_fail on the ONE
-       of the message    │  throttler shared by all client connections;
-       throttle          │  on failure arm a 5 ms timer and move on
-                         │                            (ProtocolV2.cc:1584-1610)
-       read body, decode │ throttle_stamp
-       ms_fast_dispatch  │  create tracked op, enqueue_op()
-                         │  -> shard_lock, mClock enqueue, wake a thread
-                         └─ op_before_queue_op_lat  = now − recv_stamp   (OSD.cc:9874)
-                                                                   ┌─ [B] wait in the shard's
-                                                                   │      mClock queue for one
-                                                                   │      of its 2 threads
-                                                                   │  dequeue(), drop shard_lock,
-                                                                   │  pg->lock()      (OSD.cc:11217)
-                                                                   └─ op_before_dequeue_op_lat
-                                                                      = now − recv_stamp (OSD.cc:9924)
-                                                                      do_op -> do_read ->
-                                                                      objects_read_sync -> store->read
-                                                                      (aio submit + wait, 119 µs)
-                                                                      reply; op destroyed;
-                                                                      release_message_throttle()
+  thread              what happens                                              counters, all measured from recv_stamp
+  ──────────────────  ────────────────────────────────────────────────────────  ──────────────────────────────────────
+  messenger worker    preamble read -> recv_stamp        ProtocolV2.cc:1168     ┬ ┬
+                      [A] get a slot of the message throttle                    │ │
+                          get_or_fail; on failure sleep 5 ms and serve          │ │ op_before_queue_op_lat
+                          the other connections          ProtocolV2.cc:1584     │ │   OSD.cc:9874
+                      read body, decode, create tracked op                      │ │
+                      enqueue_op: shard_lock, mClock push, wake a thread        │ ┴
+                                │  hand-off: shard = ps % 8                     │
+  shard thread        [B] wait in the shard's mClock queue for one              │ op_before_dequeue_op_lat
+  (2 per shard)           of its two threads                                    │   OSD.cc:9924
+                      dequeue, drop shard_lock, take pg->lock   OSD.cc:11217    ┴   (includes the PG lock)
+                      do_read -> objects_read_sync -> store->read               ┬ op_r_process_latency
+                          aio submit + wait, 119 µs                             │
+                      reply; op destroyed; throttle slot released               ┴   OpRequest.cc:96
 ```
 
-**[A] preamble → enqueue.** Three things can stretch it.
+**[A] preamble → enqueue** can be stretched by three things:
 
-- *The throttle.* One `Throttle` per messenger, capacity 256, shared by
-  every client connection of the OSD. Admission is `get_or_fail()`
-  (`Throttle.cc:187`): no queue of waiters, no order. A connection that
-  fails arms one timer for `ms_client_throttle_retry_time_interval`
-  (5 ms) and the worker serves other connections; a connection that
-  succeeds reads its next message and asks again immediately. The body of
-  a throttled message is not read, so it stays in the kernel socket
-  buffer; when that fills, the client's TCP window closes and the client
-  itself stalls. The slot is returned only when the op is finished
-  (`OpRequest::_unregistered()`, `OpRequest.cc:96`).
-- *The worker's own queue.* Each `AsyncMessenger` worker is one event loop
-  doing socket reads, decoding and `ms_fast_dispatch` for ~30 client
-  connections plus cluster and heartbeat sockets. This cluster runs 3
-  workers per OSD (5 configured, never restarted) and they were busy
-  50–70 % of the time during the read run, so a frame routinely waits
-  behind other connections' work. That is the 30–100 µs seen on healthy
-  OSDs.
-- *`shard_lock` at enqueue* (`OSD.cc:11413`). Three workers push into a
-  shard whose two threads take the same lock on every dequeue; cheap while
-  the queue is short, less so at 250 entries.
+- *The message throttle.* One `Throttle` per messenger, 256 slots,
+  shared by all client connections. Admission is `get_or_fail()`
+  (`Throttle.cc:187`): no waiting list, no order. A connection that
+  fails sleeps 5 ms (`ms_client_throttle_retry_time_interval`); one
+  that succeeds reads its next message and asks again at once. The
+  body of a throttled message stays in the kernel socket buffer, so a
+  long wait eventually closes the client's TCP window. The slot is
+  held until the op is finished.
+- *The worker's backlog.* One worker is one event loop serving ~30
+  client connections plus cluster and heartbeat sockets. With 3 workers
+  per OSD (5 configured, never restarted) they were busy 50–70 % during
+  the read run, so a frame often waits behind other connections. This is
+  the 30–100 µs seen on healthy OSDs.
+- *`shard_lock` at enqueue* (`OSD.cc:11413`). Workers and the shard's
+  two threads take the same lock; cheap at a short queue, less so at 250.
 
-**[B] enqueue → dequeue.** `ShardedOpWQ::_process` (`OSD.cc:11075`):
-the two threads of a shard sleep on a condition variable while the queue
-is empty; otherwise a thread takes `shard_lock`, asks dmclock for the next
-item, releases the lock, takes the PG lock, and only then stamps the
-counter.
+**[B] enqueue → dequeue** is `ShardedOpWQ::_process` (`OSD.cc:11075`):
+a shard thread takes `shard_lock`, asks dmclock for the next item, drops
+the lock, takes the PG lock, and only then stamps the counter. It grows
+when:
 
-- *Arrivals above two synchronous threads.* The read runs on the shard
-  thread itself, blocked in `store->read()` until the NVMe answers. So a
-  shard serves at most `threads / process_latency` reads per second, and
-  the queue grows the moment offered load exceeds that. This is the whole
-  story on osd.32; the OSD's other 14 threads were mostly idle.
-- *PG lock inside the shard.* If both threads dequeue ops for the same PG
-  the second waits the full read time. With 13 PGs on the shard and
-  dmclock interleaving clients this costs a few percent of capacity, but
-  it lands in this counter, not in `op_r_process_latency`.
-- *mClock's "future" sleep.* `mClockScheduler::dequeue()` returns a time
-  instead of an item when every ready request is past its limit tag, and
-  the thread sleeps until then ("dequeue future request",
-  `OSD.cc:11159`). With the `balanced` profile the client class has
-  reservation 50 %, weight 1 and limit 0 = unlimited
-  (`mClockScheduler.cc:341`), and there was no recovery traffic, so this
-  path cannot trigger here. It is the first suspect whenever [B] grows on
-  an OSD that is *not* saturated — a custom profile or a low measured
-  capacity (`osd_mclock_max_capacity_iops_ssd`, 45,810 here, split 8 ways
-  per shard) would enable it.
-- *Thread lateness.* The dequeuing thread has to be scheduled; on day one
-  the victim OSD was pinned to a NUMA node that ran every thread late
-  (155 µs process time on the same drive model that takes 142 µs
-  elsewhere). Not the case on day two.
+- *More arrivals than two synchronous threads can serve.* The read blocks
+  the shard thread in `store->read()` until the NVMe answers, so a shard
+  serves at most `threads / process_latency` reads per second. The whole
+  story on osd.32; its other 14 threads were mostly idle.
+- *Both threads pick the same PG.* The second waits the full read time on
+  `pg->lock()`. A few percent with 13 PGs on the shard, but it lands in
+  this counter, not in `op_r_process_latency`.
+- *mClock returns a time instead of an item.* The thread then sleeps
+  until that time (`OSD.cc:11159`). Only a limited client class can cause
+  it; the `balanced` profile sets the client limit to unlimited
+  (`mClockScheduler.cc:341`), so not here. First suspect whenever [B]
+  grows on an OSD that is *not* saturated.
+- *The thread runs late.* On day one the victim was pinned to a NUMA
+  node that ran every thread late (155 µs process time on a drive model
+  that takes 142 µs elsewhere). Not the case on day two.
 
 ### 9.2.3 How [B] on one shard becomes [A] for everyone
 
