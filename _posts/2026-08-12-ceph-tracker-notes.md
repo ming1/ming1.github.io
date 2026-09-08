@@ -2718,6 +2718,43 @@ cluster, each link of the chain in §9.2.1 can be watched directly while the
 fio job runs, top down, and the first link that fails to confirm is where
 the story has to change. No configuration is touched in this sequence.
 
+**Link 0 — find the slowest OSD and the slowest node first.** Every later
+step is run *on the victim*, so the victim has to be named before anything
+else, and by a ranking that does not assume the freeze mechanism. The
+cheapest live ranking is ops in flight, which by Little's law is latency
+times throughput and so singles out the slow OSD in one pass:
+
+```bash
+for i in $(ceph osd ls); do echo "$(ceph tell osd.$i dump_ops_in_flight 2>/dev/null | jq .num_ops) osd.$i"; done | sort -rn | head
+```
+
+A frozen OSD shows ~250 against ~10 everywhere else. The fuller version,
+`rank_osds.py` (in the collection repo), takes two `perf dump`s of every
+OSD 30 s apart plus one in-flight and messenger snapshot and prints, per
+OSD, the window read latency, process and device wait, in-flight count,
+queued-by-shard, throttled connections, primary skew and busiest-shard
+utilisation, sorted, then medians per host and per (host, NUMA node). On
+the 09-07 data it names the victim in its first row:
+
+```
+  osd host     pin  reads/s  op_r µs proc µs aio µs  infl  q shard throttled max/prim  util
+   32 ceph6      0   39,230    8,338     142    119   246    5:238     90/94    13/43  0.84
+   42 ceph4   none   39,799    2,365     157    126    26      4:5      0/95    11/44  0.78
+   44 ceph4   none   39,394      411     151    125    12      3:1      0/96    11/43  0.76
+
+cluster median op_r 129 µs; slowest osd.32 at 8,338 µs (65×), 246 in flight,
+90/94 connections throttled, queue on shard 5:238
+```
+
+and the per-node table underneath shows the slow node of each host as the
+pair of OSDs whose process time and kv_sync are late against the same
+drive model elsewhere (ceph1 n3, ceph2 n1, ceph3 n1 on both dates). The
+same script run offline on the 09-03 pair puts osd.38 first with 263 in
+flight and 239 of 246 connections throttled. Two things it can also say:
+*no* OSD stands out (then the shortfall is not a straggler, and Link 1 is
+where to look), or several OSDs share the top with a full host or node
+behind them (then it is the node, and Link 5 comes before Links 3–4).
+
 **Link 1 — where is the IO?** The snapshots could not see the fio hosts;
 a busy client would explain the 96 % outside the OSDs just as well as a
 convoy. On one fio host during the run:
@@ -2735,7 +2772,7 @@ chain, true or not, is not what sets the number. If a client admin socket
 is configured, `objecter_requests` per job shows the pile directly: one OSD
 with hundreds of ops, the others with fewer than ten.
 
-**Link 2 — which OSD, and freeze or merely slow.** Once a minute, from
+**Link 2 — is the slow OSD frozen, or merely slow?** Once a minute, from
 any admin node (`ceph tell` reaches the admin-socket commands):
 
 ```bash
@@ -2746,8 +2783,10 @@ for i in $(ceph osd ls); do
 done
 ```
 
-One OSD at 80–90 with every other at 0 names the victim and the mechanism.
-On the victim, split its slowest ops by event; the interval that holds the
+The OSD from Link 0 at 80–90 with every other at 0 confirms the mechanism.
+If the slowest OSD never throttles, the message cap is not what makes it
+slow, and Links 3–4 will show a shard queue or a late thread instead. On
+the victim, split its slowest ops by event; the interval that holds the
 time is the link that is broken:
 
 ```bash
