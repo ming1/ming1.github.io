@@ -1,7 +1,7 @@
 ---
 title: "Ceph Tracker Notes"
 category: storage
-tags: [ceph, bluestore, bluefs, tracker, debugging, wal, ebpf, network, tcp, checksum, clone, libaio, containers, osd, messenger, throttle, mclock, latency]
+tags: [ceph, bluestore, bluefs, tracker, debugging, wal, ebpf, network, tcp, checksum, clone, libaio, containers, osd, messenger, throttle, mclock, latency, lease, peering, laggy]
 ---
 
 * TOC
@@ -2953,3 +2953,288 @@ before the end) so the counter window holds nothing but the workload and
   counters count every op type. Read-only conclusions need
   `op_r_latency − op_r_process_latency` for the wait and the historic-ops
   event stamps for the split between throttle and queue.
+
+# 10. Tracker #80404 / PR #71663 — a laggy PG that never recovers on its own
+
+[Issue](https://tracker.ceph.com/issues/80404) ·
+[PR #71663](https://github.com/ceph/ceph/pull/71663) by Dan van der Ster ·
+component OSD (PeeringState / PrimaryLogPG) · Status: fix under review,
+reviewed here against main `5e757b85eaa` · This is the mechanism behind
+the wedge that §6 and §9 measured from the outside: §6 showed a PG going
+`laggy` when the network stalls, §9 showed how a few parked ops freeze
+the whole OSD. This tracker answers the remaining question: why does the
+PG sometimes *stay* laggy forever, even after the network recovers?
+
+## 10.1 The problem in one diagram
+
+In a healthy PG, the read-lease machinery is a loop. Every part keeps
+the next part alive:
+
+```
+        HEALTHY: a closed loop, runs every 8 seconds
+
+  +--> RenewLease timer fires
+  |        |
+  |        v
+  |    primary sends lease to replicas          readable_until
+  |        |                                    keeps moving
+  |        v                                    forward -->
+  |    replicas send lease-ack back
+  |        |
+  |        v
+  +--- primary re-arms the timer
+       (proc_renew_lease -> schedule_renew_lease)
+```
+
+The loop has no backup. Nothing outside the loop ever restarts it. If
+one link breaks once — one timer event is lost — the loop is dead until
+the next peering interval change:
+
+```
+        BROKEN: one lost event, and every arrow after it dies
+
+       RenewLease timer event LOST   x
+           |
+           v
+       no lease is sent  ------------->  readable_until stops,
+           |                             then expires
+           v
+       no lease-ack arrives
+           |
+           v
+       timer is never re-armed        <-- nothing else re-arms it
+           |
+           v
+       client op arrives, finds  mnow > readable_until
+           |
+           v
+       PG_STATE_LAGGY is latched; op parks in waiting_for_readable
+           |
+           v
+       ... forever.  Heartbeats still run (separate sockets),
+       so the OSD is never marked down, so the interval never
+       changes, so the flags are never cleared.
+```
+
+In practice the only way out is restarting an OSD by hand. On the
+tentacle cluster in the tracker, four OSDs wedged this way under a
+4 MiB / ~24 GB/s workload, and — exactly as §9 predicts — the parked
+ops pinned the client throttle and took whole OSDs offline for clients.
+
+## 10.2 Background: the read lease in three sentences
+
+The primary of a PG may serve reads only while it holds a valid lease
+from every replica; the newest ack-covered time is `readable_until`.
+The primary renews the lease every `readable_interval / 2` — with
+default `osd_heartbeat_grace = 20` and
+`osd_pool_default_read_lease_ratio = 0.8` that is a 16 s lease renewed
+every 8 s. Renewal is driven by a single self-re-arming timer chain:
+`schedule_renew_lease()` arms a timer, the timer queues a `RenewLease`
+peering event, `Active::react(RenewLease)` calls `proc_renew_lease()`,
+and `proc_renew_lease()` arms the next timer — the loop in §10.1.
+
+## 10.3 The trap: two one-way doors
+
+Two pieces of code turn "lease briefly expired" into "stuck forever".
+
+**Door 1 — `check_laggy()` stops looking at the clock.** The first op
+that finds the lease expired latches the flag. Every later op takes the
+`else` branch and parks without any time check
+(`src/osd/PrimaryLogPG.cc:857`):
+
+```cpp
+  if (state_test(PG_STATE_WAIT)) {
+    ...
+  } else if (!state_test(PG_STATE_LAGGY)) {
+    // only THIS branch compares mnow with readable_until
+    ...
+    state_set(PG_STATE_LAGGY);          // one-way latch
+  }
+  // already LAGGY?  fall through: park the op, ask no questions
+  waiting_for_readable.push_back(op);
+```
+
+**Door 2 — only a lease-ack can open the latch.** The flag is cleared
+only in `recheck_readable()`, and for an acting set larger than one,
+the only caller that can reach the "no longer laggy" branch is
+`proc_lease_ack()`. The other callers do not help:
+
+- `proc_renew_lease()` calls `recheck_readable()` **only when
+  `actingset.size() == 1`** — and anyway it is dead, it *is* the stalled
+  chain.
+- The `CheckReadable` event is queued from exactly one place
+  (`AllReplicasActivated`), once, and only for the `PG_STATE_WAIT`
+  case.
+- `Active::react(AdvMap)` re-checks only when a prior-interval OSD is
+  marked dead — unrelated.
+
+So the dependency chain to clear the flag is:
+
+```
+  clear LAGGY  <--needs--  lease-ack  <--needs--  lease sent
+               <--needs--  RenewLease timer  <--re-armed only by-- itself
+```
+
+Every link depends on the previous one, and the last link depends on
+itself. One discarded `RenewLease` event — stale `last_peering_reset`
+in a race, delivery outside `Active`, any one-time loss — and the PG
+can never renew again. The only remaining exit is
+`Started::exit()` (`src/osd/PeeringState.cc:5482`), which clears
+`WAIT | LAGGY` on an interval change — and §10.1 explained why that
+never comes: the OSD's heartbeats are fine.
+
+## 10.4 The fix: a watchdog that closes the loop from outside
+
+PR #71663 adds a second, independent loop that runs only while the PG
+is laggy. It does two things: it re-checks readability periodically,
+and — the part that actually fixes the wedge — it restarts the renewal
+chain if it can prove the chain is dead:
+
+```
+   check_laggy() latches LAGGY
+       |
+       v
+   schedule_laggy_recheck():  queue CheckReadable in interval/2
+       |
+       v                                (8 s at defaults)
+   Active::react(CheckReadable)
+       |
+       +--> recheck_lease_renewal():
+       |        mnow >= readable_until_ub_sent ?
+       |        ("the newest bound I ever SENT has expired,
+       |          so nobody has renewed for a full interval")
+       |        yes -> proc_renew_lease()   <-- restarts the chain
+       |
+       +--> recheck_readable():
+                still laggy -> schedule_laggy_recheck() again --+
+                not laggy   -> requeue parked ops, loop ends    |
+       ^                                                        |
+       +--------------------------------------------------------+
+```
+
+The stall detector compares against `readable_until_ub_sent` — the
+upper bound the primary itself last sent — not against acks. A healthy
+chain renews every `interval/2`, so the sent bound always sits at least
+`interval/2` in the future. If it has expired outright, no renewal ran
+for a full interval: the chain is dead, not slow.
+
+The PR also makes the bug reproducible: a dev-only option
+`osd_debug_drop_pg_lease_renewals` makes `PG::schedule_renew_lease()`
+silently drop the arming, and a standalone test
+(`qa/standalone/osd/osd-lease-laggy.sh`) shows a post-expiry write
+blocking forever without the fix and completing ~2 s after the latch
+with it.
+
+## 10.5 Review: is it correct?
+
+I checked every claim in the PR text against main `5e757b85eaa`. All of
+them hold:
+
+| Claim | Where verified |
+|---|---|
+| Once LAGGY, `check_laggy()` skips the time test | `PrimaryLogPG.cc:857` — the `else if (!state_test(PG_STATE_LAGGY))` shape above |
+| For acting > 1, only `proc_lease_ack()` clears it | all four `recheck_readable()` callers enumerated in §10.3 |
+| The renewal chain re-arms only itself | chain start is `all_activated_and_committed()`, once per interval; after that only `proc_renew_lease()` → `schedule_renew_lease()` |
+| Only an interval change clears the flag otherwise | `Started::exit()`, `PeeringState.cc:5482` |
+| The OSD is never marked down meanwhile | heartbeats use dedicated sockets, no PG lock — the §6 takeaway |
+
+The watchdog itself is safe on the points that matter:
+
+- **No leak across intervals.** Every `CheckReadable` carries
+  `last_peering_reset`; `PG::do_peering_event()` drops stale events via
+  `old_peering_evt()`. After an interval change the old chain dies and
+  `Started::exit()` has cleared the flags anyway.
+- **The loop self-terminates.** Once the PG is neither wait nor laggy,
+  `recheck_readable()` returns at the top and nothing re-arms.
+- **The detector cannot fire on a healthy chain.**
+  `readable_until <= readable_until_ub_sent` always
+  (`recalc_readable_until()` takes the min *including* the sent bound),
+  and a live chain keeps the sent bound at least `interval/2` ahead.
+  Conversely, when replicas simply stop acking (network partition), the
+  sent bound stays fresh, so the watchdog correctly does *not* spam
+  renewals — it just keeps re-checking until acks return.
+- **Restart is idempotent enough.** `proc_renew_lease()` moves
+  `readable_until_ub_sent` a full interval forward, so back-to-back
+  watchdog checks become no-ops; leases and acks are monotonic (peers
+  and `proc_lease_ack()` keep the max), so a duplicate renewal is
+  harmless.
+- **Guards are right.** `schedule_laggy_recheck()` checks
+  `is_primary()`; `recheck_lease_renewal()` additionally checks the
+  `SERVER_OCTOPUS` feature before reaching the `ceph_assert` inside
+  `proc_renew_lease()`. Only a primary can have latched LAGGY in the
+  first place (non-primaries get `-EAGAIN` before the latch).
+- **The test is honest.** With the injection active everywhere, each
+  restart's own re-arm is also dropped — so the test really exercises
+  the latch → watchdog → restart path repeatedly (the later `rados get`
+  wedges and recovers a second time), not just once.
+
+Verdict: the diagnosis is accurate and the fix is correct.
+
+## 10.6 Review: could it be done more effectively?
+
+The shape is right. The two obvious alternatives are worse: removing
+the latch from `check_laggy()` would re-test the clock per op but could
+never restart a dead chain (readable_until would stay expired), and an
+OSD-level periodic sweep over all PGs would pay a constant cost for a
+rare condition. A per-PG event that exists only while laggy is the
+cheap and local answer. Four things could still be tighter:
+
+1. **Restart latency is up to ~2 lease periods, not one check.** The
+   first recheck fires `interval/2` after the latch (8 s at defaults).
+   But at latch time `mnow` may still be *below*
+   `readable_until_ub_sent` — `readable_until` (min over acks) expires
+   up to one renewal period before the sent bound does — so the first
+   check can find "not provably stalled" and the restart waits for the
+   second, ~16 s of parked I/O at defaults. Scheduling the first check
+   at `max(readable_until_ub_sent - mnow, small)` instead of a flat
+   `interval/2` would make the restart fire as soon as the stall is
+   provable. Costs one subtraction; worth it on a 16 s lease.
+
+2. **Nothing dedups outstanding rechecks.** `recheck_readable()` is
+   also called from `proc_lease_ack()` and `AdvMap`, and each
+   still-laggy call schedules another `CheckReadable`; several
+   self-re-arming chains can coexist until laggy clears. They are
+   bounded and all die at the same two exits, so this is cosmetic — but
+   a `bool laggy_recheck_scheduled` would keep it at exactly one.
+
+3. **`PG_STATE_WAIT` has the same disease and is not treated.** WAIT
+   relies on a *single* `CheckReadable` queued at activation; the
+   "still wait" branch of `recheck_readable()` re-arms nothing. That
+   event rides the same mono-timer + peering-event machinery whose
+   one-time loss this very PR demonstrates. WAIT is naturally bounded
+   by `prior_readable_until_ub`, so the stakes are lower, but one more
+   `schedule_laggy_recheck()` call in the still-wait branch would close
+   the twin gap for free.
+
+4. **Crimson is not covered.** `src/crimson/osd/pg.cc` has its own
+   `recheck_readable()` with the same latch-and-clear structure. Same
+   trap, separate fix needed — worth a note on the tracker so it does
+   not get lost.
+
+None of these block the PR; 1 and 3 would be my review comments.
+
+## 10.7 Takeaways
+
+- **A self-arming timer chain is a single point of failure.** If the
+  only thing that re-arms the timer is the timer's own handler, one
+  lost event kills the loop forever. Every such chain needs a watchdog
+  that lives outside the chain — that is the entire fix here.
+- **A latch needs a matching unlatch path — enumerate it.** LAGGY had
+  exactly one clearing path for the common case, and that path depended
+  on the thing that had already failed. Asking "list every caller that
+  can clear this flag" finds this class of bug on paper, before any
+  cluster does.
+- **"The OSD is healthy" and "the PG is servable" are separate
+  machines.** Heartbeats kept the OSD up while its PGs were
+  permanently unreadable, so the cluster's self-healing (mark down →
+  new interval → flags cleared) never triggered. Same lesson as §6,
+  one layer deeper.
+- **The wedge amplifies exactly as §9 said.** Parked ops never release
+  their throttle budget; a few laggy PGs pin
+  `osd_client_message_size_cap` and the OSD stops reading all sockets.
+  Raising the cap only raised the number of stuck ops (124 at 500M,
+  255 at 1024M).
+- **A dev-only fault injection turned a production mystery into a 112
+  line standalone test.** Dropping the timer arming behind a runtime
+  flag reproduces in seconds what took a 24 GB/s cluster to hit — the
+  cheapest part of the PR and the one that makes the fix reviewable.
