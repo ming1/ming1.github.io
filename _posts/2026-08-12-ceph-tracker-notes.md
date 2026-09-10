@@ -3238,3 +3238,221 @@ None of these block the PR; 1 and 3 would be my review comments.
   line standalone test.** Dropping the timer arming behind a runtime
   flag reproduces in seconds what took a 24 GB/s cluster to hit — the
   cheapest part of the PR and the one that makes the fix reviewable.
+
+# 11. Field collection — three OSD pairs in mutual TCP backoff, 786 ops parked behind them
+
+Found in a `ceph_diagnostics` collection
+(`ceph-collect_20260909_140230`, captured mid-incident), not a bug
+report · 48-OSD tentacle 20.2.2 cluster: 6 hosts × 8 NVMe, 3×
+replication, 4 MiB RBD write workload · component: the fabric under
+the cluster network, amplified by `osd_client_message_size_cap` —
+the §6 disease with the §9 amplifier, caught in the act · fix: none
+in code — but the tuning found on the cluster had disabled every
+safety valve §6 relies on · Status: diagnosis complete from the
+collection alone; fabric localisation (§6.3.4) still to run on the
+hosts
+
+This is the same failure §6 reconstructed after the fact and §9
+modelled from one hot shard — but this collection was taken *while*
+the wedge was live, so it contains the one artifact the §6 collection
+never had: the exact TCP sockets, in RTO backoff, at capture time.
+
+## 11.1 Report
+
+### 11.1.1 The observation
+
+`ceph -s` during a 4 MiB write benchmark: everything `active+clean`,
+48/48 OSDs up, and
+
+```
+health: HEALTH_WARN
+        ...
+        34 slow ops, oldest one blocked for 50 sec,
+        daemons [osd.27,osd.32,osd.35,osd.41,osd.43,osd.46] have slow ops.
+io:
+        client: 408 B/s rd, 397 MiB/s wr, 99 op/s wr
+```
+
+397 MiB/s from 48 NVMe OSDs is a small fraction of what the same
+benchmark had been doing. By the time `ceph health detail` ran,
+seconds later, the count was **786 slow ops, oldest 55 s** — the wedge
+was growing while the collector walked the cluster. Same six OSDs in
+every sample. `healthcheck history ls` says this is not the first
+time: `SLOW_OPS` seen 68 times since 08-27 and active at capture, and
+`OSD_DOWN` 32 times — the most recent three minutes before the capture
+(`ceph -s` shows `48 up (since 3m)`), which is the §6/§10 recovery
+signature: someone, or something, keeps bouncing OSDs to clear it.
+
+### 11.1.2 Reproducing it from the collection
+
+No live cluster needed; everything below comes out of the collection:
+
+```bash
+cds ceph -s ; cds ceph health detail            # the six OSDs
+cds ceph healthcheck history ls                 # 68 x SLOW_OPS, 32 x OSD_DOWN
+ops_in_flight summary                           # §11.2.1 - flag points per OSD
+./ceph-net-retrans.py <dir> --pairs --backoff   # §11.2.3 - the smoking gun
+cds ceph config dump | grep -E 'grace|message_size_cap|objecter'
+```
+
+## 11.2 Analysis
+
+### 11.2.1 What the parked ops are waiting for
+
+Aggregating `dump_ops_in_flight` across all 48 OSDs: **1428 in-flight
+ops, and every single one has flag point `waiting for sub ops`** — the
+primary committed locally and is waiting for a replica's commit ack.
+Not one op is `waiting for readable`, so this is *not* the §10 laggy
+latch (§11.2.4 explains why it can't be). Per OSD:
+
+```
+osd.27: 255   osd.32: 255   osd.43: 255   osd.46: 255
+osd.35: 233   osd.41: 175
+```
+
+255 is not a coincidence. The cluster runs
+`osd_client_message_size_cap = 1 GiB` and the workload writes 4 MiB
+objects: 1 GiB / 4 MiB = 256 message slots. Four of the six OSDs have
+their client throttle pinned to the last slot — the §9 amplifier
+exactly: parked ops never return their throttle bytes, the messenger
+stops reading *every* client socket on the OSD, and one slow peer
+turns into a daemon-wide client freeze. It is even the same number as
+the tracker #80404 cluster, which counted 255 stuck ops at the same
+1 GiB cap.
+
+### 11.2.2 The pair structure
+
+Grouping each stuck op by which peers its ack is missing from:
+
+```
+primary osd.27 (ceph5)  waits on  43 (ceph4)     255 ops
+primary osd.43 (ceph4)  waits on  27 (ceph5)     255 ops
+primary osd.32 (ceph6)  waits on  41 (ceph4)     255 ops
+primary osd.41 (ceph4)  waits on  32 (ceph6)     175 ops
+primary osd.35 (ceph6)  waits on  46 (ceph4)     233 ops
+primary osd.46 (ceph4)  waits on  35 (ceph6)     255 ops
+```
+
+Three **mutual pairs** — 27↔43, 32↔41, 35↔46 — each waiting on the
+other, and every pair has exactly one end on **ceph4**. The third
+replica is never the problem: a sample 76-second op on osd.43 shows
+the whole story in its event timeline —
+
+```
+14:01:38.081812  waiting for subops from 21,27
+14:01:38.086705  op_commit                       local commit:   5 ms
+14:01:38.092117  sub_op_commit_rec               ack from osd.21: 10 ms
+                                                 ack from osd.27: never
+```
+
+Everything is fast except the one peer that is this OSD's backoff
+partner. The mutuality is what a dead *connection* looks like from
+both ends: peers share their cluster-network TCP path, so when it
+stops delivering, A's sub-ops to B and B's sub-ops to A strand
+together.
+
+### 11.2.3 The sockets, caught in the act
+
+The `--tcp-info` messenger dumps make this exact, and this is the
+part the §6 collection could only infer. Cluster-wide:
+
+```
+Network     Conns   Total retrans   RTT p50
+cluster     1,902       8,035,207   7.78 ms
+client      4,442             242   3.43 ms
+```
+
+Eight million retransmits on the cluster VLAN against 242 on the
+client VLAN, spread across *every* host pair (3.7–5.4 k per
+connection) — the fabric under the cluster network is dropping
+broadly, as in §6. But only six sockets were in RTO backoff at
+capture time, and they are precisely the three pairs, both
+directions:
+
+```
+osd.27(ceph5) -> osd.43(ceph4)  backoff=8 rto=52.2s unacked=32  no ack for 96.4s
+osd.43(ceph4) -> osd.27(ceph5)  backoff=8 rto=52.2s unacked=25  no ack for 80.5s
+osd.32(ceph6) -> osd.41(ceph4)  backoff=8 rto=52.2s unacked=49  no ack for 86.0s
+osd.41(ceph4) -> osd.32(ceph6)  backoff=8 rto=52.2s unacked=16  no ack for 77.1s
+osd.35(ceph6) -> osd.46(ceph4)  backoff=8 rto=52.2s unacked=8   no ack for 78.0s
+osd.46(ceph4) -> osd.35(ceph6)  backoff=8 rto=52.2s unacked=51  no ack for 67.2s
+```
+
+`backoff=8` is eight consecutive RTO doublings — these connections
+have delivered nothing for over a minute, which matches the oldest op
+age (76 s) to within collection skew. Six sockets out of 1,902
+explain all 1,428 parked ops. And all six terminate on ceph4, which
+makes that host's NIC, cabling and switch port the first place to
+look (§11.3).
+
+### 11.2.4 Why every safety net was off
+
+None of Ceph's self-healing reacted, and this time it is not only the
+§6 "heartbeats ride healthy dedicated sockets" story. The cluster
+runs `osd_heartbeat_grace = 600` — presumably a past attempt to stop
+flapping — and that one setting quietly disabled three different
+protections:
+
+- **Mark-down needs 10 minutes of heartbeat silence.** Heartbeats
+  were flowing anyway, but even a genuinely dead OSD would now stall
+  its PGs for 10 minutes before peering moves on.
+- **The read lease became 0.8 × 600 = 480 s.** A PG only goes
+  `laggy` when `mnow > readable_until`; with an 8-minute lease these
+  wedges never live long enough. That is why this collection has
+  *zero* laggy PGs while §6's cluster (default 16 s lease) showed
+  them: same disease, different presentation — and the §10 watchdog
+  has nothing to catch here either. The lease still expires *before*
+  mark-down (ratio 0.8 < 1.0), so correctness holds; what is lost is
+  every early-warning signal on the way to a 10-minute stall.
+- **The slow-ping health check moved to 30 s.** The §6.3.2
+  coupling, observed in the wild: `mon_warn_on_slow_ping_ratio`
+  (0.05) × 600 = 30 s, and indeed every one of the 48
+  `dump_osd_network` files in the collection says
+  `"threshold": 30000, "entries": []` — pings under thirty seconds
+  are not worth mentioning. `OSD_SLOW_PING_TIME_*` did fire 13 times
+  through 09-04, which given this threshold is remarkable by itself.
+
+So the failure chain, end to end: broad loss on the cluster VLAN →
+three inter-host connections (all touching ceph4) fall into deep RTO
+backoff at once → sub-op acks stop in both directions of each pair →
+six primaries park ops at `waiting for sub ops` → 4 of 6 pin the
+1 GiB client throttle at 255 × 4 MiB → those OSDs stop reading all
+client sockets → cluster-wide write throughput collapses to
+397 MiB/s — while health shows `active+clean`, no laggy flag, no
+slow-ping warning, and nothing will time out for 10 minutes.
+
+## 11.3 Proposed solution
+
+**First, localise on ceph4, while it is happening.** Every backoff
+socket has one end there; that is a strong prior the §6 collection
+never produced. The §6.3.4 commands apply verbatim on ceph4 (host
+counters vs switch discards decide fabric-vs-host); with switch
+access, the port counters for ceph4's cluster-VLAN uplink are the
+single most valuable read.
+
+**Second, undo the grace tuning.** `osd_heartbeat_grace = 600` is the
+§6.3.1 fix overshot by 15×, and §11.2.4 is the bill: it does not
+prevent the wedge (TCP backoff, not heartbeats, is the mechanism), it
+only hides it and slows recovery. The §6.3.1 values — grace 40–60
+with `mon_warn_on_slow_ping_time 1000` pinned — keep the freeze-
+survival margin while restoring mark-down, laggy visibility, and ping
+warnings. With a sane lease these wedges *would* latch `laggy`, which
+is also what makes the §10 watchdog and PR #71663 relevant to this
+cluster again.
+
+**Third, stop feeding the amplifier.** The 1 GiB
+`osd_client_message_size_cap` (with `osd_client_message_cap = 0`, so
+bytes are the only limit) sets the blast radius at 256 parked
+messages per OSD — §9's arithmetic. The tracker #80404 cluster
+already demonstrated that raising the cap only grows the number of
+stuck ops. Defaults (256 MiB) bound the same wedge at a quarter the
+parked bytes; the client-side
+`objecter_inflight_op_bytes = 1 GiB / objecter_inflight_ops = 10000`
+override, same as the tracker cluster's, deserves the same revisit.
+
+None of this fixes the drops — 8 M retransmits say the cluster VLAN
+is oversubscribed or broken regardless of which OSDs currently sit in
+backoff. But with the fabric repaired and the two tunings reverted,
+the same event degrades throughput instead of freezing six OSDs
+behind three dead sockets for minutes while health calls everything
+clean.
