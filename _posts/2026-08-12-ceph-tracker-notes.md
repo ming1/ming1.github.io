@@ -1,7 +1,7 @@
 ---
 title: "Ceph Tracker Notes"
 category: storage
-tags: [ceph, bluestore, bluefs, tracker, debugging, wal, ebpf, network, tcp, checksum, clone, libaio, containers, osd, messenger, throttle, mclock, latency, lease, peering, laggy]
+tags: [ceph, bluestore, bluefs, tracker, debugging, wal, ebpf, network, tcp, checksum, clone, libaio, containers, osd, messenger, throttle, mclock, latency, lease, peering, laggy, rdma, rgw, s3, ec, cuobject]
 ---
 
 * TOC
@@ -3417,3 +3417,1056 @@ in backoff. But with the fabric repaired, the tunings reverted and
 PR #71663 merged, the same event degrades throughput instead of
 freezing six OSDs behind three dead sockets — and can no longer
 leave a PG laggy forever after the network heals.
+
+# 11. PR #71209 — S3 over RDMA served directly from the OSDs
+
+[PR #71209](https://github.com/ceph/ceph/pull/71209) · RFC against `main`
+(Umbrella) · 30 commits, ~4,000 added lines across rgw/osdc/osd/common ·
+extends [PR #70458](https://github.com/ceph/ceph/pull/70458) (gateway-staged
+S3-over-RDMA), which rides along as the first commit.
+
+This note explains the PR as one end-to-end architecture — RGW → librados/
+Objecter → OSD → RDMA NIC → client memory — and uses the commits and source
+only to show how that architecture is implemented. It is written from the
+code at the branch tip (`wip-rgw-cuobj-osd`), not from the PR description.
+
+## 11.1 One-minute summary
+
+An S3 client that speaks the NVIDIA cuObject protocol sends an opaque RDMA
+descriptor (`x-amz-rdma-token`) with its GET. Instead of reading the object
+into gateway memory and RDMA-writing it from there, RGW now forwards that
+token to the OSDs: every RADOS stripe read carries a small **advisory
+delivery descriptor** (a new versioned field on `MOSDOp`), and each OSD that
+can honor it RDMA-writes its stripe **directly into the client's registered
+memory window** — host RAM or GPU memory — at the stripe's logical offset.
+The reply carries only byte counts (and optional CRC64-NVME checksums)
+instead of data.
+
+Any OSD that cannot push — older release, built without cuObject, feature
+disabled, lease expired, retransmitted request — replies with the data
+inline, exactly as if the descriptor were not there. RGW treats one inline
+stripe as the signal to restart the whole GET in a fallback mode. Every
+degradation path is plain, correct, in-band data; there is no protocol error
+anywhere.
+
+## 11.2 The problem
+
+RGW is a proxy on the data path. For a GET, every object byte crosses the
+fabric twice and is staged in gateway memory in between:
+
+```text
+Current / old path:
+
+S3 Client
+   |
+   | S3 GET
+   v
+ RGW
+   |
+   | RADOS READ
+   v
+ OSD
+   |
+   v
+ RGW memory        <- staging buffer, per request
+   |
+   | TCP / RDMA
+   v
+Client
+```
+
+Consequences:
+
+* **2x fabric traffic per GET** — OSD→RGW, then RGW→client.
+* **Gateway CPU and memory scale with data volume**, not request count. The
+  staged RDMA mode from #70458 makes it worse in one dimension: it
+  accumulates the *whole object* in a pre-registered gateway buffer before
+  issuing one `RDMA_WRITE`.
+* **Aggregate GET bandwidth is capped by the number of gateways**, while the
+  data already lives spread across every OSD in the cluster.
+
+For GPU-direct workloads (training clusters reading from S3 into GPU
+memory), the gateway hop is pure overhead: the client's window is already
+registered with its NIC, and the OSDs already hold the bytes.
+
+## 11.3 New data path
+
+```text
+S3 Client
+   |
+   | S3 GET + RDMA token
+   v
+ RGW                       (control plane only)
+   |
+   | RADOS READ + RDMA delivery descriptor
+   v
+ OSD
+   |
+   | RDMA_WRITE
+   v
+Client memory / GPU memory
+```
+
+What stays in RGW: authentication, bucket/object metadata, the manifest
+walk that turns one S3 object into N RADOS stripe reads, throttling, the
+HTTP response, accounting, and end-to-end checksum verification.
+
+What moves: the object bytes. They travel OSD → client NIC exactly once.
+The gateway in this mode needs **no RDMA NIC and no cuObject library at
+all** — only the OSDs do (and `cuobjserver` needs no GPU).
+
+Why this scales: every stripe of a GET is pushed by the OSD that holds it,
+so aggregate GET bandwidth grows with the number of OSDs, and the per-GET
+fabric traffic halves. This is exactly the "gateway instructs data nodes,
+data nodes push via RDMA_WRITE" reference flow in NVIDIA's cuObject
+documentation (§1.3.3).
+
+## 11.4 The concepts, one at a time
+
+```text
+Concept            What it means                          Why it is needed
+-------            -------------                          ----------------
+cuObject           NVIDIA library pair (libcuobjclient /  The RDMA transport. Server side
+                   cuobjserver) implementing S3-over-     runs on OSDs; no GPU required.
+                   RDMA over a DC (Dynamically
+                   Connected) transport.
+
+RDMA token         Opaque string the client sends per     Names the client's registered
+                   request: "raddr:rsize:rkey:lid:qp:     memory window. Any node holding
+                   has_gid:gid" (hex, colon-separated).   the token + cluster dc_key can
+                                                          write into it — no per-OSD
+                                                          connection setup.
+
+OOB delivery       Data leaves the RADOS reply and is     The whole point: reply carries
+(out-of-band)      DMA-written into client memory; the    metadata, fabric carries data
+                   reply reports byte counts only.        once.
+
+Advisory delivery  The descriptor is a *hint* on the      Any OSD that can't push replies
+descriptor         request, never a demand.               inline as a normal read. No
+                                                          protocol error, no probing, no
+                                                          ceremony in mixed clusters.
+
+CEPH_OSD_OP_       The first design: a dedicated op       Abandoned mid-series. An unknown
+READ_RDMA          code (RD|DATA slot 34).                op code *fails* on old OSDs —
+                                                          that's a protocol error to
+                                                          handle. Slot 34 is now reserved-
+                                                          unused (src/include/rados.h).
+
+MOSDOp delivery    delivery_t {token, base_offset,        The replacement: rides on the
+descriptor         flags}, one per op, trailing in        message next to the read it
+                   MOSDOp v10.                            applies to, so *any* read shape
+                                                          gets OOB delivery and old OSDs
+                                                          simply never see it.
+
+oob_results        Per-op vector on MOSDOpReply v9:       How the client learns what went
+(PR text calls     bytes pushed, optional CRC64-NVME,     out of band (0 bytes = inline =
+it oob_bytes)      flags, per-range CRCs.                 fallback signal). Trailing and
+                                                          downgrade-safe.
+
+lease              Pool option rdma_delivery_lease        Bounds how long an *unreachable*
+                   (default 5 s): an OSD may not          OSD can still write into the
+                   *initiate* a push later than this      window. Makes an abandoned
+                   after receiving the op.                window quiescent by wall clock.
+
+fencing            RGW waits lease + rgw_cuobj_fence_     A write initiated within the
+                   drain_ms (3 s) before a fallback       lease can still sit in a NIC
+                   rewrites client ranges.                retry queue; the fence outlasts
+                                                          lease + transport drain.
+
+inline fallback    Refusal == normal read reply.          One degradation path for every
+                                                          failure mode, and it is the
+                                                          same bytes the client asked for.
+```
+
+## 11.5 End-to-end GET flow
+
+```text
+Client
+  |
+  | HTTP GET + x-amz-rdma-token
+  v
+RGW  RGWGetObj_ObjStore_S3::get_params()      rgw_rest_s3.cc: capture token
+  |  RGWGetObj::execute()                     rgw_op.cc: eligibility,
+  |  select_rdma_mode()                       PASSTHROUGH/STAGED/NONE
+  |
+  |  manifest / stripe walk
+  |  RGWRados::Object::Read::iterate()        rgw_rados.cc
+  |  get_obj_iterate_cb(): per stripe:
+  |     op.read(read_ofs, len)
+  |     op.set_rdma_delivery(token,
+  |         stripe_ofs - range_start, ...)
+  v
+Objecter / librados
+  |  ObjectOperation::set_rdma_delivery()     osdc/Objecter.h
+  |  Objecter::_prepare_osd_op()              osdc/Objecter.cc: attach
+  |     gate: require_osd_release>=umbrella   descriptors to MOSDOp v10
+  |  (SplitOp::create() fans out to           osdc/SplitOp.cc, EC-direct /
+  |   sub-reads when reads are split)         balanced replica reads only
+  v
+Primary OSD (or shard OSD for EC direct)
+  |  dispatch -> do_osd_ops -> do_read        normal read machinery, unchanged
+  |  complete_read_ctx()                      PrimaryLogPG.cc: the one reply-
+  |    deliver_oob() / deliver_op_oob()       time chokepoint
+  |      refusal checks (retry, lease,
+  |      readable_until, flags, op type)
+  |      build placement plan                 osd/oob_placement.cc
+  |      OSDCuObj::execute_plan()             osd/osd_cuobj.cc
+  |        stage copy -> batched async
+  |        RDMA_WRITEs -> poll to drain
+  |    strip outdata, set oob_results
+  |  send MOSDOpReply v9
+  v
+Client memory (already written by the NIC before the reply left the OSD)
+  |
+RGW  get_obj_data::flush_rdma()               inline data? -> -EOPNOTSUPP
+  |  drain all stripes; sum bytes; fold CRCs
+  |  verify against stored crc64nvme
+  v
+HTTP 200, Content-Length: 0,
+x-amz-rdma-reply: 200, x-amz-rdma-bytes-transferred: N
+```
+
+Key property: **the OSD-side push completes before the op reply is sent**
+(`execute_plan()` blocks until the batch drains). So when RGW has drained
+every stripe op, every RDMA write from every OSD still in contact has
+landed. The drained reply *is* the completion interlock; the HTTP response
+is the client's only completion signal.
+
+## 11.6 RGW changes
+
+`src/rgw/rgw_op.{h,cc}`, `src/rgw/rgw_rest_s3.cc`,
+`src/rgw/driver/rados/rgw_rados.{h,cc}`, `src/rgw/rgw_sal.h`.
+
+Per-request state on `RGWGetObj` (rgw_op.h):
+
+```cpp
+enum class RdmaMode { NONE, STAGED, PASSTHROUGH };
+std::string rdma_token;       // x-amz-rdma-token, empty if absent
+uint64_t rdma_bytes = 0;      // bytes delivered out of band
+std::optional<uint64_t> rdma_crc64;
+```
+
+`RGWGetObj::select_rdma_mode(bool plain_chain)` picks the mode right before
+`iterate()`. `plain_chain` is literally `filter == &cb` — true only when no
+decompression, decryption, Lua or Arrow Flight filter got chained in, i.e.
+when the gateway would not need to touch the data. Passthrough additionally
+requires `rgw_cuobj_osd_passthrough=true` and that `total_len` fits the
+client window parsed from the token.
+
+The store contract moved into SAL (`rgw_sal.h`,
+`rgw::sal::Object::ReadOp::params`): when `params.rdma_token` is non-empty,
+`iterate()` must deliver all data out of band and the callback receives no
+bytes; a store that cannot must fail with `-EOPNOTSUPP` *before* delivering
+anything. Two guards enforce this against stores/filters that predate the
+field: `RGWGetObj::get_data_cb()` rejects any inline data in passthrough
+mode, and head-object prefetch is disabled whenever a token is present
+(`prefetch_data()`, plus a check in `get_obj_iterate_cb()`), because
+prefetched head data would have to be served from RGW memory.
+
+In the rados driver (`rgw_rados.cc`), `get_obj_iterate_cb()` — the manifest
+walk's per-stripe callback — attaches the descriptor to each stripe read:
+
+```cpp
+op.read(read_ofs, len, nullptr, nullptr);
+d->rdma_slots.emplace_back();
+op.set_rdma_delivery(d->rdma_token,
+                     uint64_t(obj_ofs) - d->rdma_range_start,  // client offset
+                     d->rdma_flags, &d->rdma_slots.back());
+```
+
+`obj_ofs - rdma_range_start` is the stripe's logical offset within the
+requested range — range GETs and multipart objects need nothing special,
+every stripe lands where it belongs in the window. The existing 16 MiB aio
+window (`rgw_get_obj_window_size`) now throttles how much RDMA traffic the
+OSDs aim at one client NIC.
+
+`get_obj_data::flush_rdma()` is the fallback detector: any stripe reply that
+still carries data means some OSD could not push, and returns `-EOPNOTSUPP`
+so `execute()` restarts the GET.
+
+Response (rgw_rest_s3.cc): `x-amz-rdma-reply: 200` +
+`x-amz-rdma-bytes-transferred: N` with `Content-Length: 0` on success;
+`x-amz-rdma-reply: 501` (the cuObject protocol's "fall back to HTTP" signal)
+when a token arrived but data went over HTTP. RDMA bytes are accounted in
+the beast access log, ops log and usage log (`rgw_log.cc`,
+`s->rdma_bytes_transferred`).
+
+## 11.7 librados / Objecter changes
+
+`src/include/rados/librados.hpp`, `src/librados/librados_cxx.cc`,
+`src/osdc/Objecter.{h,cc}`.
+
+The public API is one method on `ObjectReadOperation` (C++ only, following
+the `omap_rm_range` precedent):
+
+```cpp
+void set_rdma_delivery(const std::string& token, uint64_t base_offset,
+                       uint32_t flags, rdma_delivery_result *result);
+```
+
+It applies to the **most recently added** read (the `out_rval`/`out_bl`
+convention), so each read in a compound op can carry its own descriptor and
+get its own result. `rdma_delivery_result` returns `bytes` (0 = inline),
+`crc64`, `flags`, and per-range CRCs.
+
+Inside the Objecter, `ObjectOperation` and `Op` grow two vectors aligned
+with `ops`: `rdma_delivery` (the descriptors) and `rdma_oob_result` (result
+out-pointers). Two places matter:
+
+* `Objecter::_prepare_osd_op()` — stamps the descriptors onto the `MOSDOp`,
+  but **only** when `osdmap->require_osd_release >= umbrella`. This is
+  re-evaluated on *every* send, resends included; the OSD-side
+  retransmission refusal keeps re-stamped descriptors inert (§11.14).
+* `Objecter::handle_osd_op_reply()` — copies `oob_results[i]` from the
+  reply into each registered result slot; an inline reply (no vector) reads
+  back as all-zero results.
+
+There is also `IoCtx::pool_rdma_delivery_lease(double*)`, which reads the
+pool's lease from the client's own OSDMap — the same value the OSDs
+enforce, which is the point (§11.13).
+
+## 11.8 MOSDOp protocol changes
+
+`src/messages/MOSDOp.h` (v9 → **v10**), `src/messages/MOSDOpReply.h`
+(v8 → **v9**), `src/common/rdma_token.h` (the encoded types).
+
+```text
+MOSDOp v10
+ ├── everything from v9 (unchanged, byte-identical prefix)
+ └── rdma_deliveries: vector<delivery_t>        <- trailing, decoded in the
+       delivery_t (versioned ENCODE_START(1,1)):   finish_decode() tail, so
+         token        opaque cuObject descriptor   fast dispatch never
+         base_offset  client-window offset of      touches it
+                      this op's first byte
+         flags        FLAG_CRC64NVME; unknown
+                      bits => deliver inline
+
+MOSDOpReply v9
+ ├── everything from v8
+ └── oob_results: vector<oob_result_t>          <- trailing
+       oob_result_t:
+         bytes   pushed out of band (0 = inline)
+         crc64   CRC64-NVME of exactly those bytes
+         flags   CRC64NVME | CRC64_COMBINABLE | CRC64_RANGES
+         ranges  vector<crc_range_t> (ofs, len, crc64) per placed extent
+```
+
+The descriptor vector is either empty or aligned 1:1 with `ops` (an empty
+token means "inline for this op"), mirroring the reply's `oob_results`.
+That symmetry is commit `3d04739da77`: the first version carried *one*
+request-level descriptor, which silently degraded compound reads to inline
+because one `base_offset` cannot place two reads with different origins.
+
+Why the descriptor belongs on `MOSDOp` rather than in an op:
+
+* an unknown *op* is an error on an old OSD; an unknown trailing *message
+  field* is never even decoded — the fallback comes for free;
+* it reuses every existing read shape (READ, SYNC_READ, SPARSE_READ, EC
+  direct sub-reads) instead of cloning read semantics into a new op;
+* packing a token into per-op `indata` (the interim READ_RDMA design) had
+  wire-format hazards the commit message of `59a1146c2d0` calls out
+  explicitly.
+
+Compatibility encoding (§11.16 has the full story): the encoder emits v10
+only to peers with the `SERVER_UMBRELLA` feature and silently downgrades to
+v9 otherwise — losing the descriptors, which is safe *because they are
+advisory*. The reply's `oob_results` likewise encodes only to umbrella
+peers, downgrading `header.version` back to 8.
+
+The lease is deliberately **not** on the wire: it is the pool option
+`rdma_delivery_lease`, so the OSD that enforces it and the client that
+sizes its fence from it read the same OSDMap value and cannot disagree.
+
+## 11.9 The OSD delivery path
+
+`src/osd/PrimaryLogPG.{h,cc}`, `src/osd/osd_cuobj.{h,cc}`, `src/osd/OSD.cc`.
+
+Nothing changes in dispatch, `do_osd_ops()` or `do_read()` — the read
+executes exactly as before, into `OSDOp::outdata`. The delivery hook sits
+at the single reply-time chokepoint every successful data-bearing read
+reply funnels through, `PrimaryLogPG::complete_read_ctx()`:
+
+```cpp
+if (result >= 0 && osd->cuobj && m->has_rdma_delivery()) {
+  std::vector<OSDOp> rops;
+  reply->claim_ops(rops);                    // swap the reply's own op copies
+  std::vector<ceph::rdma::oob_result_t> oob(rops.size());
+  if (deliver_oob(ctx, rops, oob))
+    reply->set_oob_results(std::move(oob));
+  reply->claim_ops(rops);                    // swap back, outdata now stripped
+}
+```
+
+That placement covers plain reads, EC sync/direct reads, the EC async-read
+re-entry, and cache-tier proxy reads with one shim (commit `e07b3f8d7d7`).
+
+`deliver_oob()` runs the request-level refusal ladder — each refusal simply
+returns the data inline:
+
+1. descriptor vector doesn't mirror `ops` → malformed, inline;
+2. `m->get_retry_attempt() > 0` → retransmitted request, inline (§11.14);
+3. `osd->get_mnow() > recovery_state.get_readable_until()` → the PG read
+   lease lapsed *after* dispatch (a read can stall between `check_laggy`
+   and the reply); past `readable_until` another acting set may already be
+   serving this object into the same window, so pushing now would be a
+   stale write (commit `4043ee33b7c`);
+4. op age (`now - recv_stamp`) exceeds the pool's `rdma_delivery_lease` →
+   inline.
+
+Then per op, `deliver_op_oob()`: unknown flag bits → inline; op is not
+READ/SYNC_READ/SPARSE_READ → inline (descriptors on guards or stat ops are
+ignored); failed or empty read → inline. Otherwise it builds a placement
+plan (§11.10), calls `OSDCuObj::execute_plan()`, and on success clears
+`outdata` (a sparse read keeps its extent map inline with an empty data
+blob) and fills `oob_results[i]`.
+
+`OSDCuObj` (osd_cuobj.cc) is the per-OSD cuObject endpoint: one
+`cuObjServer` bound to `osd_cuobj_rdma_ip` (defaults to the public address
+— **must** be set when the RDMA NIC is a different interface), a pool of
+`osd_cuobj_buffer_count` × `osd_cuobj_buffer_size` pre-registered staging
+buffers (32 × 8 MiB default), and lazily-allocated per-op-worker-thread DC
+initiator channels. Created in `OSD::init()` when `osd_cuobj_enabled`; if
+the RDMA session fails to start the OSD logs a warning and serves
+everything inline. `ceph daemon osd.N cuobj status` dumps
+plans-started/completed/failed, bytes pushed, writes in flight, buffers
+leaked.
+
+`execute_plan()` is all-or-nothing:
+
+```text
+validate every triple against the token window and the data length
+split triples into <=1 GiB work items
+claim a pooled staging buffer (or a transient registration if too large)
+copy the reply bufferlist into it                <- the one staging memcpy
+loop: keep <=16 async handleGetObject() submissions in flight
+      poll completions on this thread's channel (5 us naps when idle)
+on poll error: the library reset the QP, flushing the rest -> whole plan fails
+on 60 s deadline: leak the staging buffer deliberately
+      (the HCA may still read it; recycling would corrupt a future request)
+return total bytes only if every write completed, else negative errno
+      -> caller delivers inline
+```
+
+## 11.10 Placement planning
+
+`src/osd/oob_placement.{h,cc}` — pure functions, no OSD or RDMA
+dependencies, so the interleave math unit-tests standalone
+(`src/test/osd/test_oob_placement.cc`).
+
+The OSD cannot just "send this buffer to client offset X": where each byte
+belongs in the client window depends on the object offset, the requested
+range, sparse holes, and — for EC direct reads — which chunks of which
+stripes this shard happens to hold. A plan makes that explicit:
+
+```cpp
+struct placement_triple {
+  uint64_t local_ofs;   // offset into the OSD-side reply buffer
+  uint64_t client_ofs;  // offset into the client's memory window
+  uint64_t len;
+};
+using placement_plan = std::vector<placement_triple>;
+```
+
+A plan is deliberately a *correspondence, not a direction* (commit
+`7fa7cc2b2b1`): the same geometry would let an OSD RDMA-*read* its share of
+a write payload out of client memory; direction belongs to the executor.
+
+Three builders:
+
+```text
+READ / SYNC_READ (and EC primary reads)
+  linear_plan(base_offset, data_len)
+  one triple: local [0, len) -> client [base_offset, base_offset+len)
+
+     OSD reply buffer            client window
+     [==============]   ---->    ....[==============]....
+                                     ^base_offset
+
+SPARSE_READ
+  sparse_plan(base_offset, read_ofs, extent_map, data_len)
+  the reply blob packs extents back-to-back; each extent goes to
+  base_offset + (extent_ofs - read_ofs). Extent map stays inline.
+
+     blob  [AAA][BBBB]           client window
+                        ---->    ..[AAA]......[BBBB]..
+                                   holes are never written
+
+EC direct read (client split-read path)
+  ec_direct_plan(base_offset, ro_off, ro_len, chunk_size, k, raw_shard, len)
+  this shard's reply holds its chunks in ascending stripe order; chunk c
+  (owned when c % k == raw_shard) goes to
+  base_offset + (c*chunk_size - ro_off), clipped to the range.
+```
+
+The EC interleave, drawn for k=3 (chunk = one cell, shard i owns chunks
+where chunk_no % 3 == i):
+
+```text
+logical object:   | c0 | c1 | c2 | c3 | c4 | c5 | c6 | c7 | c8 |
+owner shard:        0    1    2    0    1    2    0    1    2
+
+shard 0 reply: [c0][c3][c6] --RDMA--> client ofs of c0, c3, c6
+shard 1 reply: [c1][c4][c7] --RDMA--> client ofs of c1, c4, c7
+shard 2 reply: [c2][c5][c8] --RDMA--> client ofs of c2, c5, c8
+
+               three OSDs write concurrently; their scattered writes
+               interleave into one contiguous logical view. Client-side
+               reassembly disappears into the NIC's address arithmetic.
+```
+
+The plan builders are tested against the client-side stripe walk
+(`ECStripeIterator`) as the oracle across randomized geometries — the two
+independent implementations of the same layout math must agree.
+
+## 11.11 Replicated pools
+
+The common case is boring on purpose. RGW reads go to the primary; the
+whole stripe read produces one contiguous reply; `linear_plan()` collapses
+to a single `RDMA_WRITE`:
+
+```text
+Primary OSD
+   |
+   | read stripe from BlueStore
+   | RDMA_WRITE [stripe] -> client window @ base_offset
+   v
+Client
+```
+
+Replica *split* reads exist only under `rados_replica_read_policy=balance`
+with pool `split_reads` (replicated pools carry the flag unconditionally):
+`ReplicaSplitOp` slices one big read into page-rounded chunks round-robined
+across the acting set. The descriptor fan-out (`SplitOp::create()`,
+osdc/SplitOp.cc) gives each sub-read the window **shifted to its own
+origin**:
+
+```cpp
+auto d = op->rdma_delivery[parent];
+d.base_offset += sub_op->ops[j].op.extent.offset -
+                 op->ops[parent].op.extent.offset;   // zero for EC-direct subs
+```
+
+so each replica pushes its disjoint slice to the right client offset.
+
+The series also carries a standalone pre-existing bug fix here (commit
+`84a605bf48f`): the slice size came from a floor division rounded up to the
+page size, so the chunk count could reach `slice_count + 1`, wrapping the
+round-robin — one sub-read then got two READ ops in the same `ops_index`
+whose `out_bl`/`out_ec` slots aliased the same `Details` entry, and the
+second reply silently overwrote the first chunk's data. Ceiling division
+fixes the count. Worth knowing about even if you never enable RDMA.
+
+## 11.12 EC pools
+
+Two distinct read paths, and the distinction is a property of the pool and
+read policy, not of this PR:
+
+**Primary (reconstructing) reads — the default.** The primary gathers
+shards, reconstructs, and replies with logical data. To the delivery shim
+that reply is indistinguishable from a replicated read: `linear_plan()`,
+one write. **Plain EC pools therefore work with zero client changes** —
+this falls out of putting the hook at `complete_read_ctx()` rather than in
+a special op.
+
+**Shard-direct (split) reads.** Requires `allow_ec_optimizations` on the
+pool *and* `rados_replica_read_policy=balance` on the gateway (the pool
+flag grants permission; the balanced-read flag on the request decides).
+`ECSplitOp` sends each shard OSD a sub-read in shard-offset space; the
+sub-read carries the parent descriptor with the *original* extent (zero
+shift), and the shard OSD — which knows `chunk_size`, `k`, and its own raw
+shard index via `ctx->op->ec_direct_read()` — runs `ec_direct_plan()` to
+scatter its chunks to their logical positions:
+
+```text
+        EC object, k=3
+       /      |      \
+   OSD.s0   OSD.s1   OSD.s2        each reads only its own shard
+      \       |       /
+       \      |      /             concurrent chunk-interleaved
+        v     v     v              RDMA_WRITEs
+     [c0..][c1..][c2..]  -> one contiguous client buffer
+```
+
+Logical vs shard offsets: the *request* to a shard is in shard space
+(the shard's j-th chunk is logical chunk `raw_shard + j*k`); the
+*placement* converts back to logical space. The reconstruct-and-reassemble
+step — and its memory traffic on both primary and client — disappears.
+
+Unsupported EC cases degrade, never break: EC-direct **sparse** reads
+deliver inline (their extent maps are in shard space; interleaving them is
+a listed follow-up), as does any pool whose `sinfo` lacks
+`supports_direct_reads()`. And when a gateway stripe doesn't span multiple
+EC stripes (`rgw_obj_stripe_size == stripe_width`), each shard holds one
+contiguous range and the "interleave" collapses to a single write anyway.
+
+## 11.13 Correctness: lease, fencing, interlock
+
+One-sided RDMA breaks an assumption RADOS retry machinery relies on: a
+request the client gave up on can still have *side effects in client
+memory* later.
+
+```text
+RGW                          OSD X                       Client window
+ |  stripe read + token  ->   | (op queued, OSD wedged)
+ |  ... X marked down ...     |
+ |  restart GET in fallback   |
+ |  HTTP body rewrites the    |
+ |  same client ranges        |
+ |                            | wakes up, pushes stale   ####### corrupted
+ |                            | stripe via RDMA_WRITE -> ####### after the
+ |                            |                          ####### fact
+```
+
+Three mechanisms close this, layered by failure mode:
+
+**1. The drained reply is the interlock (OSDs still in contact).**
+`execute_plan()` completes the push *before* the op reply is sent, and RGW
+drains every stripe op before any HTTP response. So for every OSD that
+answered, the write has landed before the client hears anything.
+
+**2. Retransmitted requests deliver inline (peering changes).** RADOS
+re-sends reads after peering; the resend carries `retry_attempt > 0` and
+the OSD refuses to push it. So at most one attempt of an op ever writes the
+window — the superseded attempt's write may still be in flight on another
+OSD, and two writers to one range would race. This also keeps the
+Objecter's re-stamped descriptors (§11.7) harmless.
+
+**3. Lease + fence (OSDs that vanished).** The pool's
+`rdma_delivery_lease` (default 5 s, `ceph osd pool set <pool>
+rdma_delivery_lease <s>`) bounds how long after *receipt* an OSD may still
+**initiate** a push — `deliver_oob()` compares against
+`m->get_recv_stamp()`. On fallback, when descriptor-bearing ops already
+reached OSDs (`params.rdma_submitted`), RGW waits:
+
+```text
+fence = pool rdma_delivery_lease            (may a write still START?)
+      + rgw_cuobj_fence_drain_ms (3 s)      (may a started write still LAND?
+                                             sized to the RDMA transport's
+                                             retry budget)
+```
+
+before the fallback rewrites the same ranges (`RGWGetObj::execute()`,
+async timer on the beast yield context). The lease is wall-clock and
+documented as *best-effort across clock steps* — size it with slack.
+
+**4. PG read lease re-check (split brain).** Independent of the delivery
+lease: a primary that lost its peers re-checks `readable_until`
+immediately before pushing, because the readability check at dispatch does
+not cover a read that stalled afterward. Past it, a new acting set may be
+serving the object — and the client re-driving the request into the same
+window — so the old primary delivers inline, the same way a laggy PG stops
+serving reads.
+
+This is why the mechanism is called **advisory**: the OSD promises nothing.
+Every "no" — and every crash — converges on the same outcome the client
+can always handle: inline data, or no reply and a fenced retry.
+
+## 11.14 Retry and failure handling, concretely
+
+* **One OSD lacks the feature** → its stripe arrives inline →
+  `flush_rdma()` returns `-EOPNOTSUPP` → RGW cancels/drains the remaining
+  stripe ops, fences (§11.13), restarts the GET staged or plain-HTTP.
+  Client ranges already RDMA-written get harmlessly rewritten; no HTTP
+  byte had been committed, so the restart is invisible.
+* **OSD crashes mid-request** → the Objecter resends after peering; the
+  resend is refused (`retry_attempt > 0`) and comes back inline → same
+  fallback as above; the fence covers the crashed OSD's possible late
+  write.
+* **Mixed sub-replies under SplitOp** (some sub-reads pushed, some inline —
+  e.g. one replica of a balanced read is an old OSD) → `SplitOp::complete()`
+  detects it and returns `-EAGAIN`, retrying to the primary, where the
+  resend is *guaranteed* inline by rule 2. A half-pushed op is never
+  reported as success.
+* **RDMA transport failure on the OSD** (QP reset, timeout) →
+  `execute_plan()` fails the whole plan → that op is delivered inline; a
+  wedged transport leaks the staging buffer deliberately rather than
+  recycle memory the HCA may still read.
+* **Byte-count mismatch at RGW** (`rdma_bytes != total_len` after a
+  passthrough that claimed success) → `-EIO`, request fails; this is a
+  should-never-happen consistency check, not a fallback.
+
+## 11.15 Integrity: CRC64-NVME end to end
+
+The gateway never touches passthrough data, so verification moves to where
+the data is. With `rgw_cuobj_crc64nvme` (default on), each OSD checksums
+the exact bytes it pushed — after the read, per placement triple — and the
+reply carries them in `oob_results` (commits `62d6ff9fbc3` →
+`1a87a64b95b`; tables hoisted from rgw's vendored madler/spdk sources into
+`src/common/crc64nvme.{h,cc}`).
+
+The subtle part is *combinability* (commit `a1901149c4f`): a CRC over
+"every third chunk" is valid for what one shard moved but cannot be
+concatenated with its neighbours. So the result separates three properties:
+
+```text
+FLAG_CRC64NVME        crc64 covers the bytes this OSD moved      (validity)
+FLAG_CRC64_COMBINABLE ...and they are one contiguous logical
+                      extent, so crc64 concatenate-combines      (foldability)
+FLAG_CRC64_RANGES     ranges[] carries one (ofs, len, crc64)
+                      per placed extent                          (the general case)
+```
+
+Any set of ranges tiling a window without gaps folds in offset order
+(`fold_crc64_ranges()`, using the standard carry-less
+`crc64nvme_combine()`), *regardless of which OSD moved which chunk* — so
+interleaved EC-direct stripes verify the same way contiguous ones do,
+folded first by `SplitOp::complete()` per op, then by
+`Read::iterate()` across stripes. For a whole-object GET of an object with
+a stored non-composite `crc64nvme` attribute (the AWS
+`x-amz-checksum-crc64nvme` type), `RGWGetObj::execute()` compares before
+any response byte is committed; mismatch fails the GET with `-EIO` instead
+of reaching the application. That is corruption detection across client
+memory, the fabric, and the storage node.
+
+One doc nit if you read `doc/radosgw/s3-rdma.rst` closely: its
+*Erasure-coded pools* and *Integrity* paragraphs still say shard-direct and
+sparse reads "skip verification" — text that predates the final per-range
+CRC commit — while the *Configuration* section correctly describes the
+range-fold. The code implements the range-fold.
+
+## 11.16 Mixed-version compatibility
+
+```text
+New RGW (umbrella librados)
+   |
+   +----------------------------+
+   |                            |
+require_osd_release             require_osd_release
+>= umbrella                     <  umbrella
+   |                            |
+Objecter attaches               Objecter refuses to attach
+descriptors                     (descriptors never hit the wire)
+   |                            |
+per-connection:                 plain v9 MOSDOp, normal READ
+SERVER_UMBRELLA peer -> v10     |
+older peer -> encode as v9      |
+   |                            |
+   +-------------+--------------+
+                 |
+        any inline stripe -> RGW fallback ladder
+```
+
+Two gates, both load-bearing, because they guard different failure modes:
+
+* **`require_osd_release >= umbrella`** (checked in `_prepare_osd_op()`):
+  old OSDs do not tolerate unknown `MOSDOp` versions — they
+  *garbage-decode* them rather than rejecting them. The release gate
+  guarantees no pre-umbrella OSD can ever be sent v10.
+* **`HAVE_FEATURE(features, SERVER_UMBRELLA)`** (checked at encode time,
+  per connection): belt-and-suspenders for any peer that negotiated
+  without the feature — the encoder emits the v9 layout and the
+  descriptors are silently dropped, which is safe *only because they are
+  advisory*: the data comes back inline and RGW falls back.
+
+On the reply, `oob_results` is trailing and encodes only to umbrella peers
+(the encoder downgrades `header.version` 9 → 8 otherwise) — downgrade-safe
+by construction: a client that never sent descriptors never looks for
+results, and a pre-umbrella client never receives the field.
+
+Old RGW / new OSD needs nothing: no token, no descriptor, no change.
+`CEPH_OSD_OP_READ_RDMA`'s brief existence is memorialized as a
+reserved-unused op slot (`src/include/rados.h`, RD|DATA 34) so nothing ever
+reuses those bytes against a build of the interim series.
+
+## 11.17 RGW fallback ladder
+
+```text
+S3 GET
+  |
+  v
+x-amz-rdma-token present? -- no --> normal HTTP/RADOS path
+  |
+ yes
+  |
+eligible for passthrough?
+  (rgw_cuobj_osd_passthrough on,
+   plain filter chain, no DLO/SLO,
+   no d3n, response fits window)   -- no --+
+  |                                        |
+ yes                                       |
+  |                                        v
+iterate() with descriptors          gateway cuObjServer up?
+  |                                   |            |
+  | any stripe inline                yes           no
+  | (-EOPNOTSUPP)                     |            |
+  +----> fence wait ---------------> STAGED     HTTP body +
+  |      (lease + drain,            (stage in   x-amz-rdma-reply: 501
+  |       only if ops reached OSDs)  RGW buffer,
+  |                                  one RDMA_WRITE)
+  | all stripes pushed
+  v
+HTTP 200, Content-Length: 0, x-amz-rdma-reply: 200
+```
+
+Why each eligibility restriction exists:
+
+* **Compression / encryption / Lua / Flight** — a data filter is chained,
+  so bytes *must* flow through RGW to be transformed; passthrough is
+  detected by filter-chain identity (`filter == &cb`), not by a list of
+  cases, so future filters are automatically safe.
+* **DLO/SLO** — `handle_user_manifest()`/`handle_slo_manifest()` return
+  from `execute()` before the mode is ever selected; Swift manifests
+  stitch multiple objects with their own iteration. (Ordinary S3 multipart
+  is *not* excluded — it is just a manifest walk.)
+* **d3n cache** — substitutes local cached stripe sources for RADOS reads;
+  there is no OSD to push from. Checked in `Read::iterate()`.
+* **Response must fit the client window** — `total_len <= rsize` parsed
+  from the token; per-stripe scatter writes beyond the registered window
+  would be refused write-by-write at the NIC, wastefully.
+* **Range GETs and multipart: supported**, because `base_offset` is
+  computed relative to the requested range start, not the object start.
+
+Fallback is *per request and whole-GET*: mixing pushed and streamed
+stripes in one response is never attempted (the restart rewrites
+everything), which keeps the client contract binary — either
+`x-amz-rdma-reply: 200` and all bytes are in the window, or the body has
+everything.
+
+## 11.18 Performance implications
+
+```text
+old:   OSD ----data----> RGW ----data----> Client        2 fabric crossings,
+                                                          1 gateway staging copy
+new:   OSD ------------data (RDMA)-------> Client        1 fabric crossing,
+       OSD ----reply: byte counts, CRCs--> RGW            0 gateway data bytes
+```
+
+Architectural effects (the PR reports **no benchmark numbers**; everything
+below is expected, not measured):
+
+* per-GET fabric traffic halves; the OSD→RGW hop disappears entirely;
+* gateway memory: no per-request full-object staging buffer (staged mode
+  needs `total_len` of registered memory per in-flight GET; passthrough
+  needs zero);
+* gateway CPU: no data-path memcpy, checksum offloaded to OSDs;
+* aggregate GET bandwidth scales with OSD count; gateways size for the
+  control plane;
+* GPU-direct: client windows can be GPU memory (GPUDirect), so S3 GET
+  lands in the accelerator with no bounce through host memory anywhere.
+
+Current costs, stated plainly:
+
+* **The OSD op worker blocks** in `execute_plan()` until the batch drains
+  (bounded by the transport's retry budget, worst case 60 s). Submissions
+  are already batched async; moving the wait fully off the reply path is
+  planned follow-up work. Until then, RDMA pushes occupy op threads the
+  way slow disks would.
+* **One staging memcpy per stripe** on the OSD (reply bufferlist → 
+  pre-registered buffer). The planned fix is registering the BlueStore
+  hugepage read-buffer pool (#43849's `ExplicitHugePagePool`) with the
+  NIC — then BlueStore reads land in NIC-registered memory and the copy
+  disappears. **The current implementation is not zero-copy**:
+
+```text
+today:    NVMe --DMA--> BlueStore buffer --memcpy--> registered staging
+              buffer --NIC DMA--> fabric --> client memory
+planned:  NVMe --DMA--> registered hugepage pool --NIC DMA--> client memory
+```
+
+* Multi-initiator writes into one client window (several OSDs, one token)
+  are architecturally supported by the DC transport and validated per-op
+  against the token's range, but NVIDIA's docs never state it in one
+  sentence — the PR explicitly wants a 2-OSD hardware PoC before
+  graduating from RFC.
+
+## 11.19 Important source files and the commit layers
+
+The 30 commits, grouped by architectural layer (not in order):
+
+```text
+Layer                     Commits          Files / what
+-----                     -------          ------------
+1 cuObject foundation     39b629512d0      rgw_cuobj.{h,cc}: RGWCuObjServer
+  (staged mode, #70458)   380e4965606      singleton, staged GET/PUT,
+                          5249f35695d      buffer pool; host-prereq docs
+
+2 token parsing           c6e84042dfd      common/rdma_token.{h,cc}:
+                                           parse_rdma_token(), 512-byte cap
+
+3 client API              a783aaa0833      READ_RDMA op (interim, later
+                          59a1146c2d0      removed); delivery_t on MOSDOp
+                          3d04739da77      v10; set_rdma_delivery(); per-op
+                                           descriptor vector
+
+4 OSD execution           1c134229c6c      osd_cuobj.{h,cc}: OSDCuObj,
+                          e07b3f8d7d7      execute_plan(); oob_placement:
+                          7fa7cc2b2b1      the 3 plan builders; the
+                                           complete_read_ctx() shim
+
+5 RGW passthrough         ba5581dbb95      rgw_op/rgw_rados/rgw_sal:
+                          15d3ad0d215      mode ladder, SAL contract,
+                          73da85bb4e4      fence, fallback restart
+
+6 split-read fan-out      4160c0e70f4      SplitOp descriptor fan-out;
+                          84a605bf48f      standalone replica-wrap
+                                           aliasing bug fix
+
+7 correctness + CRC       0000b837eb2      pool rdma_delivery_lease
+                          80411d18b35      option (mon + osd_types);
+                          b00e063bc28      lease-by-initiation semantics;
+                          4043ee33b7c      readable_until re-check;
+                          62d6ff9fbc3      CRC64-NVME: common/crc64nvme,
+                          dc122831b48      wire results, OSD compute,
+                          5dc6c526024      RGW verify, validity vs
+                          4d692571a4d      combinability, per-range
+                          a1901149c4f      fold for interleaves
+                          1a87a64b95b
+                          96e4384b03b      direction-neutral descriptor
+
+8 docs / tests / build    51968f85187      doc/radosgw/s3-rdma.rst;
+                          0ea269fec0a      unittest_rdma_delivery (pins
+                          2c428782d38      wire bytes), unittest_oob_
+                          6f56bc418d1      placement (ECStripeIterator
+                                           oracle), unittest_rdma_token,
+                                           RdmaDeliveryInlineFallbackPP
+```
+
+Data structures at a glance:
+
+```text
+Structure                  Layer          Purpose
+---------                  -----          -------
+RDMA token (opaque str)    client/RGW     names the registered client window
+                                          (raddr:rsize:rkey:... + dc_key auth)
+delivery_t                 MOSDOp v10     tells the OSD where the op's bytes
+                                          go: token + base_offset + flags
+placement_plan             OSD            (local_ofs, client_ofs, len) triples
+                                          mapping reply bytes to the window
+oob_result_t               MOSDOpReply v9 bytes pushed + crc64 + flags +
+                                          per-range CRCs (0 bytes = inline)
+crc_range_t                reply/client   (ofs, len, crc64) — the foldable
+                                          unit for interleaved layouts
+rdma_delivery_lease        pool option    OSD-enforced initiation bound;
+                                          clients size the fence from it
+dc_key                     cuObject       cluster-wide DC auth key
+                                          (osd_cuobj_dc_key = client's
+                                          rdma_dc_key); token+key = write
+                                          access to the window
+rdma_delivery_result       librados       public mirror of oob_result_t
+get_obj_data.rdma_slots    RGW            per-stripe results, logical order
+```
+
+Critical-path trace with exact symbols:
+
+```text
+RGWGetObj_ObjStore_S3::get_params()          src/rgw/rgw_rest_s3.cc
+RGWGetObj::execute() / select_rdma_mode()    src/rgw/rgw_op.cc
+RGWRados::Object::Read::iterate()            src/rgw/driver/rados/rgw_rados.cc
+RGWRados::get_obj_iterate_cb()               (per stripe: read + descriptor)
+ObjectOperation::set_rdma_delivery()         src/osdc/Objecter.h
+Objecter::_prepare_osd_op()                  src/osdc/Objecter.cc (gates)
+MOSDOp v10 encode/decode                     src/messages/MOSDOp.h
+[SplitOp::create() fan-out]                  src/osdc/SplitOp.cc
+PrimaryLogPG::do_osd_ops() -> do_read()      unchanged read machinery
+PrimaryLogPG::complete_read_ctx()            src/osd/PrimaryLogPG.cc
+PrimaryLogPG::deliver_oob()/deliver_op_oob() (refusals, plan, strip outdata)
+linear_plan/sparse_plan/ec_direct_plan       src/osd/oob_placement.cc
+OSDCuObj::execute_plan()                     src/osd/osd_cuobj.cc (RDMA_WRITEs)
+MOSDOpReply v9 (oob_results)                 src/messages/MOSDOpReply.h
+Objecter::handle_osd_op_reply()              copy results to slots
+get_obj_data::flush_rdma() / drain           fallback detection, CRC fold
+RGWGetObj_ObjStore_S3::send_response_data()  x-amz-rdma-reply header
+```
+
+## 11.20 A complete 64 MiB GET, replicated pool
+
+Client registers a 64 MiB window, sends
+`GET /bucket/model.bin` + `x-amz-rdma-token`. RGW's manifest walk yields 16
+stripe reads of 4 MiB (`rgw_obj_stripe_size`), throttled 4-at-a-time by the
+16 MiB aio window:
+
+```text
+Client
+  |  GET + token (window: 64 MiB)
+  v
+RGW: eligible -> PASSTHROUGH
+  |  16 stripe reads, each: op.read(0, 4M)
+  |                         op.set_rdma_delivery(token, stripe_index*4M, CRC)
+  v
+Objecter: 16 MOSDOp v10 -> primaries of 16 PGs (spread over the cluster)
+
+OSD a (stripe 0):  BlueStore read 4M -> linear_plan(0*4M, 4M)
+                   -> RDMA_WRITE ---------------> Client[ 0M.. 4M)
+OSD b (stripe 1):  BlueStore read 4M -> linear_plan(1*4M, 4M)
+                   -> RDMA_WRITE ---------------> Client[ 4M.. 8M)
+OSD c (stripe 2):  ...          -> RDMA_WRITE --> Client[ 8M..12M)
+  ...                                    (up to 4 stripes in flight)
+OSD p (stripe 15): ...          -> RDMA_WRITE --> Client[60M..64M)
+```
+
+Reply path, per stripe: the OSD's push has already completed, so the
+`MOSDOpReply` carries empty `outdata` and
+`oob_results[0] = (bytes=4M, crc64, CRC64NVME|COMBINABLE)`. The Objecter
+copies that into the stripe's `rdma_slots` entry; `flush_rdma()` sees no
+inline data. After the drain, RGW sums 16 × 4 MiB = 64 MiB = `total_len`,
+folds the 16 combinable CRCs in stripe order, compares against the stored
+`crc64nvme` attribute, and answers:
+
+```text
+HTTP/1.1 200 OK
+Content-Length: 0
+x-amz-rdma-reply: 200
+x-amz-rdma-bytes-transferred: 67108864
+```
+
+The client's completion signal is that HTTP response; by the interlock,
+every byte was in its window before the response was formed.
+
+Now suppose **OSD c cannot push** — built without `WITH_OSD_CUOBJ`,
+`osd_cuobj_enabled` off, or `rdma_ucm` missing so its RDMA session never
+started. (A single *pre-Umbrella* OSD can't produce this: an OSD older
+than `require_osd_release` can't join, and below umbrella the Objecter
+never attaches descriptors at all — then *every* stripe arrives inline
+and the same fallback runs.) Stripe 2 comes back as a normal inline read. `flush_rdma()` returns
+`-EOPNOTSUPP`; RGW drains the other stripes, then — because descriptors
+did reach OSDs — waits the fence (5 s lease + 3 s drain at defaults),
+clears the descriptor params, and re-runs the identical `iterate()` in
+staged mode (one gateway `RDMA_WRITE` of the re-read 64 MiB) or plain HTTP
+with `x-amz-rdma-reply: 501`. Stripes 0 and 1, already sitting in client
+memory, are simply rewritten with identical bytes. The client sees one
+slower GET, nothing else.
+
+## 11.21 Key takeaways
+
+1. **RGW stops being the GET data path.** Control plane (auth, manifest,
+   HTTP, accounting) stays; the bytes go OSD→client once, and GET
+   bandwidth scales with OSDs, not gateways. A passthrough gateway needs
+   no RDMA hardware at all.
+2. **The delivery descriptor is a message field, not an op** — the interim
+   `CEPH_OSD_OP_READ_RDMA` was deliberately killed. An advisory field
+   degrades to a normal read; an unknown op degrades to an error. That one
+   choice is what makes mixed-version clusters need "no ceremony".
+3. **All refusals converge on inline data.** Old OSD, disabled feature,
+   expired lease, retransmit, unknown flags, RDMA failure, laggy PG — the
+   client-visible behavior is identical, and RGW keys one fallback ladder
+   off it.
+4. **Hooking the reply chokepoint (`complete_read_ctx`) instead of the op
+   table** is why plain EC pools work with zero client changes: an EC
+   primary read's reply is already logical data, and the shim can't tell
+   it from a replicated read.
+5. **Placement plans separate layout math from transport.** Pure
+   `(local_ofs, client_ofs, len)` builders — linear, sparse,
+   EC-chunk-interleaved — unit-tested against `ECStripeIterator` as an
+   oracle; the cuObject executor consumes them verbatim, and EC client-side
+   reassembly disappears into NIC address arithmetic.
+6. **One-sided RDMA + at-least-once RPC forces an explicit fencing story:**
+   push-before-reply as the interlock, inline delivery of retransmits, a
+   pool-level initiation lease, and an RGW fence of lease + transport
+   drain before any fallback rewrites the window.
+7. **Integrity moved to where the data is:** OSDs CRC64-NVME what they
+   push, per contiguous range, and RGW folds ranges in window order —
+   so even interleaved EC-direct layouts verify against the stored
+   full-object checksum before the HTTP response commits.
+8. **The current implementation is not zero-copy and not async on the
+   OSD:** one staging memcpy per stripe and an op worker parked until the
+   batch drains. The named follow-ups (NIC-registered BlueStore hugepage
+   read buffers, off-worker completion) are what would make this a true
+   fast path.
+9. **New knobs to know:** pool `rdma_delivery_lease`;
+   `rgw_cuobj_osd_passthrough`, `rgw_cuobj_crc64nvme`,
+   `rgw_cuobj_fence_drain_ms`; `osd_cuobj_enabled`, `osd_cuobj_rdma_ip`
+   (must name the RDMA interface), buffer pool sizing, `osd_cuobj_dc_key`;
+   and `ceph daemon osd.N cuobj status` for the interlock counters.
+10. **Still an RFC:** no benchmark numbers in the PR, crimson out of
+    scope, EC-direct sparse reads inline, and the multi-initiator
+    single-window pattern awaits a 2-OSD hardware PoC on ConnectX-5+.
