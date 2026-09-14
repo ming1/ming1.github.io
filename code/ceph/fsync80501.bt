@@ -1,0 +1,19 @@
+// Does BlueFS::fsync() return before its aio completes, and does the
+// flush() inside it issue fdatasync?  Addresses are the hot (non-.cold)
+// bodies from `nm`; A and C binaries are identical so A's addrs serve both.
+//   0x33f6b0 BlueFS::fsync(FileWriter*)
+//   0x4bab80 KernelDevice::flush()
+//   0x4fed30 aio_queue_t::get_next_completed(int, aio_t**, int)
+BEGIN { printf("%-9s %-6s %-14s %s\n", "us", "tid", "event", "detail"); @t0 = nsecs; }
+
+uprobe:BIN:0x33f6b0     { @fs[tid] = 1; @n_fsync++; }
+uretprobe:BIN:0x33f6b0  { printf("%-9lld %-6d %-14s #%d\n", (nsecs-@t0)/1000, tid, "fsync-ret", @n_fsync); delete(@fs[tid]); }
+uretprobe:BIN:0x4bab80  { if (@fs[tid]) { @flush_in_fsync++; } }
+uprobe:libc:fdatasync   { if (@fs[tid]) { @fdatasync_in_fsync++; printf("%-9lld %-6d %-14s fd=%d\n", (nsecs-@t0)/1000, tid, "fdatasync", arg0); } }
+uretprobe:BIN:0x4fed30  { if (retval > 0) { @n_done += retval; printf("%-9lld %-6d %-14s n=%d (total %d)\n", (nsecs-@t0)/1000, tid, "aio-complete", retval, @n_done); } }
+
+END {
+  printf("\nfsync calls=%d  flush() inside fsync=%d  fdatasync inside fsync=%d  aio completions=%d\n",
+         @n_fsync, @flush_in_fsync, @fdatasync_in_fsync, @n_done);
+  clear(@fs);
+}

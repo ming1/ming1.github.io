@@ -1,7 +1,7 @@
 ---
 title: "Ceph Tracker Notes"
 category: storage
-tags: [ceph, bluestore, bluefs, tracker, debugging, wal, ebpf, network, tcp, checksum, clone, libaio, containers, osd, messenger, throttle, mclock, latency, lease, peering, laggy, rdma, rgw, s3, ec, cuobject]
+tags: [ceph, bluestore, bluefs, tracker, debugging, wal, ebpf, network, tcp, checksum, clone, libaio, posix-aio, freebsd, asan, containers, osd, messenger, throttle, mclock, latency, lease, peering, laggy, rdma, rgw, s3, ec, cuobject]
 ---
 
 * TOC
@@ -4470,3 +4470,316 @@ slower GET, nothing else.
 10. **Still an RFC:** no benchmark numbers in the PR, crimson out of
     scope, EC-direct sparse reads inline, and the multi-initiator
     single-window pattern awaits a 2-OSD hardware PoC on ConnectX-5+.
+
+# 12. Tracker #80501 — a `#ifdef` that made `fsync()` a no-op on FreeBSD for nine years
+
+Reported as a heap-use-after-free in `~FileWriter()` · affects BlueFS on
+every platform built with POSIX AIO (FreeBSD) — Linux is not affected ·
+component os/bluestore (BlueFS) · fix: four preprocessor lines ·
+Status: root cause differs from the report's; proposed PR #71766 fixes the
+symptom and leaves the durability hole open
+
+## 12.1 Report
+
+### 12.1.1 The observation
+
+[Tracker #80501](https://tracker.ceph.com/issues/80501) (Willem Jan
+Withagen, 2026-09-13, FreeBSD): `unittest_bluefs
+--gtest_filter=BlueFS_wal.wal_v2_simulate_crash` crashes about once in
+200 runs. Under AddressSanitizer it is deterministic within ~120
+iterations:
+
+```
+==54046==ERROR: AddressSanitizer: heap-use-after-free
+READ of size 8 at 0x5130000061a8 thread T4
+    #0 aio_t::get_return_value()          src/blk/aio/aio.h:76
+    #1 KernelDevice::_aio_thread()        src/blk/kernel/KernelDevice.cc:730
+
+freed by thread T0 here:
+    #9  std::list<aio_t>::~list()
+    #10 IOContext::~IOContext()           src/blk/BlockDevice.h:79
+    #11 BlueFS::FileWriter::~FileWriter() src/os/bluestore/BlueFS.h:481
+    #12 BlueFS_wal_wal_v2_simulate_crash_Test::TestBody()
+                                          src/test/objectstore/test_bluefs.cc:1339
+previously allocated by thread T0 here:
+    #7  std::list<aio_t>::push_back(aio_t&&)
+    #8  KernelDevice::aio_write()         src/blk/kernel/KernelDevice.cc:1216
+    #9  BlueFS::_flush_data()             src/os/bluestore/BlueFS.cc:4230
+```
+
+The device's completion thread reads an `aio_t` that the writer's
+destructor has already freed. The reporter's reading: `fsync()` only
+*submits* aios and never waits for them, so a `FileWriter` deleted
+without `close_writer()` still has I/O in flight. Proposed fix
+([PR #71766](https://github.com/ceph/ceph/pull/71766)): call
+`aio_wait()` on each `IOContext` inside `~FileWriter()`.
+
+The test itself ([`test_bluefs.cc:1300`](https://github.com/ceph/ceph/blob/v21.3.0/src/test/objectstore/test_bluefs.cc#L1300))
+is a crash simulation — 100 rounds of `append_try_flush` + `fsync`,
+then a bare `delete writer` with the comment *"close without orderly
+shutdown, simulate failure"*, then remount and verify the data. The
+bare delete is deliberate: on a real crash nothing calls
+`close_writer()` either.
+
+### 12.1.2 Reproducing it
+
+FreeBSD is not needed. The race is a property of a build configuration,
+and that configuration can be reproduced on Linux by hand (§12.2.1
+explains why these four lines are the whole difference):
+
+```bash
+# in src/os/bluestore/BlueFS.cc (3 sites) and BlueFS.h (1 site):
+sed -i 's|^#ifdef HAVE_LIBAIO$|#if 0 /* what FreeBSD sees */|' \
+    src/os/bluestore/BlueFS.cc src/os/bluestore/BlueFS.h
+
+cmake -DWITH_ASAN=ON -DWITH_TESTS=ON ..   # RelWithDebInfo
+ninja bin/unittest_bluefs
+export ASAN_OPTIONS=halt_on_error=1:abort_on_error=1
+for i in $(seq 1 200); do
+  bin/unittest_bluefs --gtest_filter='BlueFS_wal.wal_v2_simulate_crash' \
+    > /dev/null 2>&1 || { echo "crash at iteration $i"; break; }
+done
+```
+
+Two control arms decide the question: the same binary built from
+unmodified `main` (the guards in), and one built with the four guards
+widened to `defined(HAVE_LIBAIO) || defined(HAVE_POSIXAIO)` — the fix
+proposed in §12.3. Results in §12.3.3.
+
+## 12.2 Analysis
+
+### 12.2.1 Root cause, top to bottom
+
+The report's chain starts one level too high. `fsync()` on Linux *does*
+wait; the question is why it does not on FreeBSD.
+
+```
+completion thread reads a freed aio_t
+ └─ why?   ~FileWriter() → ~IOContext() → list<aio_t>::~list() freed
+           it while the kernel still owned the I/O   (BlueFS.h:473)
+ └─ why was I/O still in flight after 100 fsync() calls?
+           on Linux it cannot be: _fsync → _flush_bdev(h) →
+           _wait_for_aio(h) → IOContext::aio_wait() blocks until
+           num_running == 0                          (BlueFS.cc:4479)
+ └─ so why is it in flight on FreeBSD?
+           that block — _claim_completed_aios + _wait_for_aio —
+           is wrapped in  #ifdef HAVE_LIBAIO,  and FreeBSD builds
+           with HAVE_POSIXAIO, not HAVE_LIBAIO     (CMakeLists.txt:250)
+           → on FreeBSD the wait is compiled out and fsync() returns
+             the moment the aios are *submitted*
+ └─ why did nothing notice for nine years?
+           until PR #71449 (2026-09, same author) KernelDevice::aio_write
+           was ALSO #ifdef HAVE_LIBAIO — so FreeBSD never submitted an
+           aio at all; every write fell through to the synchronous
+           path, and a wait for nothing was harmless
+                                                (KernelDevice.cc:1171)
+ └─ why is the guard wrong?
+           2017-09: FreeBSD POSIX-AIO support lands   (9ae94e48be8)
+           2017-11: "build bluestore w/o libaio" wraps the BlueFS
+                    waits in HAVE_LIBAIO             (57e792bcae2)
+           the second commit's guard should have been
+           HAVE_LIBAIO || HAVE_POSIXAIO — the FreeBSD commit had
+           already written exactly that in BlockDevice.h two
+           months earlier (BlockDevice.h:37, :98); the new BlueFS
+           guards did not follow it
+```
+
+The bottom of the chain is a preprocessor condition that names one
+implementation of an interface instead of the interface. `IOContext`
+has its `pending_aios`/`running_aios` lists and its `aio_wait()`
+under the correct dual guard; BlueFS simply never calls them on the
+second backend.
+
+Three sites are affected, all with the same shape:
+
+| Site | What it skips on FreeBSD |
+|---|---|
+| [`BlueFS.cc:3333`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.cc#L3333) `_rewrite_log_and_layout_sync` | wait for the log rewrite before writing the new superblock |
+| [`BlueFS.cc:4200`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.cc#L4200) | the definitions of `_claim_completed_aios` / `_wait_for_aio` |
+| [`BlueFS.cc:4479`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.cc#L4479) `_flush_bdev(FileWriter*)` | the wait inside every `fsync()` |
+
+`_drain_writer()`
+([`BlueFS.cc:4848`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.cc#L4848))
+is *not* guarded — it calls `aio_wait()` directly — which is exactly why
+`close_writer()` is safe on FreeBSD and only the bare `delete` crashes.
+The report's "close_writer drains, the destructor doesn't" is a correct
+observation of the wrong boundary.
+
+### 12.2.2 Why the crash is the small problem
+
+What `fsync()` promises and what it delivers, per backend, on the
+current tree with PR #71449 applied:
+
+```
+   Linux (HAVE_LIBAIO)                    FreeBSD (HAVE_POSIXAIO)
+
+   fsync(h)                               fsync(h)
+   ├─ _flush_F        submit aio          ├─ _flush_F        submit aio
+   ├─ _flush_bdev(h)                      ├─ _flush_bdev(h)
+   │  ├─ _wait_for_aio  ◄── blocks ──┐    │  │   #ifdef HAVE_LIBAIO
+   │  │    until num_running == 0    │    │  │   ... compiled out ...
+   │  └─ bdev->flush()  fdatasync    │    │  └─ bdev->flush()
+   └─ return 0                       │    │       io_since_flush is
+                                     │    │       still false (the
+   aio thread: kernel done ──────────┘    │       aio thread has not
+                                          │       run) → returns 0
+                                          │       WITHOUT fdatasync
+                                          └─ return 0
+                                                   ▲
+                                          aio thread: kernel done, later
+```
+
+Two things go wrong on the right, and only the second is visible:
+
+1. **The data is not durable when `fsync()` returns.** `KernelDevice::flush()`
+   ([`KernelDevice.cc:504`](https://github.com/ceph/ceph/blob/v21.3.0/src/blk/kernel/KernelDevice.cc#L504))
+   is gated on `io_since_flush`, a flag set by the *completion* thread.
+   If the aio has not completed yet, the flag is still false and
+   `flush()` returns without calling `fdatasync` at all
+   ([`:517`](https://github.com/ceph/ceph/blob/v21.3.0/src/blk/kernel/KernelDevice.cc#L517)).
+   So the write is neither complete nor synced, and RocksDB's WAL —
+   the caller — has been told it is. Its own comment says as much:
+   *"we are not really protecting data here."*
+2. **The `aio_t` outlives its I/O.** With no wait anywhere on the path,
+   the last `fsync()` before `delete writer` leaves the aio in flight;
+   `~IOContext` frees the list node; the completion thread dereferences
+   it. This is the ASan report.
+
+PR #71766 puts an `aio_wait()` in `~FileWriter()`. That closes (2) and
+nothing else: after it, `fsync()` on FreeBSD still returns before the
+data is on disk. A destructor is the last place a stale aio can bite, so
+waiting there makes the *test* pass; it does not make the *filesystem*
+correct.
+
+### 12.2.3 Why Linux never sees it
+
+`HAVE_LIBAIO` is true on every Linux build with libaio present
+([`CMakeLists.txt:259`](https://github.com/ceph/ceph/blob/v21.3.0/CMakeLists.txt#L259)),
+so all three waits compile in. The wake/wait protocol between
+`try_aio_wake()`
+([`BlockDevice.h:122`](https://github.com/ceph/ceph/blob/v21.3.0/src/blk/BlockDevice.h#L122))
+and `aio_wait()`
+([`BlockDevice.cc:62`](https://github.com/ceph/ceph/blob/v21.3.0/src/blk/BlockDevice.cc#L62))
+is sound: the completion thread decrements `num_running` under the
+context lock and touches neither `ioc` nor `aio[]` afterwards
+(KernelDevice.cc:755, with a comment saying exactly that). A waiter that
+observed `num_running == 0` is guaranteed the completion thread is done
+with every node in the list. `_claim_completed_aios` splices
+`running_aios` out *before* the wait and frees the spliced list *after*
+it — relinking, not freeing, so the completion thread's pointers stay
+valid across the splice. No window on Linux.
+
+## 12.3 Proposed solution
+
+### 12.3.1 The fix
+
+```diff
+ // src/os/bluestore/BlueFS.cc  (3 sites)  and  BlueFS.h  (1 site)
+-#ifdef HAVE_LIBAIO
++#if defined(HAVE_LIBAIO) || defined(HAVE_POSIXAIO)
+```
+
+Four lines, no logic change. It makes BlueFS's guard match the one
+`BlockDevice.h` has carried since the FreeBSD port landed in 2017, and it restores
+`fsync()`'s wait on the backend that PR #71449 has just made
+asynchronous.
+
+The `aio_wait()` in `~FileWriter()` from PR #71766 is then redundant on
+every path that fsyncs before destruction — which in the test is all of
+them. Whether to keep it as belt-and-braces for a writer destroyed with
+*unflushed* buffered data is a separate question; on that path the data
+is already lost, so the wait only prevents the UAF, and `close_writer()`
+is the documented contract (`// NOTE: caller must call
+BlueFS::close_writer()`, [`BlueFS.h:467`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.h#L467)).
+
+### 12.3.2 Why it is safe
+
+**On Linux it is a no-op.** `HAVE_LIBAIO` is already defined; the
+widened condition evaluates identically. Byte-for-byte the same object
+code.
+
+**On FreeBSD it enables code that already compiles.**
+`_claim_completed_aios` and `_wait_for_aio` use only `IOContext`
+members (`running_aios`, `aio_wait()`) that `BlockDevice.h` already
+provides under `HAVE_POSIXAIO`. There is no libaio-specific type in
+either function.
+
+**It does not change behaviour on a FreeBSD tree *without* PR #71449.**
+There, `aio_write` still takes the synchronous fallback, `num_running`
+is always 0, and `aio_wait()` returns immediately.
+
+**It closes both problems at once.** With the wait in place, the
+`io_since_flush` flag is guaranteed set by the time `flush()` is called
+(the completion thread has run — that is what the wait waited for), so
+`fdatasync` is issued; and the `aio_t` list is empty by the time the
+destructor runs.
+
+### 12.3.3 Validation
+
+Three builds of `unittest_bluefs` on the same host (c28, Fedora 42,
+gcc 15, RelWithDebInfo + ASan, `main` at `a2c71ca9282`), each run 200×
+with `ASAN_OPTIONS=halt_on_error=1`:
+
+| Build | Guards | Simulates | Result |
+|---|---|---|---|
+| A · `main` unmodified | in | Linux today | **0** crashes |
+| B · guards forced to `#if 0` | out | FreeBSD + PR #71449 | **23** crashes, first at iteration 2 |
+| C · guards widened (§12.3.1) | in, both backends | FreeBSD with this fix | **0** crashes — binary byte-identical to A (same md5) |
+
+Arm B reproduces the tracker at ~11 % per run — some 20× the reporter's
+1-in-200, ASan and a faster host widening the window. The ASan stack on
+Linux is the tracker's stack with one extra frame of information: the
+freed `aio_t` was allocated in `KernelDevice::aio_write` called from
+`_flush_data` ← `_flush_envelope_F` ← `_flush_F` ← **`BlueFS::_fsync`**
+← `many_small_writes:1050` — i.e. it was submitted by the *last*
+`fsync()`, which returned without waiting for it. The UAF site is one
+frame earlier than on FreeBSD (`get_next_completed` writing
+`paio[i]->rval`, [`aio.cc:110`](https://github.com/ceph/ceph/blob/v21.3.0/src/blk/aio/aio.cc#L110),
+rather than `get_return_value` reading it): libaio's `io_event.obj`
+still points at the freed node, so the first touch faults instead of the
+second.
+
+That `_wait_for_aio` is genuinely absent from B and present in A and C
+is checked with `nm -C`: 2 symbols, 0, 2.
+
+**The durability hole, measured.** A bpftrace script on the same
+binaries — uprobes on `BlueFS::fsync` entry/return, `libc:fdatasync`,
+and the return of `aio_queue_t::get_next_completed` — over five runs
+each:
+
+| | `fsync()` calls | returned **without any `fdatasync`** |
+|---|---|---|
+| A · guards in | 95 | **0** |
+| B · guards out | 95 | **13** |
+
+One `fsync()` in seven returns 0 having neither waited for its aio nor
+issued `fdatasync`, because `KernelDevice::flush()` saw
+`io_since_flush == false` — the completion thread had not run yet — and
+took its early exit. In A, the wait guarantees the completion thread
+*has* run before `flush()` is called, and the flag is always set.
+
+PR #71766's destructor `aio_wait()` would take arm B's crash count from
+23 to 0 and leave the 13 exactly where it is.
+
+### 12.3.4 Takeaways
+
+- **A guard that names an implementation is a latent bug on every
+  other implementation.** `HAVE_LIBAIO` meant "we have async I/O" in
+  2017 because libaio was the only async I/O. The day a second backend
+  arrived, every such guard became a question: does this block belong
+  to *libaio* or to *async*? The FreeBSD port answered it correctly in
+  `BlockDevice.h`; the guards added to `BlueFS.cc` two months later
+  were never asked.
+- **A dead code path can hide a wrong guard indefinitely.** For nine
+  years FreeBSD's `aio_write` was synchronous, so the missing wait
+  waited for nothing. PR #71449 made the I/O real and the missing wait
+  became a missing wait. The two PRs are from the same author, weeks
+  apart, and the second is diagnosing a consequence of the first.
+- **Fix where the promise is made, not where the corpse is found.**
+  The UAF is in the destructor; the broken promise is `fsync()`
+  returning early. Waiting in the destructor makes the test green and
+  leaves the WAL non-durable. The ASan trace pointed at the freed
+  object's *last* touch; the bug is at the *first* place the wait was
+  supposed to happen.
+- **Read the platform's build flags before the platform's stack
+  trace.** Everything here follows from one line of `CMakeLists.txt`.
