@@ -4475,7 +4475,7 @@ slower GET, nothing else.
 
 Reported as a heap-use-after-free in `~FileWriter()` · affects BlueFS on
 every platform built with POSIX AIO (FreeBSD) — Linux is not affected ·
-component os/bluestore (BlueFS) · fix: four preprocessor lines ·
+component os/bluestore (BlueFS) · fix: a named `HAVE_AIO` guard, four lines in BlueFS ·
 Status: root cause differs from the report's; proposed PR #71766 fixes the
 symptom and leaves the durability hole open
 
@@ -4577,11 +4577,11 @@ completion thread reads a freed aio_t
            2017-09: FreeBSD POSIX-AIO support lands   (9ae94e48be8)
            2017-11: "build bluestore w/o libaio" wraps the BlueFS
                     waits in HAVE_LIBAIO             (57e792bcae2)
-           the second commit's guard should have been
-           HAVE_LIBAIO || HAVE_POSIXAIO — the FreeBSD commit had
-           already written exactly that in BlockDevice.h two
-           months earlier (BlockDevice.h:37, :98); the new BlueFS
-           guards did not follow it
+           KernelDevice::aio_write was ALREADY #ifdef HAVE_LIBAIO
+           (since 2016, before the port), so FreeBSD I/O was
+           synchronous from day one and the BlueFS guards were
+           consistent with that. PR #71449 widens one side and not
+           the other — that is where the inconsistency is born
 ```
 
 The bottom of the chain is a preprocessor condition that names one
@@ -4673,24 +4673,47 @@ valid across the splice. No window on Linux.
 
 ### 12.3.1 The fix
 
+Two commits. The first is a refactor with no behaviour change: the
+condition "some AIO backend is present" was spelled out as
+`defined(HAVE_LIBAIO) || defined(HAVE_POSIXAIO)` at nine sites in
+`BlockDevice.{h,cc}` and once in cmake, so give it a name where the two
+backend flags already come from:
+
+```cmake
+# CMakeLists.txt, right after HAVE_LIBAIO / HAVE_POSIXAIO are decided
+if(HAVE_LIBAIO OR HAVE_POSIXAIO)
+  set(HAVE_AIO ON)
+endif()
+```
+
+emitted through `acconfig.h` as `#cmakedefine HAVE_AIO`, and every
+site that tested the pair now tests `#ifdef HAVE_AIO`. The backend
+*selectors* in `aio.h`/`aio.cc` (`#if HAVE_LIBAIO … #elif
+HAVE_POSIXAIO`) are untouched — those pick an implementation, this only
+says one exists. Preprocessed `BlockDevice.cc` before and after: byte-identical.
+
+The second commit is the fix, and it is still four lines:
+
 ```diff
  // src/os/bluestore/BlueFS.cc  (3 sites)  and  BlueFS.h  (1 site)
 -#ifdef HAVE_LIBAIO
-+#if defined(HAVE_LIBAIO) || defined(HAVE_POSIXAIO)
++#ifdef HAVE_AIO
 ```
 
-Four lines, no logic change. It makes BlueFS's guard match the one
-`BlockDevice.h` has carried since the FreeBSD port landed in 2017, and it restores
-`fsync()`'s wait on the backend that PR #71449 has just made
-asynchronous.
+Now the guard says what these sites mean — *there are aios to wait
+for* — instead of naming one backend, so a third backend cannot
+re-create this bug. It restores `fsync()`'s wait on the platform that
+PR #71449 has just made asynchronous. On Linux `HAVE_AIO` and
+`HAVE_LIBAIO` coincide, so nothing changes.
 
-The `aio_wait()` in `~FileWriter()` from PR #71766 is then redundant on
-every path that fsyncs before destruction — which in the test is all of
-them. Whether to keep it as belt-and-braces for a writer destroyed with
-*unflushed* buffered data is a separate question; on that path the data
-is already lost, so the wait only prevents the UAF, and `close_writer()`
+The `aio_wait()` in `~FileWriter()` from PR #71766 is complementary, not
+redundant. Public `flush()` submits without waiting on every platform,
+so `flush(); delete writer;` — flushed but never fsynced — would hit the
+same UAF on Linux today; nothing in-tree does that, and `close_writer()`
 is the documented contract (`// NOTE: caller must call
-BlueFS::close_writer()`, [`BlueFS.h:467`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.h#L467)).
+BlueFS::close_writer()`, [`BlueFS.h:467`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.h#L467)),
+but the destructor wait is the only thing that covers it. What it does
+not do is make `fsync()` honest; that needs the guard.
 
 ### 12.3.2 Why it is safe
 
@@ -4725,6 +4748,7 @@ with `ASAN_OPTIONS=halt_on_error=1`:
 | A · `main` unmodified | in | Linux today | **0** crashes |
 | B · guards forced to `#if 0` | out | FreeBSD + PR #71449 | **23** crashes, first at iteration 2 |
 | C · guards widened (§12.3.1) | in, both backends | FreeBSD with this fix | **0** crashes — binary byte-identical to A (same md5) |
+| D · `HAVE_AIO` form (§12.3.1), rebased on `44fded082ce` | in, both backends | the two commits as proposed | **0** crashes; `_flush_bdev` under FreeBSD macros contains the wait; `-fsyntax-only` clean |
 
 Arm B reproduces the tracker at ~11 % per run — some 20× the reporter's
 1-in-200, ASan and a faster host widening the window. The ASan stack on
@@ -4768,8 +4792,10 @@ PR #71766's destructor `aio_wait()` would take arm B's crash count from
   2017 because libaio was the only async I/O. The day a second backend
   arrived, every such guard became a question: does this block belong
   to *libaio* or to *async*? The FreeBSD port answered it correctly in
-  `BlockDevice.h`; the guards added to `BlueFS.cc` two months later
-  were never asked.
+  `BlockDevice.h`; `BlueFS.cc` and `KernelDevice.cc` were never asked,
+  and stayed consistent with each other only by both being wrong the
+  same way. Naming the condition (`HAVE_AIO`) is what stops the
+  question being asked site by site.
 - **A dead code path can hide a wrong guard indefinitely.** For nine
   years FreeBSD's `aio_write` was synchronous, so the missing wait
   waited for nothing. PR #71449 made the I/O real and the missing wait
