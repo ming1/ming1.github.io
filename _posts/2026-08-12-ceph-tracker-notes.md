@@ -856,9 +856,11 @@ in `migrate_file`). Left out of the commit deliberately; it wants its own.
 
 Found by a bpftrace memory-copy census, not by a bug report · affects
 every replicated client write · component OSD (ReplicatedBackend /
-os/Transaction) · fix: one line · Status: upstream
-[PR #71355](https://github.com/ceph/ceph/pull/71355) open; review
-surfaced a companion accounting bug, fixed first in the same PR — §13
+os/Transaction, consumer BlueStore's throttle) · fix: one line, plus a
+size-estimate correction that code review surfaced · Status: upstream
+[PR #71355](https://github.com/ceph/ceph/pull/71355) open with both
+commits, verified on a 2-OSD lab; tracker ticket for tentacle +
+umbrella backports pending
 
 ## 5.1 Report
 
@@ -935,6 +937,66 @@ second blob); the primary prints `0`/`65536`. Patched, everyone
 prints page-multiples. Full method — including the copy census that
 found this — in
 [§7 of the I/O-path post]({% post_url 2026-08-10-bluestore-io-analysis %}).
+
+### 5.1.3 What review found — the throttle sees two kilobytes of a 128 KiB write
+
+Reviewing the one-liner in 5.3.1 for PR #71355, Kefu Chai pointed at
+a second consumer of the transaction that the aligned format had
+quietly broken:
+
+> a Transaction has two data members, `data_aligned_bl` and
+> `data_misaligned_bl`, while `get_encoded_bytes()` adds up only the
+> misaligned one. [...] BlueStore uses the return value of
+> `get_encoded_bytes()` as the cost of the transaction. In other
+> words, BlueStore undercharges the transactions with aligned-page
+> payloads. This gets worse with SSD media.
+
+Measured on a two-OSD, `size 2` vstart cluster with the one-liner
+applied, reading BlueStore's own `_txc_calc_cost` debug line on the
+primary and on the replica:
+
+| replicated client write | costed bytes, primary / replica |
+|---|---|
+| 128 KiB put | **2171 / 1262** |
+| 16 KiB put at offset 1 (prefix + 2 aligned pages + suffix) | **6280 / 5371** |
+| same, deferred path | **5377 / 5299** |
+
+A 128 KiB write is charged as two kilobytes. The 16 KiB write at
+offset 1 is charged its 4095-byte prefix and 1-byte suffix plus
+metadata, and none of the 12 KiB in between. Data on disk is correct
+and scrubs are clean; only the accounting is wrong. Without the
+one-liner the same writes are costed in full — because without it
+they are not aligned-format transactions at all.
+
+**Signal 1 — a unit test that fails.** Build an aligned-format
+transaction and compare the fast size against a real encode:
+
+```cpp
+auto a = ObjectStore::Transaction{CEPH_FEATUREMASK_SERVER_TENTACLE};
+bufferlist bl; bl.append_zero(3 * CEPH_PAGE_SIZE);
+a.write(cid, oid, 0, bl.length(), bl, 0);        // page-aligned: all of it → data_aligned_bl
+ASSERT_GE(a.get_encoded_bytes(), bl.length());   // 221 vs 12288 before the fix
+```
+
+Note the `FEATUREMASK`: `HAVE_FEATURE()` tests the feature bit *and*
+its incarnation bit, so a transaction built from the bare
+`CEPH_FEATURE_SERVER_TENTACLE` constant is silently a legacy one and
+the test passes for the wrong reason. That cost one build.
+
+**Signal 2 — the cost line on a live cluster.** With the
+one-liner in the OSD:
+
+```bash
+bin/ceph tell 'osd.*' config set debug_bluestore 10/10
+head -c 131072 /dev/urandom > /tmp/f128k
+bin/rados -p p1 put o128k /tmp/f128k
+grep -o "_txc_calc_cost .*bytes)" out/osd.*.log | tail -2
+#   cost 14171 (3 ios * 4000 + 2171 bytes)      ← primary
+#   cost 13262 (3 ios * 4000 + 1262 bytes)      ← replica
+```
+
+`bytes` should be at least the payload. It is the metadata plus the
+sub-page fragments, and nothing else.
 
 ## 5.2 Analysis
 
@@ -1086,6 +1148,123 @@ Why the tests didn't catch it: they prove the format *round-trips*
 production write path *produces* transactions carrying features, so
 every test passed while every client write took the legacy branch.
 
+### 5.2.3 The size estimate that never learned about the second buffer
+
+```
+BlueStore admits far more payload bytes in flight than its throttle allows
+ └─ why?   txc->cost = ios * cost_per_io + txc->bytes            (BlueStore.cc:14717)
+           and that cost is what throttle_bytes.get() charges     (BlueStore.cc:19520)
+ └─ why is txc->bytes small?
+           queue_transactions() sums t.get_num_bytes() over the
+           transactions in the batch                              (BlueStore.cc:16133)
+ └─ what does get_num_bytes() return?
+           get_encoded_bytes():  data_misaligned_bl.length()
+                               + op_bl.length()
+                               + index and header constants        (Transaction.h:605)
+ └─ where did the payload go?
+           for an aligned-format transaction, write() puts the
+           page-multiple middle of every payload in data_aligned_bl
+           and only the ragged head and tail in data_misaligned_bl (Transaction.h:921-931)
+ └─ why does the counter not know?
+           a0c9fec7f451 added the second bufferlist to the
+           encoder and the decoder, and never to the size estimate
+```
+
+The two layouts side by side, and what the counter saw in each:
+
+```
+legacy format (features = 0)             aligned format (features = peers)
+
+data_misaligned_bl                       data_aligned_bl        data_misaligned_bl
+┌─────────────────────────────┐          ┌────────────────────┐ ┌─────────────────┐
+│ len │ payload (whole write) │          │ page-multiple body │ │ head │ tail     │
+└─────────────────────────────┘          └────────────────────┘ └─────────────────┘
+ counted ─────────────────────            NOT counted            counted ──────────
+```
+
+Nothing is lost on the wire or on disk: `encode()` ships both
+bufferlists and `decode()` restores both. The blind spot is one
+arithmetic expression that was written when the transaction had one
+payload buffer and never revisited when it grew a second.
+
+### 5.2.4 What the number is for, and who consumes it
+
+`get_encoded_bytes()` was written as a *fast estimate of the encoded
+wire size* — the comment still says "layout version 9" — so the OSD
+could bound transaction sizes without encoding them. It walks the two
+index maps and adds constants; `get_encoded_bytes_test()` is the slow
+reference that actually encodes the maps, and
+`unittest_transaction` asserts the two agree.
+
+Two callers consume the value:
+
+```
+OSD::handle_osd_map                                         (OSD.cc:8353)
+   monotonic-growth check while batching maps into one txn — only ever
+   legacy-format, sees nothing wrong
+
+BlueStore::queue_transactions                               (BlueStore.cc:16133)
+   txc->bytes += t.get_num_bytes()   for each txn in the batch
+   _txc_calc_cost:  cost = (1 + aio count) * cost_per_io + bytes
+        │
+        ▼
+   BlueStoreThrottle::try_start_transaction                 (BlueStore.cc:19501)
+        throttle_bytes.get(cost)                bluestore_throttle_bytes          64 MiB
+        deferred? throttle_deferred_bytes.get_or_fail(cost)   ..._deferred_bytes  128 MiB
+        │
+        ▼  ... I/O, kv commit ...
+   complete_kv / complete: put(cost) back
+```
+
+`cost_per_io` is the knob that decides which term matters:
+
+| media | `bluestore_throttle_cost_per_io` | what a 128 KiB write costs | share that was payload |
+|---|---|---|---|
+| HDD | 670000 | ~2.1 M | ~6 % |
+| SSD | 4000 | ~145 K | ~90 % |
+
+On HDD the per-IO constant dominates and the missing payload term
+barely moves the total. On SSD the payload *is* the cost, and with it
+gone the 64 MiB byte throttle degenerates into a counter of roughly
+five thousand transactions of any size. That is the sentence "this
+gets worse with SSD media" in the review, made concrete.
+
+### 5.2.5 Why nobody saw it, and what "exact" means
+
+Two things kept the bug quiet since March 2025.
+
+**Only recovery built aligned-format transactions** (the scorecard in
+5.2.2). Recovery traffic is paced by its own knobs (`osd_recovery_max_active`,
+`osd_max_backfills`) long before the BlueStore throttle would bite,
+so an undercharged recovery push changes nothing observable. The
+one-liner in 5.3.1 is what moves the undercount onto the hot path —
+which is exactly why the estimate has to be fixed first.
+
+**The test compared two copies of the same mistake.** `GetNumBytes`
+asserts `get_encoded_bytes() == get_encoded_bytes_test()`. Both
+ignore `data_aligned_bl`, and the test only ever built a
+default-constructed (legacy) transaction, where that bufferlist is
+empty anyway. A fast path checked against a slow path proves the two
+agree, not that either is right; the only oracle that cannot share
+the blind spot is `encode()` itself.
+
+Once the test was going to compare against a real `encode()`, the
+estimate had to be exact — and it turned out it never was, even for
+the legacy layout. The old expression counted `data_features`, which
+version 9 does not carry, and skipped the `ENCODE_START` header and
+the two bufferlist length prefixes: off by 6 bytes for every legacy
+transaction, harmless for a throttle, fatal for an equality assert.
+
+What "exact" means for a transaction that can be encoded either way:
+`encode()` picks version 10 when the *peer* has the TENTACLE feature,
+independent of the transaction's own `data_features`. An
+aligned-format transaction can only be version 10 (the encoder
+asserts it). A legacy-format one is version 9 locally and version 10
+to a new peer, differing by 12 bytes. The fix sizes the layout implied
+by the transaction's own features — the one case that is unambiguous,
+and the one that carries payload in `data_aligned_bl` — and documents
+that choice.
+
 ## 5.3 Proposed solution
 
 ### 5.3.1 The fix
@@ -1107,7 +1286,49 @@ first ([`Transaction.h:1379`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/T
 ([`Transaction.h:717`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/Transaction.h#L717)).
 `rebuild_aligned_size_and_memory` then finds nothing to rebuild.
 
-### 5.3.2 Why it is safe
+### 5.3.2 The companion fix — count both payload bufferlists
+
+A commit prepended to PR #71355, so the one-liner never ships without
+it:
+
+```cpp
+// Transaction.h — the size estimate, both payload buffers, exact for
+// the layout encode() emits for this transaction's own data_features
+uint64_t get_encoded_bytes() {
+  // ENCODE_START header, op_bl length, coll_index size, object_index size, data
+  size_t final_size = sizeof(__u8) * 2 + sizeof(ceph_le32) +
+                      sizeof(__u32) * 3 + sizeof(data);
+  ... coll_index / object_index entries, as before ...
+  final_size += _get_encoded_payload_header_bytes();
+  return data_aligned_bl.length() + data_misaligned_bl.length() +
+         op_bl.length() + final_size;
+}
+
+// v9 prefixes data_misaligned_bl with its length;
+// v10 carries data_features plus the length of each payload bufferlist
+size_t _get_encoded_payload_header_bytes() const {
+  return is_format_aligned() ? sizeof(data_features) + sizeof(__u32) * 2
+                             : sizeof(__u32);
+}
+```
+
+`get_encoded_bytes_test()` gets the same two terms so the existing
+fast-vs-slow assert keeps meaning something, and the unit test gains
+the oracle it lacked:
+
+```cpp
+// legacy transaction: fast path == real v9 encode
+bufferlist legacy_bl; a.encode(legacy_bl);
+ASSERT_EQ(a.get_encoded_bytes(), legacy_bl.length());
+
+// aligned transaction: writes at offset 0 and offset 1 exercise the
+// aligned, prefix and suffix branches; fast path == real v10 encode
+bufferlist p_bl, d_bl;
+a.encode(p_bl, d_bl, CEPH_FEATUREMASK_SERVER_TENTACLE);
+ASSERT_EQ(a.get_encoded_bytes(), p_bl.length() + d_bl.length());
+```
+
+### 5.3.3 Why it is safe
 
 Four hazards were checked before trusting one line:
 
@@ -1148,7 +1369,27 @@ construction pattern, it is the one `a0c9fec7f451` itself installed
 on the recovery paths, in production since it merged. The fix makes
 the client path consistent with the paths that already work.
 
-### 5.3.3 Validation
+For the companion fix, four more:
+
+**The cost only goes up, and only by real bytes.** Every term added is
+either payload the transaction actually carries or a header the
+encoder actually emits. For a legacy transaction the change is +6
+bytes; against a 64 MiB throttle that is noise. For an aligned one it
+is the payload that should have been there all along.
+
+**Nothing on the wire or on disk changes.** `encode()` and `decode()`
+are untouched; the function is a pure computation over members that
+already exist.
+
+**The other consumer keeps its invariant.** `OSD::handle_osd_map`
+asserts the size grows as maps are appended. Every term is
+non-decreasing under `append()`/`write()`, so it still does.
+
+**HDD behavior is unchanged in practice.** With `cost_per_io` at
+670000 the payload term was and remains a small fraction of the cost.
+The correction matters where the review said it would — on SSD.
+
+### 5.3.4 Validation
 
 Same census, patched build, probes re-verified live (metadata
 counters non-zero):
@@ -1166,7 +1407,29 @@ counters non-zero):
 At pool `size=3` the line removes two full-payload memcpys
 cluster-wide from every client write.
 
-### 5.3.4 Takeaways
+For the companion fix:
+
+`unittest_transaction`: 20/20, including the two new equality checks
+against real encodes; before the fix the aligned case reports
+`221 vs 12288`.
+
+Two-OSD lab, both OSDs on SSD-class virtio disks, pool `size 2`, one-liner in both arms, only `Transaction.h` swapped — costed bytes on
+primary / replica:
+
+| replicated client write | before | after |
+|---|---|---|
+| 128 KiB put | 2171 / 1262 | **133282 / 132355** |
+| 16 KiB at offset 1, direct | 6280 / 5371 | **18607 / 17680** |
+| 16 KiB at offset 1, deferred | 5377 / 5299 | **17704 / 17608** |
+| 1 MiB put | — | 1050699 / 1050795 |
+| deep scrub, 32 PGs | — | 0 errors |
+| `rados get` vs source file | ok | ok |
+
+The deferred rows show `1 ios` (the kv commit only) with the same
+bytes as the direct rows: the accounting is independent of which
+BlueStore path the write takes, as it should be.
+
+### 5.3.5 Takeaways
 
 - **A fix that ships but never engages looks exactly like a fix.**
   The aligned format was reviewed, merged, and exercised daily — by
@@ -1186,6 +1449,27 @@ cluster-wide from every client write.
 - Removing `header.data_off` and adding the split in one commit left
   no overlap: for msgr2 rep ops there was no interval in which *any*
   alignment mechanism was active on the hot path.
+
+- **A second buffer needs a second term everywhere the first was
+  counted.** `a0c9fec7f451` split one payload bufferlist into two and
+  updated the encoder, the decoder, `swap`, `append`, the move
+  constructor — every place that *moves* bytes. The one place that
+  *counts* them was missed, and it is the one place with no
+  round-trip test to fail.
+- **A fast path tested against a slow path proves agreement, not
+  correctness.** When both are hand-written from the same mental
+  model, the test inherits the model's blind spot. The oracle has to
+  be the thing being estimated — here, `encode()` itself.
+- **Review found what tracing did not.** The census above measured copies,
+  alignment, offsets, checksums — everything about the bytes — and
+  nothing about the bookkeeping attached to them. A reviewer asking
+  "who else reads this struct?" caught the consequence the
+  instrumentation was never pointed at.
+- **Fix the dormant bug before waking the path that hits it.** The
+  undercount had been harmless for eighteen months because only
+  recovery took the aligned path. Ordering the correction ahead of
+  the one-liner in the same PR means no commit on the branch makes
+  the throttle worse.
 
 # 6. OSDs that froze for minutes — TCP retransmits, PG read leases, and where they meet
 
@@ -4809,312 +5093,3 @@ PR #71766's destructor `aio_wait()` would take arm B's crash count from
   supposed to happen.
 - **Read the platform's build flags before the platform's stack
   trace.** Everything here follows from one line of `CMakeLists.txt`.
-
-# 13. PR #71355 review — BlueStore costed a 128 KiB replicated write at 2 KiB
-
-Found in code review of PR #71355 (Kefu Chai), not by a bug report ·
-affects every aligned-format `ObjectStore::Transaction`: recovery
-push/pull today, every replicated client write once §5's one-liner
-lands · component os/Transaction, consumer BlueStore's throttle ·
-fix: count both payload bufferlists and make the size exact ·
-Status: fix commit prepended to PR #71355, verified on a 2-OSD lab;
-tracker ticket for tentacle + umbrella backports pending
-
-## 13.1 Report
-
-### 13.1.1 The observation
-
-§5 ends with a one-line fix: build `op_t` in
-`ReplicatedBackend::submit_transaction` with the peers' features so
-the write payload takes the aligned (version 10) encoding. Reviewing
-that line, Kefu pointed at a second consumer of the transaction that
-the aligned format had quietly broken:
-
-> a Transaction has two data members, `data_aligned_bl` and
-> `data_misaligned_bl`, while `get_encoded_bytes()` adds up only the
-> misaligned one. [...] BlueStore uses the return value of
-> `get_encoded_bytes()` as the cost of the transaction. In other
-> words, BlueStore undercharges the transactions with aligned-page
-> payloads. This gets worse with SSD media.
-
-Measured on a two-OSD, `size 2` vstart cluster with the §5 one-liner
-applied, reading BlueStore's own `_txc_calc_cost` debug line on the
-primary and on the replica:
-
-| replicated client write | costed bytes, primary / replica |
-|---|---|
-| 128 KiB put | **2171 / 1262** |
-| 16 KiB put at offset 1 (prefix + 2 aligned pages + suffix) | **6280 / 5371** |
-| same, deferred path | **5377 / 5299** |
-
-A 128 KiB write is charged as two kilobytes. The 16 KiB write at
-offset 1 is charged its 4095-byte prefix and 1-byte suffix plus
-metadata, and none of the 12 KiB in between. Data on disk is correct
-and scrubs are clean; only the accounting is wrong. Without the
-one-liner the same writes are costed in full — because without it
-they are not aligned-format transactions at all.
-
-### 13.1.2 Reproducing it
-
-**Signal 1 — a unit test that fails.** Build an aligned-format
-transaction and compare the fast size against a real encode:
-
-```cpp
-auto a = ObjectStore::Transaction{CEPH_FEATUREMASK_SERVER_TENTACLE};
-bufferlist bl; bl.append_zero(3 * CEPH_PAGE_SIZE);
-a.write(cid, oid, 0, bl.length(), bl, 0);        // page-aligned: all of it → data_aligned_bl
-ASSERT_GE(a.get_encoded_bytes(), bl.length());   // 221 vs 12288 before the fix
-```
-
-Note the `FEATUREMASK`: `HAVE_FEATURE()` tests the feature bit *and*
-its incarnation bit, so a transaction built from the bare
-`CEPH_FEATURE_SERVER_TENTACLE` constant is silently a legacy one and
-the test passes for the wrong reason. That cost one build.
-
-**Signal 2 — the cost line on a live cluster.** With the §5
-one-liner in the OSD:
-
-```bash
-bin/ceph tell 'osd.*' config set debug_bluestore 10/10
-head -c 131072 /dev/urandom > /tmp/f128k
-bin/rados -p p1 put o128k /tmp/f128k
-grep -o "_txc_calc_cost .*bytes)" out/osd.*.log | tail -2
-#   cost 14171 (3 ios * 4000 + 2171 bytes)      ← primary
-#   cost 13262 (3 ios * 4000 + 1262 bytes)      ← replica
-```
-
-`bytes` should be at least the payload. It is the metadata plus the
-sub-page fragments, and nothing else.
-
-## 13.2 Analysis
-
-### 13.2.1 Root cause, top to bottom
-
-```
-BlueStore admits far more payload bytes in flight than its throttle allows
- └─ why?   txc->cost = ios * cost_per_io + txc->bytes            (BlueStore.cc:14717)
-           and that cost is what throttle_bytes.get() charges     (BlueStore.cc:19520)
- └─ why is txc->bytes small?
-           queue_transactions() sums t.get_num_bytes() over the
-           transactions in the batch                              (BlueStore.cc:16133)
- └─ what does get_num_bytes() return?
-           get_encoded_bytes():  data_misaligned_bl.length()
-                               + op_bl.length()
-                               + index and header constants        (Transaction.h:605)
- └─ where did the payload go?
-           for an aligned-format transaction, write() puts the
-           page-multiple middle of every payload in data_aligned_bl
-           and only the ragged head and tail in data_misaligned_bl (Transaction.h:921-931)
- └─ why does the counter not know?
-           a0c9fec7f451 added the second bufferlist to the
-           encoder and the decoder, and never to the size estimate
-```
-
-The two layouts side by side, and what the counter saw in each:
-
-```
-legacy format (features = 0)             aligned format (features = peers)
-
-data_misaligned_bl                       data_aligned_bl        data_misaligned_bl
-┌─────────────────────────────┐          ┌────────────────────┐ ┌─────────────────┐
-│ len │ payload (whole write) │          │ page-multiple body │ │ head │ tail     │
-└─────────────────────────────┘          └────────────────────┘ └─────────────────┘
- counted ─────────────────────            NOT counted            counted ──────────
-```
-
-Nothing is lost on the wire or on disk: `encode()` ships both
-bufferlists and `decode()` restores both. The blind spot is one
-arithmetic expression that was written when the transaction had one
-payload buffer and never revisited when it grew a second.
-
-### 13.2.2 What the number is for, and who consumes it
-
-`get_encoded_bytes()` was written as a *fast estimate of the encoded
-wire size* — the comment still says "layout version 9" — so the OSD
-could bound transaction sizes without encoding them. It walks the two
-index maps and adds constants; `get_encoded_bytes_test()` is the slow
-reference that actually encodes the maps, and
-`unittest_transaction` asserts the two agree.
-
-Two callers consume the value:
-
-```
-OSD::handle_osd_map                                         (OSD.cc:8353)
-   monotonic-growth check while batching maps into one txn — only ever
-   legacy-format, sees nothing wrong
-
-BlueStore::queue_transactions                               (BlueStore.cc:16133)
-   txc->bytes += t.get_num_bytes()   for each txn in the batch
-   _txc_calc_cost:  cost = (1 + aio count) * cost_per_io + bytes
-        │
-        ▼
-   BlueStoreThrottle::try_start_transaction                 (BlueStore.cc:19501)
-        throttle_bytes.get(cost)                bluestore_throttle_bytes          64 MiB
-        deferred? throttle_deferred_bytes.get_or_fail(cost)   ..._deferred_bytes  128 MiB
-        │
-        ▼  ... I/O, kv commit ...
-   complete_kv / complete: put(cost) back
-```
-
-`cost_per_io` is the knob that decides which term matters:
-
-| media | `bluestore_throttle_cost_per_io` | what a 128 KiB write costs | share that was payload |
-|---|---|---|---|
-| HDD | 670000 | ~2.1 M | ~6 % |
-| SSD | 4000 | ~145 K | ~90 % |
-
-On HDD the per-IO constant dominates and the missing payload term
-barely moves the total. On SSD the payload *is* the cost, and with it
-gone the 64 MiB byte throttle degenerates into a counter of roughly
-five thousand transactions of any size. That is the sentence "this
-gets worse with SSD media" in the review, made concrete.
-
-### 13.2.3 Why nobody saw it
-
-Two things kept the bug quiet since March 2025.
-
-**Only recovery built aligned-format transactions.** §5.2.2's
-scorecard: `_do_push` and `_do_pull_response` got the feature-aware
-constructor, the client-write paths did not. Recovery traffic is
-paced by its own knobs (`osd_recovery_max_active`,
-`osd_max_backfills`) long before the BlueStore throttle would bite,
-so an undercharged recovery push changes nothing observable. The §5
-one-liner is what would have moved the undercount onto the hot path
-— which is exactly why it needs to be fixed first.
-
-**The test compared two copies of the same mistake.** `GetNumBytes`
-asserts `get_encoded_bytes() == get_encoded_bytes_test()`. Both
-ignore `data_aligned_bl`, and the test only ever built a
-default-constructed (legacy) transaction, where that bufferlist is
-empty anyway. A fast path checked against a slow path proves the two
-agree, not that either is right; the only oracle that cannot share
-the blind spot is `encode()` itself.
-
-### 13.2.4 The exactness question
-
-Once the test was going to compare against a real `encode()`, the
-estimate had to be exact — and it turned out it never was, even for
-the legacy layout. The old expression counted `data_features`, which
-version 9 does not carry, and skipped the `ENCODE_START` header and
-the two bufferlist length prefixes: off by 6 bytes for every legacy
-transaction, harmless for a throttle, fatal for an equality assert.
-
-What "exact" means for a transaction that can be encoded either way:
-`encode()` picks version 10 when the *peer* has the TENTACLE feature,
-independent of the transaction's own `data_features`. An
-aligned-format transaction can only be version 10 (the encoder
-asserts it). A legacy-format one is version 9 locally and version 10
-to a new peer, differing by 12 bytes. The fix sizes the layout implied
-by the transaction's own features — the one case that is unambiguous,
-and the one that carries payload in `data_aligned_bl` — and documents
-that choice.
-
-## 13.3 Proposed solution
-
-### 13.3.1 The fix
-
-A commit prepended to PR #71355, so the one-liner never ships without
-it:
-
-```cpp
-// Transaction.h — the size estimate, both payload buffers, exact for
-// the layout encode() emits for this transaction's own data_features
-uint64_t get_encoded_bytes() {
-  // ENCODE_START header, op_bl length, coll_index size, object_index size, data
-  size_t final_size = sizeof(__u8) * 2 + sizeof(ceph_le32) +
-                      sizeof(__u32) * 3 + sizeof(data);
-  ... coll_index / object_index entries, as before ...
-  final_size += _get_encoded_payload_header_bytes();
-  return data_aligned_bl.length() + data_misaligned_bl.length() +
-         op_bl.length() + final_size;
-}
-
-// v9 prefixes data_misaligned_bl with its length;
-// v10 carries data_features plus the length of each payload bufferlist
-size_t _get_encoded_payload_header_bytes() const {
-  return is_format_aligned() ? sizeof(data_features) + sizeof(__u32) * 2
-                             : sizeof(__u32);
-}
-```
-
-`get_encoded_bytes_test()` gets the same two terms so the existing
-fast-vs-slow assert keeps meaning something, and the unit test gains
-the oracle it lacked:
-
-```cpp
-// legacy transaction: fast path == real v9 encode
-bufferlist legacy_bl; a.encode(legacy_bl);
-ASSERT_EQ(a.get_encoded_bytes(), legacy_bl.length());
-
-// aligned transaction: writes at offset 0 and offset 1 exercise the
-// aligned, prefix and suffix branches; fast path == real v10 encode
-bufferlist p_bl, d_bl;
-a.encode(p_bl, d_bl, CEPH_FEATUREMASK_SERVER_TENTACLE);
-ASSERT_EQ(a.get_encoded_bytes(), p_bl.length() + d_bl.length());
-```
-
-### 13.3.2 Why it is safe
-
-**The cost only goes up, and only by real bytes.** Every term added is
-either payload the transaction actually carries or a header the
-encoder actually emits. For a legacy transaction the change is +6
-bytes; against a 64 MiB throttle that is noise. For an aligned one it
-is the payload that should have been there all along.
-
-**Nothing on the wire or on disk changes.** `encode()` and `decode()`
-are untouched; the function is a pure computation over members that
-already exist.
-
-**The other consumer keeps its invariant.** `OSD::handle_osd_map`
-asserts the size grows as maps are appended. Every term is
-non-decreasing under `append()`/`write()`, so it still does.
-
-**HDD behavior is unchanged in practice.** With `cost_per_io` at
-670000 the payload term was and remains a small fraction of the cost.
-The correction matters where the review said it would — on SSD.
-
-### 13.3.3 Validation
-
-`unittest_transaction`: 20/20, including the two new equality checks
-against real encodes; before the fix the aligned case reports
-`221 vs 12288`.
-
-Two-OSD lab, both OSDs on SSD-class virtio disks, pool `size 2`, §5
-one-liner in both arms, only `Transaction.h` swapped — costed bytes on
-primary / replica:
-
-| replicated client write | before | after |
-|---|---|---|
-| 128 KiB put | 2171 / 1262 | **133282 / 132355** |
-| 16 KiB at offset 1, direct | 6280 / 5371 | **18607 / 17680** |
-| 16 KiB at offset 1, deferred | 5377 / 5299 | **17704 / 17608** |
-| 1 MiB put | — | 1050699 / 1050795 |
-| deep scrub, 32 PGs | — | 0 errors |
-| `rados get` vs source file | ok | ok |
-
-The deferred rows show `1 ios` (the kv commit only) with the same
-bytes as the direct rows: the accounting is independent of which
-BlueStore path the write takes, as it should be.
-
-### 13.3.4 Takeaways
-
-- **A second buffer needs a second term everywhere the first was
-  counted.** `a0c9fec7f451` split one payload bufferlist into two and
-  updated the encoder, the decoder, `swap`, `append`, the move
-  constructor — every place that *moves* bytes. The one place that
-  *counts* them was missed, and it is the one place with no
-  round-trip test to fail.
-- **A fast path tested against a slow path proves agreement, not
-  correctness.** When both are hand-written from the same mental
-  model, the test inherits the model's blind spot. The oracle has to
-  be the thing being estimated — here, `encode()` itself.
-- **Review found what tracing did not.** §5 measured copies,
-  alignment, offsets, checksums — everything about the bytes — and
-  nothing about the bookkeeping attached to them. A reviewer asking
-  "who else reads this struct?" caught the consequence the
-  instrumentation was never pointed at.
-- **Fix the dormant bug before waking the path that hits it.** The
-  undercount had been harmless for eighteen months because only
-  recovery took the aligned path. Ordering the correction ahead of
-  the one-liner in the same PR means no commit on the branch makes
-  the throttle worse.
