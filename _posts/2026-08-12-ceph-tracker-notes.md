@@ -857,7 +857,8 @@ in `migrate_file`). Left out of the commit deliberately; it wants its own.
 Found by a bpftrace memory-copy census, not by a bug report · affects
 every replicated client write · component OSD (ReplicatedBackend /
 os/Transaction, consumer BlueStore's throttle) · fix: one line, plus a
-size-estimate correction that code review surfaced · Status: upstream
+size-estimate correction that code review surfaced · open: the aligned
+format assumes both ends share a page size (5.4.2) · Status: upstream
 [PR #71355](https://github.com/ceph/ceph/pull/71355) open with the
 one-liner; the size-estimate commit sits ahead of it on the local
 branch, not yet pushed; both verified on a 2-OSD lab; tracker ticket
@@ -901,8 +902,8 @@ since 2025-04. The classic OSD's client-write path never switched it on.
 4. **This was already fixed.** PR #57740 (`a0c9fec7f451`) added an
    alternate encoding that ships the page-multiple part of the payload
    first, so it lands at +0. It engages only when the Transaction is
-   *constructed* with peer features — the gate that guarantees every
-   replica can decode the new format.
+   *constructed* with peer features — the gate that tells the primary
+   every replica understands the new format.
 5. **The gate was never opened for the transaction that ships.**
    `submit_transaction()` default-constructs `op_t` — the only
    Transaction carrying data that `generate_subop()` encodes for
@@ -1091,7 +1092,8 @@ commit deleted the tracking and the stamp — renaming the fields to
 is a packed struct appended to the wire verbatim, and the padding
 keeps the on-wire layout identical.
 
-**What it added.** Three layers that only work as a chain:
+**What it added.** Three layers that only work as a chain (byte
+layouts in 5.3.3):
 
 ```
 sender: Transaction::write(off, len, data)          [split at DESTINATION
@@ -1156,6 +1158,130 @@ Why the tests didn't catch it: they prove the format *round-trips*
 production write path *produces* transactions carrying features, so
 every test passed while every client write took the legacy branch.
 
+### 5.3.3 The two encodings — v9 and v10, byte by byte
+
+Line numbers are
+[`Transaction.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/Transaction.h)
+at v21.3.0.
+
+**What a Transaction holds.** Ops are fixed-size structs; every
+variable-length argument lives in a separate stream and is consumed in
+op order. There is no offset table — position in the stream *is* the
+binding, which is why `setattrs` before `write` means attrs in front of
+the payload.
+
+```
+ObjectStore::Transaction
+ ├─ op_bl                Op[]: op, cid, oid, off, len, …  (packed, fixed size)      :250
+ ├─ coll_index           coll_t     → id   ┐ an Op names its collection and
+ ├─ object_index         ghobject_t → id   ┘ object by id
+ ├─ data                 TransactionData: ops count, fadvise_flags, unused1–3       :225
+ ├─ data_misaligned_bl   every variable-length argument, in op order:               :244
+ │                       attr names and maps, omap keys/values, write payloads
+ ├─ data_aligned_bl      page-multiple write payload, nothing else        ← new     :243
+ └─ data_features        0, or the peers' feature set                     ← new     :232
+```
+
+**Two switches, not one.** *Format* is chosen at construction and
+decides where `write()` puts the payload. *Wire version* is chosen at
+`encode()` from the features argument and decides how many streams come
+out.
+
+```
+                           encode(p, d, features)                                  :1350
+                           no TENTACLE → v9           TENTACLE → v10               :1362
+ Transaction()             one stream                 two streams, aligned part empty
+   legacy format           (old peers, local use)     ← every client write today    #5
+ Transaction(features)     ceph_assert(ver >= 10)     two streams, payload first
+   aligned format   :258   :1365                      ← the fix
+```
+
+The single-argument `encode(bl)` is `encode(bl, bl, 0)` — always v9
+(`:1345`), so an aligned-format transaction can only leave through the
+two-stream call. `append()` refuses to mix formats (`:535`).
+
+**Layout v9** — one stream:
+
+```
+ENCODE_START(9)           6 B     struct_v, compat_v, length
+data_misaligned_bl        u32 length + bytes          ← the payload is in here
+op_bl                     u32 length + Op[]
+coll_index, object_index  maps
+data                      TransactionData, packed, verbatim
+```
+
+**Layout v10** — two streams:
+
+```
+p  → MOSDRepOp MIDDLE segment             d  → DATA segment (page-aligned rx buffer)
+ENCODE_START(10)                          data_aligned_bl       raw, no length word
+op_bl                                     data_misaligned_bl    raw, no length word
+coll_index, object_index
+data
+data_features                 8 B
+data_aligned_bl.length        4 B
+data_misaligned_bl.length     4 B
+```
+
+v10 − v9 = 8 + 4 + 4 − 4 = 12 B: the three new fields, less the length
+word `data_misaligned_bl` no longer carries inline. If `d` comes out
+empty — a v9 encode, or a v10 transaction with no stream data at all —
+`generate_subop()` falls back to everything-in-DATA
+([`ReplicatedBackend.cc:1182`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L1182)).
+
+**How `write()` fills the streams** (`:900`). The split follows the
+*destination* offset, not the buffer's address:
+
+```
+write(off, len, data)        alignstart = bytes from off up to the next page boundary
+
+legacy    misaligned += [u32 len][data]
+
+aligned   len <  PAGE + alignstart →  misaligned += data                     whole, raw
+          len >= PAGE + alignstart →  misaligned += data[0, alignstart)      prefix
+                                      aligned    += the whole pages after it  middle
+                                      misaligned += the rest                 suffix
+```
+
+In the aligned format `write()` emits no length word (attr maps and
+omap keep theirs in both formats): `decode_bl()` (`:717`) recomputes
+the three-way split from `op->off`, `op->len` — and the *receiver's*
+`CEPH_PAGE_SIZE`. With 4 KiB pages, 16 KiB at offset 1 → prefix 4095,
+three pages in `data_aligned_bl`, suffix 1.
+
+`CEPH_PAGE_SIZE` is `sysconf(_SC_PAGESIZE)` in a runtime global
+(`common/page.cc:28`), and it is not on the wire: v10 carries
+`data_features` and two lengths, nothing else. The split is therefore
+only the *same* split when both ends have the same page size — the
+open hazard in 5.4.2.
+
+**The measured 128 KiB write, in each encoding** — the replica's view;
+the middle row is Signal 2 of 5.2.2 (`1196+375+131408`; attrs 332 =
+the measured 336 less the write's own length word), the other two are
+derived from the code above:
+
+```
+                       MIDDLE   DATA segment                                   payload at
+v9, old peer           —        [hdr 6][u32][attrs 332][u32][payload]…[op_bl]…  +346
+v10 legacy  (today)    375 B    [attrs 332][u32 len][payload 131072] = 131408   +336
+v10 aligned (the fix)  375 B    [payload 131072][attrs 332]          = 131404   +0
+```
+
+**Receiver.** `do_repop` decodes `p` from the MIDDLE segment and `d`
+from DATA
+([`ReplicatedBackend.cc:1304`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L1304)).
+For v10, `decode_nohead(length, data_aligned_bl, d_bl)` (`:1410`) takes
+the first `length` bytes of DATA as a view — no copy — so the payload
+sits at +0 of a page-aligned buffer. The format *choice* is
+self-describing: `data_features` travels in `p`, and the receiver's
+iterator takes `new_format` from it (`:673`), never from its own
+feature set; a v9 decode forces `data_features = 0` (`:1397`). The
+split *unit* is not.
+
+**EC** wraps the same thing: `ECSubWrite` v5 (TENTACLE peers) calls
+`t.encode(p_bl, d_bl, features)`, v4 puts everything in one stream
+([`ECMsgTypes.cc:35`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ECMsgTypes.cc#L35)).
+
 ## 5.4 Proposed solution
 
 ### 5.4.1 The fix
@@ -1177,9 +1303,10 @@ first ([`Transaction.h:1379`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/T
 ([`Transaction.h:717`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/Transaction.h#L717)).
 `rebuild_aligned_size_and_memory` then finds nothing to rebuild.
 
-### 5.4.2 Why it is safe
+### 5.4.2 Why it is safe — and where it is not yet
 
-Four hazards were checked before trusting one line:
+Five hazards were checked before trusting one line. Four are closed;
+the last is not:
 
 **The encode-version assert.** `Transaction::encode` aborts if an
 aligned-format transaction is encoded for a peer without the feature
@@ -1204,16 +1331,74 @@ only intersected per peer. No
 peers → aligned format used locally, which the local decode handles
 (and recovery I/O has exercised since the format landed). An old
 peer in the set → the TENTACLE bit drops out → byte-for-byte
-today's behavior. The wire format is self-describing —
+today's behavior. The format *choice* is self-describing —
 `data_features` travels in the encoding, so the decoder routes by
-what the encoder declared, never by guessing.
+what the encoder declared, never by guessing. (The split *unit* is
+not — the last hazard below.)
 
 **Sub-page and mixed writes.** Writes smaller than a page route
 entirely to the misaligned bl — exactly today's behavior. Mixed
 transactions (write + setattrs + omap + pg-log keys) only move the
 metadata *behind* the payload instead of in front of it.
 
-Precedent covers half of this. The construction pattern is the one
+**Mixed page sizes — open.** The aligned split is computed from
+`CEPH_PAGE_SIZE` twice: in `write()` on the primary
+([`Transaction.h:904`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/Transaction.h#L904))
+and again in `decode_bl()` on the replica (`:727`), each with its own
+host's page size, which nothing exchanges (5.3.3). Simulated on x86 by
+flipping the mutable `ceph::_page_size`/`_page_mask` between encode and
+decode — the §1.6 trick — with a standalone program linked against the
+lab build:
+
+```
+sender  4096 -> receiver  4096  write     0~8192   : ok             control
+sender 16384 -> receiver 16384  write     0~8192   : ok             control
+sender  4096 -> receiver 16384  write     0~131072 : ok             the 128 KiB lab write
+sender  4096 -> receiver 16384  write     0~8192   : end_of_buffer
+sender 16384 -> receiver  4096  write     0~8192   : end_of_buffer
+sender  4096 -> receiver 16384  write     0~4096   : end_of_buffer  a 4 KiB RBD-style write
+sender  4096 -> receiver 16384  write  4096~65536  : end_of_buffer
+sender  4096 -> receiver 65536  write     0~69632  : end_of_buffer
+```
+
+A 4 KiB-page primary puts an 8 KiB write wholly in `data_aligned_bl`; a
+16 KiB-page replica sees a sub-page write and reads 8192 bytes from a
+misaligned stream that holds ~332 of attrs. `decode_bl()` throws in
+the `OP_WRITE` case of `BlueStore::_txc_add_transaction`
+([`BlueStore.cc:16267`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L16267)),
+and nothing on the replica's apply path catches it (`_process` →
+`dequeue_op` → `do_request` → `do_repop` → `queue_transactions`): an
+uncaught exception on an op thread terminates the replica OSD. That is
+by code reading — not run on a live mixed pair. The throw is the
+benign outcome: it needs the wrong stream to run short. With large
+xattrs, omap values or several writes in one transaction the stream is
+long enough, the replica reads the wrong bytes without error, and every
+later argument in that transaction is shifted.
+
+The 128 KiB write at offset 0 splits identically under 4K, 16K and 64K
+pages — which is why every measurement in this section passed; the
+4 KiB deferred and 64 K bench rows of 5.4.3 pass only because both lab
+OSDs share a page size.
+
+This is a design assumption of `a0c9fec7f451`, latent in the classic
+OSD because it never shipped a non-empty aligned bufferlist between
+hosts; the one-liner (and its EC sibling) is what puts it on the wire.
+Crimson already ships one, and its stores decode with the same iterator
+(`cyan_store.cc:602`), so a mixed-page-size crimson cluster is exposed
+at v21.3.0 as it stands. It only
+bites clusters that mix page sizes — x86 with 16K/64K arm64, the
+hosts of [§1](#1-tracker-79141--bluefs-assert-aborts-every-osd-on-16k-page-hosts).
+The alignment that actually matters is 4 KiB everywhere else in the
+chain: msgr2 aligns the DATA segment to a constant 4096
+([`frames_v2.h:74`](https://github.com/ceph/ceph/blob/v21.3.0/src/msg/async/frames_v2.h#L74)),
+and `aio_write` needs `block_size`. Directions, not yet evaluated:
+carry the split unit in the encoding, or split on a fixed 4096. Both
+change what some host emits today, and a v10 decoder would skip a
+trailing field and still mis-split — so either needs the sender to
+know its peer decodes the new layout: a feature bit, not just a struct
+version.
+
+Precedent covers half of the rest. The construction pattern is the one
 `a0c9fec7f451` itself installed on the recovery paths, so `write()`
 routing and the local `decode_bl` have been in production since it
 merged. The other half — a replica decoding a v10 message whose
@@ -1261,7 +1446,7 @@ primary and on the replica:
 | replicated client write | costed bytes, primary / replica |
 |---|---|
 | 128 KiB put | **2171 / 1262** |
-| 16 KiB put at offset 1 (prefix + 2 aligned pages + suffix) | **6280 / 5371** |
+| 16 KiB put at offset 1 (prefix + 3 aligned pages + suffix) | **6280 / 5371** |
 | same, deferred path | **5377 / 5299** |
 
 A 128 KiB write is charged as two kilobytes. The 16 KiB write at
@@ -1525,6 +1710,11 @@ The copy:
   device-side rebuild are one chain; the census attributed the copy
   to the device layer, but the cause — and the fix — live two
   layers up.
+- **A reproducer can be the one input that cannot fail.** Every
+  measurement passed because 128 KiB at offset 0 splits identically
+  under every page size in use. The mixed-page-size hazard (5.4.2)
+  surfaced only when the encoding was written down field by field and
+  the question became "what is *not* on the wire?".
 - Removing `header.data_off` and adding the split in one commit left
   no overlap: for msgr2 rep ops there was no interval in which *any*
   alignment mechanism was active on the hot path.
