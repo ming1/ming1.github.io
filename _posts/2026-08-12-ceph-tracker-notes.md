@@ -861,8 +861,9 @@ size-estimate correction that code review surfaced · open: the aligned
 format assumes both ends share a page size (5.4.2) · Status: upstream
 [PR #71355](https://github.com/ceph/ceph/pull/71355) open with the
 one-liner; the size-estimate commit sits ahead of it on the local
-branch, not yet pushed; both verified on a 2-OSD lab; tracker ticket
-for tentacle + umbrella backports pending
+branch, not yet pushed; both verified on a 2-OSD lab; the EC sibling
+patch is local, A/B-verified on five OSDs (5.6); tracker ticket for
+tentacle + umbrella backports pending
 
 ## 5.1 The story in one view
 
@@ -920,7 +921,8 @@ since 2025-04. The classic OSD's client-write path never switched it on.
 ```
 #1–#5  the copy         §5.2 report → §5.3 analysis → §5.4 fix
 #6     the accounting   §5.5
-       lessons          §5.6
+       the EC sibling   §5.6   same gap, same fix, A/B on five OSDs
+       lessons          §5.7
 ```
 
 ## 5.2 Report
@@ -1130,10 +1132,12 @@ that is where coverage at v21.3.0 is uneven:
 | classic recovery (`_do_push`, `_do_pull_response`) | yes — but local transactions, never encoded for the wire |
 | classic replica-side local txn (`RepModify::localt`) | yes — local pg-log transaction, never encoded |
 | **classic replicated client writes** (`submit_transaction`) | **no — default ctor, §5.3.1** |
-| **classic EC client writes** (`ECCommon::RMWPipeline::cache_ready`) | **no — `trans[shard]` default-constructs every per-shard transaction** |
+| **classic EC client writes, optimized** (`ECCommon::RMWPipeline::cache_ready`) | **no — `trans[shard]` default-constructs every per-shard transaction** |
+| **classic EC client writes, legacy** (`ECCommonL::RMWPipeline::try_reads_to_commit`) | **no — `trans[i->shard]`, same** |
 
-The two **no** rows have different histories. The replicated one is
-an omission in `a0c9fec7f451` itself. The EC one is a regression: the
+The **no** rows have different histories. The replicated one is an
+omission in `a0c9fec7f451` itself. The optimized-EC one is a
+regression: the
 commit did wire it (`trans.emplace(i->shard,
 get_parent()->min_peer_features())` in `ECCommon.cc`), and
 `9e2841ab167` ("osd: Introduce optimized EC",
@@ -1141,11 +1145,11 @@ get_parent()->min_peer_features())` in `ECCommon.cc`), and
 2025-04-23 — five days after #57740) rewrote the function back to
 `trans[shard];`. Both landed before v20.1.0, so no release ever
 shipped the wired version; the legacy pipeline (`ECCommonL.cc:905`,
-pools without `allow_ec_optimizations`) was never wired at all.
-`shard_id_map::operator[]`
-value-initializes, so `data_features` is 0 for every shard
+pools without `allow_ec_optimizations`) was never wired at all. Both
+containers' `operator[]` value-initialize (`shard_id_map`, and a plain
+`std::map` in the legacy one), so `data_features` is 0 for every shard
 transaction; the ECSubWrite v5 wire format is just as dormant as
-MOSDRepOp's, and closing it is the natural follow-up to this fix.
+MOSDRepOp's; closing it is 5.6.
 
 So in the classic OSD — the one every production cluster runs — no
 write path ships an aligned payload. Crimson's does, but its receiver
@@ -1689,7 +1693,151 @@ The deferred rows show `1 ios` (the kv commit only) with the same
 bytes as the direct rows: the accounting is independent of which
 BlueStore path the write takes, as it should be.
 
-## 5.6 Takeaways
+## 5.6 The EC sibling — same gap, same fix, measured
+
+### 5.6.1 The gap
+
+The two EC **no** rows of the 5.3.2 scorecard. Both EC write pipelines
+value-initialize their per-shard transactions, so every shard
+transaction is legacy-format and `ECSubWrite` v5 ships an empty aligned
+stream:
+
+```
+optimized   RMWPipeline::cache_ready()           trans[shard];       ECCommon.cc:876
+            wired by a0c9fec7f451, undone by 9e2841ab167
+legacy      RMWPipeline::try_reads_to_commit()   trans[i->shard];    ECCommonL.cc:905
+            never wired
+                  │
+                  ▼   one ECSubWrite per remote shard the write touches
+            DATA segment = [ aligned: empty ][ misaligned: …, u32 len, chunk ]
+                  │
+                  ▼   chunk off the 4 KiB grid → aio_write rebuilds: memcpy per shard
+```
+
+The replicated bug, multiplied: one full-chunk memcpy on every remote
+shard — one not held by the primary OSD — that a client write touches.
+(The optimized pipeline skips untouched shards; "non-primary shard" is
+avoided here because optimized EC defines it differently.)
+
+### 5.6.2 The fix
+
+Same one-line idea, once per pipeline — local commit on top of the two
+in 5.4.1 and 5.5.6, not yet posted:
+
+```cpp
+// ECCommon.cc — RMWPipeline::cache_ready()
+-    trans[shard];
++    trans.emplace(shard, get_parent()->min_peer_features());
+
+// ECCommonL.cc — RMWPipeline::try_reads_to_commit()
+-    trans[i->shard];
++    trans.try_emplace(i->shard, get_parent()->min_peer_features());
+```
+
+Both pipelines share `ECSubWrite` and `MOSDECSubOpWrite`, so the v5
+split of 5.3.3 serves legacy pools too.
+
+### 5.6.3 Why it is safe — and where it is not yet
+
+**The encode-version assert — weaker than in 5.4.2.** The replicated
+path reads `min_peer_features()` twice in one synchronous chain. EC
+reads two *different* sources:
+
+```
+format    trans.emplace(shard, min_peer_features())    the PG's intersection over its peers
+version   MOSDECSubOpWrite::encode_payload(features)   this connection's features
+                                                                  MOSDECSubOpWrite.h:72
+            → ECSubWrite::encode: ver = TENTACLE ? 5 : 4          ECMsgTypes.cc:35
+            → ver 4: t.encode(p_bl, p_bl, features) → v9          ECMsgTypes.cc:45
+                     → ceph_assert(ver >= 10)                     Transaction.h:1365
+```
+
+The assert needs a connection without TENTACLE under a
+`min_peer_features()` with it. `peer_features` is reset and
+re-intersected over the whole probe set on every new interval
+(`PeeringState.cc:7546`, `:7570`, `:7632`), every sub-write target is
+in that set, and a peer changing version forces a new interval. No
+reachable mismatch was found; that is an argument, not a proof.
+
+**Mixed page sizes — open, and EC is the worst case for it.** The
+hazard of 5.4.2 applies unchanged, and EC shard writes are exactly the
+failing shape: small multiples of the 4 KiB chunk — for a 16 KiB
+object at k=3, 8 KiB on every shard in the legacy pipeline (padded to
+the 12 KiB stripe), 8/4/4 KiB data and 8 KiB parity in the optimized
+one — which a 16K-page peer re-splits differently.
+
+The rest of 5.4.2 carries over: `append()` never sees these
+transactions, sub-page writes stay in the misaligned stream, an old
+peer drops the TENTACLE bit and restores today's behavior.
+
+### 5.6.4 Validation
+
+One host, five OSDs on real block devices, two EC pools — the legacy
+and the optimized pipeline side by side:
+
+```bash
+MON=1 MGR=1 OSD=5 MDS=0 ../src/vstart.sh -n --without-dashboard \
+    --bluestore --bluestore-devs /dev/sdX,/dev/sdY,…        # 5 devices
+bin/ceph osd erasure-code-profile set p32 k=3 m=2 crush-failure-domain=osd
+bin/ceph config set global osd_pool_default_flag_ec_optimizations false   # the default; pinned
+for p in ecl eco; do
+  bin/ceph osd pool create $p 16 16 erasure p32
+  bin/ceph osd pool set $p allow_ec_overwrites true
+done
+bin/ceph osd pool set eco allow_ec_optimizations true
+```
+
+A = the two commits of this section; B = A + the EC patch; `ceph-osd`
+rebuilt per arm (the rebuilt EC plugins carry the git version, so a
+saved A binary refuses them). Signal: Signal 1 of 5.2.2, the
+`debug_bdev 20` rebuild line, counted per OSD.
+
+Workload per pool — 22 client writes, 44 in all: puts of 4 × 16 KiB,
+4 × 64 KiB, 2 × 1 MiB; a 16 KiB overwrite at offset 1, 4095, 4097,
+12287 and 30000, each on its own 64 KiB object; a 5000-byte append to
+a 16 KiB object.
+
+| 44 client writes, both pools | A | B |
+|---|---|---|
+| `aio_write`s that had to rebuild / all `aio_write`s to the device, BlueFS included | 214 / 717 | **5** / 728 |
+| read-back, byte-exact | 32 / 32 | 64 / 64 — A's objects included |
+| deep scrub, 32 EC PGs | 0 inconsistent | 0 inconsistent |
+| one OSD down — every object through EC decode | 32 / 32 | 64 / 64 |
+| after its restart | 32 / 32 | 64 / 64 |
+
+The rebuild line counts `aio_write`s that rebuilt *anything*, not
+bytes, so 214 → 5 is a count of events. Each write type alone says who
+rebuilds:
+
+| one write, in isolation | A: OSDs that rebuild | B |
+|---|---|---|
+| put 16 KiB / 64 KiB / 1 MiB, either pool | every remote shard | none |
+| append, either pool | every remote shard written | none |
+| 16 KiB overwrite at an unaligned offset, optimized pool | every remote shard | none |
+| same, legacy pool | every remote shard, **and the primary** | the primary |
+
+B's five leftovers are those primaries — osd.1, osd.0 twice, osd.3,
+osd.4, exactly the primaries of the five legacy-pool overwrite
+objects. The primary's shard never crosses the wire, but the patch does
+switch its local transaction to the aligned format too, and the first
+five isolated runs of A caught the primary only 4 times. So whose copy
+this is had to be measured — twenty more overwrites per arm (offsets 1
+and 12287, ten fresh objects each):
+
+| 20 legacy-pool unaligned overwrites | A | B |
+|---|---|---|
+| primary rebuilds | 20 / 20 | 20 / 20 |
+| remote-shard rebuilds | 80 / 80 | **0** / 80 |
+
+The primary's rebuild is there before the patch and just as frequent
+after it — rebuilding `aio_write`s counted, bytes copied not compared:
+a second copy inside the legacy read-modify-write path, which the
+patch neither causes nor removes. Not root-caused here.
+
+Not covered: every peer in this lab has TENTACLE and a 4 KiB page, so
+neither hazard of 5.6.3 is exercised.
+
+## 5.7 Takeaways
 
 The copy:
 
@@ -1710,6 +1858,10 @@ The copy:
   device-side rebuild are one chain; the census attributed the copy
   to the device layer, but the cause — and the fix — live two
   layers up.
+- **Attribute the leftovers, don't subtract them.** 214 → 5 rebuilds
+  reads as "98 % fixed". One write type at a time put all five on
+  primaries; twenty overwrites per arm showed that copy is there with
+  or without the patch — a different copy altogether (5.6.4).
 - **A reproducer can be the one input that cannot fail.** Every
   measurement passed because 128 KiB at offset 0 splits identically
   under every page size in use. The mixed-page-size hazard (5.4.2)
