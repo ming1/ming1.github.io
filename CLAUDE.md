@@ -41,6 +41,19 @@ There are no tests or linters configured.
 
 `code/` is **not** site code — it's reproducers and analysis scripts referenced from posts (e.g. `ublk-mntns-*.sh` backs the ublk mount-namespace deadlock post; `xfs-meta-*.sh|*.py` back the XFS metadata internals post; `writeback-observe.bt` is a bpftrace script). When editing one of those posts, expect the script in `code/` to be the authoritative source the post quotes from.
 
+## Ceph tracker notes (`_posts/2026-08-12-ceph-tracker-notes.md`)
+
+One `# N.` section per issue: a status line (how found · affects · component · fix · Status), then Report → Analysis → Proposed solution → Takeaways. When adding or reworking a section:
+
+- **Open with the story.** Unless the issue is a few paragraphs long, make `N.1` a "story in one view" (model: §5.1) so the reader has the whole idea before any evidence:
+  1. a one- or two-sentence thesis;
+  2. one lane/flow diagram with `#N` gutter markers;
+  3. a numbered cause→effect chain keyed to the same `#N` — how the path normally works → where it goes wrong → what that costs → what was supposed to prevent it → the gap → the fix (and any twist the fix exposes);
+  4. a 2–3 line map of which subsection proves which step.
+- The N.1 chain runs top-down (cause→effect) in plain words; the Analysis `why?` tree runs bottom-up (symptom→cause) with `file:line`. Keep both, and don't restate the mechanism in prose between them.
+- **One bug, one linear story.** If an issue grows a second bug (a review finding, a sibling gap), give it its own `N.x` block — observation → root cause → fix → why safe → validation — instead of interleaving it through Report/Analysis/Solution. One merged Takeaways at the end.
+- When renumbering, fix the in-section `N.x.y` cross-refs; other posts link only to a section as a whole.
+
 ## Repo hygiene gotchas
 
 - `.gitignore` excludes `*~`, but the working tree is full of stray backup files (`*.md~`, `:w`, single-letter files like `2`/`3`, dumps like `ll`, `test.log`) and binary artifacts (`fast26-pan.pdf`, `favicon.ico` duplicated at root). **Do not `git add -A`** — stage explicitly. Most of these are untracked clutter, not in-progress work.

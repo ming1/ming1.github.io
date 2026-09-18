@@ -858,13 +858,73 @@ Found by a bpftrace memory-copy census, not by a bug report · affects
 every replicated client write · component OSD (ReplicatedBackend /
 os/Transaction, consumer BlueStore's throttle) · fix: one line, plus a
 size-estimate correction that code review surfaced · Status: upstream
-[PR #71355](https://github.com/ceph/ceph/pull/71355) open with both
-commits, verified on a 2-OSD lab; tracker ticket for tentacle +
-umbrella backports pending
+[PR #71355](https://github.com/ceph/ceph/pull/71355) open with the
+one-liner; the size-estimate commit sits ahead of it on the local
+branch, not yet pushed; both verified on a 2-OSD lab; tracker ticket
+for tentacle + umbrella backports pending
 
-## 5.1 Report
+## 5.1 The story in one view
 
-### 5.1.1 The observation
+The encoding that makes a replica write zero-copy has been in the tree
+since 2025-04. The classic OSD's client-write path never switched it on.
+
+```
+      primary OSD                  wire: MOSDRepOp         replica OSD
+      ───────────                  ───────────────         ───────────
+      submit_transaction()
+ #5     Transaction op_t;          // features = 0
+        generate_transaction()     // op_t.write(): one stream, attrs first
+ #1     generate_subop(): encode
+             │
+ #2          └──────────────────→  DATA segment  ───────→  rx buffer, page-aligned
+                                   ┌───────┬─────────┐     payload at +336
+                                   │ attrs │ payload │          │
+                                   │ 336 B │ 128 KiB │          ▼
+ #3                                └───────┴─────────┘     KernelDevice::aio_write()
+                                                           O_DIRECT, 336 % 4096 != 0
+                                                           → memcpy 2 × 64 KiB blobs
+
+ #4   Transaction op_t{peer_features} → DATA = [payload][attrs] → payload at +0
+      PR #57740: wired into recovery's local txns, not into the one that is shipped
+```
+
+1. **Replication ships an encoded transaction.** The primary builds an
+   `ObjectStore::Transaction`, encodes it, and sends it to each replica
+   in a rep op. Op metadata rides the MIDDLE segment; xattrs and write
+   payload share one stream in the DATA segment.
+2. **The payload lands wherever the encoding put it.** The replica's
+   messenger receives the DATA segment into a page-aligned rx buffer —
+   and the payload sits behind ~336 B of encoded attrs.
+3. **`O_DIRECT` demands aligned memory.** `KernelDevice::aio_write()`
+   finds the payload misaligned and rebuilds it: a memcpy of the whole
+   payload into fresh aligned memory. Once per replica, per write.
+4. **This was already fixed.** PR #57740 (`a0c9fec7f451`) added an
+   alternate encoding that ships the page-multiple part of the payload
+   first, so it lands at +0. It engages only when the Transaction is
+   *constructed* with peer features — the gate that guarantees every
+   replica can decode the new format.
+5. **The gate was never opened for the transaction that ships.**
+   `submit_transaction()` default-constructs `op_t` — the only
+   Transaction carrying data that `generate_subop()` encodes for
+   replicas: features zero,
+   aligned bufferlist shipped empty. PR #57740 converted the recovery
+   transactions instead, which are built and applied locally and never
+   cross the wire. The fix is one line.
+6. **Opening it wakes a second gap.** `get_encoded_bytes()` — the byte
+   term of BlueStore's throttle cost — never counted the aligned
+   bufferlist. Harmless while only recovery used it; with the one-liner,
+   a 128 KiB client write counts as ~2 KB. Review of the PR caught it;
+   the correction is ordered ahead of the one-liner.
+
+```
+#1–#5  the copy         §5.2 report → §5.3 analysis → §5.4 fix
+#6     the accounting   §5.5
+       lessons          §5.6
+```
+
+## 5.2 Report
+
+### 5.2.1 The observation
 
 Counting real copies of I/O data inside `ceph-osd` (uprobes on
 `buffer::ptr::copy_in` and `list::rebuild`, two-OSD vstart cluster,
@@ -882,7 +942,7 @@ copies nothing, and whichever is replica copies everything. Deferred
 wrong functionally — data is correct, scrubs are clean — the cluster
 just spends a full-payload memcpy per replica per write, forever.
 
-### 5.1.2 Reproducing it
+### 5.2.2 Reproducing it
 
 Any vstart cluster where writes actually replicate:
 
@@ -904,7 +964,7 @@ grep -c "rebuilding buffer to be aligned" out/osd.*.log
 
 Unpatched: the count lands on whichever OSD was the *replica* for
 each object — about 2 per write (one per 64 KiB blob), zero on the
-primary. Patched (the one-liner in 5.3): zero everywhere. (`osd map p1 rep-N` tells you
+primary. Patched (the one-liner in 5.4.1): zero everywhere. (`osd map p1 rep-N` tells you
 who was primary for each object.)
 
 **Signal 2 — the wire format is v10 yet still copies.** With
@@ -934,73 +994,11 @@ uprobe:/path/to/bin/ceph-osd:0xADDR_OF_aio_write
 
 Unpatched, the replica prints `off_in_raw=336` (and `65872` for the
 second blob); the primary prints `0`/`65536`. Patched, everyone
-prints page-multiples. Full method — including the copy census that
-found this — in
-[§7 of the I/O-path post]({% post_url 2026-08-10-bluestore-io-analysis %}).
+prints page-multiples.
 
-### 5.1.3 What review found — the throttle sees two kilobytes of a 128 KiB write
+## 5.3 Analysis
 
-Reviewing the one-liner in 5.3.1 for PR #71355, Kefu Chai pointed at
-a second consumer of the transaction that the aligned format had
-quietly broken:
-
-> a Transaction has two data members, `data_aligned_bl` and
-> `data_misaligned_bl`, while `get_encoded_bytes()` adds up only the
-> misaligned one. [...] BlueStore uses the return value of
-> `get_encoded_bytes()` as the cost of the transaction. In other
-> words, BlueStore undercharges the transactions with aligned-page
-> payloads. This gets worse with SSD media.
-
-Measured on a two-OSD, `size 2` vstart cluster with the one-liner
-applied, reading BlueStore's own `_txc_calc_cost` debug line on the
-primary and on the replica:
-
-| replicated client write | costed bytes, primary / replica |
-|---|---|
-| 128 KiB put | **2171 / 1262** |
-| 16 KiB put at offset 1 (prefix + 2 aligned pages + suffix) | **6280 / 5371** |
-| same, deferred path | **5377 / 5299** |
-
-A 128 KiB write is charged as two kilobytes. The 16 KiB write at
-offset 1 is charged its 4095-byte prefix and 1-byte suffix plus
-metadata, and none of the 12 KiB in between. Data on disk is correct
-and scrubs are clean; only the accounting is wrong. Without the
-one-liner the same writes are costed in full — because without it
-they are not aligned-format transactions at all.
-
-**Signal 1 — a unit test that fails.** Build an aligned-format
-transaction and compare the fast size against a real encode:
-
-```cpp
-auto a = ObjectStore::Transaction{CEPH_FEATUREMASK_SERVER_TENTACLE};
-bufferlist bl; bl.append_zero(3 * CEPH_PAGE_SIZE);
-a.write(cid, oid, 0, bl.length(), bl, 0);        // page-aligned: all of it → data_aligned_bl
-ASSERT_GE(a.get_encoded_bytes(), bl.length());   // 221 vs 12288 before the fix
-```
-
-Note the `FEATUREMASK`: `HAVE_FEATURE()` tests the feature bit *and*
-its incarnation bit, so a transaction built from the bare
-`CEPH_FEATURE_SERVER_TENTACLE` constant is silently a legacy one and
-the test passes for the wrong reason. That cost one build.
-
-**Signal 2 — the cost line on a live cluster.** With the
-one-liner in the OSD:
-
-```bash
-bin/ceph tell 'osd.*' config set debug_bluestore 10/10
-head -c 131072 /dev/urandom > /tmp/f128k
-bin/rados -p p1 put o128k /tmp/f128k
-grep -o "_txc_calc_cost .*bytes)" out/osd.*.log | tail -2
-#   cost 14171 (3 ios * 4000 + 2171 bytes)      ← primary
-#   cost 13262 (3 ios * 4000 + 1262 bytes)      ← replica
-```
-
-`bytes` should be at least the payload. It is the metadata plus the
-sub-page fragments, and nothing else.
-
-## 5.2 Analysis
-
-### 5.2.1 Root cause, top to bottom
+### 5.3.1 Root cause, top to bottom
 
 Each answer below was measured before moving down a level, DWARF
 call stacks first, then dumping the buffer geometry at the probe:
@@ -1034,19 +1032,17 @@ replica memcpys every write payload
 ```
 
 The bottom of the chain is a wiring gap. Commit `a0c9fec7f451`
-("os/Transaction: page align write data buffers to improve
-performance", 2025-03) built the whole mechanism — split the encoded
-transaction into an aligned and a misaligned bufferlist, ship the
-aligned one first in the message's page-aligned DATA segment, decode
-it back into page-aligned views on the replica. It converted the
-recovery paths (`_do_push`, `_do_pull_response`,
+(authored 2025-03, merged 2025-04, dissected in 5.3.2) put the
+feature-aware constructor on the recovery paths (`_do_push`,
+`_do_pull_response`,
 [`ReplicatedBackend.cc:989`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L989))
-to the feature-aware constructor — and left the client-write path,
-the hottest path in the OSD, on the default constructor. The same
-commit also deleted the old `header.data_off` alignment hint, the
-previous (v1-messenger-era) mechanism for this. So the old fix is
-gone and the new fix never engages: the machinery is complete,
-tested by every recovery op, and dormant where it matters most.
+— whose transactions are built and applied on the receiving OSD and
+never encoded for the wire — and left `op_t`, the one Transaction
+`generate_subop()` ships to replicas, on the default one. The same
+commit deleted the old `header.data_off` alignment hint, the previous
+(v1-messenger-era) mechanism for this. So the old fix is gone and the
+new fix never engages: the wire format is complete, unit-tested, and
+has never carried a payload between classic replicated OSDs.
 
 What the wire actually carries, before and after:
 
@@ -1072,7 +1068,7 @@ Alignment of the *buffer* is useless when the *payload* starts 336
 bytes into it; only the encode-side split can fix the offset, and
 the split was switched off.
 
-### 5.2.2 What `a0c9fec7f451` actually built — and where it was wired
+### 5.3.2 What `a0c9fec7f451` actually built — and where it was wired
 
 The commit behind this whole story
 ([a0c9fec7f451](https://github.com/ceph/ceph/commit/a0c9fec7f451),
@@ -1114,7 +1110,7 @@ receiver: decode_bl() rebuilds each write as views: [prefix][middle][suffix]
           → the middle is page-aligned in memory → aio submits it as-is
 ```
 
-Plus the safety rails met in 5.3.2: the `data_features` member set at
+Plus the safety rails checked in 5.4.2: the `data_features` member set at
 construction, `is_format_aligned()` gating the split, the
 encode-version assert, and the `append()` feature-equality assert.
 The same commit gave erasure coding the equivalent treatment:
@@ -1124,39 +1120,198 @@ OSDs. It even shipped ~1100 lines of encode/decode round-trip tests.
 
 **Where the constructor was wired — the scorecard.** The format only
 activates where the transaction is *built* with peer features, and
-that is where the commit's coverage is uneven:
+that is where coverage at v21.3.0 is uneven:
 
 | path | feature-aware construction? |
 |---|---|
 | crimson client writes (`ops_executer`) | yes — `txn(pg->min_peer_features())` |
-| classic recovery (`_do_push`, `_do_pull_response`) | yes |
-| classic replica decode (`RepModify`) | yes |
-| **classic replicated client writes** (`submit_transaction`) | **no — default ctor, §5.2.1** |
+| classic recovery (`_do_push`, `_do_pull_response`) | yes — but local transactions, never encoded for the wire |
+| classic replica-side local txn (`RepModify::localt`) | yes — local pg-log transaction, never encoded |
+| **classic replicated client writes** (`submit_transaction`) | **no — default ctor, §5.3.1** |
 | **classic EC client writes** (`ECCommon::RMWPipeline::cache_ready`) | **no — `trans[shard]` default-constructs every per-shard transaction** |
 
-So the next-generation OSD got the hot path, and the classic OSD —
-the one every production cluster runs — got only its recovery and
-decode sides. The EC row means the gap this section fixes for the
-replicated backend has an exact sibling in the EC write path
-(`shard_id_map::operator[]` value-initializes, so `data_features`
-is 0 for every shard transaction); the ECSubWrite v5 wire format is
-just as dormant as MOSDRepOp's was, and closing it is the natural
-follow-up to this fix.
+The two **no** rows have different histories. The replicated one is
+an omission in `a0c9fec7f451` itself. The EC one is a regression: the
+commit did wire it (`trans.emplace(i->shard,
+get_parent()->min_peer_features())` in `ECCommon.cc`), and
+`9e2841ab167` ("osd: Introduce optimized EC",
+[PR #62556](https://github.com/ceph/ceph/pull/62556), merged
+2025-04-23 — five days after #57740) rewrote the function back to
+`trans[shard];`. Both landed before v20.1.0, so no release ever
+shipped the wired version; the legacy pipeline (`ECCommonL.cc:905`,
+pools without `allow_ec_optimizations`) was never wired at all.
+`shard_id_map::operator[]`
+value-initializes, so `data_features` is 0 for every shard
+transaction; the ECSubWrite v5 wire format is just as dormant as
+MOSDRepOp's, and closing it is the natural follow-up to this fix.
+
+So in the classic OSD — the one every production cluster runs — no
+write path ships an aligned payload. Crimson's does, but its receiver
+does not page-align the DATA segment yet (`FrameAssemblerV2.cc:392`,
+"TODO: create aligned and contiguous buffer from socket") — at v21.3.0
+the payload lands aligned nowhere.
 
 Why the tests didn't catch it: they prove the format *round-trips*
 — encode with features, decode, compare. Nothing asserted that the
 production write path *produces* transactions carrying features, so
 every test passed while every client write took the legacy branch.
 
-### 5.2.3 The size estimate that never learned about the second buffer
+## 5.4 Proposed solution
+
+### 5.4.1 The fix
+
+```cpp
+// ReplicatedBackend::submit_transaction
+-  ObjectStore::Transaction op_t;
++  ObjectStore::Transaction op_t{get_parent()->min_peer_features()};
+```
+
+That is the entire change. With `data_features` set,
+`Transaction::write()` splits every ≥ page-size payload at its
+destination-page boundaries: the aligned middle goes to
+`data_aligned_bl`, the ragged head/tail (and everything smaller than
+a page) to `data_misaligned_bl`. The v10 encoding ships aligned
+first ([`Transaction.h:1379`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/Transaction.h#L1379))
+— at offset 0 of the page-aligned rx buffer — and the replica's
+`decode_bl` reassembles the write as views into that region
+([`Transaction.h:717`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/Transaction.h#L717)).
+`rebuild_aligned_size_and_memory` then finds nothing to rebuild.
+
+### 5.4.2 Why it is safe
+
+Four hazards were checked before trusting one line:
+
+**The encode-version assert.** `Transaction::encode` aborts if an
+aligned-format transaction is encoded for a peer without the feature
+(`ceph_assert(ver >= 10)`). Cannot fire: construction
+(`submit_transaction`) and encoding (`generate_subop`) run in one
+synchronous chain under the PG lock, and peering — the only writer
+of `peer_features` — takes the same lock. Both sites see the same
+value, always.
+
+**Feature-mixing in `Transaction::append`.** Appending transactions
+with different `data_features` would mis-route decode — and is
+guarded by `ceph_assert(data_features == other.data_features)`
+([`Transaction.h:535`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/Transaction.h#L535)).
+The only `append` call sites are the EC/peering rollback visitor,
+whose transactions are all default-constructed among themselves; the
+replicated backend marks its log entries unrollbackable, and `op_t`
+itself is never appended to anything.
+
+**No replicas / mixed versions.** `peer_features` starts at the
+build's full supported set (`CEPH_FEATURES_SUPPORTED_DEFAULT`) and is
+only intersected per peer. No
+peers → aligned format used locally, which the local decode handles
+(and recovery I/O has exercised since the format landed). An old
+peer in the set → the TENTACLE bit drops out → byte-for-byte
+today's behavior. The wire format is self-describing —
+`data_features` travels in the encoding, so the decoder routes by
+what the encoder declared, never by guessing.
+
+**Sub-page and mixed writes.** Writes smaller than a page route
+entirely to the misaligned bl — exactly today's behavior. Mixed
+transactions (write + setattrs + omap + pg-log keys) only move the
+metadata *behind* the payload instead of in front of it.
+
+Precedent covers half of this. The construction pattern is the one
+`a0c9fec7f451` itself installed on the recovery paths, so `write()`
+routing and the local `decode_bl` have been in production since it
+merged. The other half — a replica decoding a v10 message whose
+aligned bufferlist is *not* empty — has the commit's round-trip unit
+tests and the lab runs in 5.4.3 behind it, and no production history
+in the classic OSD.
+
+### 5.4.3 Validation
+
+Same census, patched build, probes re-verified live (metadata
+counters non-zero):
+
+| | before | after |
+|---|---|---|
+| replica submit offset in rx buffer | 336 | **0** |
+| payload copies, 5 × 128 KiB direct writes | 5 × 131072 B (replica) | **0** on both OSDs |
+| payload copies, 5 × 4 KiB deferred writes | 5 × 4096 B (replica, deferred submit) | **0** |
+| `rebuild_aligned` calls | still run (2/op) | still run — but no longer copy |
+| `rados get` md5, 10 objects | ok | ok |
+| deep-scrub of both PGs | 0 errors | **0 errors** |
+| `rados bench` 64 K, qd 8 | — | 1906 writes, healthy |
+
+At pool `size=3` the line removes two full-payload memcpys
+cluster-wide from every client write.
+
+## 5.5 What review found — the throttle sees two kilobytes of a 128 KiB write
+
+### 5.5.1 The observation
+
+Reviewing the one-liner in 5.4.1 for PR #71355, Kefu Chai pointed at
+a second consumer of the transaction that the aligned format had
+quietly broken:
+
+> a Transaction has two data members, `data_aligned_bl` and
+> `data_misaligned_bl`, while `get_encoded_bytes()` adds up only the
+> misaligned one. [...] BlueStore uses the return value of
+> `get_encoded_bytes()` as the cost of the transaction. In other
+> words, BlueStore undercharges the transactions with aligned-page
+> payloads. This gets worse with SSD media.
+
+Measured on a two-OSD, `size 2` vstart cluster with the one-liner
+applied, reading BlueStore's own `_txc_calc_cost` debug line on the
+primary and on the replica:
+
+| replicated client write | costed bytes, primary / replica |
+|---|---|
+| 128 KiB put | **2171 / 1262** |
+| 16 KiB put at offset 1 (prefix + 2 aligned pages + suffix) | **6280 / 5371** |
+| same, deferred path | **5377 / 5299** |
+
+A 128 KiB write is charged as two kilobytes. The 16 KiB write at
+offset 1 is charged its 4095-byte prefix and 1-byte suffix plus
+metadata, and none of the 12 KiB in between. Data on disk is correct
+and scrubs are clean; only the accounting is wrong. Without the
+one-liner the same writes are costed in full — because without it
+they are not aligned-format transactions at all.
+
+### 5.5.2 Reproducing it
+
+**Signal 1 — a unit test that fails.** Build an aligned-format
+transaction and compare the fast size against a real encode:
+
+```cpp
+auto a = ObjectStore::Transaction{CEPH_FEATUREMASK_SERVER_TENTACLE};
+bufferlist bl; bl.append_zero(3 * CEPH_PAGE_SIZE);
+a.write(cid, oid, 0, bl.length(), bl, 0);        // page-aligned: all of it → data_aligned_bl
+ASSERT_GE(a.get_encoded_bytes(), bl.length());   // 221 vs 12288 before the fix
+```
+
+Note the `FEATUREMASK`: `HAVE_FEATURE()` tests the feature bit *and*
+its incarnation bit, so a transaction built from the bare
+`CEPH_FEATURE_SERVER_TENTACLE` constant is silently a legacy one and
+the test passes for the wrong reason. That cost one build.
+
+**Signal 2 — the cost line on a live cluster.** With the
+one-liner in the OSD:
+
+```bash
+bin/ceph tell 'osd.*' config set debug_bluestore 10/10
+head -c 131072 /dev/urandom > /tmp/f128k
+bin/rados -p p1 put o128k /tmp/f128k
+grep -o "_txc_calc_cost .*bytes)" out/osd.*.log | tail -2
+#   cost 14171 (3 ios * 4000 + 2171 bytes)      ← primary
+#   cost 13262 (3 ios * 4000 + 1262 bytes)      ← replica
+```
+
+`bytes` should be at least the payload. It is the metadata plus the
+sub-page fragments, and nothing else.
+
+### 5.5.3 Root cause — the size estimate that never learned about the second buffer
 
 ```
 BlueStore admits far more payload bytes in flight than its throttle allows
- └─ why?   txc->cost = ios * cost_per_io + txc->bytes            (BlueStore.cc:14717)
-           and that cost is what throttle_bytes.get() charges     (BlueStore.cc:19520)
+ └─ why?   txc->cost = ios * cost_per_io + txc->bytes            (BlueStore.cc:14588)
+           and that cost is what throttle_bytes.get() charges     (BlueStore.cc:19389)
  └─ why is txc->bytes small?
            queue_transactions() sums t.get_num_bytes() over the
-           transactions in the batch                              (BlueStore.cc:16133)
+           transactions in the batch                              (BlueStore.cc:16002)
  └─ what does get_num_bytes() return?
            get_encoded_bytes():  data_misaligned_bl.length()
                                + op_bl.length()
@@ -1187,7 +1342,7 @@ bufferlists and `decode()` restores both. The blind spot is one
 arithmetic expression that was written when the transaction had one
 payload buffer and never revisited when it grew a second.
 
-### 5.2.4 What the number is for, and who consumes it
+### 5.5.4 What the number is for, and who consumes it
 
 `get_encoded_bytes()` was written as a *fast estimate of the encoded
 wire size* — the comment still says "layout version 9" — so the OSD
@@ -1199,16 +1354,16 @@ reference that actually encodes the maps, and
 Two callers consume the value:
 
 ```
-OSD::handle_osd_map                                         (OSD.cc:8353)
+OSD::handle_osd_map                                         (OSD.cc:8352)
    monotonic-growth check while batching maps into one txn — only ever
    legacy-format, sees nothing wrong
 
-BlueStore::queue_transactions                               (BlueStore.cc:16133)
+BlueStore::queue_transactions                               (BlueStore.cc:16002)
    txc->bytes += t.get_num_bytes()   for each txn in the batch
    _txc_calc_cost:  cost = (1 + aio count) * cost_per_io + bytes
         │
         ▼
-   BlueStoreThrottle::try_start_transaction                 (BlueStore.cc:19501)
+   BlueStoreThrottle::try_start_transaction                 (BlueStore.cc:19370)
         throttle_bytes.get(cost)                bluestore_throttle_bytes          64 MiB
         deferred? throttle_deferred_bytes.get_or_fail(cost)   ..._deferred_bytes  128 MiB
         │
@@ -1229,15 +1384,15 @@ gone the 64 MiB byte throttle degenerates into a counter of roughly
 five thousand transactions of any size. That is the sentence "this
 gets worse with SSD media" in the review, made concrete.
 
-### 5.2.5 Why nobody saw it, and what "exact" means
+### 5.5.5 Why nobody saw it, and what "exact" means
 
-Two things kept the bug quiet since March 2025.
+Two things kept the bug quiet since April 2025.
 
 **Only recovery built aligned-format transactions** (the scorecard in
-5.2.2). Recovery traffic is paced by its own knobs (`osd_recovery_max_active`,
+5.3.2). Recovery traffic is paced by its own knobs (`osd_recovery_max_active`,
 `osd_max_backfills`) long before the BlueStore throttle would bite,
 so an undercharged recovery push changes nothing observable. The
-one-liner in 5.3.1 is what moves the undercount onto the hot path —
+one-liner in 5.4.1 is what moves the undercount onto the hot path —
 which is exactly why the estimate has to be fixed first.
 
 **The test compared two copies of the same mistake.** `GetNumBytes`
@@ -1265,31 +1420,10 @@ by the transaction's own features — the one case that is unambiguous,
 and the one that carries payload in `data_aligned_bl` — and documents
 that choice.
 
-## 5.3 Proposed solution
+### 5.5.6 The fix — count both payload bufferlists
 
-### 5.3.1 The fix
-
-```cpp
-// ReplicatedBackend::submit_transaction
--  ObjectStore::Transaction op_t;
-+  ObjectStore::Transaction op_t{get_parent()->min_peer_features()};
-```
-
-That is the entire change. With `data_features` set,
-`Transaction::write()` splits every ≥ page-size payload at its
-destination-page boundaries: the aligned middle goes to
-`data_aligned_bl`, the ragged head/tail (and everything smaller than
-a page) to `data_misaligned_bl`. The v10 encoding ships aligned
-first ([`Transaction.h:1379`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/Transaction.h#L1379))
-— at offset 0 of the page-aligned rx buffer — and the replica's
-`decode_bl` reassembles the write as views into that region
-([`Transaction.h:717`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/Transaction.h#L717)).
-`rebuild_aligned_size_and_memory` then finds nothing to rebuild.
-
-### 5.3.2 The companion fix — count both payload bufferlists
-
-A commit prepended to PR #71355, so the one-liner never ships without
-it:
+A commit ordered ahead of the one-liner on the PR branch (local, not
+yet pushed to #71355), so the one-liner never ships without it:
 
 ```cpp
 // Transaction.h — the size estimate, both payload buffers, exact for
@@ -1328,48 +1462,7 @@ a.encode(p_bl, d_bl, CEPH_FEATUREMASK_SERVER_TENTACLE);
 ASSERT_EQ(a.get_encoded_bytes(), p_bl.length() + d_bl.length());
 ```
 
-### 5.3.3 Why it is safe
-
-Four hazards were checked before trusting one line:
-
-**The encode-version assert.** `Transaction::encode` aborts if an
-aligned-format transaction is encoded for a peer without the feature
-(`ceph_assert(ver >= 10)`). Cannot fire: construction
-(`submit_transaction`) and encoding (`generate_subop`) run in one
-synchronous chain under the PG lock, and peering — the only writer
-of `peer_features` — takes the same lock. Both sites see the same
-value, always.
-
-**Feature-mixing in `Transaction::append`.** Appending transactions
-with different `data_features` would mis-route decode — and is
-guarded by `ceph_assert(data_features == other.data_features)`
-([`Transaction.h:535`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/Transaction.h#L535)).
-The only `append` call sites are the EC/peering rollback visitor,
-whose transactions are all default-constructed among themselves; the
-replicated backend marks its log entries unrollbackable, and `op_t`
-itself is never appended to anything.
-
-**No replicas / mixed versions.** `peer_features` starts at the
-build's full supported set (`CEPH_FEATURES_SUPPORTED_DEFAULT`) and is
-only intersected per peer. No
-peers → aligned format used locally, which the local decode handles
-(and recovery I/O has exercised since the format landed). An old
-peer in the set → the TENTACLE bit drops out → byte-for-byte
-today's behavior. The wire format is self-describing —
-`data_features` travels in the encoding, so the decoder routes by
-what the encoder declared, never by guessing.
-
-**Sub-page and mixed writes.** Writes smaller than a page route
-entirely to the misaligned bl — exactly today's behavior. Mixed
-transactions (write + setattrs + omap + pg-log keys) only move the
-metadata *behind* the payload instead of in front of it.
-
-And the strongest argument is precedent: this is not a new
-construction pattern, it is the one `a0c9fec7f451` itself installed
-on the recovery paths, in production since it merged. The fix makes
-the client path consistent with the paths that already work.
-
-For the companion fix, four more:
+### 5.5.7 Why it is safe
 
 **The cost only goes up, and only by real bytes.** Every term added is
 either payload the transaction actually carries or a header the
@@ -1389,25 +1482,7 @@ non-decreasing under `append()`/`write()`, so it still does.
 670000 the payload term was and remains a small fraction of the cost.
 The correction matters where the review said it would — on SSD.
 
-### 5.3.4 Validation
-
-Same census, patched build, probes re-verified live (metadata
-counters non-zero):
-
-| | before | after |
-|---|---|---|
-| replica submit offset in rx buffer | 336 | **0** |
-| payload copies, 5 × 128 KiB direct writes | 5 × 131072 B (replica) | **0** on both OSDs |
-| payload copies, 5 × 4 KiB deferred writes | 5 × 4096 B (replica, deferred submit) | **0** |
-| `rebuild_aligned` calls | still run (2/op) | still run — but no longer copy |
-| `rados get` md5, 10 objects | ok | ok |
-| deep-scrub of both PGs | 0 errors | **0 errors** |
-| `rados bench` 64 K, qd 8 | — | 1906 writes, healthy |
-
-At pool `size=3` the line removes two full-payload memcpys
-cluster-wide from every client write.
-
-For the companion fix:
+### 5.5.8 Validation
 
 `unittest_transaction`: 20/20, including the two new equality checks
 against real encodes; before the fix the aligned case reports
@@ -1429,13 +1504,17 @@ The deferred rows show `1 ios` (the kv commit only) with the same
 bytes as the direct rows: the accounting is independent of which
 BlueStore path the write takes, as it should be.
 
-### 5.3.5 Takeaways
+## 5.6 Takeaways
+
+The copy:
 
 - **A fix that ships but never engages looks exactly like a fix.**
   The aligned format was reviewed, merged, and exercised daily — by
-  recovery. Nothing measured whether the path it was written for
-  ever took it. Counting copies at runtime found in one afternoon
-  what the code reading could not: `write_v10_aligned_bytes == 0`.
+  recovery transactions that never leave the OSD. Nothing measured
+  whether the path it was written for ever took it. Counting copies
+  at runtime found in one afternoon
+  what the code reading could not: the aligned bufferlist was empty on
+  every client write.
 - **Feature-gated formats need the features at *construction*, not
   just at encode.** The encode call was dutifully passed
   `min_peer_features()` — and it made no difference, because the
@@ -1450,6 +1529,8 @@ BlueStore path the write takes, as it should be.
   no overlap: for msgr2 rep ops there was no interval in which *any*
   alignment mechanism was active on the hot path.
 
+The accounting:
+
 - **A second buffer needs a second term everywhere the first was
   counted.** `a0c9fec7f451` split one payload bufferlist into two and
   updated the encoder, the decoder, `swap`, `append`, the move
@@ -1460,15 +1541,15 @@ BlueStore path the write takes, as it should be.
   correctness.** When both are hand-written from the same mental
   model, the test inherits the model's blind spot. The oracle has to
   be the thing being estimated — here, `encode()` itself.
-- **Review found what tracing did not.** The census above measured copies,
+- **Review found what tracing did not.** The census measured copies,
   alignment, offsets, checksums — everything about the bytes — and
   nothing about the bookkeeping attached to them. A reviewer asking
   "who else reads this struct?" caught the consequence the
   instrumentation was never pointed at.
 - **Fix the dormant bug before waking the path that hits it.** The
-  undercount had been harmless for eighteen months because only
+  undercount had been harmless for seventeen months because only
   recovery took the aligned path. Ordering the correction ahead of
-  the one-liner in the same PR means no commit on the branch makes
+  the one-liner on the same branch means no commit on it makes
   the throttle worse.
 
 # 6. OSDs that froze for minutes — TCP retransmits, PG read leases, and where they meet
