@@ -1,0 +1,114 @@
+diff --git a/drivers/block/ublk_drv.c b/drivers/block/ublk_drv.c
+index 66eb55e7162e..67e4be758c65 100644
+--- a/drivers/block/ublk_drv.c
++++ b/drivers/block/ublk_drv.c
+@@ -360,6 +360,7 @@ static bool ublk_try_buf_match(struct ublk_device *ub, struct request *rq,
+ 				  u32 *buf_idx, u32 *buf_off);
+ static void ublk_buf_cleanup(struct ublk_device *ub);
+ static void ublk_abort_queue(struct ublk_device *ub, struct ublk_queue *ubq);
++static void ublk_start_cancel(struct ublk_device *ub);
+ static inline struct request *__ublk_check_and_get_req(struct ublk_device *ub,
+ 		u16 q_id, u16 tag, struct ublk_io *io);
+ static void ublk_batch_dispatch(struct ublk_queue *ubq,
+@@ -2116,6 +2117,63 @@ static void ublk_queue_cmd_list(struct ublk_io *io, struct rq_list *l)
+ 	io_uring_cmd_complete_in_task(cmd, ublk_cmd_list_tw_cb);
+ }
+ 
++/*
++ * ublk_ch_release() fails requests owned by a dead ublk server, but it only
++ * runs after the last reference to /dev/ublkcN is dropped, and that reference
++ * may be held by someone other than the server: a forked helper, a SCM_RIGHTS
++ * receiver, a vfork child.
++ *
++ * COMMIT is only accepted from io->task, so once that task is exiting nobody
++ * can complete this request any more. Fail it on behalf of the dead daemon in
++ * the same way as COMMIT does: references held off-daemon (user copy,
++ * registered buffer) are still covered by io->ref.
++ *
++ * ->canceling has to be set first, since this io no longer has a uring_cmd
++ * for dispatching the next request with the same tag.
++ *
++ * Batch IO doesn't bind io to a task, and isn't covered.
++ */
++static bool ublk_abort_dead_io(struct ublk_device *ub, struct ublk_io *io)
++{
++	struct task_struct *t = READ_ONCE(io->task);
++	struct request *req;
++	bool compl = true;
++
++	if (!t || !(READ_ONCE(t->flags) & PF_EXITING))
++		return false;
++
++	ublk_start_cancel(ub);
++
++	mutex_lock(&ub->cancel_mutex);
++	if (!(io->flags & UBLK_IO_FLAG_OWNED_BY_SRV) ||
++			READ_ONCE(io->task) != t) {
++		mutex_unlock(&ub->cancel_mutex);
++		return false;
++	}
++
++	req = io->req;
++	io->flags &= ~UBLK_IO_FLAG_OWNED_BY_SRV;
++	io->res = -EIO;
++	if (ublk_dev_need_req_ref(ub))
++		compl = ublk_sub_req_ref(io);
++	if (compl)
++		__ublk_complete_rq(req, io, ublk_dev_need_map_io(ub), NULL);
++	mutex_unlock(&ub->cancel_mutex);
++	return true;
++}
++
++static void ublk_abort_dead_ios(struct ublk_device *ub)
++{
++	u16 i, j;
++
++	for (i = 0; i < ub->dev_info.nr_hw_queues; i++) {
++		struct ublk_queue *ubq = ublk_get_queue(ub, i);
++
++		for (j = 0; j < ubq->q_depth; j++)
++			ublk_abort_dead_io(ub, &ubq->ios[j]);
++	}
++}
++
+ static enum blk_eh_timer_return ublk_timeout(struct request *rq)
+ {
+ 	struct ublk_queue *ubq = rq->mq_hctx->driver_data;
+@@ -2123,6 +2181,14 @@ static enum blk_eh_timer_return ublk_timeout(struct request *rq)
+ 	struct task_struct *p;
+ 	struct pid *pid;
+ 
++	/*
++	 * Outstanding requests are reissued to the new server in case of
++	 * UBLK_F_USER_RECOVERY_REISSUE, so leave them alone.
++	 */
++	if (!ublk_nosrv_should_reissue_outstanding(ubq->dev) &&
++	    ublk_abort_dead_io(ubq->dev, &ubq->ios[rq->tag]))
++		return BLK_EH_DONE;
++
+ 	if (!(ubq->flags & UBLK_F_UNPRIVILEGED_DEV))
+ 		return BLK_EH_RESET_TIMER;
+ 
+@@ -2722,8 +2788,11 @@ static void ublk_abort_queue(struct ublk_device *ub, struct ublk_queue *ubq)
+ 	for (i = 0; i < ubq->q_depth; i++) {
+ 		struct ublk_io *io = &ubq->ios[i];
+ 
+-		if (io->flags & UBLK_IO_FLAG_OWNED_BY_SRV)
++		if (io->flags & UBLK_IO_FLAG_OWNED_BY_SRV) {
++			/* ublk_abort_dead_io() must not fail it again */
++			io->flags &= ~UBLK_IO_FLAG_OWNED_BY_SRV;
+ 			__ublk_fail_req(ub, io, io->req);
++		}
+ 	}
+ 
+ 	if (ublk_support_batch_io(ubq))
+@@ -2999,6 +3068,9 @@ static void ublk_stop_dev_unlocked(struct ublk_device *ub)
+ 	if (ub->dev_info.state == UBLK_S_DEV_DEAD)
+ 		return;
+ 
++	/* the server may be dead with /dev/ublkcN kept open by others */
++	ublk_abort_dead_ios(ub);
++
+ 	if (ublk_nosrv_dev_should_queue_io(ub))
+ 		ublk_force_abort_dev(ub);
+ 	del_gendisk(ub->ub_disk);
