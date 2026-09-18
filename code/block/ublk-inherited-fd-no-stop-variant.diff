@@ -1,0 +1,28 @@
+--- ublk_inherited_fd_test.c	2026-09-18 09:33:05.424165337 -0500
++++ ublk_inherited_fd_timeout_test.c	2026-09-18 09:52:55.641276546 -0500
+@@ -488,6 +488,25 @@
+ 	/* 6. the writer is stuck, STOP_DEV wedges */
+ 	usleep(2000000);
+ 	printf("# 2s after the server died:\n");
++	if (getenv("UBLK_NO_STOP")) {
++		double t0 = now();
++		int r;
++
++		dump_task(wr, "writer");
++		deadline = now() + 90;
++		for (;;) {
++			if (read_line(a[0], line, sizeof(line), deadline) <= 0) {
++				printf("not ok 1 # writer still stuck 90s after the server died, helper alive, no STOP_DEV\n");
++				dump_task(wr, "writer");
++				break;
++			}
++			if (sscanf(line, "WRITER fsync returned %d errno %d", &r, &err) == 2) {
++				printf("ok 1 fsync returned %d errno %d after %.1fs with the helper still alive\n", r, err, now() - t0 + 2);
++				break;
++			}
++		}
++		goto out;
++	}
+ 	dump_task(wr, "writer");
+ 	if (task_state(wr) == 'D')
+ 		reproduced = 1;
