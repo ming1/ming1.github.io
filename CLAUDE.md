@@ -41,7 +41,14 @@ There are no tests or linters configured.
 
 `code/` is **not** site code — it's reproducers and analysis scripts referenced from posts (e.g. `ublk-mntns-*.sh` backs the ublk mount-namespace deadlock post; `xfs-meta-*.sh|*.py` back the XFS metadata internals post; `writeback-observe.bt` is a bpftrace script). When editing one of those posts, expect the script in `code/` to be the authoritative source the post quotes from.
 
-## Ceph tracker notes (`_posts/2026-08-12-ceph-tracker-notes.md`)
+## Issue notes (running posts)
+
+Two running posts share one shape — a new issue is a new section in the matching post, never a new post:
+
+| Post | Scope |
+|---|---|
+| `_posts/2026-08-12-ceph-tracker-notes.md` | Ceph tracker issues / PRs (category `storage`) |
+| `_posts/2026-09-18-linux-block-layer-issue-notes.md` | Linux block layer issues — blk-mq, ublk, nvme, scsi, dm, loop, io_uring↔block (category `linux kernel`) |
 
 One `# N.` section per issue: a status line (how found · affects · component · fix · Status), then Report → Analysis → Proposed solution → Takeaways. When adding or reworking a section:
 
@@ -53,6 +60,31 @@ One `# N.` section per issue: a status line (how found · affects · component �
 - The N.1 chain runs top-down (cause→effect) in plain words; the Analysis `why?` tree runs bottom-up (symptom→cause) with `file:line`. Keep both, and don't restate the mechanism in prose between them.
 - **One bug, one linear story.** If an issue grows a second bug (a review finding, a sibling gap), give it its own `N.x` block — observation → root cause → fix → why safe → validation — instead of interleaving it through Report/Analysis/Solution. One merged Takeaways at the end.
 - When renumbering, fix the in-section `N.x.y` cross-refs; other posts link only to a section as a whole.
+- Add a tag to the post's front-matter `tags:` when a new section brings a new component or technique.
+
+### Block layer notes — role and approach
+
+When tracking, analyzing, or writing up a kernel block layer issue, work as a **senior kernel / block layer developer**:
+
+1. **Root-cause, top to bottom, in diagrams and plain text.**
+   - Start from what is visible (splat, hang, stall, regression number) and walk down the I/O path — submitter → bio → blk-mq (plug, scheduler, tags, hctx dispatch) → driver `queue_rq` → completion / timeout / teardown — narrowing layer by layer until one line or one missing invariant explains the symptom. Stop only at the cause, not at the first suspicious code.
+   - Lead with a diagram, not prose: a lane diagram (one lane per context — task, kworker, irq/softirq, daemon) for races and ordering bugs; a call tree for "who reaches this"; a state diagram for lifetime / freeze / quiesce / recovery bugs. Mark the exact step where the invariant breaks.
+   - Text around the diagram is short declarative sentences: what is guaranteed, by which lock / ref / RCU / flag, and where that guarantee ends. Every claim carries its evidence (`file:line`, trace frame, measurement); say what is proven vs. inferred.
+   - Explain why it *usually* works — the window, the config, the hardware, the timing that hides it — since that is what makes the bug reproducible on demand.
+2. **Find the effective solution.**
+   - Fix the broken invariant at the layer that owns it, not the symptom where it surfaces; name the introducing commit for `Fixes:`.
+   - Smallest upstream-acceptable change: no new lock or fast-path cost when an existing ref / freeze / quiesce / ordering already gives the guarantee; keep it stable-backportable.
+   - List the alternatives considered and why each was rejected (cost, complexity, new races, ABI).
+   - State why the fix is safe — what else reaches the changed code, which contexts, which configs — and prove it with a deterministic reproducer and an A/B run.
+
+### Block layer notes — what differs from the Ceph post
+
+- **Section title**: `# N. <subsystem>: <what breaks>` — kernel subject-line style, not a tracker number. The post carries a commented-out (`{::comment}`) section skeleton at the top; copy it.
+- **Status line**: link the lore thread (`https://lore.kernel.org/linux-block/<msgid>/`), syzbot or bugzilla report; "affects" names the first bad release and the introducing commit; Status walks `analysis only → posted vN → applied to block-X.Y → in vX.Y-rcN → stable backport`.
+- **Commits** are cited kernel-style: 12-char sha + `("subject")`. **`file:line`** refs are pinned to a named tag or sha (say which, once per section) — mainline moves under them.
+- **Evidence**: quote the splat / hung-task trace / blktests or ublk selftest output verbatim, trimmed to the relevant frames. Validation is an A/B table — stock REPRODUCED → patched clean — naming the kernel sha, the test, and the run count for racy bugs.
+- **Reproducers** go in `code/block/` and are linked with `{{ site.baseurl }}/code/block/<file>`, same as `code/ceph/`.
+- **Security-sensitive issues**: no section until the fix is public in mainline.
 
 ## Repo hygiene gotchas
 
