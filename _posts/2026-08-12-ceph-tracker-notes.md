@@ -1233,6 +1233,22 @@ empty — a v9 encode, or a v10 transaction with no stream data at all —
 `generate_subop()` falls back to everything-in-DATA
 ([`ReplicatedBackend.cc:1182`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L1182)).
 
+**`write(cid, oid, off, len, data, flags)`, parameter by parameter**
+(`:900`). Each argument lands somewhere different:
+
+| parameter | what it is | where it goes |
+|---|---|---|
+| `cid` | `coll_t`, the PG's collection (`2.2_head`) | interned once in `coll_index` (`:813`); the Op stores the u32 id |
+| `oid` | `ghobject_t`: hobject + generation + shard | interned once in `object_index` (`:822`); the Op stores the u32 id |
+| `off` | byte offset in the object | `Op::off`; also drives the split below |
+| `len` | byte count, must equal `data.length()` (`:910`) | `Op::len`; `decode_bl()` recomputes the split from it, so no piece carries a length |
+| `data` | the payload bufferlist | appended by reference — `substr_of` views (`:923`), no copy — to one or both payload streams |
+| `flags` | `CEPH_OSD_OP_FLAG_FADVISE_*` cache hints ([`rados.h:498`](https://github.com/ceph/ceph/blob/v21.3.0/src/include/rados.h#L498)) | OR-ed into the transaction-wide `data.fadvise_flags` (`:911`); no per-op field exists, so one write's hint applies to every write in the transaction, and BlueStore reads that one value per op ([`BlueStore.cc:16265`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L16265)) |
+
+One Op record is appended to `op_bl` and `data.ops` goes up by one.
+Nothing is checked against the object's current state here; that
+happens when the store applies the transaction.
+
 **How `write()` fills the streams** (`:900`). The split follows the
 *destination* offset, not the buffer's address:
 
