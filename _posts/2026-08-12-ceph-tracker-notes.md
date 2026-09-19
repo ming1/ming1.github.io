@@ -1649,25 +1649,49 @@ A commit ordered ahead of the one-liner on the PR branch (local, not
 yet pushed to #71355), so the one-liner never ships without it:
 
 ```cpp
-// Transaction.h — the size estimate, both payload buffers, exact for
-// the layout encode() emits for this transaction's own data_features
+// Transaction.h — everything encode() wraps around the streams, for the
+// layout this transaction's own data_features selects. The index maps
+// are left out: each size function sizes those its own way.
+size_t _get_encoded_framing_bytes() const {
+  size_t r = 0;
+  r += sizeof(__u8);              // ENCODE_START: struct_v
+  r += sizeof(__u8);              // ENCODE_START: struct_compat
+  r += sizeof(ceph_le32);         // ENCODE_START: struct_len
+  r += sizeof(__u32);             // length word ahead of op_bl
+  r += sizeof(data);              // TransactionData, appended verbatim
+  if (is_format_aligned()) {
+    // version 10: the payload bufferlists go out raw, described here
+    r += sizeof(data_features);   // data_features
+    r += sizeof(__u32);           // data_aligned_bl.length()
+    r += sizeof(__u32);           // data_misaligned_bl.length()
+  } else {
+    // version 9: data_misaligned_bl is encoded inline
+    r += sizeof(__u32);           // length word ahead of data_misaligned_bl
+  }
+  return r;
+}
+
+// the fast path: index maps by per-entry encoded_size() arithmetic
 uint64_t get_encoded_bytes() {
-  // ENCODE_START header, op_bl length, coll_index size, object_index size, data
-  size_t final_size = sizeof(__u8) * 2 + sizeof(ceph_le32) +
-                      sizeof(__u32) * 3 + sizeof(data);
-  ... coll_index / object_index entries, as before ...
-  final_size += _get_encoded_payload_header_bytes();
+  size_t final_size = _get_encoded_framing_bytes() + sizeof(__u32) * 2;  // + the two map counts
+  ... per-entry coll_index / object_index terms, as before ...
   return data_aligned_bl.length() + data_misaligned_bl.length() +
          op_bl.length() + final_size;
 }
 
-// v9 prefixes data_misaligned_bl with its length;
-// v10 carries data_features plus the length of each payload bufferlist
-size_t _get_encoded_payload_header_bytes() const {
-  return is_format_aligned() ? sizeof(data_features) + sizeof(__u32) * 2
-                             : sizeof(__u32);
+// the slow reference: index maps by really encoding them
+uint64_t get_encoded_bytes_test() {
+  bufferlist bl; encode(coll_index, bl); encode(object_index, bl);
+  return data_aligned_bl.length() + data_misaligned_bl.length() +
+         op_bl.length() + bl.length() + _get_encoded_framing_bytes();
 }
 ```
+
+The two size functions differ only in how they size the index maps, so
+everything else they add lives in the one helper, one commented line
+per byte of framing. `final_size` in the fast path is that framing plus
+the two map entry counts plus, per entry, the key's `encoded_size()`
+and its 4-byte id — everything that is not raw stream content.
 
 **The comment on the function, sentence by sentence.** The old one
 said "layout: data_misaligned_bl + op_bl + coll_index + object_index +
@@ -1706,9 +1730,9 @@ new one:
   walk over the two index maps runs per call, which is what keeps the
   function cheap enough for BlueStore's per-transaction path.
 
-`get_encoded_bytes_test()` gets the same two terms so the existing
-fast-vs-slow assert keeps meaning something, and the unit test gains
-the oracle it lacked:
+The slow reference sharing the helper keeps the existing fast-vs-slow
+assert meaningful for the index arithmetic, and the unit test gains the
+oracle it lacked for everything else:
 
 ```cpp
 // legacy transaction: fast path == real v9 encode
