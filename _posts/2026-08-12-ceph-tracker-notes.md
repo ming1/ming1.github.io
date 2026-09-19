@@ -1669,6 +1669,43 @@ size_t _get_encoded_payload_header_bytes() const {
 }
 ```
 
+**The comment on the function, sentence by sentence.** The old one
+said "layout: data_misaligned_bl + op_bl + coll_index + object_index +
+data + data_features" — a v9 field order with a v10 field mixed in —
+and `encode()` noted that the function "assumes layout version 9". The
+new one:
+
+```cpp
+/// How big is the encoded Transaction buffer?
+///
+/// Sizes the layout that encode() emits for this transaction's own
+/// data_features: version 9 for a legacy-format transaction, version 10
+/// for an aligned-format one. Both payload bufferlists count; BlueStore
+/// charges the result as the transaction's throttle cost.
+```
+
+- *"for this transaction's own data_features"* — the sentence that
+  settles an ambiguity. `encode()` picks the wire version from its
+  *features argument*, so a legacy-format transaction has two sizes: v9
+  to an old peer, v10 to a new one, 12 bytes apart. The function
+  promises the one that matches the transaction's own format — what
+  `encode(bl)` produces for a legacy transaction, and the only legal
+  layout for an aligned one. A reader who needs the other case now
+  knows not to expect it here.
+- *"Both payload bufferlists count"* — the fix, stated as contract
+  rather than history, so a third payload stream one day cannot be
+  added without noticing this line.
+- *"BlueStore charges the result as the transaction's throttle cost"*
+  — why the number matters. Without it the function looks like a wire
+  size estimate where a few kilobytes of drift is harmless; with it,
+  an undercount is admission control letting real bytes through.
+- The two layout sketches in the body list v9 and v10 separately, in
+  the order `encode()` writes the fields, so each term of the
+  arithmetic can be matched to a line. The constants — header, length
+  words, index counts, `sizeof(data)` — fold at compile time; only the
+  walk over the two index maps runs per call, which is what keeps the
+  function cheap enough for BlueStore's per-transaction path.
+
 `get_encoded_bytes_test()` gets the same two terms so the existing
 fast-vs-slow assert keeps meaning something, and the unit test gains
 the oracle it lacked:
