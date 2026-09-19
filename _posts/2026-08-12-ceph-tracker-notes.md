@@ -1249,6 +1249,24 @@ One Op record is appended to `op_bl` and `data.ops` goes up by one.
 Nothing is checked against the object's current state here; that
 happens when the store applies the transaction.
 
+**A common misreading of `off`.** `off` is a position in the *object*,
+not a position in `data`. The buffer is always used from its first byte
+to its last. Take the test's call `write(cid, oid, 1, bl.length(), bl)`
+with a 12288-byte `bl`:
+
+```
+source:       bl[0 .. 12288)            all of it, nothing skipped, nothing read past the end
+destination:  object[1 .. 12289)        starts at byte 1, so the object grows by one byte
+```
+
+Nothing overflows. `off` and `len` are 64-bit, and `1 + 12288` is just
+the end of the destination range; it is not stored anywhere. Writing
+past the current end of an object is normal: the object gets longer. In
+the unit test there is no object at all — the transaction is only
+built, sized and encoded, never applied — so the only effect of
+offset 1 is the split it produces: a 4095-byte prefix, two whole pages,
+and one byte of suffix.
+
 **How `write()` fills the streams** (`:900`). The split follows the
 *destination* offset, not the buffer's address:
 
