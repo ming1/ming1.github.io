@@ -43,67 +43,51 @@ map of which subsection proves which step
 attached) · found by review of an unrelated series · affects v6.15+, since
 `82a8a30c581b` ("ublk: improve detection and handling of ublk server exit") ·
 component ublk (`drivers/block/ublk_drv.c`) · fix: keep release as the fast
-path, add a daemon-liveness backstop in `ublk_timeout()` and
-`ublk_stop_dev()` · Status: analysis + prototype, A/B verified in a VM, not
-posted
+path, add a liveness backstop in `ublk_timeout()` and `ublk_stop_dev()`;
+batch mode additionally binds the char device to its opener · Status:
+analysis + prototype, A/B verified in a VM, not posted
 
 `file:line` below is against `5dd1818b15d9` (v7.3-rc3+313).
 
 ## 1.1 The story in one view
 
-ublk decides "the server is dead" by one event: the last `fput()` of
-`/dev/ublkcN`. Anything else holding a reference on that file — a forked
-helper, an `SCM_RIGHTS` receiver, a vfork child — postpones the event, and
-with it every consequence of the server's death.
+ublk learns that its server died from one event only: the last reference to
+`/dev/ublkcN` going away. A forked helper holds a second reference, so the
+server can be dead while ublk still believes it is alive.
 
 ```
-     server S            helper H           writer W / admin A      ublk_drv
-     ────────            ────────           ──────────────────      ────────
-#1   open ublkcN ─────────────────────────────────────────────────→ UB_STATE_OPEN: exactly one
-     FETCH × QD                                                      struct file per device
-#2   fork() ───────────→ fdtable copy:
-                         +1 ref on that file
-#3                                          W: write 4K, fsync ───→ queue_rq → task work on S
-     tw: dispatch ←─────────────────────────────────────────────── io = OWNED_BY_SRV,
-                                                                    its uring_cmd is completed
-#4   crash
-       io_uring cancel ───────────────────────────────────────────→ cancel_fn: ->canceling = 1,
-                                                                    completes idle FETCH cmds only
-       exit_files ────────────────────────────────────────────────→ file ref 2 → 1, no ->release()
-#5                       pause()            W: D  folio_wait_writeback
-                                            A: STOP_DEV → del_gendisk
-                                               → bdev_mark_dead → sync     D, holds ub->mutex
-                                            anyone: sync(2) → sync_bdevs   D, holds open_mutex
-#6                       SIGKILL
-                         last fput ───────────────────────────────→ ublk_ch_release → abort: -EIO
+#1   server S ──fd──┐                                 ublk_ch_open()       one struct file per device
+                    ├──→ struct file /dev/ublkcN ──→  ublk_ch_release()    runs when refs == 0
+     helper H ──fd──┘                                  └ ublk_abort_queue()  the ONLY abort of S's I/O
+     dup_fd() at fork()
+
+
+     time ───────────────────────────────────────────────────────────────────────────────→
+
+#2   S        ublk_dispatch_req() ───────── ✗ dies
+              io = OWNED_BY_SRV              ublk_uring_cmd_cancel_fn(): idle FETCH cmds only
+#3   refs     2 ─────────────────────────── 1 ──────────────────────────── 0    H exits / is killed
+     WRITE    COMMIT from io->task only ─── orphaned ───────────────────── ublk_abort_queue(): -EIO
+     waiters                                blkdev_fsync() · del_gendisk() · sync_bdevs()   all in D
+
+#4   fix                                    ▲ ublk_abort_dead_io()  ← ublk_timeout(), ublk_stop_dev_unlocked()
 ```
 
-1. `/dev/ublkcN` is exclusive-open, so "another holder" is always another
-   reference on the *same* `struct file`, and `->release()` runs once.
-2. Dispatch hands the request to the server: the io becomes
-   `OWNED_BY_SRV` and its uring_cmd is completed. From here only a COMMIT
-   issued by `io->task` can finish the request.
-3. The server dies. io_uring cancellation completes the idle FETCH commands
-   and sets `->canceling`, which gates *new* I/O. The server-owned request
-   is not touched.
-4. The one place that fails server-owned requests is `ublk_abort_queue()`,
-   and its one caller is the char-device release work.
-5. The gap: release ≠ server exit. `STOP_DEV`/`DEL_DEV` have no abort of
-   their own and walk straight into `del_gendisk()`'s sync;
-   `ublk_timeout()` does nothing for a privileged device.
-6. Cost: unkillable writer, wedged `STOP_DEV`, and `sync(2)` — so reboot —
-   hung with `disk->open_mutex` held. If the holder is itself the waiter
-   (vfork child), it is permanent.
-7. Fix: the daemon task's liveness is a second, fd-independent detector.
-   Consult it where someone already waits — request timeout and
-   `STOP_DEV` — and fail the request the way a COMMIT would.
-8. Twist: the failed io has no uring_cmd left, so `->canceling` must be set
-   before completing it or the recycled tag dispatches through a stale
-   `io->cmd`.
+| # | function | what it does here |
+|---|---|---|
+| 1 | `ublk_ch_open()` | exclusive open (`UB_STATE_OPEN`): one `struct file` |
+|   | `dup_fd()` | `fork()` gives H a second reference to it |
+| 2 | `ublk_dispatch_req()` | hands the WRITE to S: io is `OWNED_BY_SRV` |
+|   | `ublk_ch_uring_cmd_local()` | COMMIT accepted from `io->task` only — S, nobody else |
+| 3 | `ublk_uring_cmd_cancel_fn()` | S dies: completes idle FETCH cmds, skips owned ios |
+|   | `ublk_abort_queue()` | the only abort; reached only from `ublk_ch_release()`, which waits for H |
+|   | `ublk_stop_dev_unlocked()` | no abort → `del_gendisk()` → `bdev_mark_dead()` → `sync_blockdev()`: D |
+|   | `ublk_timeout()` | privileged device: `BLK_EH_RESET_TIMER`, nothing else |
+| 4 | `ublk_abort_dead_io()` (new) | `io->task` is `PF_EXITING` → `ublk_start_cancel()`, complete `-EIO` as COMMIT would |
+|   | | called from `ublk_timeout()` and `ublk_stop_dev_unlocked()`, before `del_gendisk()` |
 
 ```
-#1–#6   1.2 report → 1.3 analysis          #7–#8   1.5 fix → 1.6 validation
-        1.4 the two amplifiers (vfork, async partition scan)
+#1–#3   1.2 report → 1.3 analysis → 1.4 amplifiers        #4   1.5 fix → 1.6 validation
 ```
 
 ## 1.2 Report
@@ -197,6 +181,26 @@ decides whether an earlier abort is safe:
 | batch `COMMIT_IO_CMDS` | allowed, `io->task == NULL`, only `OWNED_BY_SRV` checked (`:3762`) | nothing |
 | mmap | other mm rejected; RO descriptor page | — |
 
+The I/O command path has no process-identity check at all —
+`ublksrv_tgid` only feeds the timeout SIGKILL and the `START_DEV` pid
+check; `ub->mm` only guards `mmap`. Authorization is per io, by *who
+fetched it*. Three consequences:
+
+- **No takeover.** For an io the dead server owned, the helper's COMMIT is
+  `-EINVAL` forever (`io->task` still points at the dead task) and it
+  cannot re-FETCH the slot (`ublk_dev_ready()` → `-EBUSY`). Nothing the
+  holder can issue rescues the request; the only userspace remedy is to
+  drop the fd.
+- **The helper may be a legitimate daemon.** FETCH before `START_DEV` is
+  accepted from any task, so a forked worker that fetched its own ios is a
+  real server for them. A process-level "opener is gone" test would kill
+  its I/O; the per-io one fails only the dead task's ios.
+- **Batch mode has no such anchor.** `io->task == NULL`; measured on stock,
+  a process that obtained the fd with `pidfd_getfd()` gets its
+  `COMMIT_IO_CMDS` as far as copying the element buffer (`-EFAULT` with a
+  null one). While any holder exists, "nobody can complete this" is simply
+  false.
+
 So outside batch mode: once `io->task` is exiting, nobody can commit the io,
 and everything else goes through `io->ref` — exactly the situation a normal
 COMMIT already handles.
@@ -239,41 +243,70 @@ on `open_mutex` — the abort has to come *before* `del_gendisk()`.
 ## 1.5 Fix
 
 Release stays the detector for the normal case (immediate, handles a
-saturated queue). Added: per-io daemon liveness, consulted at the two
+saturated queue). Added: an "orphaned io" predicate, consulted at the two
 places where a waiter already exists.
 
+```
+                  who may commit this io?          orphaned when
+non-batch         io->task only (:3423)            io->task is PF_EXITING
+batch, stock      any holder of the fd             undecidable
+batch, patched    opener's thread group only       that thread group has exited
+```
+
+The batch row needs the access rule before it can have a liveness rule, so
+the prototype binds a batch device's char dev to the thread group that
+opened it: `ublk_ch_batch_io_uring_cmd()` and batch `ublk_user_copy()`
+return `-EPERM` for anyone else. Same idea as KVM
+(`kvm->mm != current->mm → -EIO`, `virt/kvm/kvm_main.c:5174`), vhost
+(`vhost_dev_check_owner()`) and ublk's own `mmap` check — but keyed on the
+tgid, not the mm: a vfork child shares the mm, and a binding it passes
+cannot prove the request orphaned. Threads, io-wq workers and SQPOLL all
+share the tgid. Non-batch is left alone: forked per-io daemons are legal
+there, and `io->task` already is the anchor.
+
 ```c
+static bool ublk_io_orphaned(struct ublk_device *ub, const struct ublk_io *io)
+{
+	if (ublk_dev_support_batch_io(ub))
+		return ublk_srv_exited(ub);	/* srv_pid: !task || exit_state && !delay_group_leader */
+	t = READ_ONCE(io->task);
+	return t && (READ_ONCE(t->flags) & PF_EXITING);
+}
+
 static bool ublk_abort_dead_io(struct ublk_device *ub, struct ublk_io *io)
 {
-	struct task_struct *t = READ_ONCE(io->task);
-	...
-	if (!t || !(READ_ONCE(t->flags) & PF_EXITING))
+	if (!ublk_io_orphaned(ub, io))
 		return false;
 
-	ublk_start_cancel(ub);			/* #8: before the tag can be reused */
+	ublk_start_cancel(ub);			/* before the tag can be reused, see below */
 
 	mutex_lock(&ub->cancel_mutex);		/* vs. release work's abort */
-	if (!(io->flags & UBLK_IO_FLAG_OWNED_BY_SRV) || READ_ONCE(io->task) != t)
-		goto unlock;
-	req = io->req;
-	io->flags &= ~UBLK_IO_FLAG_OWNED_BY_SRV;
-	io->res = -EIO;
-	if (ublk_dev_need_req_ref(ub))
-		compl = ublk_sub_req_ref(io);	/* same as COMMIT */
-	if (compl)
-		__ublk_complete_rq(req, io, ublk_dev_need_map_io(ub), NULL);
+	if (batch)
+		ublk_io_lock(io);		/* as batch COMMIT does */
+	if (io->flags & UBLK_IO_FLAG_OWNED_BY_SRV) {
+		req = io->req;
+		io->flags &= ~UBLK_IO_FLAG_OWNED_BY_SRV;
+		io->res = -EIO;
+		if (ublk_dev_need_req_ref(ub))
+			compl = ublk_sub_req_ref(io);	/* same as COMMIT */
+	}
 	...
+	if (req && compl)
+		__ublk_complete_rq(req, io, ublk_dev_need_map_io(ub), NULL);
 }
 ```
 
 ```
-ublk_timeout()            if !REISSUE && ublk_abort_dead_io(io of rq) → BLK_EH_DONE
+ublk_timeout()            !REISSUE: non-batch → abort this rq's io → BLK_EH_DONE
+                                    batch     → abort all orphans + drain evts_fifo
+                                                (the rq may be queued, not owned)
+                                                → DONE iff rq is no longer started
 ublk_stop_dev_unlocked()  ublk_abort_dead_ios(ub) first, then force_abort, del_gendisk
 ```
 
 Full diff:
 [`ublk-dead-daemon-abort-prototype.diff`]({{ site.baseurl }}/code/block/ublk-dead-daemon-abort-prototype.diff)
-(+73/−1, one file).
+(+152/−1, one file).
 
 Why it is safe:
 
@@ -309,14 +342,17 @@ Rejected:
 | `blk_mark_disk_dead()` before `del_gendisk()` | skips the sync but the started request still pins `blk_mq_freeze_queue_wait()` (`block/genhd.c:759`) |
 | `f_op->flush` with `fl_owner_t` as "opener's fdtable closed" | `dup()`+`close()` and legitimate fd hand-off trigger it; abuses flush |
 | back to pre-6.15 cancel_fn abort | blind to a saturated queue, which is why it needed the timeout leg anyway |
+| bind the fd to the opener's *mm* (KVM/vhost style) | a vfork child passes it, so it restricts forked helpers but cannot anchor the orphan test |
+| process-level predicate for non-batch too | kills the ios of a legitimate forked per-io daemon |
 | document only | leaves an unkillable task and a reboot hang reachable by `fork()` without `exec` |
 
 Open:
 
-- **Batch mode** has no `io->task`; any fd holder may legally commit, so
-  "nobody can complete this" is undecidable per io. Needs a device-level
-  predicate (all fetch commands cancelled + opener thread group gone?) and
-  `io->lock`.
+- **Batch owner binding is an ABI change**: a launcher that opens
+  `/dev/ublkcN` and hands the fd to another process stops working for
+  batch devices. `UBLK_F_BATCH_IO` first shipped in v7.0, so the window to
+  decide is now; otherwise it has to be opt-in. The user-copy half of the
+  gate is untested — `kublk add -b -u` does not come up even on stock.
 - **Recovery cannot start** while the fd is leaked: `START_USER_RECOVERY`
   requires `!UB_STATE_OPEN` (`:5116`). With the fix the admin can at least
   delete the device; making recovery independent of the leak is a separate
@@ -336,16 +372,27 @@ Runner:
 [`ublk-dead-server-ab.sh`]({{ site.baseurl }}/code/block/ublk-dead-server-ab.sh);
 (1t) is the report's test (1) minus `STOP_DEV`
 ([variant diff]({{ site.baseurl }}/code/block/ublk-inherited-fd-no-stop-variant.diff)),
-to isolate the timeout leg.
+to isolate the timeout leg. (3)–(5) use the in-tree kublk server:
+[`ublk-leak-kublk.sh`]({{ site.baseurl }}/code/block/ublk-leak-kublk.sh) with
+[`ublk-leak-steal-fd.py`]({{ site.baseurl }}/code/block/ublk-leak-steal-fd.py),
+and
+[`ublk-leak-steal-cmd.c`]({{ site.baseurl }}/code/block/ublk-leak-steal-cmd.c)
+for (5). `DEL_DEV` itself still waits — interruptibly, by design — for the
+helper's file reference before the device id is freed; what must not depend
+on the helper is the writer and the disk, and that is what (3)/(4) assert.
 
 | case | stock | patched |
 |---|---|---|
 | (1) helper holds fd, `STOP_DEV` | REPRODUCED: wedged until helper is killed | `STOP_DEV` returns with the helper alive, fsync `-EIO` |
 | (1t) same, no `STOP_DEV` | writer D forever | fsync `-EIO` after ~30 s (`io_timeout`; 30.1 s, 30.5 s) |
 | (2) vfork child `close()` | REPRODUCED: child D forever, device undeletable | child still D 10 s after the kill (timeout not reached), released by `STOP_DEV`; 0 D-state tasks, 0 devices left |
+| (3) kublk `fault_inject`, fd taken via `pidfd_getfd()`, non-batch: `del` | REPRODUCED: writer D, disk present, `del` in `del_gendisk` | writer `-EIO`, disk gone in 1 s, helper alive |
+| (3t) same, no `del` | — | writer `-EIO` via timeout leg |
+| (4) same as (3), `UBLK_F_BATCH_IO` | REPRODUCED, identical | writer `-EIO`, disk gone in <1 s; (4t) timeout leg OK |
+| (5) non-owner `COMMIT_IO_CMDS` on a batch device | processed: `-EFAULT` on the null element buffer | `-EPERM`; server's own I/O unaffected |
 | VM power-off | hung in `sync_bdevs`, killed from host | clean |
 | lockdep / WARN / hung-task | 3 hung tasks | none |
-| ublk selftests (generic, recover, stress 01–05) | — | 19 pass / 0 fail / 1 skip (first cut: `generic_06` WARN + panic, see 1.5) |
+| ublk selftests (generic, recover, batch, stress 01–05, 08–09) | — | 25 pass / 0 fail / 1 skip (first cut: `generic_06` WARN + panic, see 1.5) |
 
 ## 1.7 Takeaways
 
@@ -362,6 +409,12 @@ to isolate the timeout leg.
   reaching `del_gendisk()`'s sync with a request only a dead server could
   complete is the block-layer form of waiting on yourself; abort first,
   then delete.
+- **An orphan test needs an access rule underneath it.** "Nobody can
+  complete this" is only decidable where the driver says who *may*:
+  non-batch had that rule per io and the predicate fell out of it; batch
+  had dropped it, so the rule had to come back — at process granularity —
+  before the fix could cover it. Restricting *use* of a leaked fd does not
+  shorten the file's lifetime, but it is what makes the lifetime harmless.
 - **A flag that outlives the state it names is a trap for the second
   reader.** `OWNED_BY_SRV` staying set after the release abort was harmless
   with one reader; adding a second turned it into a double free. The A/B
