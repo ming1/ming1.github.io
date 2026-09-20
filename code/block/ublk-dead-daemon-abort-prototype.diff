@@ -1,62 +1,117 @@
 diff --git a/drivers/block/ublk_drv.c b/drivers/block/ublk_drv.c
-index 66eb55e7162e..67e4be758c65 100644
+index 66eb55e7162e..bc7483911c32 100644
 --- a/drivers/block/ublk_drv.c
 +++ b/drivers/block/ublk_drv.c
-@@ -360,6 +360,7 @@ static bool ublk_try_buf_match(struct ublk_device *ub, struct request *rq,
+@@ -336,6 +336,7 @@ struct ublk_device {
+ 	struct mutex cancel_mutex;
+ 	bool canceling;
+ 	pid_t 	ublksrv_tgid;
++	struct pid	*srv_pid;	/* opener's thread group, protected by ->lock */
+ 	struct delayed_work	exit_work;
+ 	struct work_struct	partition_scan_work;
+ 
+@@ -360,6 +361,9 @@ static bool ublk_try_buf_match(struct ublk_device *ub, struct request *rq,
  				  u32 *buf_idx, u32 *buf_off);
  static void ublk_buf_cleanup(struct ublk_device *ub);
  static void ublk_abort_queue(struct ublk_device *ub, struct ublk_queue *ubq);
 +static void ublk_start_cancel(struct ublk_device *ub);
++static void ublk_abort_batch_queue(struct ublk_device *ub,
++				   struct ublk_queue *ubq);
  static inline struct request *__ublk_check_and_get_req(struct ublk_device *ub,
  		u16 q_id, u16 tag, struct ublk_io *io);
  static void ublk_batch_dispatch(struct ublk_queue *ubq,
-@@ -2116,6 +2117,63 @@ static void ublk_queue_cmd_list(struct ublk_io *io, struct rq_list *l)
+@@ -2116,6 +2120,116 @@ static void ublk_queue_cmd_list(struct ublk_io *io, struct rq_list *l)
  	io_uring_cmd_complete_in_task(cmd, ublk_cmd_list_tw_cb);
  }
  
++/*
++ * Batch IO doesn't bind io to a task, so the char device is bound to the
++ * thread group which opened it: nobody else is allowed to issue io commands
++ * or to copy io data, see ublk_ch_batch_io_uring_cmd() and ublk_user_copy().
++ */
++static bool ublk_is_batch_owner(const struct ublk_device *ub)
++{
++	return task_tgid(current) == READ_ONCE(ub->srv_pid);
++}
++
++/* Has the thread group which opened the char device exited? */
++static bool ublk_srv_exited(struct ublk_device *ub)
++{
++	struct task_struct *t;
++	struct pid *pid;
++	bool exited;
++
++	spin_lock(&ub->lock);
++	pid = get_pid(ub->srv_pid);
++	spin_unlock(&ub->lock);
++
++	if (!pid)
++		return false;
++
++	rcu_read_lock();
++	t = pid_task(pid, PIDTYPE_PID);
++	exited = !t || (READ_ONCE(t->exit_state) && !delay_group_leader(t));
++	rcu_read_unlock();
++	put_pid(pid);
++	return exited;
++}
++
 +/*
 + * ublk_ch_release() fails requests owned by a dead ublk server, but it only
 + * runs after the last reference to /dev/ublkcN is dropped, and that reference
 + * may be held by someone other than the server: a forked helper, a SCM_RIGHTS
 + * receiver, a vfork child.
 + *
-+ * COMMIT is only accepted from io->task, so once that task is exiting nobody
-+ * can complete this request any more. Fail it on behalf of the dead daemon in
-+ * the same way as COMMIT does: references held off-daemon (user copy,
-+ * registered buffer) are still covered by io->ref.
++ * Nobody can complete this io any more if:
++ *
++ * - io->task is exiting, since COMMIT is only accepted from io->task, or
++ * - the owner thread group has exited in case of batch IO
++ *
++ * Fail it on behalf of the dead server in the same way as COMMIT does:
++ * references held off-daemon (user copy, registered buffer) are still covered
++ * by io->ref.
 + *
 + * ->canceling has to be set first, since this io no longer has a uring_cmd
 + * for dispatching the next request with the same tag.
-+ *
-+ * Batch IO doesn't bind io to a task, and isn't covered.
 + */
++static bool ublk_io_orphaned(struct ublk_device *ub, const struct ublk_io *io)
++{
++	struct task_struct *t;
++
++	if (ublk_dev_support_batch_io(ub))
++		return ublk_srv_exited(ub);
++
++	t = READ_ONCE(io->task);
++	return t && (READ_ONCE(t->flags) & PF_EXITING);
++}
++
 +static bool ublk_abort_dead_io(struct ublk_device *ub, struct ublk_io *io)
 +{
-+	struct task_struct *t = READ_ONCE(io->task);
-+	struct request *req;
++	bool batch = ublk_dev_support_batch_io(ub);
++	struct request *req = NULL;
 +	bool compl = true;
 +
-+	if (!t || !(READ_ONCE(t->flags) & PF_EXITING))
++	if (!ublk_io_orphaned(ub, io))
 +		return false;
 +
 +	ublk_start_cancel(ub);
 +
 +	mutex_lock(&ub->cancel_mutex);
-+	if (!(io->flags & UBLK_IO_FLAG_OWNED_BY_SRV) ||
-+			READ_ONCE(io->task) != t) {
-+		mutex_unlock(&ub->cancel_mutex);
-+		return false;
++	if (batch)
++		ublk_io_lock(io);
++	if (io->flags & UBLK_IO_FLAG_OWNED_BY_SRV) {
++		req = io->req;
++		io->flags &= ~UBLK_IO_FLAG_OWNED_BY_SRV;
++		io->res = -EIO;
++		if (ublk_dev_need_req_ref(ub))
++			compl = ublk_sub_req_ref(io);
 +	}
-+
-+	req = io->req;
-+	io->flags &= ~UBLK_IO_FLAG_OWNED_BY_SRV;
-+	io->res = -EIO;
-+	if (ublk_dev_need_req_ref(ub))
-+		compl = ublk_sub_req_ref(io);
-+	if (compl)
++	if (batch)
++		ublk_io_unlock(io);
++	if (req && compl)
 +		__ublk_complete_rq(req, io, ublk_dev_need_map_io(ub), NULL);
 +	mutex_unlock(&ub->cancel_mutex);
-+	return true;
++	return req != NULL;
 +}
 +
 +static void ublk_abort_dead_ios(struct ublk_device *ub)
@@ -68,13 +123,21 @@ index 66eb55e7162e..67e4be758c65 100644
 +
 +		for (j = 0; j < ubq->q_depth; j++)
 +			ublk_abort_dead_io(ub, &ubq->ios[j]);
++
++		/* requests queued in the fifo, but never fetched */
++		if (ublk_support_batch_io(ubq) && ublk_srv_exited(ub)) {
++			ublk_start_cancel(ub);
++			mutex_lock(&ub->cancel_mutex);
++			ublk_abort_batch_queue(ub, ubq);
++			mutex_unlock(&ub->cancel_mutex);
++		}
 +	}
 +}
 +
  static enum blk_eh_timer_return ublk_timeout(struct request *rq)
  {
  	struct ublk_queue *ubq = rq->mq_hctx->driver_data;
-@@ -2123,6 +2181,14 @@ static enum blk_eh_timer_return ublk_timeout(struct request *rq)
+@@ -2123,6 +2237,21 @@ static enum blk_eh_timer_return ublk_timeout(struct request *rq)
  	struct task_struct *p;
  	struct pid *pid;
  
@@ -82,14 +145,50 @@ index 66eb55e7162e..67e4be758c65 100644
 +	 * Outstanding requests are reissued to the new server in case of
 +	 * UBLK_F_USER_RECOVERY_REISSUE, so leave them alone.
 +	 */
-+	if (!ublk_nosrv_should_reissue_outstanding(ubq->dev) &&
-+	    ublk_abort_dead_io(ubq->dev, &ubq->ios[rq->tag]))
-+		return BLK_EH_DONE;
++	if (!ublk_nosrv_should_reissue_outstanding(ubq->dev)) {
++		if (ublk_support_batch_io(ubq)) {
++			/* this rq may sit in the fifo instead of being owned */
++			ublk_abort_dead_ios(ubq->dev);
++			if (!blk_mq_request_started(rq))
++				return BLK_EH_DONE;
++		} else if (ublk_abort_dead_io(ubq->dev, &ubq->ios[rq->tag])) {
++			return BLK_EH_DONE;
++		}
++	}
 +
  	if (!(ubq->flags & UBLK_F_UNPRIVILEGED_DEV))
  		return BLK_EH_RESET_TIMER;
  
-@@ -2722,8 +2788,11 @@ static void ublk_abort_queue(struct ublk_device *ub, struct ublk_queue *ubq)
+@@ -2399,11 +2528,15 @@ static int ublk_ch_open(struct inode *inode, struct file *filp)
+ 		return -EBUSY;
+ 	filp->private_data = ub;
+ 	ub->ublksrv_tgid = current->tgid;
++	spin_lock(&ub->lock);
++	ub->srv_pid = get_task_pid(current, PIDTYPE_TGID);
++	spin_unlock(&ub->lock);
+ 	return 0;
+ }
+ 
+ static void ublk_reset_ch_dev(struct ublk_device *ub)
+ {
++	struct pid *pid;
+ 	u16 i;
+ 
+ 	for (i = 0; i < ub->dev_info.nr_hw_queues; i++) {
+@@ -2420,6 +2553,12 @@ static void ublk_reset_ch_dev(struct ublk_device *ub)
+ 	ub->nr_queue_ready = 0;
+ 	ub->unprivileged_daemons = false;
+ 	ub->ublksrv_tgid = -1;
++
++	spin_lock(&ub->lock);
++	pid = ub->srv_pid;
++	ub->srv_pid = NULL;
++	spin_unlock(&ub->lock);
++	put_pid(pid);
+ }
+ 
+ static struct gendisk *ublk_get_disk(struct ublk_device *ub)
+@@ -2722,8 +2861,11 @@ static void ublk_abort_queue(struct ublk_device *ub, struct ublk_queue *ubq)
  	for (i = 0; i < ubq->q_depth; i++) {
  		struct ublk_io *io = &ubq->ios[i];
  
@@ -102,7 +201,7 @@ index 66eb55e7162e..67e4be758c65 100644
  	}
  
  	if (ublk_support_batch_io(ubq))
-@@ -2999,6 +3068,9 @@ static void ublk_stop_dev_unlocked(struct ublk_device *ub)
+@@ -2999,6 +3141,9 @@ static void ublk_stop_dev_unlocked(struct ublk_device *ub)
  	if (ub->dev_info.state == UBLK_S_DEV_DEAD)
  		return;
  
@@ -112,3 +211,23 @@ index 66eb55e7162e..67e4be758c65 100644
  	if (ublk_nosrv_dev_should_queue_io(ub))
  		ublk_force_abort_dev(ub);
  	del_gendisk(ub->ub_disk);
+@@ -4012,6 +4157,9 @@ static int ublk_ch_batch_io_uring_cmd(struct io_uring_cmd *cmd,
+ 		return 0;
+ 	}
+ 
++	if (unlikely(!ublk_is_batch_owner(ub)))
++		return -EPERM;
++
+ 	switch (cmd_op) {
+ 	case UBLK_U_IO_PREP_IO_CMDS:
+ 		ret = ublk_check_batch_cmd(&data);
+@@ -4091,6 +4239,9 @@ ublk_user_copy(struct kiocb *iocb, struct iov_iter *iter, int dir)
+ 	if (!ublk_dev_support_user_copy(ub))
+ 		return -EACCES;
+ 
++	if (ublk_dev_support_batch_io(ub) && !ublk_is_batch_owner(ub))
++		return -EPERM;
++
+ 	if (tag >= ub->dev_info.queue_depth)
+ 		return -EINVAL;
+ 
