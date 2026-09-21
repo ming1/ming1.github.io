@@ -1,0 +1,17 @@
+#!/usr/bin/env bpftrace
+// rrpart.bt -- who re-reads the partition table of a disk, and does sd
+// then read the disk's properties (rotational flag, ...) again?
+//
+// Run it, then in another shell open and close the whole disk for
+// write:  python3 -c 'import os; os.close(os.open("/dev/sdX", os.O_WRONLY))'
+// 0x125f is BLKRRPART.
+
+tracepoint:syscalls:sys_enter_ioctl /args->cmd == 0x125f/
+{
+	printf("%-6d %-16s ioctl(BLKRRPART)\n", pid, comm);
+}
+
+kprobe:sd_revalidate_disk
+{
+	printf("%-6d %-16s sd_revalidate_disk%s\n", pid, comm, kstack(8));
+}
