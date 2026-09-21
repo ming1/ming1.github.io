@@ -18,8 +18,8 @@ to the disk. This post covers everything above that call.
 
 The method is the same: run one real thing on a lab cluster, capture it,
 then read the code that did it. This first version is the **overview**:
-every part of the OSD once, in short text and pictures. Later versions
-add one deep case study per part (§13).
+every part of the OSD once, in short text and pictures. Then come deep
+case studies, one per part: §13 is the first, §14 lists the rest.
 
 - **Assumed:** you have used Ceph (`ceph -s`, pools, PGs).
   **Not assumed:** any knowledge of the code in `src/osd`.
@@ -609,6 +609,7 @@ Notes:
   One of the shard's two workers runs that list next to its normal
   items, so commits stay in order. The callback takes the PG lock
   itself. mClock never sees it: a commit is never delayed by scheduling.
+  §13.4 shows it in a trace.
 - **#13, who is waited for.** The client gets its reply only when
   **all** OSDs of the acting set have committed. The primary also waits
   for an OSD that is being backfilled: it is not in the acting set, but
@@ -1205,15 +1206,410 @@ pgmeta objects. Now the two `P` records have names:
    pgmeta key _fastinfo                     ─► P record 2: the new last_update   (§6 #10, log_operation)
 ```
 
-# 13. What comes next
+# 13. Case study: one write and one read, on three OSDs
+
+§6 walked the write path in the code. This section runs it: the same
+16 KiB `rados put` of `o48`, followed with bpftrace through the client
+and **all three OSDs** on one clock. Then one `rados get`.
+
+## 13.1 The run
+
+| | |
+|---|---|
+| Lab | §4. Object `o48`, pool `p1`, PG `8.2`, acting `[2,0,1]` |
+| Lanes | `primary` = osd.2 (`/dev/vdb`), `replicaA` = osd.0 (`/dev/nvme0n1`), `replicaB` = osd.1 (`/dev/sda`) |
+| Script | [`wosdop.bt`]({{ site.baseurl }}/code/ceph/wosdop.bt): 48 probes. BlueStore gets two lines (in, out). Every step of the OSD layer gets one |
+| Collector | [`wosdopcollect.sh`]({{ site.baseurl }}/code/ceph/wosdopcollect.sh)` <build> <outdir> put`, then `get`. It finds the three pids, writes the object once untraced, traces the second op, and saves the op tracker's record of the same op |
+| Checker | [`wosdopcheck.py`]({{ site.baseurl }}/code/ceph/wosdopcheck.py): trace against tracker (§13.5) |
+
+Three things the script had to solve, because they say something about
+the OSD:
+
+- **The lab is never idle.** The MDS and the RGW send ops all the time.
+  So the script follows *one op*: by message tid at the messenger, by
+  `OpRequest` pointer through the queue, and by thread while a worker
+  runs it.
+- **The op tracker forgets fast.** It keeps the last 20 ops
+  (`osd_op_history_size`), and a finished op reaches the history through
+  its own thread (`OpHistorySvc`). Ask too early and the op is not there
+  yet. Ask 3 s later and the background ops have pushed it out. The
+  collector raises the size for the run and asks after one second.
+- **Return values move the arguments.** A function that returns an
+  object (`mClockScheduler::dequeue`, `get_object_context`) gets the
+  return slot as its first argument, so `this` is `arg1`, not `arg0`.
+
+## 13.2 The write, line by line
+
+The `#` column is added. `EVENT x` is an op tracker event, printed at
+the moment the OSD records it. The four messenger events
+(`header_read` … `dispatched`) are shown for the first message only.
+
+```
+  #         us     tid  proc     thread           function                             event
+  1          2   43917  client   rados            Objecter::_op_submit                 obj=o48 pool=8
+  2        285   43920  client   msgr-worker-0    ProtocolV2::write_message            MOSDOp tid=1 -> socket
+  3        319   35687  primary  msgr-worker-2    OSD::ms_fast_dispatch                osd_op tid=1 arrives, front+middle+data=219+0+16384 B
+  4        324   35687  primary  msgr-worker-2    TrackedOp::mark_event                EVENT header_read
+  5        325   35687  primary  msgr-worker-2    TrackedOp::mark_event                EVENT throttled
+  6        326   35687  primary  msgr-worker-2    TrackedOp::mark_event                EVENT all_read
+  7        327   35687  primary  msgr-worker-2    TrackedOp::mark_event                EVENT dispatched
+  8        333   35687  primary  msgr-worker-2    OSD::enqueue_op                      op 0x564d6efef2c0, sent at epoch 74
+  9        335   35687  primary  msgr-worker-2    TrackedOp::mark_event                EVENT queued_for_pg
+ 10        338   35687  primary  msgr-worker-2    mClockScheduler::enqueue             item -> scheduler 0x564d6bcf1880 (one per op shard)
+ 11        375   36124  primary  tp_osd_tp        OSD::dequeue_op                      op 0x564d6efef2c0 from scheduler 0x564d6bcf1880: 33 us queued + 9 us to here (PG lock wait 1 us)
+ 12        378   36124  primary  tp_osd_tp        TrackedOp::mark_event                EVENT reached_pg
+ 13        380   36124  primary  tp_osd_tp        PrimaryLogPG::do_request             can the PG serve it now?
+ 14        385   36124  primary  tp_osd_tp        PrimaryLogPG::do_op                  finish_decode, then do_op_impl
+ 15        391   36124  primary  tp_osd_tp        PrimaryLogPG::do_op_impl             the checks
+ 16        407   36124  primary  tp_osd_tp        PrimaryLogPG::get_object_context     obj=o48 can_create=1
+ 17        415   36124  primary  tp_osd_tp        TrackedOp::mark_event                EVENT started
+ 18        416   36124  primary  tp_osd_tp        PrimaryLogPG::execute_ctx            OpContext 0x564d6ea3db00
+ 19        419   36124  primary  tp_osd_tp        PrimaryLogPG::prepare_transaction    do_osd_ops, then finish_ctx
+ 20        420   36124  primary  tp_osd_tp        PrimaryLogPG::do_osd_ops             first OSDOp code 0x2202 (writefull)
+ 21        428   36124  primary  tp_osd_tp        PrimaryLogPG::make_writeable         clone first? (snapshots)
+ 22        429   36124  primary  tp_osd_tp        PrimaryLogPG::finish_ctx             new object_info_t + one log entry (type 1), in memory
+ 23        446   36124  primary  tp_osd_tp        PrimaryLogPG::issue_repop            RepGather 0x564d6c781680, rep_tid=455
+ 24        450   36124  primary  tp_osd_tp        ReplicatedBackend::submit_transaction PGTransaction -> ObjectStore::Transaction
+ 25        460   36124  primary  tp_osd_tp        ReplicatedBackend::issue_op          1st: one MOSDRepOp per replica
+ 26        464   36124  primary  tp_osd_tp        TrackedOp::mark_event                EVENT waiting for subops from 0,1
+ 27        475   36124  primary  tp_osd_tp        OSDService::send_message_osd_cluster MOSDRepOp tid=455 -> osd.0
+ 28        493   36124  primary  tp_osd_tp        OSDService::send_message_osd_cluster MOSDRepOp tid=455 -> osd.1
+ 29        500   35687  primary  msgr-worker-2    ProtocolV2::write_message            MOSDRepOp tid=455 -> socket
+ 30        504   36124  primary  tp_osd_tp        PeeringState::append_log             the log entry -> this OSD's transaction
+ 31        507   36124  primary  tp_osd_tp        PeeringState::write_if_dirty         the PG info (_fastinfo) -> this OSD's transaction
+ 32        514   35686  primary  msgr-worker-1    ProtocolV2::write_message            MOSDRepOp tid=455 -> socket
+ 33        522   36124  primary  tp_osd_tp        BlueStore::queue_transactions        the transaction goes to the store
+ 34        568   38721  replicaA msgr-worker-2    OSD::ms_fast_dispatch                osd_repop tid=455 arrives, front+middle+data=1138+296+16713 B
+ 35        569   34436  replicaB msgr-worker-0    OSD::ms_fast_dispatch                osd_repop tid=455 arrives, front+middle+data=1138+296+16713 B
+ 36        583   34436  replicaB msgr-worker-0    OSD::enqueue_op                      op 0x555981c15c20, sent at epoch 74
+ 37        584   38721  replicaA msgr-worker-2    OSD::enqueue_op                      op 0x55fcfdb7e5a0, sent at epoch 74
+ 38        585   34436  replicaB msgr-worker-0    TrackedOp::mark_event                EVENT queued_for_pg
+ 39        587   38721  replicaA msgr-worker-2    TrackedOp::mark_event                EVENT queued_for_pg
+ 40        588   34436  replicaB msgr-worker-0    mClockScheduler::enqueue             item -> scheduler 0x55597fcf5880 (one per op shard)
+ 41        589   38721  replicaA msgr-worker-2    mClockScheduler::enqueue             item -> scheduler 0x55fcfb555880 (one per op shard)
+ 42        623   36124  primary  tp_osd_tp        PrimaryLogPG::eval_repop             all committed? then run the on_committed callbacks
+ 43        625   36124  primary  tp_osd_tp        PGOpItem::run (return)               item done, PG unlocked
+ 44        625   39150  replicaA tp_osd_tp        OSD::dequeue_op                      op 0x55fcfdb7e5a0 from scheduler 0x55fcfb555880: 33 us queued + 7 us to here (PG lock wait 1 us)
+ 45        628   39150  replicaA tp_osd_tp        TrackedOp::mark_event                EVENT reached_pg
+ 46        630   39150  replicaA tp_osd_tp        PrimaryLogPG::do_request             can the PG serve it now?
+ 47        635   39150  replicaA tp_osd_tp        ReplicatedBackend::do_repop          decode the primary's transaction + log entry
+ 48        644   39150  replicaA tp_osd_tp        TrackedOp::mark_event                EVENT started
+ 49        658   39150  replicaA tp_osd_tp        PeeringState::append_log             the log entry -> this OSD's transaction
+ 50        659   34917  replicaB tp_osd_tp        OSD::dequeue_op                      op 0x555981c15c20 from scheduler 0x55597fcf5880: 42 us queued + 34 us to here (PG lock wait 2 us)
+ 51        662   39150  replicaA tp_osd_tp        PeeringState::write_if_dirty         the PG info (_fastinfo) -> this OSD's transaction
+ 52        663   34917  replicaB tp_osd_tp        TrackedOp::mark_event                EVENT reached_pg
+ 53        666   34917  replicaB tp_osd_tp        PrimaryLogPG::do_request             can the PG serve it now?
+ 54        669   34917  replicaB tp_osd_tp        ReplicatedBackend::do_repop          decode the primary's transaction + log entry
+ 55        677   34917  replicaB tp_osd_tp        TrackedOp::mark_event                EVENT started
+ 56        677   39150  replicaA tp_osd_tp        BlueStore::queue_transactions        the transaction goes to the store
+ 57        689   34917  replicaB tp_osd_tp        PeeringState::append_log             the log entry -> this OSD's transaction
+ 58        693   34917  replicaB tp_osd_tp        PeeringState::write_if_dirty         the PG info (_fastinfo) -> this OSD's transaction
+ 59        709   34917  replicaB tp_osd_tp        BlueStore::queue_transactions        the transaction goes to the store
+ 60        826   34917  replicaB tp_osd_tp        PGOpItem::run (return)               item done, PG unlocked
+ 61       2355   39150  replicaA tp_osd_tp        PGOpItem::run (return)               item done, PG unlocked
+ 62      14976   39124  replicaA bstore_kv_final  BlueStore::_txc_committed_kv         committed after 14300 us in the store; callbacks -> context_queue
+ 63      15019   39150  replicaA tp_osd_tp        ReplicatedBackend::repop_commit      commit callback (not a queue item), started 10 us ago, PG lock wait 1 us
+ 64      15021   39150  replicaA tp_osd_tp        TrackedOp::mark_event                EVENT commit_sent
+ 65      15026   39150  replicaA tp_osd_tp        OSDService::send_message_osd_cluster MOSDRepOpReply tid=455 -> osd.2
+ 66      15043   39150  replicaA tp_osd_tp        TrackedOp::mark_event                EVENT done
+ 67      15045   39150  replicaA tp_osd_tp        BlessedContext::finish (return)      callback done, PG unlocked
+ 68      15055   38721  replicaA msgr-worker-2    ProtocolV2::write_message            MOSDRepOpReply tid=455 -> socket
+ 69      15220   35687  primary  msgr-worker-2    OSD::ms_fast_dispatch                osd_repop_reply tid=455 arrives, front+middle+data=111+0+0 B
+ 70      15240   35687  primary  msgr-worker-2    OSD::enqueue_op                      op 0x564d6ef37a40, sent at epoch 74
+ 71      15242   35687  primary  msgr-worker-2    TrackedOp::mark_event                EVENT queued_for_pg
+ 72      15245   35687  primary  msgr-worker-2    mClockScheduler::enqueue             item -> scheduler 0x564d6bcf1880 (one per op shard)
+ 73      15279   36116  primary  tp_osd_tp        OSD::dequeue_op                      op 0x564d6ef37a40 from scheduler 0x564d6bcf1880: 32 us queued + 6 us to here (PG lock wait 0 us)
+ 74      15283   36116  primary  tp_osd_tp        TrackedOp::mark_event                EVENT reached_pg
+ 75      15285   36116  primary  tp_osd_tp        PrimaryLogPG::do_request             can the PG serve it now?
+ 76      15288   36116  primary  tp_osd_tp        ReplicatedBackend::do_repop_reply    a replica committed
+ 77      15289   36116  primary  tp_osd_tp        TrackedOp::mark_event                EVENT started
+ 78      15291   36116  primary  tp_osd_tp        TrackedOp::mark_event                EVENT sub_op_commit_rec
+ 79      15293   36116  primary  tp_osd_tp        PGOpItem::run (return)               item done, PG unlocked
+ 80      15294   36116  primary  tp_osd_tp        TrackedOp::mark_event                EVENT done
+ 81      19218   36090  primary  bstore_kv_final  BlueStore::_txc_committed_kv         committed after 18697 us in the store; callbacks -> context_queue
+ 82      19262   36116  primary  tp_osd_tp        ReplicatedBackend::op_commit         commit callback (not a queue item), started 7 us ago, PG lock wait 1 us; waiting_for_commit=2
+ 83      19269   36116  primary  tp_osd_tp        TrackedOp::mark_event                EVENT op_commit
+ 84      19272   36116  primary  tp_osd_tp        BlessedContext::finish (return)      callback done, PG unlocked
+ 85      19705   34883  replicaB bstore_kv_final  BlueStore::_txc_committed_kv         committed after 18997 us in the store; callbacks -> context_queue
+ 86      19729   34909  replicaB tp_osd_tp        ReplicatedBackend::repop_commit      commit callback (not a queue item), started 3 us ago, PG lock wait 1 us
+ 87      19730   34909  replicaB tp_osd_tp        TrackedOp::mark_event                EVENT commit_sent
+ 88      19733   34909  replicaB tp_osd_tp        OSDService::send_message_osd_cluster MOSDRepOpReply tid=455 -> osd.2
+ 89      19746   34909  replicaB tp_osd_tp        TrackedOp::mark_event                EVENT done
+ 90      19749   34909  replicaB tp_osd_tp        BlessedContext::finish (return)      callback done, PG unlocked
+ 91      19756   34436  replicaB msgr-worker-0    ProtocolV2::write_message            MOSDRepOpReply tid=455 -> socket
+ 92      19824   35686  primary  msgr-worker-1    OSD::ms_fast_dispatch                osd_repop_reply tid=455 arrives, front+middle+data=111+0+0 B
+ 93      19838   35686  primary  msgr-worker-1    OSD::enqueue_op                      op 0x564d6ee0a780, sent at epoch 74
+ 94      19839   35686  primary  msgr-worker-1    TrackedOp::mark_event                EVENT queued_for_pg
+ 95      19840   35686  primary  msgr-worker-1    mClockScheduler::enqueue             item -> scheduler 0x564d6bcf1880 (one per op shard)
+ 96      19853   36116  primary  tp_osd_tp        OSD::dequeue_op                      op 0x564d6ee0a780 from scheduler 0x564d6bcf1880: 13 us queued + 2 us to here (PG lock wait 0 us)
+ 97      19854   36116  primary  tp_osd_tp        TrackedOp::mark_event                EVENT reached_pg
+ 98      19855   36116  primary  tp_osd_tp        PrimaryLogPG::do_request             can the PG serve it now?
+ 99      19855   36116  primary  tp_osd_tp        ReplicatedBackend::do_repop_reply    a replica committed
+100      19856   36116  primary  tp_osd_tp        TrackedOp::mark_event                EVENT started
+101      19857   36116  primary  tp_osd_tp        TrackedOp::mark_event                EVENT sub_op_commit_rec
+102      19859   36116  primary  tp_osd_tp        PrimaryLogPG::repop_all_committed    rep_tid=455: waiting_for_commit is empty
+103      19861   36116  primary  tp_osd_tp        PrimaryLogPG::eval_repop             all committed? then run the on_committed callbacks
+104      19864   36116  primary  tp_osd_tp        PrimaryLogPG::log_op_stats           reply -> client; the op was 19534 us in this OSD (in 16384 B, out 0 B)
+105      19869   36116  primary  tp_osd_tp        TrackedOp::mark_event                EVENT commit_sent
+106      19883   35687  primary  msgr-worker-2    ProtocolV2::write_message            MOSDOpReply tid=1 -> socket, data 0 B
+107      19887   36116  primary  tp_osd_tp        TrackedOp::mark_event                EVENT done
+108      19894   36116  primary  tp_osd_tp        PGOpItem::run (return)               item done, PG unlocked
+109      19895   36116  primary  tp_osd_tp        TrackedOp::mark_event                EVENT done
+110      19944   43920  client   msgr-worker-0    Objecter::handle_osd_op_reply        MOSDOpReply tid=1, data 0 B
+```
+
+## 13.3 The map
+
+```
+     us  client         primary (osd.2)                                   replicaA (osd.0)             replicaB (osd.1)
+
+      2  #1 submit
+    285  #2 MOSDOp ───► #3   msgr-worker: ms_fast_dispatch
+                        #8   enqueue_op ─► #10 mClock
+                             ⋮ 33 us in the queue
+    375                 #11  tp_osd_tp 36124: dequeue_op        ┐
+                        #13–#22  do_request … finish_ctx        │ PG LOCKED
+                        #25–#28  MOSDRepOp × 2 ─────────────────│────────► #34 msgr-worker ──────────► #35 msgr-worker
+                        #30–#31  log entry + PG info ─► txn     │ 250 us   #37 queue                   #36 queue
+                        #33  queue_transactions ─► store        │          #44 tp_osd_tp: PG LOCKED    #50 tp_osd_tp: PG LOCKED
+    625                 #43  PG unlocked                        ┘          #47 do_repop                #54 do_repop
+                             ⋮                                             #49 #51 log entry + info    #57 #58 log entry + info
+                             ⋮   three stores commit in parallel.          #56 ─► store                #59 ─► store
+                             ⋮   NO PG lock is held, on any OSD            #61 PG unlocked (2355)      #60 PG unlocked (826)
+                             ⋮
+  14976                      ⋮                                             #62 store committed
+  15019                      ⋮                                             #63 repop_commit: a CALLBACK, PG locked
+                        #69  msgr-worker ◄────────── MOSDRepOpReply ────── #65
+  15279                 #73  tp_osd_tp 36116: a QUEUE ITEM, PG locked
+                        #76  do_repop_reply; #78 sub_op_commit_rec
+  19218                 #81  store committed
+  19262                 #82  op_commit: a CALLBACK, PG locked, 36116
+  19705                                                                                                #85 store committed
+  19729                                                                                                #86 repop_commit: a CALLBACK
+                        #92  msgr-worker ◄────────────────────────────── MOSDRepOpReply ────────────── #88
+  19853                 #96  tp_osd_tp 36116: a QUEUE ITEM, PG locked
+                        #99  do_repop_reply; #101 sub_op_commit_rec
+                        #102 repop_all_committed ─► #103 eval_repop
+  19944  #110 ◄──────── #106 MOSDOpReply
+```
+
+## 13.4 Four zoom-ins
+
+**1. From the socket to the PG lock: 56 µs (#3–#11).**
+
+```
+ #3   319  message arrives on msgr-worker-2
+ #8   333  enqueue_op                        14 us   make the OpRequest, find the PG's op shard
+ #10  338  mClockScheduler::enqueue                  scheduler 0x…1880
+      366  a worker takes the item from mClock       33 us after #8: a thread must wake up
+ #11  375  dequeue_op on tp_osd_tp 36124      9 us   find the PG slot, lock the PG (1 us wait)
+```
+
+The scheduler pointer is the same on both sides (#10, #11): PG `8.2`
+always uses this one op shard. On an idle OSD mClock adds no delay that
+can be seen. The 33 µs are a thread wake-up. Every message pays this
+toll again: the two replica ops (#34–#44, #35–#50) and the two replies
+(#69–#73, #92–#96).
+
+**2. Under the PG lock: 250 µs (#11–#43).**
+
+```
+ us after #11
+    0  #11  dequeue_op                       PG locked
+   10  #14  do_op: finish_decode             the OSDOp list is decoded only now, on the worker
+   16  #15  do_op_impl                       the checks
+   32  #16  get_object_context(o48)          cached: the object was written before
+   40  #17  EVENT started
+   45  #20  do_osd_ops                       writefull ─► PGTransaction
+   54  #22  finish_ctx                       the log entry, in memory
+   71  #23  issue_repop                      rep_tid=455
+   85  #25  issue_op                         1st: send
+  100  #27  MOSDRepOp ─► osd.0
+  118  #28  MOSDRepOp ─► osd.1
+  129  #30  append_log                       2nd: log entry ─► the local transaction
+  132  #31  write_if_dirty                   PG info (_fastinfo) ─► the local transaction
+  147  #33  queue_transactions               3rd: the local store
+  248  #42  eval_repop                       nothing has committed yet: nothing to do
+  250  #43  PG unlocked
+```
+
+This is §6 #10 in real data: **send first (#27, #28), then the log
+entry (#30, #31), then the local store (#33)**. The messenger threads
+put the two `MOSDRepOp` on the wire (#29, #32) while the worker is still
+building the local transaction.
+
+The lock is released at 625 µs. The local store commits at 19218 µs.
+So **for more than 97 % of this write's life in the OSD, nobody holds
+the PG lock**. The PG is free to start the next op. This is the pipeline that
+makes one PG lock bearable.
+
+About 100 of the 250 µs are inside `BlueStore::queue_transactions`
+(#33–#42): the store prepares and submits the data I/O in the caller's
+thread (the BlueStore post, §3.1). On replicaA this call took 1.7 ms
+(#56–#61), and so that PG stayed locked for 1.7 ms. It did so in every
+run. The cause is on the store side and is not examined here. What it
+shows: **whatever `queue_transactions` costs, the PG pays it under its
+lock.**
+
+**3. Commits come back two ways (#62–#101).**
+
+```
+ the local commit: a CALLBACK                         a replica's commit: a MESSAGE, so a QUEUE ITEM
+ #81  19218  _txc_committed_kv (bstore_kv_final)      #65  15026  replicaA sends MOSDRepOpReply
+             callbacks ─► the shard's context_queue   #69  15220  ms_fast_dispatch on the primary
+ #82  19262  op_commit on tp_osd_tp 36116             #72  15245  mClock
+             PG lock taken by the callback itself     #73  15279  dequeue_op, PG locked
+                                                      #76  15288  do_repop_reply
+             44 us from store to PG                               262 us from replica to PG
+```
+
+mClock never sees the callback (§6, note #11). The thread that ran the
+callbacks was the same in every run of this study: 36116 on the primary,
+39150 on replicaA, 34909 on replicaB. In each OSD it is one fixed worker
+of the PG's op shard. The client op itself ran on either worker (36124
+here, 36116 in other runs). This matches the code: only the worker with
+the smaller index takes the `context_queue`
+([`is_smallest_thread_index`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L11123)), so that commits
+of one shard stay in order.
+
+`waiting_for_commit=2` at #82 means: replicaA had already answered
+(#76), so the set was {primary, replicaB}. In this run a replica
+committed *before* the primary. The order is not fixed. The reply to the
+client leaves when the set is empty (#102), whoever was last.
+
+**4. Where the 19.9 ms went.**
+
+| Part | µs | |
+|---|---|---|
+| client: submit → socket | 283 | #1–#2: `rados` opens its session |
+| primary: socket → PG lock | 56 | zoom-in 1 |
+| primary: under the PG lock | 250 | zoom-in 2; about 100 of it is the store's submit |
+| **three stores, in parallel** | **14300 · 18697 · 18997** | #62, #81, #85. The slowest one decides |
+| primary: 2 replies + 1 callback | about 160 | #69–#79, #81–#84, #92–#101: mostly the queue toll |
+| primary: last reply → `MOSDOpReply` on the socket | 30 | #101–#106 |
+
+The OSD layer's own work on the primary is about 0.5 ms of 19.5 ms. On
+these slow virtual disks that is 2.5 %. The cost is per op, not per
+byte, so it is the same 0.5 ms in front of a fast device: there it is
+what is left to optimize.
+
+## 13.5 The trace, checked against the op tracker
+
+Two tools with two clocks saw the same op: bpftrace (monotonic clock,
+uprobes) and the OSD's own op tracker (wall clock, its own code). The
+tracker's record of this op:
+
+```
+osd_op(client.4449.0:1 8.2 8:477f3578:::o48:head [writefull 0~16384] snapc 0=[] ondisk+write+known_if_redirected+supports_pool_eio e74)
+duration 0.019584291
+   13:26:25.733811+0000 initiated
+   13:26:25.733811+0000 header_read
+   13:26:25.733813+0000 throttled
+   13:26:25.733821+0000 all_read
+   13:26:25.733823+0000 dispatched
+   13:26:25.733844+0000 queued_for_pg
+   13:26:25.733886+0000 reached_pg
+   13:26:25.733923+0000 started
+   13:26:25.733973+0000 waiting for subops from 0,1
+   13:26:25.748800+0000 sub_op_commit_rec
+   13:26:25.752777+0000 op_commit
+   13:26:25.753366+0000 sub_op_commit_rec
+   13:26:25.753377+0000 commit_sent
+   13:26:25.753396+0000 done
+```
+
+`wosdopcheck.py` compares the offsets after `queued_for_pg`:
+
+```
+event                              tracker us  bpftrace us   diff
+queued_for_pg                               0            0      0
+reached_pg                                 42           43      1
+started                                    79           80      1
+waiting for subops from 0,1               129          129      0
+sub_op_commit_rec                       14956        14956      0
+op_commit                               18933        18934      1
+sub_op_commit_rec                       19522        19522      0
+commit_sent                             19533        19534      1
+done                                    19552        19552      0
+```
+
+They agree to 1 µs. So the tracker can be trusted for the primary's
+stage boundaries, and it needs no tooling. What it cannot show is
+everything else in §13.3: the replicas, the threads, the PG lock, the
+two ways a commit comes back. One detail: `header_read`, `throttled`,
+`all_read` and `dispatched` are not live events. The OSD copies them
+from the message's own time stamps when it creates the `OpRequest`
+(#4–#7 are 3 µs apart).
+
+## 13.6 The read
+
+```
+  #         us     tid  proc     thread           function                             event
+  1          3   44069  client   rados            Objecter::_op_submit                 obj=o48 pool=8
+  2        556   44072  client   msgr-worker-0    ProtocolV2::write_message            MOSDOp tid=1 -> socket
+  3        587   35687  primary  msgr-worker-2    OSD::ms_fast_dispatch                osd_op tid=1 arrives, front+middle+data=219+0+0 B
+  4        595   35687  primary  msgr-worker-2    TrackedOp::mark_event                EVENT header_read
+  5        596   35687  primary  msgr-worker-2    TrackedOp::mark_event                EVENT throttled
+  6        597   35687  primary  msgr-worker-2    TrackedOp::mark_event                EVENT all_read
+  7        598   35687  primary  msgr-worker-2    TrackedOp::mark_event                EVENT dispatched
+  8        606   35687  primary  msgr-worker-2    OSD::enqueue_op                      op 0x564d6ec05c20, sent at epoch 74
+  9        609   35687  primary  msgr-worker-2    TrackedOp::mark_event                EVENT queued_for_pg
+ 10        612   35687  primary  msgr-worker-2    mClockScheduler::enqueue             item -> scheduler 0x564d6bcf1880 (one per op shard)
+ 11        651   36116  primary  tp_osd_tp        OSD::dequeue_op                      op 0x564d6ec05c20 from scheduler 0x564d6bcf1880: 33 us queued + 13 us to here (PG lock wait 1 us)
+ 12        655   36116  primary  tp_osd_tp        TrackedOp::mark_event                EVENT reached_pg
+ 13        658   36116  primary  tp_osd_tp        PrimaryLogPG::do_request             can the PG serve it now?
+ 14        663   36116  primary  tp_osd_tp        PrimaryLogPG::do_op                  finish_decode, then do_op_impl
+ 15        673   36116  primary  tp_osd_tp        PrimaryLogPG::do_op_impl             the checks
+ 16        691   36116  primary  tp_osd_tp        PrimaryLogPG::get_object_context     obj=o48 can_create=0
+ 17        702   36116  primary  tp_osd_tp        TrackedOp::mark_event                EVENT started
+ 18        703   36116  primary  tp_osd_tp        PrimaryLogPG::execute_ctx            OpContext 0x564d6ea3db00
+ 19        707   36116  primary  tp_osd_tp        PrimaryLogPG::prepare_transaction    do_osd_ops, then finish_ctx
+ 20        709   36116  primary  tp_osd_tp        PrimaryLogPG::do_osd_ops             first OSDOp code 0x1201 (read)
+ 21        711   36116  primary  tp_osd_tp        PrimaryLogPG::do_read                replicated pool: a synchronous read
+ 22        713   36116  primary  tp_osd_tp        ReplicatedBackend::objects_read_sync off=0 len=16384: read the local store, in this thread
+ 23       2316   36116  primary  tp_osd_tp        ReplicatedBackend::objects_read_sync returned 16384 after 1603 us
+ 24       2327   36116  primary  tp_osd_tp        PrimaryLogPG::complete_read_ctx      result=0: build and send the reply
+ 25       2329   36116  primary  tp_osd_tp        PrimaryLogPG::log_op_stats           reply -> client; the op was 1728 us in this OSD (in 0 B, out 16384 B)
+ 26       2350   36116  primary  tp_osd_tp        PGOpItem::run (return)               item done, PG unlocked
+ 27       2351   36116  primary  tp_osd_tp        TrackedOp::mark_event                EVENT done
+ 28       2360   35687  primary  msgr-worker-2    ProtocolV2::write_message            MOSDOpReply tid=1 -> socket, data 16384 B
+ 29       2430   44072  client   msgr-worker-0    Objecter::handle_osd_op_reply        MOSDOpReply tid=1, data 16384 B
+```
+
+The path is the same up to #20. Then a read is short: no `RepGather`, no
+transaction, no log entry, no replica, no commit to wait for. The reply
+is built at #24, in the same thread, 1.7 ms after the message arrived.
+
+But look at the lock. The PG is locked from #11 to #26: **the whole
+read from the device, 1603 µs, happens under the PG lock**
+(`objects_read_sync`, #22–#23). A write holds the PG for 250 µs and
+then waits for 19 ms *without* the lock. A read in a replicated pool
+waits for the device *with* the lock. Every other op of this PG waits
+behind it. In another run of this same read, the device needed 97 ms,
+and the PG was locked for 97 ms.
+
+(The read goes to the device although the object was written just
+before: `bluestore_default_buffered_write` is false, so BlueStore does
+not keep written data in its cache.)
+
+| Function in the trace | Source |
+|---|---|
+| `TrackedOp::mark_event` | [`TrackedOp::mark_event`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/TrackedOp.cc#L602) |
+| `mClockScheduler::enqueue`, `dequeue` | [`enqueue`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scheduler/mClockScheduler.cc#L76), [`dequeue`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scheduler/mClockScheduler.cc#L148) |
+| PG lock | [`PG::lock`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PG.cc#L241) |
+| `PGOpItem::run` | [`PGOpItem::run`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scheduler/OpSchedulerItem.cc#L23) |
+| the commit callback | [`BlessedContext`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L200), [`C_OSD_OnOpCommit`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L354), [`C_OSD_RepModifyCommit`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L89) |
+| `context_queue` | [`context_queue`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L1035), [`class ContextQueue`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/Finisher.h#L165), [`handle_oncommits`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L1818) |
+| the rest | §6 |
+
+# 14. What comes next
 
 Each part above gets one deep case study in the style of the BlueStore
-post: one real run in the lab, a numbered trace, one lane map, zoom-in
-call trees.
+post: one real run in the lab, a numbered trace, one lane map,
+zoom-ins. §13 is the first. The others:
 
 | Study | Run in the lab |
 |---|---|
-| One write, 3 replicas: the OSD layer | the §6 write, with bpftrace on all three OSDs and the op tracker checked against it; then one read |
 | One OSD failure | `kill -STOP` one OSD: from the missed ping to the new map. (A killed OSD would take the "connection refused" shortcut of §8) |
 | One OSDMap epoch | `ceph osd out`, followed from the mon message to each PG |
 | One peering | stop osd.2 while writing to `pg1`, start it again |
