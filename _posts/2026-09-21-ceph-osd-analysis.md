@@ -649,9 +649,11 @@ bookkeeping.
 How does everybody find the OSDs of an object, without asking anybody?
 
 Client and OSD run the same code, on the same map, and get the same
-answer. There is no lookup table and no server to ask. If a client's
-map is older than the OSD's, the OSD shares its newer map first, and the
-client sends the op again.
+answer. There is no lookup table and no server to ask. Every op carries
+the sender's map epoch (the `e71` in §6). If the OSD's map is older, the
+op waits in `waiting_for_map` until the OSD has that epoch. If the
+client's map is older, the OSD sends it the newer map, and the client
+sends the op again if its target changed.
 
 ```
  "o48", pool 8
