@@ -559,7 +559,7 @@ three stores that commit in parallel. The BlueStore post explains them.
  #8                 ├► prepare_transaction   PrimaryLogPG.cc:9137
                     │  ├► do_osd_ops         PrimaryLogPG.cc:6163   each OSDOp becomes changes in a PGTransaction
                     │  └► finish_ctx         PrimaryLogPG.cc:9208   new object_info_t; ONE PG log entry, in memory
- #9                 └► new_repop, issue_repop PrimaryLogPG.cc:4502, 11696  make the RepGather; give it to the backend
+ #9                 └► new_repop, issue_repop  PrimaryLogPG.cc:4502, 11696   make the RepGather
  #10                   └► submit_transaction ReplicatedBackend.cc:591
                           ├► issue_op           :642 (def :1210)    1st: one MOSDRepOp per replica, data + log entry;
                           │                                         event waiting for subops
@@ -1089,7 +1089,8 @@ fixed kinds of work, not tenants.
  #7  OsdScrub::initiate_scrub                from tick_without_osd_lock
  #8  └► PgScrubber, ScrubMachine             reserve the replicas, then chunk by chunk:
  #9     ├► select_range                      the next chunk of objects
- #10    ├► be_scan_list                      EVERY OSD builds a ScrubMap of the chunk: sizes, attrs; a deep scrub also reads the data and adds checksums
+ #10    ├► be_scan_list                      EVERY OSD builds a ScrubMap of the chunk: sizes and attrs;
+        │                                    a deep scrub also reads the data and adds checksums
  #11    └► scrub_compare_maps                the primary compares the maps
  #12       └► repair_object                  repair only: mark the bad copy missing; recovery (#3) copies a good one
 
