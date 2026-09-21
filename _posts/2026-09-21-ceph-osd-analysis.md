@@ -8,8 +8,8 @@ tags: [ceph, osd, rados, pg, peering, recovery, scrub, mclock, tracing]
 {:toc}
 
 Working notes on the Ceph OSD in v21.3.0: what is inside one `ceph-osd`
-process, and what it does with a client request, a new cluster map, a
-failed peer.
+process, and what it does with a client request, a failed peer, a new
+cluster map.
 
 This is the companion of
 [BlueStore I/O Path Analysis]({% post_url 2026-08-10-bluestore-io-analysis %}).
@@ -18,24 +18,28 @@ to the disk. This post covers everything above that call.
 
 The method is the same: run one real thing on a lab cluster, capture it,
 then read the code that did it. This first version is the **overview**:
-every part of the OSD once, short text, one picture each. Later versions
+every part of the OSD once, in short text and pictures. Later versions
 add one deep case study per part (§13).
 
-How to read it:
-
-- Diagrams carry `#N` markers. The table under a diagram has the same
-  `#N`, and there every name is a link to the source.
+- **Assumed:** you have used Ceph (`ceph -s`, pools, PGs).
+  **Not assumed:** any knowledge of the code in `src/osd`.
+- Most diagrams carry `#N` markers. The table under the diagram has the
+  same `#N`, and there every name is a link to the source. (A link
+  cannot be put inside a diagram.)
 - All links go to the fixed tag
   [`v21.3.0`](https://github.com/ceph/ceph/tree/v21.3.0). A bare `:NNNN`
   in a diagram is a line number in the file named on the same line or
   above it.
-- Only the classic OSD is covered. Not covered: crimson, cache tiering,
-  the inside of the erasure-code backends.
+- Only the classic OSD is covered. Not covered: crimson (the new
+  Seastar-based OSD), cache tiering, the inside of the erasure-code (EC)
+  backends.
+- Notes marked **Block-layer view** compare a Ceph idea with a Linux
+  one, and say where the comparison stops.
 
 # 1. Words first
 
-Eight words block most readers of OSD code. Here they are, with the real
-values from the lab (§3).
+These words stop most readers of OSD code. Values are real lab values
+(§4) where the text says so; the other pictures are examples.
 
 ## 1.1 Object, PG, up set, acting set
 
@@ -51,6 +55,8 @@ values from the lab (§3).
  primary     osd.2          usually the first OSD of the acting set
 ```
 
+Real, from the lab (`p2` means: the primary is osd.2):
+
 ```
 $ ceph osd map p1 o48
 osdmap e71 pool 'p1' (8) object 'o48' -> pg 8.1eacfee2 (8.2) -> up ([2,0,1], p2) acting ([2,0,1], p2)
@@ -58,77 +64,136 @@ osdmap e71 pool 'p1' (8) object 'o48' -> pg 8.1eacfee2 (8.2) -> up ([2,0,1], p2)
 
 - A **PG** (placement group) is a group of objects. The OSD does not
   place, replicate, or repair single objects. It does all of that per PG.
+- **CRUSH** is a function, not a table: map + rule + a seed number give
+  a list of OSDs. Everybody who has the same map computes the same list.
 - A client talks **only to the primary**. The primary talks to the other
-  OSDs of the acting set. (One exception, off by default: with balanced
-  or localized reads a replica may serve a read.)
-- **up** and **acting** are nearly always the same. They differ when the
-  new up set has no data yet: the old OSDs keep serving (acting) while
-  the new ones are filled (§8.3).
+  OSDs of the acting set. (One exception, a client option that is off by
+  default: with balanced or localized reads a replica may serve a read.)
+- **up** and **acting** are nearly always the same. They differ when an
+  OSD of the new up set has no data yet. §7 explains how.
 
-## 1.2 Epoch and interval
+## 1.2 Epoch, interval, past intervals
+
+An example:
 
 ```
- OSDMap epoch   68     69     70     71     72     73
-                │      │      │      │      │      │
- PG 8.2 acting  [2,0,1][2,0,1][2,0,1][2,0,1] [2,0]  [2,0]
-                └──────── one interval ─────┘└─ next ─┘
-                                             ▲
-                                 osd.1 marked down: the acting set changes,
-                                 a new interval starts, the PG peers again
+ OSDMap epoch    68        69        70        71        72        73
+                 │         │         │         │         │         │
+ PG 8.2 acting   [2,0,1]   [2,0,1]   [2,0,1]   [2,0,1]   [2,0]     [2,0]
+                 └─────────── one interval ──────────┘   └── the next ──┘
+                                                         ▲
+                                        osd.1 marked down: the acting set changes,
+                                        a new interval starts, the PG peers again
 ```
 
 - The **OSDMap** is the cluster map: which OSDs exist, which are up,
   the pools, the CRUSH rules. Every change makes a new **epoch**.
 - An **interval** is a run of epochs in which one PG kept the same up
   set, acting set and primary. Most new epochs do not touch a given PG.
-  When one does, the interval ends and the PG must **peer** again (§8).
+  When one does, the interval ends and the PG must **peer** again (§10).
   A change of the pool's `size` or `min_size`, a PG split and a PG merge
-  also end the interval
+  (the pool's `pg_num` changed) also end the interval
   ([`PastIntervals::is_new_interval`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.cc#L4285)).
+- **Past intervals**: the list of a PG's earlier intervals, each with
+  its acting set. Peering reads it to know which OSDs may hold writes,
+  so whom it must ask.
+
+**Block-layer view:** the epoch is a generation number, like the
+`events` counter in an md superblock. The limit: the epoch counts
+changes of the whole cluster. The interval is derived from it, per PG.
 
 ## 1.3 Version, PG log, last_update, last_complete, missing
 
 Every change to an object gets a version,
 [`eversion_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.h#L890), printed as `epoch'number`,
 for example `71'3`. The PG keeps its recent changes, in order, in the
-**PG log**.
+**PG log**. An entry names the object and the operation. It does not
+hold the data.
+
+An example: a replica that was down while three writes happened. It is
+back, and peering (§10) has just given it the newer log entries from the
+primary. The objects themselves are not copied yet.
 
 ```
- PG log of one OSD
+ PG log of this replica
 
-   tail                                            head
-    ▼                                               ▼
-  71'10   71'11   71'12   74'13   74'14   74'15   74'16
-                    ▲                               ▲
-                    │                               └─ last_update     newest change this OSD knows
-                    └─ last_complete                   every object up to here is really on this disk
+ tail                                                       head
+  ▼                                                           ▼
+ 71'9 │ 71'10   71'11   71'12   74'13   74'14   74'15   74'16
+  ▲                       ▲                               ▲
+  │                       │                               └─ last_update     newest change this OSD knows
+  │                       └─ last_complete                   every change up to here is applied on this disk
+  └─ tail = the version just before the oldest entry kept
 
-  74'13 … 74'16: the log names the changed objects, but the data is not here yet
-                 → these objects are this OSD's "missing" set
+ 74'13 … 74'16: the log names the changed objects, the new data is not here yet
+                ─► these objects are this OSD's "missing" set (an older copy may exist on disk)
 ```
 
-On a healthy PG both are equal (`ceph pg 8.2 query`):
+In normal operation this state never appears: a write and its log entry
+are committed together on each OSD (§6). Real, from the healthy lab PG
+(`ceph pg 8.2 query`):
 
 ```
 last_update 71'3    last_complete 71'3    log_tail 0'0    last_backfill MAX
 ```
 
+`log_tail 0'0` means: no entry was ever trimmed, the log still covers the
+whole life of the PG. The log is trimmed by entry count
+(`osd_min_pg_log_entries` = 250, `osd_max_pg_log_entries` = 10000), not
+by time. `last_backfill MAX` means: no backfill is needed (§1.4).
+
 ## 1.4 Recovery and backfill
 
 Both copy objects to an OSD that is behind. The difference is how the
-OSD knows *which* objects.
+OSD knows *which* objects. X and Y are the `last_update` of the replica.
 
 ```
- RECOVERY  the replica was away for a short time       BACKFILL  the replica is new, or was away too long
-
+ RECOVERY  the primary's log still covers the gap      BACKFILL  the replica's log is too old,
+                                                                 or an earlier backfill did not finish
    primary log:  [tail ....... X ....... head]            primary log:            [tail ....... head]
    replica log:  [tail ....... X]                         replica log:   [.... Y]
                                ▲                                               ▲
-   X is still inside the primary's log.                   Y is older than the primary's log tail.
+   X is not older than the primary's log tail.            Y is older than the primary's log tail.
    The log names every object changed after X.            The log cannot tell what changed.
    Copy only those.                                       Walk ALL objects of the PG in order and compare.
                                                           last_backfill = how far the walk got.
 ```
+
+So the question is not how long an OSD was away. It is how many writes
+it missed. A new, empty OSD is backfilled only if the PG has already
+trimmed its log. On a young PG (`log_tail 0'0`) the log covers
+everything, and even an empty OSD gets log recovery.
+
+**Block-layer view:** the PG log works like the md write-intent bitmap
+or the DRBD activity log. After a short outage, resync only what the log
+names. When the log no longer covers the gap, do a full resync. The
+limits: the PG log is an ordered list of operations on objects, with
+versions, not a bitmap of regions. And it is **not a journal**: it holds
+no data and is never replayed to the disk. The write-ahead log is
+BlueStore's job.
+
+## 1.5 Small words
+
+| Word | Meaning here |
+|---|---|
+| pool, `size`, `min_size` | a pool is a set of PGs with one replication rule. `size` = number of copies. `min_size` = copies that must be up, or the PG stops serving I/O |
+| RADOS | the object layer of Ceph: clients, mons, OSDs. rbd, CephFS and rgw are built on it |
+| `M…` names | `MOSDOp`, `MOSDRepOp`, …: message classes, one header each in `src/messages/` |
+| `MOSDOp`, `OSDOp` | one `MOSDOp` message is one client request on one object. It carries a list of `OSDOp`: the steps (write, setxattr, …) |
+| repop, subop | repop = a replicated write, as the primary sees it. subop = the copy of it sent to one replica (`MOSDRepOp`) |
+| fast dispatch | the messenger thread calls the OSD's handler directly. There is no queue and no dispatch thread in between |
+| op shard | one part of the OSD's op queue (§2 #4). In this post "shard" alone always means this |
+| EC shard | in an erasure-coded pool, each OSD of the PG holds one chunk of every object. That position is the EC shard |
+| PG slot | the entry of one PG inside its op shard (§3). Not a reservation |
+| reservation | a permit for background work: a PG needs one before it may recover, backfill or scrub (§11) |
+| finisher | a thread that runs queued completion callbacks. Like a kernel workqueue |
+| collection | the ObjectStore's "directory" of objects. One per PG, plus one called `meta` (§12) |
+| omap | a sorted key/value map attached to an object. BlueStore keeps it in RocksDB |
+| head, clone | the head is the live object. A clone is an older, read-only version of it, kept for a snapshot (§11.3) |
+| scrub, deep scrub | compare the copies of each object between the OSDs of the PG. Deep scrub also reads and checksums the data |
+| watch / notify | a client registers a watch on an object. Another client sends a notify. Every watcher gets it (`MWatchNotify`). rbd uses it |
+| objecter | the client-side library that sends `MOSDOp`. The OSD has one too, to act as a client of other OSDs |
+| debug log | the text log of a daemon (`debug_osd = N`). In this post "the log" alone always means the PG log |
 
 # 2. The OSD in one view
 
@@ -137,59 +202,171 @@ OSD knows *which* objects.
    librados · librbd
    libcephfs · rgw
       │ MOSDOp                      │ MOSDRepOp / MOSDRepOpReply       │ MOSDMap            │ MPGStats
-      │ MOSDOpReply                 │ MOSDPGQuery2/Notify2/Info2/Log   │ MOSDBoot
-      │ MWatchNotify                │ MOSDPGPush/Pull/Scan/Backfill    │ MOSDFailure
-      │                             │ MOSDPing                         │ MOSDBeacon
+      │ MOSDOpReply                 │ MOSDPGQuery2/Notify2/Info2/Log   │ MOSDBoot           │
+      │ MWatchNotify                │ MOSDPGPush/Pull/Scan/Backfill    │ MOSDAlive          │
+      │                             │ MOSDPing                         │ MOSDFailure/Beacon │
  ═════╪═════════════════════════════╪══════════════════════════════════╪════════════════════╪═════
  #1   messengers ×7     client · cluster · 4 × heartbeat · ms_objecter          threads: msgr-worker
- ═════╪═════════════════════════════╪══════════════════════════════════╪══════════════════════════
- #2   OSD               ms_fast_dispatch ──► enqueue_op          #9  handle_osd_map
-                                                │                         │ store the map, then
-                                                ▼                         ▼ consume_map
- #3   op queue          OSDShard 0 │ OSDShard 1 │  ...  │ OSDShard 7   ◄──┘ one peering event per PG
-                        each shard: one mClock scheduler + its own PGs
-                                                │
- #4   workers           tp_osd_tp × 16:   _process ──► lock the PG ──► item.run()
- ═══════════════════════════════════════════════╪═════════════════════════════════════════════════
- #5   PG                PrimaryLogPG            │      #6 PGLog            #7 PeeringState
-                        do_request ─► do_op ─► execute_ctx  what changed,     who has what,
-                        OpContext · ObjectContext · RepGather  in order       who serves the PG
-                                                │
- #8   PGBackend         ReplicatedBackend   │   ECSwitch ─► erasure-code backends
- ═══════════════════════════════════════════════╪═════════════════════════════════════════════════
- #10  ObjectStore       queue_transactions · read · omap_*          ──► the BlueStore post
+ ═════╤══════════════════════════════════════════════════════╤════════════════════════════════════
+      │ client ops, replica ops, peering and recovery msgs   │ MOSDMap
+      ▼                                                      ▼
+ #2   ms_fast_dispatch ─► enqueue_op                    #3   handle_osd_map: store the map, then
+      │                                                      consume_map: one peering event per PG
+      ▼                                                      │
+ #4   op queue        [ op shard 0 ]  [ op shard 1 ]  ...  [ op shard 7 ]   ◄────────┘
+                      each op shard: one mClock scheduler + its own PGs
+      │
+      ▼
+ #5   workers         tp_osd_tp × 16:   _process ─► lock the PG ─► item.run()
+ ═════╪═══════════════════════════════════════════════════════════════════════════════════════════
+      ▼
+ #6   PG              PrimaryLogPG: do_request ─► do_op ─► execute_ctx
+                      with  #7 PGLog   and   #8 PeeringState
+      │
+      ▼
+ #9   PGBackend       ReplicatedBackend   or   the EC backends (ECSwitch picks one)
+ ═════╪═══════════════════════════════════════════════════════════════════════════════════════════
+      ▼
+ #10  ObjectStore     queue_transactions · read · omap_*          ─► the BlueStore post
 
- #11  background work   recovery · backfill · scrub · snap trim: all are items in the same op queue (#3)
+ #11  background work   recovery · backfill · scrub · snap trim: all are items in the same op queue (#4)
  #12  heartbeat         own thread, own 4 messengers for MOSDPing; failures go to the mon as MOSDFailure
 ```
 
-| # | Part | Main names | § |
-|---|---|---|---|
-| #1 | messengers | created in [`main`](https://github.com/ceph/ceph/blob/v21.3.0/src/ceph_osd.cc#L124), see [`ms_public`](https://github.com/ceph/ceph/blob/v21.3.0/src/ceph_osd.cc#L560) … [`ms_objecter`](https://github.com/ceph/ceph/blob/v21.3.0/src/ceph_osd.cc#L572) | 4.1 |
-| #2 | OSD | [`class OSD`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L1243), [`class OSDService`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L99), [`OSD::ms_fast_dispatch`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L7690), [`OSD::enqueue_op`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L9920) | 5 |
-| #3 | op queue | [`struct OSDShard`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L985), [`class OpScheduler`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scheduler/OpScheduler.h#L37), [`class mClockScheduler`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scheduler/mClockScheduler.h#L42), [`class OpSchedulerItem`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scheduler/OpSchedulerItem.h#L39) | 5, 9 |
-| #4 | workers | [`OSD::ShardedOpWQ::_process`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L11114) | 4.2, 5 |
-| #5 | PG | [`class PG`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PG.h#L169), [`class PrimaryLogPG`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.h#L62) | 5 |
-| #6 | PG log | [`struct PGLog`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PGLog.h#L126), [`struct pg_log_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.h#L4733), [`struct pg_log_entry_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.h#L4525) | 8 |
-| #7 | peering | [`class PeeringState`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.h#L275) | 8 |
-| #8 | backend | [`class PGBackend`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PGBackend.h#L64), [`class ReplicatedBackend`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.h#L22), [`class ECSwitch`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ECSwitch.h#L27) | 5 |
-| #9 | maps | [`OSD::handle_osd_map`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L8214), [`OSD::consume_map`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L9200) | 7 |
-| #10 | store | [`class ObjectStore`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/ObjectStore.h#L65), [`queue_transactions`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/ObjectStore.h#L241) | 12 |
-| #11 | background | [`class PGRecovery`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scheduler/OpSchedulerItem.h#L475), [`class PGScrub`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scheduler/OpSchedulerItem.h#L301), [`class PGSnapTrim`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scheduler/OpSchedulerItem.h#L278) | 9 |
-| #12 | heartbeat | [`OSD::heartbeat`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L6243), [`OSD::handle_osd_ping`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L5823) | 10 |
+| # | Part | What it is | Main names | § |
+|---|---|---|---|---|
+| #1 | messengers | the network | created in [`main`](https://github.com/ceph/ceph/blob/v21.3.0/src/ceph_osd.cc#L124) | 5.1 |
+| #2 | dispatch | message in, queue item out | [`OSD::ms_fast_dispatch`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L7690), [`OSD::enqueue_op`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L9920) | 6 |
+| #3 | maps | new epoch in, peering events out | [`OSD::handle_osd_map`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L8214), [`OSD::consume_map`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L9200) | 9 |
+| #4 | op queue | all work waits here | [`struct OSDShard`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L985), [`class mClockScheduler`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scheduler/mClockScheduler.h#L42), [`class OpSchedulerItem`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scheduler/OpSchedulerItem.h#L39) | 6, 11 |
+| #5 | workers | the threads that do PG work | [`OSD::ShardedOpWQ::_process`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L11114) | 5.2, 6 |
+| #6 | PG | client I/O of one PG | [`class PG`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PG.h#L169), [`class PrimaryLogPG`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.h#L62) | 6 |
+| #7 | PG log | what changed, in order | [`struct PGLog`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PGLog.h#L126), [`struct pg_log_entry_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.h#L4525) | 1.3, 10 |
+| #8 | peering | who has what, who serves the PG | [`class PeeringState`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.h#L275) | 10 |
+| #9 | backend | replication or erasure coding | [`class PGBackend`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PGBackend.h#L64), [`class ReplicatedBackend`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.h#L22), [`class ECSwitch`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ECSwitch.h#L27) | 6 |
+| #10 | store | the local disk | [`class ObjectStore`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/ObjectStore.h#L65), [`queue_transactions`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/ObjectStore.h#L241) | 12 |
+| #11 | background | work the OSD starts itself | [`class PGRecovery`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scheduler/OpSchedulerItem.h#L475), [`class PGScrub`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scheduler/OpSchedulerItem.h#L301), [`class PGSnapTrim`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scheduler/OpSchedulerItem.h#L278) | 11 |
+| #12 | heartbeat | is my peer alive? | [`OSD::heartbeat`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L6243), [`OSD::handle_osd_ping`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L5823) | 8 |
 
 Three ideas explain most of this picture:
 
-1. **Everything is per PG.** A PG has one lock. Client ops, peering,
-   recovery and scrub of one PG never run at the same time.
+1. **Everything is per PG.** A PG has one lock, and every queue item
+   takes it. So the steps of client ops, peering, recovery and scrub of
+   one PG interleave, but two of them never run in parallel. Background
+   work does not stop client I/O. It takes turns with it.
 2. **One queue for all work.** Client ops and background work wait in
    the same sharded queue. The mClock scheduler decides who goes next.
    This is how the OSD keeps recovery from starving clients.
-3. **The map drives the state.** The OSD never decides alone who serves
-   a PG. It reads that from the OSDMap, and each new epoch can restart
-   peering.
+3. **The map drives the state.** An OSD does not decide alone who serves
+   a PG. It reads that from the OSDMap. It can only *ask* the mon for a
+   change. Each new epoch can restart peering.
 
-# 3. The lab
+Idea 3 gives the OSD its main loop. Sections 8 to 11 follow it:
+
+```
+ a peer stops answering pings        §8
+        ▼
+ the mon marks it down               a NEW OSDMap epoch
+        ▼
+ every OSD gets the new map          §9     one peering event per PG
+        ▼
+ PGs whose acting set changed        a NEW interval
+        ▼
+ peering                             §10    the OSDs of the PG agree on the log
+        ▼
+ active: client I/O runs again
+        ▼
+ recovery or backfill, in the background     §11
+        ▼
+ clean
+```
+
+**Block-layer view:** an op shard is like a blk-mq hardware queue with
+its own scheduler, and `hash(PG id)` picks the shard like the CPU picks
+the hctx. The limits: the key is the PG, not the submitting CPU. And two
+threads serve one shard, so the queue alone does not keep the order. §3
+shows what does.
+
+# 3. Data structures: who owns what
+
+Read this tree before the paths. Every later section walks over it.
+
+```
+ OSD                                   one per process
+ #1  ├── OSDService                    helpers shared by all PGs: map cache, reservers,
+     │                                 recovery throttle, timers, the objecter
+ #2  ├── 7 messengers; heartbeat_peers: one HeartbeatInfo per peer OSD
+ #3  ├── OSDSuperblock                 who am I, which map epochs do I have
+ #4  ├── OSDMapRef                     the current map
+ #5  └── OSDShard × 8                  one op shard
+         ├── OpScheduler (mClock)      the queue of this shard
+ #6      └── pg_slots: one OSDShardPGSlot per PG
+                 ├── to_process        items taken from the queue, in order, waiting for the PG lock
+                 └── pg                the PG below
+
+ PG  (a PrimaryLogPG object)           one per PG on this OSD
+ #7  ├── _lock                         THE lock: all work on this PG is serial (idea 1)
+ #8  ├── PeeringState (recovery_state)
+ #9  │   ├── pg_info_t                 last_update, last_complete, log_tail, last_backfill
+     │   │   └── pg_history_t          the important epochs of the past: same_interval_since, ...
+ #10 │   ├── PastIntervals             who served this PG before (§1.2)
+ #11 │   ├── PGLog, its IndexedLog     the PG log (§1.3), with an index by object
+ #12 │   │   └── pg_missing_t          what this OSD is missing
+     │   ├── peer_info, peer_missing   the same two things, for every other OSD of the PG
+ #13 │   └── MissingLoc                for each missing object: which OSD has a good copy
+ #14 ├── object_contexts               cache of ObjectContext, one per object in use
+ #15 ├── repop_queue                   RepGather: writes that wait for commits
+ #16 ├── waiting_for_*                 lists of ops that cannot run now:
+     │                                 _map (client's map is newer) · _peered · _active ·
+     │                                 _readable · _scrub · _blocked_object · ...
+ #17 ├── PGBackend                     ReplicatedBackend, or ECSwitch for an EC pool
+     ├── PgScrubber, SnapTrimmer, SnapMapper        §11
+     └── ch                            this PG's collection in the ObjectStore (§12)
+```
+
+| # | Source |
+|---|---|
+| #1 | [`class OSD`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L1243), [`class OSDService`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L99) |
+| #2 | [`struct HeartbeatInfo`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L1541) |
+| #3 | [`class OSDSuperblock`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.h#L5835) |
+| #4 | [`class OSDMap`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSDMap.h#L363) |
+| #5 | [`struct OSDShard`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L985), [`class OpScheduler`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scheduler/OpScheduler.h#L37) |
+| #6 | [`struct OSDShardPGSlot`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L960) |
+| #7 | [`class PG`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PG.h#L169), [`PG::_lock`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PG.h#L802) |
+| #8 | [`class PeeringState`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.h#L275) |
+| #9 | [`struct pg_info_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.h#L3105), [`struct pg_history_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.h#L2922) |
+| #10 | [`class PastIntervals`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.h#L3420) |
+| #11 | [`struct PGLog`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PGLog.h#L126), [`struct IndexedLog`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PGLog.h#L171), [`struct pg_log_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.h#L4733) |
+| #12 | [`pg_missing_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.h#L5549) |
+| #13 | [`class MissingLoc`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/MissingLoc.h#L15) |
+| #14 | [`struct ObjectContext`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_internal_types.h#L40) |
+| #15 | [`RepGather`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.h#L864) |
+| #16 | [`waiting_for_map`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PG.h#L1069) … [`waiting_for_blocked_object`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PG.h#L1086) |
+| #17 | [`class PGBackend`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PGBackend.h#L64) |
+
+**How a PG's ops stay in order.** A PG always hashes to the same op
+shard, but two threads serve that shard. The worker therefore moves the
+item from the scheduler into `to_process` of the PG slot (#6), takes the
+PG lock (#7), and only then runs the item. The slot list keeps the
+order, the PG lock keeps it serial.
+
+The locks, in the order the worker
+([`_process`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L11114)) takes them:
+
+| Order | Lock | Protects |
+|---|---|---|
+| 1 | [`PG::_lock`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PG.h#L802) | everything inside one PG |
+| 2 | [`OSDShard::shard_lock`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L1006) | one op shard's queue and `pg_slots`. The worker drops it, takes the PG lock, then takes it again |
+| – | [`OSD::osd_lock`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L1249) | OSD-wide state: boot, shutdown, `tick`, map handling |
+| – | [`OSD::map_lock`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L1893) | a read/write lock: readers of the current map against the writer that installs a new one (§9 #2) |
+| – | [`OSD::heartbeat_lock`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L1616) | `heartbeat_peers`. Separate, so that a ping never waits for `osd_lock` |
+
+The code has one comment about this order
+([`lock ordering`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L62), `OSD.h:62`). Its order is
+right, but its names are out of date: `ShardData::lock` is now
+`OSDShard::shard_lock`, and `OSD::pg_map_lock` no longer exists.
+
+# 4. The lab
 
 | | |
 |---|---|
@@ -197,69 +374,42 @@ Three ideas explain most of this picture:
 | Daemons | MON=1 MGR=1 OSD=3 MDS=1 RGW=1 |
 | osd.0 / osd.1 / osd.2 | `/dev/nvme0n1` 8 GiB · `/dev/sda` 12 GiB · `/dev/vdb` 8 GiB, all detected as `ssd` |
 | pool `p1` | 32 PGs, size 3, min_size 2: the I/O studies |
-| pool `pg1` | **1 PG** (`9.0`), size 3: peering, recovery, scrub. Every object lands in the one PG, so a log is about exactly one acting set |
+| pool `pg1` | **1 PG** (`9.0`), size 3. Every object lands in this one PG. So every peering line in an OSD's debug log is about this PG |
 | pool `rbd`, `cephfs.a.*`, rgw pools | for the client studies |
-| all pools | autoscaler off: pg ids must not change under a trace |
+| all pools | autoscaler off: pg ids must not change during a trace |
 
 [`osdlab.sh`]({{ site.baseurl }}/code/ceph/osdlab.sh) builds all of
-this: `osdlab.sh <build-dir> start`. It also handles two traps.
-
-**Trap 1: the rotational flag of a SCSI disk comes back.** A virtual
-disk says `rotational=1`. Then BlueStore *and* the OSD pick HDD settings:
-deferred writes, 1 op shard × 5 threads instead of 8 × 2, the hdd mClock
-values. The BlueStore post cleared the flag with `echo 0`. On `/dev/sda`
-that does not hold:
-
-```
- echo 0 > /sys/block/sda/queue/rotational
- any writer closes /dev/sda            dd, ceph-osd --mkfs, an OSD stop;
-        │                              a starting OSD opens and closes it ~6 times
-        ▼
- udev sees the close, asks the kernel to re-read the partition table (BLKRRPART)
-        ▼
- sd reads the disk's properties again  →  rotational = 1
-```
-
-BlueStore opens its device with `O_EXCL`
-([`KernelDevice::open`](https://github.com/ceph/ceph/blob/v21.3.0/src/blk/kernel/KernelDevice.cc#L161)), so while
-an OSD *runs* the re-read is refused. But every stop and start goes
-through the window. The fix is a udev rule with `OPTIONS:="nowatch"`
-([`99-osdlab-rotational.rules`]({{ site.baseurl }}/code/ceph/99-osdlab-rotational.rules)).
-The script checks `bluestore_bdev_type` of every OSD and stops if one is
-not `ssd`.
-
-**Trap 2: vstart can lose an OSD.** vstart runs `ceph-osd --mkfs` right
-after `ceph osd new`. On a slow mon the new cephx key is sometimes not
-usable yet: mkfs fails with `handle_auth_bad_method`, and that OSD never
-starts. The script redoes mkfs for every OSD that has no store.
+this: `osdlab.sh <build-dir> start`. Building it hit two traps, one in
+Linux and one in vstart. Appendix A has both.
 
 This VM stalls at times (slow virtual disks). Read the **order and
-shape** of events here, not the microseconds.
+shape** of events in this post, not the microseconds.
 
-# 4. One process: messengers, threads, boot
+# 5. One process: messengers, threads, boot
 
-## 4.1 Seven messengers
+What is running inside one `ceph-osd`, before any I/O arrives?
+
+## 5.1 Seven messengers
 
 [`main`](https://github.com/ceph/ceph/blob/v21.3.0/src/ceph_osd.cc#L124) creates seven messengers before it
 creates the [`OSD`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L2396) object.
 
-```
- name               network   used for
- ─────────────────────────────────────────────────────────────────────────────
- client             public    MOSDOp in, MOSDOpReply out; also mon and mgr
- cluster            cluster   replication, peering, recovery between OSDs
- hb_front_client    public  ┐ send MOSDPing
- hb_back_client     cluster ┘
- hb_front_server    public  ┐ receive MOSDPing
- hb_back_server     cluster ┘
- ms_objecter        public    the OSD's own RADOS client (copy-from, tiering)
-```
+| Variable | Name | Network | Listens? | Used for |
+|---|---|---|---|---|
+| [`ms_public`](https://github.com/ceph/ceph/blob/v21.3.0/src/ceph_osd.cc#L560) | `client` | public | yes | `MOSDOp` in, `MOSDOpReply` out. Also all traffic to the mon and the mgr |
+| [`ms_cluster`](https://github.com/ceph/ceph/blob/v21.3.0/src/ceph_osd.cc#L562) | `cluster` | cluster | yes | replication, peering, recovery between OSDs |
+| [`ms_hb_front_server`](https://github.com/ceph/ceph/blob/v21.3.0/src/ceph_osd.cc#L570) | `hb_front_server` | public | yes | receive `MOSDPing` |
+| [`ms_hb_back_server`](https://github.com/ceph/ceph/blob/v21.3.0/src/ceph_osd.cc#L568) | `hb_back_server` | cluster | yes | receive `MOSDPing` |
+| [`ms_hb_front_client`](https://github.com/ceph/ceph/blob/v21.3.0/src/ceph_osd.cc#L566) | `hb_front_client` | public | no | send `MOSDPing` |
+| [`ms_hb_back_client`](https://github.com/ceph/ceph/blob/v21.3.0/src/ceph_osd.cc#L564) | `hb_back_client` | cluster | no | send `MOSDPing` |
+| [`ms_objecter`](https://github.com/ceph/ceph/blob/v21.3.0/src/ceph_osd.cc#L572) | `ms_objecter` | public | no | the OSD as a client of other OSDs (used by the copy-from op) |
 
 Heartbeat has its own four messengers for one reason: a ping must not
 wait behind data. Front and back are separate so that the OSD can tell
 "the public network is broken" from "the cluster network is broken".
 
-`ceph osd dump` shows the four listening ones for osd.0:
+The four listening ones of osd.0, from `ceph osd dump` (`v2`/`v1` are
+the two messenger protocols):
 
 ```
 public_addrs          v2:10.0.0.28:6820  v1:10.0.0.28:6821
@@ -268,13 +418,13 @@ heartbeat_front_addrs v2:10.0.0.28:6824  v1:10.0.0.28:6825
 heartbeat_back_addrs  v2:10.0.0.28:6826  v1:10.0.0.28:6827
 ```
 
-## 4.2 Threads
+## 5.2 Threads
 
 One idle OSD in the lab has 77 threads (`/proc/<pid>/task/*/comm`).
 
 | Threads | Name | Owner and job |
 |---|---|---|
-| 16 | `tp_osd_tp` | [`osd_op_tp`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L2431): **all queued** PG work. 8 shards × 2 threads on SSD ([`get_num_op_shards`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L3590)); 1 × 5 on HDD |
+| 16 | `tp_osd_tp` | [`osd_op_tp`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L2431): **all queued** PG work. 8 op shards × 2 threads on SSD ([`get_num_op_shards`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L3590)); 1 × 5 on HDD |
 | 3 | `msgr-worker-N` | network I/O of all seven messengers (`ms_async_op_threads`). Fast dispatch runs here |
 | 7 + 7 | `ms_dispatch`, `ms_local` | one pair per messenger: messages that are not fast-dispatched |
 | 1 | `osd_srv_heartbt` | [`OSD::heartbeat_entry`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L6171) |
@@ -283,9 +433,9 @@ One idle OSD in the lab has 77 threads (`/proc/<pid>/task/*/comm`).
 | 1 | `finisher` | the objecter's finisher |
 | 1 | `OpHistorySvc` | op tracker history (`dump_historic_ops`) |
 | 1 | `osd_srv_agent` | cache tier agent (not covered) |
-| 11 | `bstore_*`, `cfin`, `rocksdb:*` | the store: see the BlueStore post |
+| 10 | `bstore_*`, `cfin`, `rocksdb:*` | the store: see the BlueStore post |
 | 12 | `ceph-osd` | threads with no name of their own |
-| rest | `admin_socket`, `log`, `signal_handler`, `service`, `io_context_pool`, `ceph_timer` | process services |
+| 8 | `admin_socket`, `log`, `signal_handler`, `service`, `io_context_pool` ×2, `ceph_timer` ×2 | process services |
 
 The rule to remember: **`msgr-worker` receives, `tp_osd_tp` works.** A
 messenger thread decodes the header of a message and queues it. The
@@ -294,23 +444,42 @@ peering events, recovery, scrub steps) run on `tp_osd_tp`. A few other
 threads take a PG lock for short jobs: timers (watch timeout, scrub
 start) and the admin socket.
 
-## 4.3 Boot
+The regular housekeeping runs from two of the timers:
+[`OSD::tick`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L6377) (with `osd_lock`) and
+[`OSD::tick_without_osd_lock`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L6432). The second one
+checks heartbeats (§8) and starts scrubs (§11). PG statistics go to the
+**mgr**, not the mon: [`OSD::collect_pg_stats`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L7924)
+builds an [`MPGStats`](https://github.com/ceph/ceph/blob/v21.3.0/src/messages/MPGStats.h#L25).
+
+**Block-layer view:** fast dispatch is like a hardirq top half that only
+queues work, and `tp_osd_tp` is like the threaded handler. The limit:
+`msgr-worker` is a normal epoll thread. "Do not block here" is a rule,
+nothing enforces it. A blocked worker stalls every connection it serves.
+
+## 5.3 Boot
 
 ```
- #1 OSD::init          mount the store, read the superblock, load_pgs, start the op threads
- #2 start_boot         state PREBOOT     ask the mon: which maps exist?
- #3 _preboot           catch up on maps if too old; else ──► _send_boot
- #4 _send_boot         state BOOTING     send MOSDBoot with the cluster and heartbeat addresses
-        ⋮              the mon marks the OSD up in a NEW OSDMap epoch
- #5 _committed_osd_maps state ACTIVE     the OSD sees itself "up" in a map it has stored
+     function              OSD state      what happens
+ #1  OSD::init             INITIALIZING   mount the store, read the superblock, load_pgs, start the op threads
+ #2  start_boot            PREBOOT        ask the mon: which map epochs exist?
+ #3  _preboot              PREBOOT        my newest map is too old? fetch the missing maps first. Else: _send_boot
+ #4  _send_boot            BOOTING        send MOSDBoot with the cluster and heartbeat addresses
+        ⋮                                 the mon marks the OSD up in a NEW OSDMap epoch
+ #5  _committed_osd_maps   ACTIVE         the OSD reads, in a map it has stored, that it is up
 ```
 
+From the debug log of osd.0. The number after `osd.0` is the OSD's
+current map epoch:
+
 ```
-06:49:03.973 osd.0 0  load_pgs opened 0 pgs
+06:49:03.973 osd.0 0  load_pgs opened 0 pgs                        #1
 06:49:06.585 osd.0 0  done with init, starting boot process
-06:49:06.585 osd.0 0  start_boot
-06:50:04.783 osd.0 28 state: booting -> active
+06:49:06.585 osd.0 0  start_boot                                   #2
+06:50:04.783 osd.0 28 state: booting -> active                     #5
 ```
+
+(The 58 s between #2 and #5 belong to this slow lab start. They are not
+examined here.)
 
 | # | Function |
 |---|---|
@@ -318,25 +487,40 @@ start) and the admin socket.
 | #2 | [`OSD::start_boot`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L6881) |
 | #3 | [`OSD::_preboot`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L6906) |
 | #4 | [`OSD::_send_boot`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L7081), [`class MOSDBoot`](https://github.com/ceph/ceph/blob/v21.3.0/src/messages/MOSDBoot.h#L25) |
-| #5 | [`OSD::_committed_osd_maps`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L8621); states are [`STATE_INITIALIZING`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L1419) … |
+| #5 | [`OSD::_committed_osd_maps`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L8621); the states are [`STATE_INITIALIZING`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L1419) … |
 
-The OSD does not make itself active. It becomes active in #5, on the
-map path, when the mon's new map says so. This is idea 3 of §2 at work.
+The OSD does not make itself active. It becomes active in #5: it reads,
+in a new map, that the mon marked it up. This is idea 3 of §2.
 
-# 5. One write through the OSD
+# 6. One write through the OSD
+
+What does the OSD layer do with one client write, and in which thread?
 
 One 16 KiB `rados put` of `o48` into pool `p1`. The primary is osd.2, the
-replicas are osd.0 and osd.1. The op tracker of osd.2 recorded this
-(`ceph daemon osd.2 dump_historic_ops`, the `#` column is added):
+replicas are osd.0 and osd.1. The op tracker of osd.2 recorded the op
+(`ceph daemon osd.2 dump_historic_ops`). Its first line reads like this:
 
 ```
-     osd_op(client.4359.0:1 8.2 8:477f3578:::o48:head [writefull 0~16384] snapc 0=[] ... e71)
+ osd_op(client.4359.0:1  8.2  8:477f3578:::o48:head  [writefull 0~16384]  snapc 0=[]  ondisk+write+...  e71)
+        │                │    │                       │                   │                             │
+        │                │    │                       │                   │       the client's map epoch┘
+        │                │    │                       │                   └─ snapshot context: none (§11.3)
+        │                │    │                       └─ the OSDOp list: one step, offset~length
+        │                │    └─ the object: pool : hash (bit-reversed) : namespace : key : name : head
+        │                └─ the PG
+        └─ who: client id . incarnation : request number
+```
+
+And its events (the `#` column is added; it matches the call tree
+below):
+
+```
      duration 0.045789976
-     08:08:14.546472  initiated
-     08:08:14.546472  header_read
-     08:08:14.546474  throttled
-     08:08:14.546485  all_read
-     08:08:14.546487  dispatched
+     08:08:14.546472  initiated               ┐
+     08:08:14.546472  header_read             │
+     08:08:14.546474  throttled               │ the messenger reads the message
+     08:08:14.546485  all_read                │
+     08:08:14.546487  dispatched              ┘
  #2  08:08:14.546493  queued_for_pg
  #4  08:08:14.546535  reached_pg
  #6  08:08:14.546573  started
@@ -348,175 +532,288 @@ replicas are osd.0 and osd.1. The op tracker of osd.2 recorded this
      08:08:14.592262  done
 ```
 
-The OSD layer needs 0.17 ms from `initiated` to #10: the op is sent to
-the replicas and given to the local store. The other 45 ms are three
-stores committing in parallel. The BlueStore post explains those.
+From `initiated` to #10 the OSD layer needs 0.17 ms. At #10 the op is
+sent to the replicas and given to the local store. The other 45 ms are
+three stores that commit in parallel. The BlueStore post explains them.
 
 ```
- msgr-worker  #1  OSD::ms_fast_dispatch              OSD.cc:7690    message ─► OpRequest
-              #2  └► OSD::enqueue_op                 :9920          event queued_for_pg
-                     └► ShardedOpWQ::_enqueue        :11451         shard = hash of the PG id; give the item to mClock
- ─────────────────────────────────────────────────────────────────────────────────────────────────────
- tp_osd_tp    #3  ShardedOpWQ::_process              :11114         take the next item from mClock; lock its PG
-                  └► PGOpItem::run                   OpSchedulerItem.cc:23
-              #4     └► OSD::dequeue_op              OSD.cc:9978    event reached_pg
-              #5        └► PrimaryLogPG::do_request  PrimaryLogPG.cc:1824   can the PG serve ops now?
-              #6           └► do_op ─► do_op_impl    :2588 ─► :2001 checks, ObjectContext, OpContext; event started
-              #7              └► execute_ctx         :4290
-              #8                 ├► prepare_transaction   :9137
-                                 │  ├► do_osd_ops         :6163     each OSDOp ─► changes in a PGTransaction
-                                 │  └► finish_ctx         :9208     new object_info_t and ONE PG log entry
-              #9                 └► issue_repop           :11696
-              #10                   └► ReplicatedBackend::submit_transaction   ReplicatedBackend.cc:591
-                                       ├► issue_op        :1210     one MOSDRepOp per replica; event waiting for subops
-                                       └► queue_transactions  :675  the local store: the BlueStore post starts here
- ─────────────────────────────────────────────────────────────────────────────────────────────────────
- later        #11 ReplicatedBackend::op_commit       :681           local store committed; event op_commit
-              #12 ReplicatedBackend::do_repop_reply  :706           one MOSDRepOpReply per replica; event sub_op_commit_rec
-              #13 PrimaryLogPG::eval_repop           PrimaryLogPG.cc:11647   all commits are in: run the callback
-                                                                    from execute_ctx (:4473): send MOSDOpReply; event commit_sent
+ context: msgr-worker thread, no PG lock
+ #1  ms_fast_dispatch                  OSD.cc:7690                message becomes an OpRequest
+ #2  └► enqueue_op                     OSD.cc:9920                event queued_for_pg
+        └► ShardedOpWQ::_enqueue       OSD.cc:11451               op shard = hash of the PG id; give the item to mClock
+
+ context: tp_osd_tp thread, PG lock held
+ #3  ShardedOpWQ::_process             OSD.cc:11114               take the next item from mClock; lock its PG (§3)
+     └► PGOpItem::run                  OpSchedulerItem.cc:23
+ #4     └► dequeue_op                  OSD.cc:9978                event reached_pg
+ #5        └► do_request               PrimaryLogPG.cc:1824       can the PG serve ops now? if not: a waiting_for_* list
+ #6           └► do_op, do_op_impl     PrimaryLogPG.cc:2588, 2001 checks, ObjectContext, OpContext; event started
+ #7              └► execute_ctx        PrimaryLogPG.cc:4290
+ #8                 ├► prepare_transaction   PrimaryLogPG.cc:9137
+                    │  ├► do_osd_ops         PrimaryLogPG.cc:6163   each OSDOp becomes changes in a PGTransaction
+                    │  └► finish_ctx         PrimaryLogPG.cc:9208   new object_info_t; ONE PG log entry, in memory
+ #9                 └► issue_repop           PrimaryLogPG.cc:11696  make the RepGather
+ #10                   └► submit_transaction ReplicatedBackend.cc:591
+                          ├► issue_op           :641 (def :1210)    1st: one MOSDRepOp per replica, data + log entry;
+                          │                                         event waiting for subops
+                          ├► log_operation      :658                2nd: log key + PG info into the LOCAL transaction
+                          └► queue_transactions :675                3rd: the local store. The BlueStore post starts here
+
+ context: tp_osd_tp thread, PG lock held, each time as a new queue item
+ #11 op_commit                         ReplicatedBackend.cc:681   the local store committed; event op_commit
+ #12 do_repop_reply                    ReplicatedBackend.cc:706   a MOSDRepOpReply came in (through #1–#4 again);
+                                                                  event sub_op_commit_rec
+ #13 eval_repop                        PrimaryLogPG.cc:11647      all commits are in: run the callback that execute_ctx
+                                                                  registered (:4473): send MOSDOpReply; event commit_sent
 ```
 
 | # | Function | What to know |
 |---|---|---|
-| #1 | [`OSD::ms_fast_dispatch`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L7690) | runs on the messenger thread, so it must be short and must not block |
-| #2 | [`OSD::enqueue_op`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L9920), [`OSD::ShardedOpWQ::_enqueue`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L11451) | a PG always maps to the same shard, so its ops stay in order |
-| #3 | [`OSD::ShardedOpWQ::_process`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L11114), [`struct OSDShardPGSlot`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L960), [`PGOpItem::run`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scheduler/OpSchedulerItem.cc#L23) | the worker takes the PG lock *before* it runs the item |
+| #1 | [`OSD::ms_fast_dispatch`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L7690) | it runs on the messenger thread, so it must be short and must not block |
+| #2 | [`OSD::enqueue_op`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L9920), [`_enqueue`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L11451) | a PG always maps to the same op shard |
+| #3 | [`_process`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L11114), [`PGOpItem::run`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scheduler/OpSchedulerItem.cc#L23) | the worker takes the PG lock *before* it runs the item (idea 1) |
 | #4 | [`OSD::dequeue_op`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L9978) | |
-| #5 | [`PrimaryLogPG::do_request`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L1824) | if the PG is not active, or the client's map is too new, the op waits in a list |
-| #6 | [`PrimaryLogPG::do_op`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L2588), [`PrimaryLogPG::do_op_impl`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L2001), [`PrimaryLogPG::get_object_context`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L12138) | in v21 `do_op` is a thin wrapper; the known body is `do_op_impl`. An op on a missing object waits until the object is recovered |
-| #7 | [`PrimaryLogPG::execute_ctx`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L4290) | |
-| #8 | [`PrimaryLogPG::prepare_transaction`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L9137), [`PrimaryLogPG::do_osd_ops`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L6163), [`PrimaryLogPG::finish_ctx`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L9208) | `finish_ctx` builds the log entry in memory. In #10 it goes into the **same** transaction as the data. This is why the log can always be trusted |
-| #9 | [`PrimaryLogPG::issue_repop`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L11696) | |
-| #10 | [`ReplicatedBackend::submit_transaction`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L591), [`ReplicatedBackend::issue_op`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L1210) | first the log entry and the PG info are put into the transaction ([`PeeringState::append_log`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.cc#L4772) → `write_if_dirty`). Then the primary sends to the replicas, and only then writes locally |
-| #11 | [`ReplicatedBackend::op_commit`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L681) | |
-| #12 | [`ReplicatedBackend::do_repop_reply`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L706) | |
-| #13 | [`PrimaryLogPG::eval_repop`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L11647) | the client gets its reply only when **all** OSDs of the acting set have committed. Backfill and async-recovery targets are waited for too |
+| #5 | [`do_request`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L1824) | an op that cannot run now is parked in a `waiting_for_*` list (§3 #16) and queued again later |
+| #6 | [`do_op`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L2588), [`do_op_impl`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L2001), [`get_object_context`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L12138) | in v21 `do_op` is a thin wrapper. The code that older texts call `do_op` is now `do_op_impl` |
+| #7 | [`execute_ctx`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L4290) | |
+| #8 | [`prepare_transaction`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L9137), [`do_osd_ops`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L6163), [`finish_ctx`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L9208) | |
+| #9 | [`issue_repop`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L11696) | |
+| #10 | [`submit_transaction`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L591), [`issue_op`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L1210), [`append_log`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.cc#L4772) | see the notes below |
+| #11 | [`op_commit`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L681) | |
+| #12 | [`do_repop_reply`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L706) | |
+| #13 | [`eval_repop`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L11647) | |
 
-On a replica, #1–#5 are the same. Then `do_request` gives the message to
-the backend: [`ReplicatedBackend::do_repop`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L1266)
-decodes the transaction and the log entry and calls `queue_transactions`.
-On commit, [`ReplicatedBackend::repop_commit`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L1369)
-sends the `MOSDRepOpReply`. A replica does not run `do_op`: it does not
-check or build anything, it applies what the primary built.
+Notes:
+
+- **#10, the order.** The primary sends to the replicas first and
+  writes locally last, so all stores work in parallel. In between,
+  `log_operation` → `append_log` → `write_if_dirty` adds the log key and
+  the PG info to the local transaction. The replicas get the log entry
+  as a field of `MOSDRepOp`, and each adds its own keys the same way.
+- **#10, one transaction.** On each OSD the data and the log entry are
+  in the same ObjectStore transaction. They commit together or not at
+  all. This is why peering can trust the log.
+- **#13, who is waited for.** The client gets its reply only when
+  **all** OSDs of the acting set have committed. The primary also waits
+  for an OSD that is being backfilled: it is not in the acting set, but
+  it gets every write.
+
+**On a replica**, #1–#5 are the same. Then `do_request` gives the
+message to the backend:
+[`do_repop`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L1266) decodes the
+transaction and the log entry and calls `queue_transactions`. On commit,
+[`repop_commit`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L1369) sends the
+`MOSDRepOpReply`. A replica does not run `do_op`: it checks nothing and
+builds nothing, it applies what the primary built.
 [§3.3 of the BlueStore post]({% post_url 2026-08-10-bluestore-io-analysis %}#33-one-16-kib-write-replicated)
 traces both sides with bpftrace.
 
-A **read** is shorter. In a replicated pool it stops at #8: the
+**A read** is shorter. In a replicated pool it stops at #8: the
 [`CEPH_OSD_OP_READ`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L6273) case calls
-[`PrimaryLogPG::do_read`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L5934), which reads
-from the local store
-([`ReplicatedBackend::objects_read_sync`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L279)).
-No replica is asked, no transaction, no log entry. The reply goes out
-from `execute_ctx`. In an EC pool the primary must read shards from
-other OSDs first, so the read is asynchronous and the reply comes later.
+[`do_read`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L5934), which reads from the local
+store ([`objects_read_sync`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L279)). No
+replica is asked, there is no transaction and no log entry. The reply
+goes out from `execute_ctx`. In an EC pool the primary holds only one
+chunk of the object. It must read chunks from other OSDs first, so it
+sends the reply later, from a callback.
 
-The objects of this path:
+The objects of this path, and how long each lives (`#N` as above):
 
-| Object | Lives | Holds |
-|---|---|---|
-| [`struct OpRequest`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OpRequest.h#L28) | one per message | the message and its tracker events |
-| [`struct Session`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/Session.h#L124) | one per client connection | caps, ops that wait for a map |
-| [`struct ObjectContext`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_internal_types.h#L40) | one per object in use, cached | [`object_info_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.h#L6328), read/write lock, watchers |
-| [`OpContext`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.h#L680) | one per client op | the ops, the `PGTransaction`, the log entries, the reply |
-| [`class PGTransaction`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PGTransaction.h#L44) | inside the `OpContext` | the change, per object, not yet in store form. The backend turns it into an `ObjectStore::Transaction` |
-| [`RepGather`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.h#L864) | one per write, on the primary | waits for all commits, then runs the callbacks |
-| [`InProgressOp`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.h#L388) | same, inside the backend | `waiting_for_commit`: the OSDs that did not answer yet |
+```
+ MOSDOp ── wrapped by ──► OpRequest            #1 … "done"      the message and its tracker events
+ Session                                       per connection   the client's permissions (caps)
+ ObjectContext                                 cached           object_info_t, a read/write lock, the watchers
+   ▲ used by
+ OpContext                                     #6 … the reply   one per client op
+   ├── the OSDOp list
+   ├── PGTransaction ──#10──► ObjectStore::Transaction (local)  +  MOSDRepOp (replicas)
+   └── the log entries
+ RepGather                                     #9 … #13         PG layer: wait for all commits, run callbacks
+   └── InProgressOp                            #10 … #12        backend: waiting_for_commit {2,0,1} shrinks to {}
+```
 
-# 6. From object name to OSDs
+[`struct OpRequest`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OpRequest.h#L28) ·
+[`struct Session`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/Session.h#L124) ·
+[`struct ObjectContext`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_internal_types.h#L40) ·
+[`object_info_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.h#L6328) ·
+[`OpContext`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.h#L680) ·
+[`class PGTransaction`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PGTransaction.h#L44) ·
+[`RepGather`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.h#L864) ·
+[`InProgressOp`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.h#L388).
+`RepGather` and `InProgressOp` look double. The first belongs to the PG
+and works for every backend. The second is the replicated backend's own
+bookkeeping.
+
+# 7. From object name to OSDs
+
+How does everybody find the OSDs of an object, without asking anybody?
 
 Client and OSD run the same code, on the same map, and get the same
-answer. There is no lookup table and no server to ask.
+answer. There is no lookup table and no server to ask. If a client's
+map is older than the OSD's, the OSD shares its newer map first, and the
+client sends the op again.
 
 ```
  "o48", pool 8
-    │ #1 hash the name (rjenkins)                      ps  = 0x1eacfee2
+    │ #1 hash the name (rjenkins)                        ps  = 0x1eacfee2   (placement seed)
     ▼
  raw PG  8.1eacfee2
-    │ #2 stable_mod(ps, pg_num=32)                     PG  = 8.2
-    │ #3 mix in the pool id                            pps = placement seed for CRUSH
+    │ #2 stable_mod(ps, pg_num = 32)                     PG  = 8.2
+    │ #3 mix in the pool id                              pps = the seed given to CRUSH
     ▼
- #4 CRUSH rule(pps)                                    raw  = [2, 0, 1]
-    │ #5 pg_upmap exceptions
-    │ #6 remove down OSDs                              up   = [2, 0, 1], up_primary 2
-    │ #7 primary affinity
+    │ #4 CRUSH rule(pps)                                 raw = [2, 0, 1]
+    │ #5 pg_upmap: exceptions an admin or the balancer set
+    │ #6 remove down OSDs, pick the first as primary
+    │ #7 primary affinity: may pick another primary      up = [2, 0, 1], up_primary = 2
     ▼
- #8 pg_temp / primary_temp, if set                     acting = [2, 0, 1], acting_primary 2
+      #8 pg_temp / primary_temp, if set                  acting = [2, 0, 1], acting_primary = 2
 ```
 
 | # | Function |
 |---|---|
 | #1 | [`OSDMap::object_locator_to_pg`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSDMap.cc#L2730) → [`OSDMap::map_to_pg`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSDMap.cc#L2710) → [`pg_pool_t::hash_key`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.cc#L1817) → [`ceph_str_hash_rjenkins`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/ceph_hash.cc#L22) |
-| #2 | [`pg_pool_t::raw_pg_to_pg`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.cc#L1838) |
+| #2 | [`pg_pool_t::raw_pg_to_pg`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.cc#L1838). `stable_mod` is a modulo that moves few objects when `pg_num` grows |
 | #3 | [`pg_pool_t::raw_pg_to_pps`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.cc#L1849) |
 | #4 | [`OSDMap::_pg_to_raw_osds`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSDMap.cc#L2779) → [`crush_do_rule`](https://github.com/ceph/ceph/blob/v21.3.0/src/crush/mapper.c#L2017) |
 | #5 | [`OSDMap::_apply_upmap`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSDMap.cc#L2809) |
 | #6 | [`OSDMap::_raw_to_up_osds`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSDMap.cc#L2877), [`OSDMap::_pick_primary`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSDMap.cc#L2799) |
 | #7 | [`OSDMap::_apply_primary_affinity`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSDMap.cc#L2902) |
-| #8 | [`OSDMap::_get_temp_osds`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSDMap.cc#L3066); all of #4–#8 is driven by [`OSDMap::_pg_to_up_acting_osds`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSDMap.cc#L3143) |
+| #8 | [`OSDMap::_get_temp_osds`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSDMap.cc#L3066). All of #4–#8 is driven by [`OSDMap::_pg_to_up_acting_osds`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSDMap.cc#L3143) |
 
-The names of the types: [`struct hobject_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/hobject.h#L49)
-is an object (name, snapshot, hash, pool).
-[`struct ghobject_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/hobject.h#L476) adds generation and
-shard: this is the name the ObjectStore sees.
-[`struct pg_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.h#L407) is pool + seed,
-[`struct spg_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.h#L526) adds the EC shard.
-[`struct pg_pool_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.h#L1284) is one pool's settings
-inside [`class OSDMap`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSDMap.h#L363).
+**#8 is how "up ≠ acting" is made** (§1.1). Say CRUSH now picks a new,
+empty OSD for a PG. The primary asks the mon for a `pg_temp` entry in
+the OSDMap. The entry names the old OSDs. They stay the acting set and
+serve I/O, while the new OSD is backfilled in the background. Then the
+primary asks the mon to remove the entry, and acting becomes up.
 
-`pg_temp` in #8 is the tool behind "up ≠ acting" (§1.1): the primary asks
-the mon to keep the old OSDs acting while a new OSD is backfilled.
-
-# 7. A new OSDMap epoch
+The types behind these names:
 
 ```
- mon ── MOSDMap (epochs 72..73) ──► OSD
-                                     │
- #1 handle_osd_map        write each new map into the store (meta collection)
-                                     │ transaction committed
- #2 _committed_osd_maps   publish the newest map to the OSD; also: up? down? boot done? (§4.3)
- #3 consume_map           give the map to every OSDShard; queue a peering event for every PG
-                                     │ through the op queue, class "immediate"
- ────────────────────────────────────┼──────────────────────────────── tp_osd_tp, PG lock held
- #4 dequeue_peering_evt
- #5 └► advance_pg         move THIS PG from its epoch to the new one, one epoch at a time:
- #6      ├► PG::handle_advance_map ─► PeeringState::advance_map      event AdvMap, once per epoch
-         │     └► did up / acting / primary (or pool size, split, merge) change?  ─► a new interval, restart peering (§8)
- #7      └► PG::handle_activate_map ─► PeeringState::activate_map    event ActMap, once at the end
- #8 dispatch_context      send the peering messages and commit the transaction this produced
+ hobject_t   = pool + hash + name + snapshot + namespace      one object, as the PG sees it
+ ghobject_t  = hobject_t + generation + EC shard              the name the ObjectStore sees
+ pg_t        = pool + seed                                    "8.2"
+ spg_t       = pg_t + EC shard                                no shard in a replicated pool
+ coll_t      = one collection; a PG's is named after its spg_t    "8.2_head" (§12)
+ pg_pool_t   = one pool's settings, inside the OSDMap
+```
+
+[`struct hobject_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/hobject.h#L49) ·
+[`struct ghobject_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/hobject.h#L476) ·
+[`struct pg_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.h#L407) ·
+[`struct spg_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.h#L526) ·
+[`struct pg_pool_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.h#L1284) ·
+[`class OSDMap`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSDMap.h#L363).
+
+# 8. Heartbeat and failure report
+
+Who notices a dead OSD, and how does that become a new epoch?
+
+```
+ osd.0                                           osd.2                        mon
+ #1 heartbeat()   thread osd_srv_heartbt,
+                  every 0.5–5.9 s (random)
+      MOSDPing PING, on front AND back ─────────► #2 handle_osd_ping    (a msgr-worker thread)
+      ◄──────────────────────── PING_REPLY ──────────┘
+ #3 heartbeat_check()   from tick_without_osd_lock,
+      a safe_timer thread: a peer silent on front
+      or back for more than 20 s (osd_heartbeat_grace)
+ #4 send_failures() ── MOSDFailure ──────────────────────────────────────────► #5 prepare_failure
+      same thread; it goes out on the                                             check_failure:
+      "client" messenger, like all mon traffic                                    enough reporters ─► mark it
+                                                                                  down in a NEW OSDMap epoch
+ every OSD gets the new map  ─►  §9  ─►  the PGs of the dead OSD start a new interval  ─►  §10
 ```
 
 | # | Function |
 |---|---|
-| #1 | [`OSD::handle_osd_map`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L8214); map objects are named by [`get_osdmap_pobject_name`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L1330) and [`get_inc_osdmap_pobject_name`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L1335) |
+| #1 | [`OSD::heartbeat_entry`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L6171), [`OSD::heartbeat`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L6243), [`OSD::maybe_update_heartbeat_peers`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L5684) |
+| #2 | [`OSD::handle_osd_ping`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L5823), [`class MOSDPing`](https://github.com/ceph/ceph/blob/v21.3.0/src/messages/MOSDPing.h#L36), [`struct HeartbeatInfo`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L1541) |
+| #3 | [`OSD::heartbeat_check`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L6194) |
+| #4 | [`OSD::send_failures`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L7337), [`class MOSDFailure`](https://github.com/ceph/ceph/blob/v21.3.0/src/messages/MOSDFailure.h#L23) |
+| #5 | [`OSDMonitor::prepare_failure`](https://github.com/ceph/ceph/blob/v21.3.0/src/mon/OSDMonitor.cc#L3385), [`OSDMonitor::check_failure`](https://github.com/ceph/ceph/blob/v21.3.0/src/mon/OSDMonitor.cc#L3300) |
+
+- **#1, the interval** is random, up to `osd_heartbeat_interval` = 6 s.
+- **#1, the peers** are the OSDs this OSD shares PGs with, plus the
+  next and the previous up OSD by id, plus more until there are
+  `osd_heartbeat_min_peers` (10). So an OSD with no PGs is still watched.
+- **#5, enough reporters**: `mon_osd_min_down_reporters` = 2, and they
+  must come from different subtrees of the level
+  `mon_osd_reporter_subtree_level` = `host`. vstart sets the level to
+  `osd`. With `host`, a one-host lab could never mark an OSD down.
+
+OSDs watch each other, the mon only counts reports. One slower path
+exists for when the reports do not come. Each OSD sends a
+[`MOSDBeacon`](https://github.com/ceph/ceph/blob/v21.3.0/src/messages/MOSDBeacon.h#L8) to the mon every 5 minutes
+([`OSD::send_beacon`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L7381)). If the mon gets no
+beacon from an OSD for 15 minutes (`mon_osd_report_timeout`), it marks
+that OSD down.
+
+# 9. A new OSDMap epoch
+
+How does one new map reach every PG?
+
+```
+ mon ── MOSDMap (epochs 72..73) ──► OSD
+
+ context: a messenger dispatch thread, osd_lock held
+ #1 handle_osd_map        write each new map into the store (collection "meta")
+        ⋮                 the transaction commits
+ #2 _committed_osd_maps   install the newest map as the OSD's current map; am I up? down? booted? (§5.3)
+ #3 consume_map           give the map to every op shard; queue one peering event (NullEvt) for every PG,
+                          through the op queue, class "immediate" (§11)
+
+ context: tp_osd_tp thread, PG lock held, once per PG
+ #4 dequeue_peering_evt
+ #5 └► advance_pg         move THIS PG from its own epoch to the newest, one epoch at a time:
+ #6      ├► PG::handle_advance_map ─► PeeringState::advance_map      event AdvMap, once per epoch
+         │     └► a new interval (§1.2)?  then restart peering (§10)
+ #7      └► PG::handle_activate_map ─► PeeringState::activate_map    event ActMap, once at the end
+ #8 dispatch_context      send the peering messages and commit the transaction that #5–#7 produced
+```
+
+| # | Function |
+|---|---|
+| #1 | [`OSD::handle_osd_map`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L8214). Map objects are named by [`get_osdmap_pobject_name`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L1330) and [`get_inc_osdmap_pobject_name`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L1335) |
 | #2 | [`OSD::_committed_osd_maps`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L8621) |
 | #3 | [`OSD::consume_map`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L9200), [`OSDShard::consume_map`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L10736) |
 | #4 | [`OSD::dequeue_peering_evt`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L10019), [`class PGPeeringEvent`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PGPeeringEvent.h#L32) |
 | #5 | [`OSD::advance_pg`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L9000) |
-| #6 | [`PG::handle_advance_map`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PG.cc#L2184), [`PeeringState::advance_map`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.cc#L573), [`PeeringState::should_restart_peering`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.cc#L666), [`PeeringState::start_peering_interval`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.cc#L699), [`PastIntervals::check_new_interval`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.cc#L4393) |
+| #6 | [`PG::handle_advance_map`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PG.cc#L2184), [`PeeringState::advance_map`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.cc#L573) |
+| #6 | [`PeeringState::should_restart_peering`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.cc#L666), [`PeeringState::start_peering_interval`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.cc#L699), [`PastIntervals::check_new_interval`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.cc#L4393) |
 | #7 | [`PG::handle_activate_map`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PG.cc#L2202), [`PeeringState::activate_map`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.cc#L599) |
 | #8 | [`OSD::dispatch_context`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L9434), [`struct PeeringCtx`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.h#L215) |
 
-Two things to notice. The OSD has one current map, but **each PG has its
-own epoch** and catches up when its event runs. And old maps stay in the
-store ([`OSDService::map_cache`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L695) in front of it),
-because a PG that was away must walk every epoch it missed to find its
-past intervals.
+Notice two things.
 
-# 8. Peering
+1. The OSD has one current map, but **each PG has its own epoch**. A PG
+   moves to the newest epoch only when its peering event runs.
+2. The OSD keeps old maps in the store.
+   [`map_cache`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L695) is the in-memory cache in front of
+   them. After an OSD was down, each of its PGs reads every epoch it
+   missed, and builds its past intervals from them.
 
-Peering is how the OSDs of a PG agree on the state of the PG before they
-serve I/O again. It runs at the start of every interval (§1.2). The
-primary drives it. The code is one state machine,
+# 10. Peering
+
+How do the OSDs of a PG agree on its state before they serve I/O again?
+
+Peering runs at the start of every interval (§1.2). The primary drives
+it. The code is one state machine,
 [`PeeringState`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.h#L275), built with
-`boost::statechart`. It has 35 states: 34, plus `Crashed` for an event
-that no state handles.
+`boost::statechart`. It has 34 states, plus `Crashed`, which is entered
+when no state handles an event.
 
-## 8.1 The real thing first
+**Block-layer view:** peering is like md assembling an array. Compare
+the event counts of the members, pick the freshest, then choose between
+a bitmap resync and a full rebuild. The limit: peering does not decide
+*who is a member*. The mon did that, in the OSDMap. Peering only
+reconciles the logs of the given members, per PG.
+
+## 10.1 The real thing first
 
 The OSD keeps each PG's state history
 (`ceph daemon osd.N dump_pgstate_history`). This is PG `9.0` right after
-pool `pg1` was created. osd.1 is the primary:
+pool `pg1` was created. It is a **new, empty PG**, so #5 and #6 have
+nothing to do and take microseconds. osd.1 is the primary:
 
 ```
     enter            exit             state                                 primary, osd.1
@@ -537,228 +834,277 @@ pool `pg1` was created. osd.1 is the primary:
 #13 06:50:23.085577  06:50:27.686796  Started/ReplicaActive/RepNotRecovering
 ```
 
-The same lines go to the log at `debug_osd = 5` as `enter <state>` and
-`exit <state> <seconds> ...`
-([`log_enter`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.cc#L8267),
-[`log_exit`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.cc#L8274)). For peering, the log *is*
-the trace.
+The replica's history starts 0.9 s later: osd.2 creates its copy of the
+PG only when the primary's first message arrives.
 
-## 8.2 What each step does
+The same lines go to the OSD's debug log at `debug_osd = 5`, as
+`enter <state>` and `exit <state> <seconds> ...`
+([`log_enter`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.cc#L8267),
+[`log_exit`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.cc#L8274)). For peering, the debug
+log is the trace. bpftrace is not needed.
+
+## 10.2 What each step does
+
+```
+       primary                                      other OSDs of the PG                  mon
+ #4  GetInfo     ── MOSDPGQuery2 (info) ──────────► every OSD that past intervals name
+                 ◄─ MOSDPGNotify2 (its pg_info_t) ──┘
+ #5  GetLog      ── MOSDPGQuery2 (log) ───────────► ONLY the OSD with the best log
+                 ◄─ MOSDPGLog ─────────────────────┘   (skipped if the primary has the best log)
+ #6  GetMissing  ── MOSDPGQuery2 (log) ───────────► every other OSD of the acting set, and backfill targets
+                 ◄─ MOSDPGLog (its log, its missing set) ┘   (skipped for an OSD that is empty or up to date)
+ #7  WaitUpThru  ── MOSDAlive: "record my up_thru" ──────────────────────────────────────► mon
+                 ◄─ MOSDMap: a new epoch that has it ◄────────────────────────────────────┘
+ #8  Activating  ── MOSDPGLog (new info + the log entries it lacks) ─► replica: Stray ─► ReplicaActive
+                    (only MOSDPGInfo2 if the replica is already up to date)
+                 ◄─ MOSDPGInfo2: "activation committed" ─┘
+                 all replicas answered ─► the PG is active: client I/O runs again
+```
 
 | # | State | In one sentence |
 |---|---|---|
-| #2 | [`Reset`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.h#L714) | A new interval began. Forget the old peering, wait for `ActMap`. |
+| #2, #11 | [`Reset`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.h#L714) | A new interval began. Forget the old peering, wait for `ActMap`. |
 | #3 | [`Start`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.h#L773) | Am I the primary of the acting set? Then `MakePrimary`, else `MakeStray`. |
-| #4 | [`GetInfo`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.h#L1293) | Ask every OSD that may have served this PG in a past interval for its [`pg_info_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.h#L3105) ([`MOSDPGQuery2`](https://github.com/ceph/ceph/blob/v21.3.0/src/messages/MOSDPGQuery2.h#L9) → [`MOSDPGNotify2`](https://github.com/ceph/ceph/blob/v21.3.0/src/messages/MOSDPGNotify2.h#L9)). [`PastIntervals`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.h#L3420) says whom to ask. |
-| #5 | [`GetLog`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.h#L1316) | Pick the OSD with the best log ([`find_best_info`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.cc#L1690)), decide the acting set ([`choose_acting`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.cc#L2522)), fetch that log ([`MOSDPGLog`](https://github.com/ceph/ceph/blob/v21.3.0/src/messages/MOSDPGLog.h#L23)) and merge it ([`proc_master_log`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.cc#L3385), [`PGLog::merge_log`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PGLog.cc#L388)). The primary's log is now the truth. |
-| #6 | [`GetMissing`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.h#L1343) | Get the log of each acting replica and compute what each one is missing ([`proc_replica_log`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.cc#L3603)). |
-| #7 | [`WaitUpThru`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.h#L1360) | Wait until the mon has written into the map that this primary was alive in this interval (`up_thru`). Later peerings need this to know if this interval could have taken writes. It costs one new map epoch: the 553 ms above. |
-| #8 | [`Activating`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.h#L1215) | [`PeeringState::activate`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.cc#L2911): send each replica its info and log, write the new state to disk. When all replicas have answered, **client I/O runs again**. |
+| #4 | [`GetInfo`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.h#L1293) | Collect the [`pg_info_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.h#L3105) of every OSD that may hold writes of this PG ([`get_infos`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.cc#L7555)). |
+| #5 | [`GetLog`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.h#L1316) | Pick the best log ([`find_best_info`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.cc#L1690)) and the acting set ([`choose_acting`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.cc#L2522)). Fetch that log and merge it ([`proc_master_log`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.cc#L3385), [`PGLog::merge_log`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PGLog.cc#L388)). The primary now holds the authoritative log. |
+| #6 | [`GetMissing`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.h#L1343) | Compare each replica's log with the authoritative log. The difference is that replica's missing set ([`proc_replica_log`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.cc#L3603)). |
+| #7 | [`WaitUpThru`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.h#L1360) | Wait for a map that records `up_thru` for this primary ([`OSD::send_alive`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L7256), [`MOSDAlive`](https://github.com/ceph/ceph/blob/v21.3.0/src/messages/MOSDAlive.h#L23)). |
+| #8 | [`Activating`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.h#L1215) | [`PeeringState::activate`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.cc#L2911): send each replica the new info and the log entries it lacks, and write the new state to disk. |
 | #9 | [`Recovered`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.h#L939) | Nothing is missing anywhere. |
 | #10 | [`Clean`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.h#L926) | The acting set is the up set and all is complete: `active+clean`. |
-| #12 | [`Stray`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.h#L1225) | Not the primary. Answer queries, wait for the primary's log or info. |
+| #12 | [`Stray`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.h#L1225) | Every OSD that is not the primary starts here. Answer queries, wait for the primary to activate me. |
 | #13 | [`ReplicaActive`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.h#L1043) | Activated by the primary. Apply `MOSDRepOp`. |
 
-Notice #8: the PG goes active **before** recovery. Client I/O does not
-wait for the PG to be complete. Only an op on an object that is still
-missing waits, and that object is recovered first.
+The messages: [`MOSDPGQuery2`](https://github.com/ceph/ceph/blob/v21.3.0/src/messages/MOSDPGQuery2.h#L9),
+[`MOSDPGNotify2`](https://github.com/ceph/ceph/blob/v21.3.0/src/messages/MOSDPGNotify2.h#L9),
+[`MOSDPGLog`](https://github.com/ceph/ceph/blob/v21.3.0/src/messages/MOSDPGLog.h#L23),
+[`MOSDPGInfo2`](https://github.com/ceph/ceph/blob/v21.3.0/src/messages/MOSDPGInfo2.h#L9). What a query asks for
+is in [`pg_query_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.h#L3973).
 
-## 8.3 The state map
+**#7, `up_thru`.** The primary asks the mon to write into the OSDMap:
+"this OSD was alive as a primary up to this epoch". Without that mark,
+a later peering could not know if this interval took writes or if the
+primary died before it served one. With it, the later peering knows it
+must find an OSD of this interval. The cost is one new map epoch: the
+553 ms above.
 
-One arrow per line, so that no line can be read the wrong way.
+**#8, active before recovered.** The PG goes active *before* recovery.
+Client I/O does not wait for the PG to be complete. Only an op on an
+object that is still missing waits, and that object is recovered first.
+
+**Block-layer view:** `up_thru` has the purpose of md raising the event
+count on the surviving members *before* it writes in degraded mode, so
+that the dropped disk is known to be stale later. The limit: Ceph
+records it in the OSDMap, at the mon, because no single OSD sees all
+members.
+
+## 10.3 The state map
+
+In a statechart, states nest. `Started/Primary/Peering/GetInfo` is a
+path: `GetInfo` is inside `Peering`, which is inside `Primary`, which is
+inside `Started`. An event that the inner state does not handle goes to
+the state around it. When a state is entered, its first inner state is
+entered too.
 
 ```
- Initial ────Initialize───────────► Reset
- Reset ──────ActMap───────────────► Started           it starts in Start
- Start ──────MakePrimary──────────► Primary           it starts in Peering / GetInfo
- Start ──────MakeStray────────────► Stray
- Stray ──────MLogRec or MInfoRec──► ReplicaActive     RepNotRecovering, RepWait…Reserved, RepRecovering
- any state inside Started ─AdvMap that starts a new interval─► Reset
+ Initial
+ Reset
+ Started
+ ├── Start
+ ├── Primary
+ │   ├── Peering            GetInfo (first) · GetLog · GetMissing · WaitUpThru · Down · Incomplete
+ │   ├── WaitActingChange
+ │   └── Active             Activating (first) · Recovered · Clean
+ │                          WaitLocalRecoveryReserved · WaitRemoteRecoveryReserved · Recovering · NotRecovering
+ │                          WaitLocalBackfillReserved · WaitRemoteBackfillReserved · Backfilling · NotBackfilling
+ ├── Stray
+ ├── ReplicaActive          RepNotRecovering (first) · RepWaitRecoveryReserved · RepWaitBackfillReserved · RepRecovering
+ └── ToDelete               WaitDeleteReserved (first) · Deleting
+```
 
- Primary / Peering
-   GetInfo ─────GotInfo───────────► GetLog
-   GetLog ──────GotLog────────────► GetMissing
-   GetMissing ──NeedUpThru────────► WaitUpThru
-   Peering ─────Activate──────────► Active            posted by GetMissing, or by WaitUpThru when the map came
-   GetInfo ─────IsDown────────────► Down
-   GetLog ──────IsIncomplete──────► Incomplete
-   GetLog ──────NeedActingChange──► WaitActingChange  a state of Primary; it leaves only with a new map (► Reset)
+The main arrows, one per line:
 
- Primary / Active                                     it starts in Activating
-   Activating ──AllReplicasRecovered──► Recovered ──GoClean──► Clean
-   Activating ──DoRecovery────────► WaitLocalRecoveryReserved ─► WaitRemoteRecoveryReserved ─► Recovering
-   Activating ──RequestBackfill───► WaitLocalBackfillReserved ─► WaitRemoteBackfillReserved ─► Backfilling
-   Recovering ──AllReplicasRecovered──► Recovered
-   Recovering ──RequestBackfill───► WaitLocalBackfillReserved    log recovery is done, a backfill target is left:
-                                                                 both reservations are taken again
-   Backfilling ─Backfilled────────► Recovered
+```
+ Initial ─────Initialize──────────────► Reset
+ Reset ───────ActMap──────────────────► Started / Start
+ Start ───────MakePrimary─────────────► Primary / Peering / GetInfo
+ Start ───────MakeStray───────────────► Stray
+ Stray ───────MLogRec or MInfoRec─────► ReplicaActive
+ anything in Started ─AdvMap that starts a new interval──► Reset
+ anything in Peering ─AdvMap that changes the prior set──► Reset      e.g. the OSD that Down waits for came up
+
+ GetInfo ─────GotInfo─────────────────► GetLog
+ GetLog ──────GotLog──────────────────► GetMissing
+ GetMissing ──NeedUpThru──────────────► WaitUpThru
+ Peering ─────Activate────────────────► Active / Activating           posted by GetMissing, or by WaitUpThru
+ GetInfo ─────IsDown──────────────────► Down
+ Down ────────MNotifyRec, newer info──► GetInfo
+ GetLog ──────IsIncomplete────────────► Incomplete
+ Incomplete ──MNotifyRec, new info────► GetLog
+ GetLog ──────NeedActingChange────────► WaitActingChange              it leaves only with a new map, to Reset
+
+ Activating ──AllReplicasRecovered────► Recovered
+ Recovered ───GoClean─────────────────► Clean
+ Activating ──DoRecovery──────────────► WaitLocalRecoveryReserved
+ WaitLocalRecoveryReserved ──LocalRecoveryReserved──► WaitRemoteRecoveryReserved
+ WaitRemoteRecoveryReserved ─AllRemotesReserved─────► Recovering
+ Recovering ──AllReplicasRecovered────► Recovered
+ Activating ──RequestBackfill─────────► WaitLocalBackfillReserved
+ Recovering ──RequestBackfill─────────► WaitLocalBackfillReserved     log recovery is done, a backfill target is left
+ WaitLocalBackfillReserved ──LocalBackfillReserved──► WaitRemoteBackfillReserved
+ WaitRemoteBackfillReserved ─AllBackfillsReserved───► Backfilling
+ Backfilling ─Backfilled──────────────► Recovered
 ```
 
 - **Down**: an OSD that may hold newer writes is not reachable. The PG
-  must wait for it. **Incomplete**: no reachable OSD has a usable log.
-  Both mean: no I/O.
-- **WaitActingChange**: `choose_acting` wants another acting set (for
-  example the old OSDs, because the new one is empty). The primary asks
-  the mon for a `pg_temp` entry. The new map then starts a new interval.
-- The **Wait…Reserved** states are the brake on background work: a PG
-  must get a slot on its own OSD and then on every replica before it
-  may recover or backfill (§9).
+  waits until it comes up. **Incomplete**: no reachable OSD has a usable
+  log. Both mean: no I/O.
+- **WaitActingChange**: `choose_acting` wants another acting set. The
+  primary asks the mon for a `pg_temp` entry (§7 #8). The new map then
+  starts a new interval.
+- The **Wait…Reserved** states throttle background work. A PG must get
+  a reservation on its own OSD, then on every replica. Only then may it
+  recover or backfill (§11).
 
-# 9. Background work
+# 11. Background work
 
-Recovery, backfill, scrub and snap trim do not have threads of their
-own. Each is a queue item, like a client op (§2, idea 2).
+Who does recovery, backfill, scrub and snap trim, and what keeps them
+from hurting client I/O?
+
+They do not have threads of their own. Each is a queue item, like a
+client op (§2, idea 2).
+
+## 11.1 One queue, four classes
 
 ```
-                        ┌───────────────────────────── OSDShard ─────────────────────────────┐
- client op, from the    │  mClock scheduler                                                  │
- network ─────────────► │   class                    items                                   │
- peering event, from a  │   immediate                PGPeeringItem; PGOpItem that is not a   │
- new map ─────────────► │                            client op (MOSDRepOp, replies, ...)     │ ─► tp_osd_tp
- recovery, from a PG    │   client                   PGOpItem with MOSDOp                    │    lock PG,
- that got its slots ──► │   background_recovery      recovery items of a PG that is          │    item.run()
- scrub, from the tick   │                            degraded, undersized or forced          │
- timer ───────────────► │   background_best_effort   recovery items of a PG that is not      │
-                        │                            degraded (misplaced data); PGScrub,     │
-                        │                            PGSnapTrim, PGDelete                    │
-                        └────────────────────────────────────────────────────────────────────┘
+ where items come from                 one op shard                                     who runs them
+                          ┌──────────────────────────────────────────────────────┐
+ a new map (§9),          │  immediate                 NOT scheduled: a strict   │
+ replica ops, replies ──► │    PGPeeringItem           queue that goes first     │
+                          │    PGOpItem that is not a client op (MOSDRepOp, ...) │
+                          │ ──────────────────────────────────────────────────── │
+ clients ───────────────► │  client                    scheduled by mClock:      │ ─► tp_osd_tp:
+                          │    PGOpItem with MOSDOp    each class has            │    lock the PG,
+ a PG that holds its      │  background_recovery         a reservation (minimum) │    item.run()
+ reservations ──────────► │    recovery items of a PG    a weight (share)        │
+                          │    that is degraded,         a limit (maximum)       │
+                          │    undersized or forced                              │
+ the tick timer (scrub),  │  background_best_effort                              │
+ a removed snapshot ────► │    recovery items of a PG that is not degraded       │
+                          │    (misplaced data); PGScrub, PGSnapTrim, PGDelete   │
+                          └──────────────────────────────────────────────────────┘
 ```
+
+Degraded = a copy is missing. Undersized = the acting set is smaller
+than `size`. Misplaced = all copies exist, but one is on the wrong OSD.
+Forced = an admin ran `ceph pg force-recovery`.
 
 The classes are [`op_scheduler_class`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/mclock_common.h#L28).
-Each item says its own class: see
+Each item says its own class:
 [`PGOpItem`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scheduler/OpSchedulerItem.h#L222),
 [`PGPeeringItem`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scheduler/OpSchedulerItem.h#L253),
 [`PGRecovery`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scheduler/OpSchedulerItem.h#L475),
 [`PGRecoveryMsg`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scheduler/OpSchedulerItem.h#L564)
 (push, pull, scan and backfill messages),
 [`PGScrub`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scheduler/OpSchedulerItem.h#L301),
-[`PGSnapTrim`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scheduler/OpSchedulerItem.h#L278). Recovery items get their class from the recovery priority of the PG
+[`PGSnapTrim`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scheduler/OpSchedulerItem.h#L278). Recovery
+items get their class from the recovery priority of the PG
 ([`priority_to_scheduler_class`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scheduler/OpSchedulerItem.h#L201)).
-A replica write is `immediate`: the primary already paid for it in the
-`client` class. `osd_mclock_profile` (here `balanced`) sets how much each class
-gets.
+[`mClockScheduler::enqueue`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scheduler/mClockScheduler.cc#L76)
+puts `immediate` items into a strict queue that is served first.
 
-| Work | Starts when | Path | Brake |
-|---|---|---|---|
-| **Recovery** (log based, §1.4) | peering finds missing objects | [`OSDService::queue_for_recovery`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L662) → [`PGRecovery::run`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scheduler/OpSchedulerItem.cc#L172) → [`OSD::do_recovery`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L9770) → [`PrimaryLogPG::start_recovery_ops`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L13552) → [`recover_primary`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L13712) (pull what the primary misses), [`recover_replicas`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L13984) (push what replicas miss). Wire: [`MOSDPGPull`](https://github.com/ceph/ceph/blob/v21.3.0/src/messages/MOSDPGPull.h#L21), [`MOSDPGPush`](https://github.com/ceph/ceph/blob/v21.3.0/src/messages/MOSDPGPush.h#L21) | [`local_reserver`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L471) and [`remote_reserver`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L472) ([`AsyncReserver`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/AsyncReserver.h#L34), `osd_max_backfills` = 1); `osd_recovery_max_active_ssd` = 10 |
-| **Backfill** (full walk, §1.4) | the log cannot cover the gap | same entry, then [`recover_backfill`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L14152): scan a range on both sides ([`MOSDPGScan`](https://github.com/ceph/ceph/blob/v21.3.0/src/messages/MOSDPGScan.h#L21)), push the differences, move [`last_backfill`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.h#L3116) ([`MOSDPGBackfill`](https://github.com/ceph/ceph/blob/v21.3.0/src/messages/MOSDPGBackfill.h#L21)) | same reservers |
-| **Scrub** | the tick timer: [`OsdScrub::initiate_scrub`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scrubber/osd_scrub.cc#L98) | [`PgScrubber`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scrubber/pg_scrubber.h#L254) runs the [`ScrubMachine`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scrubber/scrub_machine.h#L290): reserve the replicas, then chunk by chunk: [`select_range`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scrubber/pg_scrubber.cc#L969) → every OSD builds a [`ScrubMap`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.h#L6654) ([`be_scan_list`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PGBackend.cc#L930)) → the primary compares ([`scrub_compare_maps`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scrubber/scrub_backend.cc#L253)) | replica reservation ([`ReplicaReservations`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scrubber/scrub_reservations.h#L67)); a write into the chunk being scrubbed stops that chunk (preemption), or waits if the scrub may not be preempted ([`write_blocked_by_scrub`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scrubber/pg_scrubber.cc#L1108)) |
-| **Snap trim** | a snapshot was removed (the OSDMap says so) | the [`SnapTrimmer`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.h#L1662) state machine asks [`SnapMapper`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/SnapMapper.h#L133) for the clones of that snap and removes them with [`trim_object`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L4779), as normal replicated writes | [`snap_reserver`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L520) |
+A replica write (`MOSDRepOp`) is `immediate`. The primary already
+scheduled this write in its `client` class, so the replica does not
+schedule it a second time. `osd_mclock_profile` (here `balanced`) sets
+the reservation, weight and limit of each class.
 
-Repair is not a fifth kind of work. Scrub marks the bad copy as missing
-([`ScrubBackend::repair_object`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scrubber/scrub_backend.cc#L390)),
-and recovery copies a good one over it.
+**Block-layer view:** the three mClock values are like `io.min`,
+`io.weight` and `io.max` of blk-cgroup, and `immediate` is like an
+at-head insert that bypasses the elevator. The limit: the classes are
+fixed kinds of work, not tenants.
 
-Snapshots in one picture: a client write carries a
-[`SnapContext`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/snap_types.h#L83). If it is newer than the
-object's [`SnapSet`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.h#L6016),
-[`make_writeable`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L8799) first clones the
-object inside the same transaction, then the write goes to the head.
+## 11.2 The four kinds of work
 
-# 10. Heartbeat and failure report
+| Work | Starts when | Throttle |
+|---|---|---|
+| **Recovery** (log based, §1.4) | peering finds missing objects | reservations: [`local_reserver`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L471), then [`remote_reserver`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L472) on each replica ([`AsyncReserver`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/AsyncReserver.h#L34), `osd_max_backfills` = 1). Then `osd_recovery_max_active_ssd` = 10 objects at a time |
+| **Backfill** (full walk, §1.4) | the log cannot cover the gap | the same reservations |
+| **Scrub** | the tick timer | a reservation on each replica ([`ReplicaReservations`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scrubber/scrub_reservations.h#L67)) |
+| **Snap trim** | the OSDMap says a snapshot was removed | [`snap_reserver`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L520) |
 
 ```
- osd.0                                           osd.2                        mon
- #1 heartbeat()   thread osd_srv_heartbt,
-                  every 0.5–5.9 s (random)
-      MOSDPing PING, on front AND back ─────────► #2 handle_osd_ping
-      ◄──────────────────────── PING_REPLY ──────────┘  (a msgr-worker thread)
- #3 heartbeat_check()   from tick_without_osd_lock,
-      a safe_timer thread: a peer silent on front
-      or back for more than 20 s (osd_heartbeat_grace)
- #4 send_failures() ── MOSDFailure ──────────────────────────────────────────► #5 prepare_failure
-      same thread; it goes out on the                                             check_failure:
-      "client" messenger, like all mon traffic                                    2 reporters from different
-                                                                                  hosts ─► mark it down
-                                                                                  in a NEW OSDMap epoch
- every OSD gets the new map  ─►  §7  ─►  the PGs of the dead OSD start a new interval  ─►  §8
+ recovery and backfill
+ #1  OSDService::queue_for_recovery          the PG holds its reservations
+ #2  └► PGRecovery::run ─► OSD::do_recovery   a queue item
+ #3     └► start_recovery_ops
+ #4        ├► recover_primary       pull what the primary misses            MOSDPGPull
+ #5        ├► recover_replicas      push what a replica misses              MOSDPGPush
+ #6        └► recover_backfill      scan a range on both sides,             MOSDPGScan
+                                    push the differences,                   MOSDPGPush
+                                    move last_backfill forward              MOSDPGBackfill
+
+ scrub
+ #7  OsdScrub::initiate_scrub                from tick_without_osd_lock
+ #8  └► PgScrubber, ScrubMachine             reserve the replicas, then chunk by chunk:
+ #9     ├► select_range                      the next chunk of objects
+ #10    ├► be_scan_list                      EVERY OSD builds a ScrubMap of the chunk (sizes, attrs, checksums)
+ #11    └► scrub_compare_maps                the primary compares the maps
+ #12       └► repair_object                  repair only: mark the bad copy missing; recovery (#3) copies a good one
+
+ snap trim
+ #13 SnapTrimmer                             a small state machine in the PG
+ #14 └► SnapMapper                           which clones belong to the removed snap?
+ #15    └► trim_object                       remove each clone, as a normal replicated write (§6)
 ```
 
-| # | Function |
+| # | Source |
 |---|---|
-| #1 | [`OSD::heartbeat_entry`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L6171), [`OSD::heartbeat`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L6243); the interval is random, up to `osd_heartbeat_interval` = 6 s. The peers come from [`OSD::maybe_update_heartbeat_peers`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L5684): the OSDs this OSD shares PGs with, plus the next and the previous up OSD by id, plus more until there are `osd_heartbeat_min_peers` (10). So an OSD with no PGs is still watched |
-| #2 | [`OSD::handle_osd_ping`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L5823), [`class MOSDPing`](https://github.com/ceph/ceph/blob/v21.3.0/src/messages/MOSDPing.h#L36), [`struct HeartbeatInfo`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L1541) |
-| #3 | [`OSD::heartbeat_check`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L6194) |
-| #4 | [`OSD::send_failures`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L7337), [`class MOSDFailure`](https://github.com/ceph/ceph/blob/v21.3.0/src/messages/MOSDFailure.h#L23) |
-| #5 | [`OSDMonitor::prepare_failure`](https://github.com/ceph/ceph/blob/v21.3.0/src/mon/OSDMonitor.cc#L3385), [`OSDMonitor::check_failure`](https://github.com/ceph/ceph/blob/v21.3.0/src/mon/OSDMonitor.cc#L3300) (`mon_osd_min_down_reporters` = 2, `mon_osd_reporter_subtree_level` = host). vstart sets the level to `osd`: with `host`, a one-host lab could never mark an OSD down |
+| #1 | [`OSDService::queue_for_recovery`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L662) |
+| #2 | [`PGRecovery::run`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scheduler/OpSchedulerItem.cc#L172), [`OSD::do_recovery`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L9770) |
+| #3 | [`PrimaryLogPG::start_recovery_ops`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L13552) |
+| #4 | [`recover_primary`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L13712), [`MOSDPGPull`](https://github.com/ceph/ceph/blob/v21.3.0/src/messages/MOSDPGPull.h#L21) |
+| #5 | [`recover_replicas`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L13984), [`MOSDPGPush`](https://github.com/ceph/ceph/blob/v21.3.0/src/messages/MOSDPGPush.h#L21) |
+| #6 | [`recover_backfill`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L14152), [`MOSDPGScan`](https://github.com/ceph/ceph/blob/v21.3.0/src/messages/MOSDPGScan.h#L21), [`MOSDPGBackfill`](https://github.com/ceph/ceph/blob/v21.3.0/src/messages/MOSDPGBackfill.h#L21), [`last_backfill`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.h#L3116) |
+| #7 | [`OsdScrub::initiate_scrub`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scrubber/osd_scrub.cc#L98) |
+| #8 | [`PgScrubber`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scrubber/pg_scrubber.h#L254), [`ScrubMachine`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scrubber/scrub_machine.h#L290) |
+| #9 | [`select_range`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scrubber/pg_scrubber.cc#L969) |
+| #10 | [`be_scan_list`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PGBackend.cc#L930), [`ScrubMap`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.h#L6654) |
+| #11 | [`scrub_compare_maps`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scrubber/scrub_backend.cc#L253) |
+| #12 | [`ScrubBackend::repair_object`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scrubber/scrub_backend.cc#L390) |
+| #13 | [`SnapTrimmer`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.h#L1662) |
+| #14 | [`SnapMapper`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/SnapMapper.h#L133) |
+| #15 | [`trim_object`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L4779) |
 
-OSDs watch each other, the mon only counts reports. Two slower paths
-exist for when the reports do not come: each OSD sends a
-[`MOSDBeacon`](https://github.com/ceph/ceph/blob/v21.3.0/src/messages/MOSDBeacon.h#L8) to the mon every 5 minutes
-([`OSD::send_beacon`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L7381)), and the mon marks an OSD
-down after 15 minutes of silence (`mon_osd_report_timeout`). PG
-statistics do not go to the mon: [`OSD::collect_pg_stats`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L7924)
-builds an [`MPGStats`](https://github.com/ceph/ceph/blob/v21.3.0/src/messages/MPGStats.h#L25) for the **mgr**.
+Scrub and client writes: a write into the chunk that is being scrubbed
+stops that chunk, and the scrub tries it again later (preemption). If
+the scrub may not be preempted any more, the write waits
+([`write_blocked_by_scrub`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scrubber/pg_scrubber.cc#L1108)).
 
-The regular housekeeping runs from two timers:
-[`OSD::tick`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L6377) (with `osd_lock`) and
-[`OSD::tick_without_osd_lock`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L6432), which also starts
-scrubs.
-
-# 11. Data structures: who owns what
+## 11.3 Snapshots in one picture
 
 ```
- OSD                                 one per process                                   OSD.h:1243
- ├── OSDService                      helpers shared by all PGs: map cache, reservers,  OSD.h:99
- │                                   recovery throttle, timers, the objecter
- ├── 7 messengers, heartbeat_peers ─► HeartbeatInfo                                    OSD.h:1541
- ├── OSDSuperblock                   who am I, which map epochs do I have              osd_types.h:5835
- ├── OSDMapRef                       the current map                                   OSDMap.h:363
- └── OSDShard × 8                                                                      OSD.h:985
-     ├── OpScheduler (mClock)        the queue of this shard
-     └── pg_slots: spg_t ─► OSDShardPGSlot                                             OSD.h:960
-                              ├── to_process     items taken from the queue, waiting for the PG lock
-                              └── PG ─────────────────────────────────────────┐
-                                                                              ▼
- PG  (PrimaryLogPG)                  one per PG on this OSD                            PG.h:169
- ├── _lock                           THE lock: all work on this PG is serial           PG.h:802
- ├── PeeringState  (recovery_state)                                                    PeeringState.h:275
- │   ├── pg_info_t                   last_update, last_complete, log_tail,             osd_types.h:3105
- │   │   └── pg_history_t            last_backfill; the epochs of the past             osd_types.h:2922
- │   ├── PastIntervals               who served this PG before                         osd_types.h:3420
- │   ├── PGLog ─► IndexedLog         the log (§1.3), indexed by object                 PGLog.h:126
- │   │   └── pg_missing_t            what this OSD is missing                          osd_types.h:5549
- │   ├── peer_info, peer_missing     the same for every other OSD of the PG
- │   └── MissingLoc                  for each missing object: which OSD has it         MissingLoc.h:15
- ├── object_contexts                 cache: hobject_t ─► ObjectContext                 osd_internal_types.h:40
- ├── repop_queue                     RepGather: writes that wait for commits           PrimaryLogPG.h:864
- ├── PGBackend                       ReplicatedBackend or ECSwitch                     PGBackend.h:64
- ├── PgScrubber, SnapTrimmer, SnapMapper
- └── ch                              this PG's collection in the ObjectStore
+ o48:head  v1                     the live object
+     │ a snapshot is taken: snap id 5. The object is not touched.
+     │ a write arrives. It carries a SnapContext: "the newest snap is 5"
+     ▼
+ make_writeable: 5 is newer than anything in the object's SnapSet
+     ├─ clone  o48:head ─► o48:5          the old data, read-only
+     └─ then write o48:head               clone + write = one transaction
+     ▼
+ o48:head  v2    SnapSet { clones: [5] }  (kept in an attribute of the head)
+ o48:5     v1
+     │ the snapshot is removed
+     ▼
+ snap trim (§11.2 #13) removes o48:5
 ```
 
-Links for this tree:
-[`class OSD`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L1243) ·
-[`class OSDService`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L99) ·
-[`class OSDSuperblock`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.h#L5835) ·
-[`struct OSDShard`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L985) ·
-[`struct OSDShardPGSlot`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L960) ·
-[`class PG`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PG.h#L169) ·
-[`class PeeringState`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.h#L275) ·
-[`struct pg_info_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.h#L3105) ·
-[`struct pg_history_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.h#L2922) ·
-[`class PastIntervals`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.h#L3420) ·
-[`struct PGLog`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PGLog.h#L126) ·
-[`struct IndexedLog`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PGLog.h#L171) ·
-[`pg_missing_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.h#L5549) ·
-[`class MissingLoc`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/MissingLoc.h#L15) ·
-[`struct ObjectContext`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_internal_types.h#L40) ·
-[`class PGBackend`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PGBackend.h#L64).
-
-Locks, from the outside in. The only comment about the order of the PG
-and shard locks
-([`lock ordering`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L62), `OSD.h:62`) is out of date: it names
-`ShardData::lock` and `OSD::pg_map_lock`, which no longer exist.
-
-| Lock | Protects |
-|---|---|
-| [`PG::_lock`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PG.h#L802) | everything inside one PG. Taken by the worker before `run()` |
-| [`OSDShard::shard_lock`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L1006) | one shard's queue and `pg_slots` |
-| [`OSD::osd_lock`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L1249) | OSD-wide state: boot, shutdown, `tick`, map handling |
-| [`OSD::map_lock`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L1893) | the current `OSDMap` pointer: readers against the publish step |
-| [`OSD::heartbeat_lock`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L1616) | `heartbeat_peers`. Separate, so that a ping never waits for `osd_lock` |
+[`SnapContext`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/snap_types.h#L83) ·
+[`SnapSet`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.h#L6016) ·
+[`make_writeable`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L8799).
 
 # 12. What the OSD keeps on disk
+
+Where is all this state when the OSD is down?
 
 The OSD has no files of its own. All its state is objects, attributes
 and omap keys in the ObjectStore.
@@ -768,16 +1114,19 @@ and omap keys in the ObjectStore.
  ├── osd_superblock                     OSDSuperblock: fsid, whoami, oldest and newest map
  ├── osdmap.<epoch>                     one full map per epoch kept
  ├── inc_osdmap.<epoch>                 one incremental map per epoch kept
- ├── snapmapper                         snap ─► objects index (keys SNA_…, OBJ_…)
- └── purged_snaps                       snaps already trimmed (keys PSN_…)
+ ├── snapmapper                         snap ─► objects index (omap keys SNA_…, OBJ_…)
+ └── purged_snaps                       snaps already trimmed (omap keys PSN_…)
 
  collection "<pgid>_head", e.g. 8.2_head                           one per PG
- ├── pgmeta object  (empty name)        data: none.  omap:
- │     _infover, _info, _biginfo        pg_info_t; past intervals + purged snaps
+ ├── pgmeta object  (empty name)        data: none.  omap keys:
+ │     _infover                         format version
+ │     _info                            pg_info_t
+ │     _biginfo                         past intervals + purged snaps
  │     _fastinfo                        the few pg_info_t fields that change on EVERY write
  │     _epoch                           the PG's map epoch
- │     0000000071.00000000000000000003  one key per pg_log_entry_t, sorted by version
- │     dup_…, missing/…                 old request ids; the missing set
+ │     0000000071.00000000000000000003  one key per pg_log_entry_t, sorted by version (this one = 71'3)
+ │     dup_…                            old request ids: to detect a client that sends an old op again
+ │     missing/…                        the missing set
  └── every object of the PG
        data                             the bytes
        xattr "_"                        object_info_t: version, size, mtime, last request id
@@ -794,13 +1143,18 @@ and omap keys in the ObjectStore.
 | log keys | [`eversion_t::get_key_name`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.cc#L1300), [`PGLog::_write_log_and_missing`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PGLog.cc#L880) |
 | object attributes | [`OI_ATTR`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.h#L6067), [`SS_ATTR`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.h#L6068) |
 
-This closes a loop with the BlueStore post. It found that one client
-write puts two `P` records and one `O` record (the onode) into RocksDB.
-Now the two `P` records have names: the log key and `_fastinfo` of the
-pgmeta object. `finish_ctx` builds the log entry in memory (§5, #8).
-`submit_transaction` (#10) puts both keys into the transaction, through
-`log_operation` → `append_log` → `write_if_dirty`. It is the same
-transaction as the data.
+This answers an open question of the BlueStore post. That post found
+that one client write puts two `P` records and one `O` record (the
+onode) into RocksDB, where `P` is BlueStore's key prefix for the omap of
+pgmeta objects. Now the two `P` records have names:
+
+```
+ one client write = ONE ObjectStore transaction on each OSD
+   data of o48                              ─► the device
+   xattr "_" of o48 (object_info_t)         ─► inside the O record
+   pgmeta key 0000000071.0000…0003          ─► P record 1: the PG log entry      (§6 #10, log_operation)
+   pgmeta key _fastinfo                     ─► P record 2: the new last_update   (§6 #10, log_operation)
+```
 
 # 13. What comes next
 
@@ -810,12 +1164,69 @@ call trees.
 
 | Study | Run in the lab |
 |---|---|
-| One write, 3 replicas: the OSD layer | the §5 write, with bpftrace on all three OSDs and the op tracker checked against it; then one read |
+| One write, 3 replicas: the OSD layer | the §6 write, with bpftrace on all three OSDs and the op tracker checked against it; then one read |
+| One OSD failure | `kill -STOP` one OSD: from the missed ping to the new map |
 | One OSDMap epoch | `ceph osd out`, followed from the mon message to each PG |
 | One peering | stop osd.2 while writing to `pg1`, start it again |
 | One recovery | the objects written while osd.2 was down |
-| One backfill | add a fourth OSD |
+| One backfill | add a fourth OSD, after the PG has trimmed its log (§1.4) |
 | One deep scrub, one repair | damage one copy with `ceph-objectstore-tool` |
 | One snapshot, one snap trim | `rados mksnap`, overwrite, `rmsnap` |
-| One OSD failure | `kill -STOP` one OSD: from the missed ping to the new map |
-| What each client asks the OSD to do | one `rbd` write, one CephFS write, one S3 PUT: the op vectors, watch/notify, object classes |
+| What each client asks the OSD to do | one `rbd` write, one CephFS write, one S3 PUT: the `OSDOp` lists, watch/notify, object classes |
+
+# Appendix A. Two lab traps
+
+## A.1 A SCSI disk sets its rotational flag again
+
+A virtual disk says `rotational=1`. Then BlueStore *and* the OSD pick
+HDD settings: deferred writes (see the BlueStore post), 1 op shard × 5
+threads instead of 8 × 2, the hdd values for mClock. The BlueStore post
+cleared the flag with `echo 0`. On `/dev/sda` the flag does not stay 0:
+
+```
+ echo 0 > /sys/block/sda/queue/rotational
+ any writer closes /dev/sda            dd, ceph-osd --mkfs, an OSD stop;
+        │                              a starting OSD opens and closes it ~6 times
+        ▼
+ udev watches the disk, sees the close, and asks the kernel to read the partition table again
+        ▼
+ the kernel opens the disk for that scan; sd reads the disk's properties again
+        ▼
+ rotational = 1
+```
+
+bpftrace shows it
+([`rrpart.bt`]({{ site.baseurl }}/code/ceph/rrpart.bt)), for one open and
+close of a disk by a writer:
+
+```
+716    systemd-udevd    ioctl(BLKRRPART)
+716    systemd-udevd    sd_revalidate_disk
+        sd_revalidate_disk+1
+        sd_open+317
+        blkdev_get_whole+44
+        bdev_open+514
+        bdev_file_open_by_dev+201
+        disk_scan_partitions+104
+        blkdev_ioctl+455
+        __x64_sys_ioctl+151
+```
+
+An NVMe disk and a virtio disk kept the 0 in the same test. BlueStore
+opens its device with `O_EXCL`
+([`KernelDevice::open`](https://github.com/ceph/ceph/blob/v21.3.0/src/blk/kernel/KernelDevice.cc#L161)), so
+while an OSD *runs*, the scan is refused. But at every OSD stop and
+start the device is closed for a moment, and the scan happens then.
+
+The fix is a udev rule with `OPTIONS:="nowatch"`: udev stops watching
+the device for a close after a write
+([`99-osdlab-rotational.rules`]({{ site.baseurl }}/code/ceph/99-osdlab-rotational.rules)).
+`osdlab.sh` checks `bluestore_bdev_type` of every OSD and stops if one
+is not `ssd`.
+
+## A.2 vstart can lose an OSD
+
+vstart runs `ceph-osd --mkfs` right after `ceph osd new`. On a slow mon
+the new cephx key is sometimes not usable yet: mkfs fails with
+`handle_auth_bad_method`, and that OSD never starts. `osdlab.sh` does
+mkfs again for every OSD that has no store.
