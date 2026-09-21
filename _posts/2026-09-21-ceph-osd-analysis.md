@@ -1055,9 +1055,10 @@ items get their class from the recovery priority of the PG
 [`mClockScheduler::enqueue`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scheduler/mClockScheduler.cc#L76)
 puts `immediate` items into a strict queue that is served first.
 
-A replica write (`MOSDRepOp`) is `immediate`. The primary already
-scheduled this write in its `client` class, so the replica does not
-schedule it a second time. `osd_mclock_profile` (here `balanced`) sets
+A replica write (`MOSDRepOp`) is `immediate`. My reading of why (no
+comment in the code says it): the primary already scheduled this write
+in its `client` class, so the replica does not schedule it a second
+time. `osd_mclock_profile` (here `balanced`) sets
 the reservation, weight and limit of each class.
 
 **Block-layer view:** the three mClock values are like `io.min`,
