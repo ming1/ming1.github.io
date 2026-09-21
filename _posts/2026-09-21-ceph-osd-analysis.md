@@ -644,7 +644,7 @@ The objects of this path, and how long each lives (`#N` as above):
    ├── the OSDOp list
    ├── PGTransaction ──#10──► ObjectStore::Transaction (local)  +  MOSDRepOp (replicas)
    └── the log entries
- RepGather                                     #9 … #13         PG layer (made in execute_ctx): wait for all commits, run callbacks
+ RepGather                                     #9 … #13         PG layer: wait for all commits, run callbacks
    └── InProgressOp                            #10 … #12        backend: waiting_for_commit {2,0,1} shrinks to {}
 ```
 
