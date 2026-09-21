@@ -181,9 +181,9 @@ uretprobe:$1:_ZN4ceph3osd9scheduler8PGOpItem3runE*
 
 /* every op tracker event of the traced op, as the OSD records it.  The
  * first events are marked inside create_request, before the pointer is
- * known (@cur); the last one, "done", when the OpRequest is destroyed,
- * which can be after the worker finished the item (@op; an OpRequest is
- * a TrackedOp at offset 0). */
+ * known (@cur); the last one, "done", when the last reference to the
+ * OpRequest is dropped (TrackedOp::put), which can be after the worker
+ * finished the item (@op; an OpRequest is a TrackedOp at offset 0). */
 uprobe:$1:_ZN9TrackedOp10mark_eventE*
 /@cur[tid] || @op[arg0]/
 {

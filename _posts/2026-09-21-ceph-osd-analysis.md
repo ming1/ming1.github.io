@@ -1229,14 +1229,16 @@ the OSD:
   So the script follows *one op*: by message tid at the messenger, by
   `OpRequest` pointer through the queue, and by thread while a worker
   runs it.
-- **The op tracker forgets fast.** It keeps the last 20 ops
-  (`osd_op_history_size`), and a finished op reaches the history through
-  its own thread (`OpHistorySvc`). Ask too early and the op is not there
-  yet. Ask 3 s later and the background ops have pushed it out. The
+- **The op tracker forgets fast.** Its history holds 20 ops
+  (`osd_op_history_size`). When it is full, it drops the op with the
+  *shortest* duration. A finished op reaches the history through its own
+  thread (`OpHistorySvc`). Ask too early and the op is not there yet.
+  Ask 3 s later and slower background ops have pushed it out. The
   collector raises the size for the run and asks after one second.
 - **Return values move the arguments.** A function that returns an
-  object (`mClockScheduler::dequeue`, `get_object_context`) gets the
-  return slot as its first argument, so `this` is `arg1`, not `arg0`.
+  object with a destructor (`mClockScheduler::dequeue` returns a
+  `std::variant`, `get_object_context` a `shared_ptr`) gets the return
+  slot as its first argument. So `this` is `arg1`, not `arg0`.
 
 ## 13.2 The write, line by line
 
@@ -1399,8 +1401,8 @@ the moment the OSD records it. The four messenger events
 
 ```
  #3   319  message arrives on msgr-worker-2
- #8   333  enqueue_op                        14 us   make the OpRequest, find the PG's op shard
- #10  338  mClockScheduler::enqueue                  scheduler 0x…1880
+ #8   333  enqueue_op                        14 us   make the OpRequest, read the PG id from the message
+ #10  338  mClockScheduler::enqueue           5 us   find the PG's op shard (hash of the PG id): scheduler 0x…1880
       366  a worker takes the item from mClock       33 us after #8: a thread must wake up
  #11  375  dequeue_op on tp_osd_tp 36124      9 us   find the PG slot, lock the PG (1 us wait)
 ```
@@ -1418,7 +1420,7 @@ toll again: the two replica ops (#34–#44, #35–#50) and the two replies
     0  #11  dequeue_op                       PG locked
    10  #14  do_op: finish_decode             the OSDOp list is decoded only now, on the worker
    16  #15  do_op_impl                       the checks
-   32  #16  get_object_context(o48)          cached: the object was written before
+   32  #16  get_object_context(o48)          8 us to the next line: most likely a cache hit
    40  #17  EVENT started
    45  #20  do_osd_ops                       writefull ─► PGTransaction
    54  #22  finish_ctx                       the log entry, in memory
@@ -1467,10 +1469,14 @@ mClock never sees the callback (§6, note #11). The thread that ran the
 callbacks was the same in every run of this study: 36116 on the primary,
 39150 on replicaA, 34909 on replicaB. In each OSD it is one fixed worker
 of the PG's op shard. The client op itself ran on either worker (36124
-here, 36116 in other runs). This matches the code: only the worker with
-the smaller index takes the `context_queue`
-([`is_smallest_thread_index`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L11123)), so that commits
-of one shard stay in order.
+here, 36116 in other runs): an item wakes both, and either can win. This
+matches the code: in each shard only the *first* worker takes the
+`context_queue`
+([`is_smallest_thread_index`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L11123):
+`thread_index < num_shards`). With two workers per shard, the SSD
+default, that is the one with the smaller index. With the HDD default,
+1 shard × 5 threads, one of the five runs all callbacks of the OSD. The
+reason is in a source comment: commits of one shard must stay in order.
 
 `waiting_for_commit=2` at #82 means: replicaA had already answered
 (#76), so the set was {primary, replicaB}. In this run a replica
@@ -1481,12 +1487,12 @@ client leaves when the set is empty (#102), whoever was last.
 
 | Part | µs | |
 |---|---|---|
-| client: submit → socket | 283 | #1–#2: `rados` opens its session |
+| client: submit → socket | 283 | #1–#2: most likely `rados` opens its session to the OSD |
 | primary: socket → PG lock | 56 | zoom-in 1 |
 | primary: under the PG lock | 250 | zoom-in 2; about 100 of it is the store's submit |
 | **three stores, in parallel** | **14300 · 18697 · 18997** | #62, #81, #85. The slowest one decides |
 | primary: 2 replies + 1 callback | about 160 | #69–#79, #81–#84, #92–#101: mostly the queue toll |
-| primary: last reply → `MOSDOpReply` on the socket | 30 | #101–#106 |
+| primary: last reply → `MOSDOpReply` on the socket | 26 | #101–#106 |
 
 The OSD layer's own work on the primary is about 0.5 ms of 19.5 ms. On
 these slow virtual disks that is 2.5 %. The cost is per op, not per
@@ -1584,13 +1590,22 @@ But look at the lock. The PG is locked from #11 to #26: **the whole
 read from the device, 1603 µs, happens under the PG lock**
 (`objects_read_sync`, #22–#23). A write holds the PG for 250 µs and
 then waits for 19 ms *without* the lock. A read in a replicated pool
-waits for the device *with* the lock. Every other op of this PG waits
+that misses the cache waits for the device *with* the lock. Every other op of this PG waits
 behind it. In another run of this same read, the device needed 97 ms,
 and the PG was locked for 97 ms.
 
-(The read goes to the device although the object was written just
-before: `bluestore_default_buffered_write` is false, so BlueStore does
-not keep written data in its cache.)
+There is a second cost. This read ran on thread 36116, the primary's
+callback worker (§13.4, zoom-in 3). Commit callbacks run only from that
+thread's loop. So while it waits for the device, the commits of **every
+PG of this op shard** wait too, not only the ops of PG `8.2`.
+
+This trace always shows a cache miss. The object was written just
+before, and `bluestore_default_buffered_write` is false: BlueStore does
+not keep written data in its cache. It does keep data that was *read*
+(`bluestore_default_buffered_read` is true). A second read of `o48`
+would come from the cache, and the lock would be held for microseconds.
+So the exact statement is: a read in a replicated pool that misses the
+cache waits for the device with the PG lock held.
 
 | Function in the trace | Source |
 |---|---|
