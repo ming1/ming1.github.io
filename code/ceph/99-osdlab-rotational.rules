@@ -1,0 +1,8 @@
+# osdlab: the OSD test disks are virtual; let BlueStore see them as SSD.
+#
+# udev watches every disk and answers each close-after-write with a
+# partition re-read (BLKRRPART).  For a SCSI disk that re-read makes sd
+# fetch the rotational flag from the device again, so a 0 written to
+# sysfs is lost as soon as dd, ceph-osd --mkfs or a stopping OSD closes
+# the disk.  nowatch stops the re-read; the 0 then stays.
+ACTION=="add|change", SUBSYSTEM=="block", KERNEL=="sda|vdb", OPTIONS:="nowatch", ATTR{queue/rotational}="0"
