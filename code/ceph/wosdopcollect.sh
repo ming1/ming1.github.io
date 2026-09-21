@@ -61,8 +61,9 @@ for i in $(seq 1 120); do
 	sleep 1
 done
 
-# The OSD keeps only its last 20 ops (osd_op_history_size), and the MDS
-# and the RGW of the lab send more than that in a few seconds.
+# The OSD's op history holds only 20 ops (osd_op_history_size) and drops
+# the shortest one when it is full; the MDS and the RGW of the lab fill
+# it in a few seconds.
 bin/ceph tell osd.$PRI config set osd_op_history_size 2000 >/dev/null 2>&1
 
 # The traced op.
