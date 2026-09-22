@@ -2520,10 +2520,12 @@ blob with `blob_start` 0. A and B are therefore on the same csum grid, and
 
 <div class="language-plaintext highlighter-rouge"><div class="highlight"><pre class="highlight"><code> onode a    0x0000~0x8000 -&gt; A @ 0      0x8000~0x8000 -&gt; B @ 0x8000
 
+ blob A     SHARED sbid 1, llen 0x8000, pextents [P~0x8000], csum [c0]
  blob B     private, llen 0x10000, blob_start 0
             pextents [hole~0x8000]<span style="color:#d11">[Q~0x3000][R~0x5000]</span>   csum [ - , c1]
 
  csum grid   chunk 0: 0x0000-0x7fff  |  chunk 1: 0x8000-0xffff
+ blob A      |&lt;----- P 0x8000 -----&gt;|
  blob B      |&lt;------ hole ------&gt;|<span style="color:#d11">&lt;-- Q 0x3000 --&gt;|&lt;---- R 0x5000 ----&gt;</span>|
                                                    <span style="color:#d11">^ pextent boundary at 0xb000,</span>
                                                      <span style="color:#d11">inside chunk 1</span>
