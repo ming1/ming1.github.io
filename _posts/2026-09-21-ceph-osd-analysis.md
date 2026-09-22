@@ -1647,14 +1647,14 @@ identical. The mon's laggy history from an earlier incident:
  39  11:30:26.423  osd.1   pg 9.0: start_peering_interval up [1,2,0] -> [1,0]
  40  11:30:26.424  osd.0   _committed_osd_maps 93
  41  11:30:26.424  osd.1   pg 9.0: enter Peering/GetInfo
- 42  11:30:26.424  osd.1   pg 9.0: build_prior: up_thru 91 < same_interval_since 93, must notify monitor
+ 42  11:30:26.424  osd.1   pg 9.0: build_prior: up_thru 91 < same_since 93, must notify monitor
  43  11:30:26.424  osd.1   pg 9.0: GetInfo, querying info from osd.0
  44  11:30:26.425  osd.0   --> osd_alive(want up_thru 93) to mon
  45  11:30:26.426  mon     <== osd_alive(want up_thru 93) from osd.0
  46  11:30:26.432  osd.1   pg 9.0: enter Peering/WaitUpThru
  47  11:30:26.440  osd.0   pg 8.2: start_peering_interval up [2,0,1] -> [0,1]
  48  11:30:26.440  osd.0   pg 8.2: enter Peering/GetInfo
- 49  11:30:26.440  osd.0   pg 8.2: build_prior: up_thru 91 < same_interval_since 93, must notify monitor
+ 49  11:30:26.440  osd.0   pg 8.2: build_prior: up_thru 91 < same_since 93, must notify monitor
  50  11:30:26.440  osd.0   pg 8.2: GetInfo, querying info from osd.1
  51  11:30:26.440  osd.0   pg 8.2: enter Peering/WaitUpThru
  52  11:30:27.451  osd.1   <== osd_map(94..94) from the mon
@@ -1682,7 +1682,7 @@ identical. The mon's laggy history from an earlier incident:
  74  11:30:33.721  mon     <== osd_alive(want up_thru 96) from osd.2
  75  11:30:33.722  osd.1   pg 9.0: start_peering_interval up [1,0] -> [1,2,0]
  76  11:30:33.722  osd.1   pg 9.0: enter Peering/GetInfo
- 77  11:30:33.722  osd.1   pg 9.0: build_prior: up_thru 93 < same_interval_since 96, must notify monitor
+ 77  11:30:33.722  osd.1   pg 9.0: build_prior: up_thru 93 < same_since 96, must notify monitor
  78  11:30:33.722  osd.1   pg 9.0: GetInfo, querying info from osd.0
  79  11:30:33.722  osd.1   pg 9.0: GetInfo, querying info from osd.2
  80  11:30:33.745  osd.1   pg 9.0: enter Peering/WaitUpThru
@@ -1728,15 +1728,15 @@ identical. The mon's laggy history from an earlier incident:
  30:33.61  #69 start_boot ─► osd_boot ─────────────────────────────────────────────────────► #70–#72 e96: osd.2 up
  30:33.72  #73 booting ─► active
                                 #75 pg 9.0: new interval [1,0] ─► [1,2,0]; GetInfo asks osd.0 AND osd.2
- 30:34.74                                                                                       #82 e97: up_thru 96
+ 30:34.74                                                                                       #82 e97: up_thru 96, all three
  30:34.75                       #83 osd.2 has 3 missing ─► #86 Recovering ─► #87 Clean (5 ms)
 ```
 
 ### 4.3.3 Lines 1–18 — the pings stop, and 21 s pass
 
 Each OSD pings each heartbeat peer at a random interval of 0.5–5.9 s
-(§3.4). osd.1's pings to osd.2 in the trace: 02.70, 04.40, 09.70,
-10.20, 14.90, 19.00, 24.30. Every ping gets a **deadline**: its send
+(§3.4). osd.1's last answered ping was at 02.70; its pings after that:
+04.40, 09.70, 10.20, 14.90, 19.00, 24.30. Every ping gets a **deadline**: its send
 time plus [`osd_heartbeat_grace`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L6270) (20 s), set
 in `OSD::heartbeat`. A peer is unhealthy
 when *now* is past the deadline of its **oldest unanswered** ping
@@ -1781,9 +1781,9 @@ three questions:
 ```
  1  enough reporters?     reporters are counted per subtree of level mon_osd_reporter_subtree_level
                           (vstart: osd; default: host).  2 ≥ mon_osd_min_down_reporters (2)        #24
- 2  how long is grace?    osd_heartbeat_grace + a term from the target's laggy history
-                          (get_grace_time): 20.000 + 0 + 0.  laggy_interval is 0 here, so the
-                          laggy_probability of 0.92 adds nothing                                   #24
+ 2  how long is grace?    osd_heartbeat_grace + the target's laggy term + the reporters' average
+                          laggy term (get_grace_time): 20.000 + 0 + 0.  laggy_interval is 0 for
+                          all three OSDs, so the laggy_probability of 0.92 adds nothing            #24
  3  failed long enough?   failed_for = now − max_failed_since, the MOST RECENT failed_since of
                           the reporters: 26.000 − 03.001 = 23.0 s ≥ 20 s ─► mark it down          #24, #25
 ```
@@ -1792,9 +1792,12 @@ three questions:
 `OSDMonitor.cc:3335`. Two details from the
 numbers. `max_failed_since` is 03.001, not osd.1's real last answer
 02.703: the integer `failed_for` rounded it (26.000 − 23). And the mon
-takes the *latest* `failed_since` of all reporters, so the slowest
-reporter's view sets the clock. One reporter is never enough with the
-defaults, whatever it says.
+takes the *latest* `failed_since` of all reporters: the reporter that
+heard from the target most recently sets the clock. That is the safe
+side. One *timeout* report is never enough
+with the defaults. Only a "connection refused" report (`FLAG_IMMEDIATE`,
+§3.4) marks an OSD down alone. A frozen process keeps its ports open,
+so that path did not run here.
 
 ### 4.3.5 Lines 27–35 — one new epoch
 
@@ -1805,10 +1808,10 @@ and proposes at most once per `paxos_propose_interval` (1 s;
 happen in the same commit:
 
 - [`maybe_prime_pg_temp`](https://github.com/ceph/ceph/blob/v21.3.0/src/mon/OSDMonitor.cc#L1391) (#28)
-  pre-computes `pg_temp` entries for PGs whose acting set would differ
-  from the new up set. Here none is needed: with three OSDs and one
-  down, CRUSH gives every PG the two survivors, in an order they
-  already have.
+  pre-sets `pg_temp` to the old acting set when the new up set has an
+  OSD without the data, mostly when an OSD comes *up*. Here the new up
+  set `[1,0]` is a subset of the old acting set `[1,2,0]`: both
+  survivors have the data, nothing is needed.
 - [`down_pending_out`](https://github.com/ceph/ceph/blob/v21.3.0/src/mon/OSDMonitor.cc#L942) (#29): osd.2 is
   still `in`. If it stays down for `mon_osd_down_out_interval` (600 s),
   the mon marks it `out`, CRUSH gives its PGs a new third OSD, and
@@ -1833,12 +1836,12 @@ Two kinds:
 | up / acting | `[1,2,0]` → `[1,0]` | `[2,0,1]` → `[0,1]` |
 | primary | stays osd.1 | **osd.2 was primary; osd.0 takes over**, as the first of the new up set |
 | GetInfo (#41–#46, #48–#51) | asks the prior set: osd.0 | asks osd.1 |
-| GetLog | primary has the only log | both at `92'23`; the primary's is newest, nothing to fetch |
+| GetLog | both logs empty (`0'0`); the primary wins the tie, nothing to fetch | both at `92'23`; the primary's is newest, nothing to fetch |
 | time in Peering before WaitUpThru | 8 ms | 0.6 ms |
 
 Both then stop in `WaitUpThru` for 1.02 s. The reason is in the log
-(#42, #49): `build_prior: up_thru 91 < same_interval_since 93, must
-notify monitor` ([`build_prior`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.cc#L1452)).
+(#42, #49): `build_prior: up_thru 91 < same_since 93, must notify
+monitor` (`same_since` is `same_interval_since`) ([`build_prior`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.cc#L1452)).
 The primary's `up_thru` in the map is 91, older than the new interval.
 It asks the mon to record it
 ([`queue_want_up_thru`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L7238) → `osd_alive`, #37, #44),
@@ -1854,8 +1857,8 @@ runs. The three writes at 31.7 (#61) show it: osd.1 sends one
 
 One tool note. The script's `ceph pg stat` saw "all active" only at
 31.68 (T2), four seconds after the PGs were active in their own logs.
-PG states reach the mgr with the OSDs' periodic stats reports. The log
-is the truth; `ceph -s` is late.
+PG states reach the mgr with the OSDs' stats reports, every
+`mgr_stats_period` (5 s). The log is the truth; `ceph -s` is late.
 
 ### 4.3.7 Lines 61–87 — the frozen OSD comes back
 
@@ -1866,10 +1869,13 @@ alive. What happens next is in
 
 ```
   #64  "map e94 wrongly marked me down at e93"
- #66  MOSDMarkMeDead(epoch 94) ─► mon        "I really was dead until now": the mon records dead_epoch = 94,
-                                             so that later peerings can trust that no write reached me     ─► e95
+ #66  MOSDMarkMeDead(epoch 94) ─► mon        "I really was dead": the mon records dead_epoch = 94.  A down OSD
+                                             may still answer reads until its read lease runs out, so a new
+                                             primary waits for that lease (PG_STATE_WAIT).  "Dead" ends the
+                                             wait at once.  Here the lease had run out long ago: no effect   ─► e95
  #65  start_waiting_for_healthy               do not boot at once
- #67  is_healthy: 0/2 up peers (< 33 %)       my heartbeat table is stale; wait for answers from my peers
+ #67  is_healthy: 0/2 up peers (< 33 %)       my heartbeat connections were dropped and rebound; I need fresh
+                                             replies, front and back, from at least 33 % of my peers
  #69  1 s later: start_boot ─► osd_boot       _preboot, MOSDBoot with my addresses                          ─► e96
  #73  "state: booting -> active"              I see myself up in e96
 ```
@@ -1891,12 +1897,13 @@ pushes, log-based. That is the next case study's material (§6); the
 data is captured.
 
 One failure and one return cost five epochs: 93 (down), 94 (`up_thru`
-of the survivors), 95 (`dead_epoch`), 96 (up), 97 (`up_thru` of the
-returned OSD).
+of the survivors), 95 (`dead_epoch`), 96 (up), 97 (`up_thru` 96 of all
+three OSDs: e96 started a new interval for every PG).
 
-### 4.3.8 Where the 22.9 s went
+### 4.3.8 Where the 22.8 s went
 
-From the freeze to "down in the map":
+From the freeze to "down in the map" (the script's poll saw it 0.1 s
+later):
 
 | Part | s | |
 |---|---|---|
@@ -1912,8 +1919,9 @@ Then one more second (#30 → #54, the `up_thru` round trip) before any
 PG that had osd.2 served I/O again. During those ~24 s, every write to
 every one of the 118 PGs waited: PGs with osd.2 as primary had no
 primary, PGs with osd.2 as replica waited for a `MOSDRepOpReply` that
-never came. The grace is 87 % of it. The rest is three timers of one
-second and one of five; each is a config option, and the trace shows
+never came. The grace is 88 % of the 22.8 s to the map, 84 % of the
+~24 s to the first I/O. The rest is three timers of one second and one
+of five; each is a config option, and the trace shows
 which one to look at.
 
 ### 4.3.9 The trace, checked against itself
@@ -1940,7 +1948,10 @@ the `enter`/`exit` log lines. PG 9.0 on osd.1, the first interval:
 
 Against the log: `Reset` at #39 (26.423), `GetInfo` at #41 (26.424),
 `WaitUpThru` at #46 (26.432), `Activating` at #55 (27.456), `Clean` at
-#58 (27.473). They agree to the millisecond the log prints. The mon's
+#58 (27.473). They agree within 2 ms: the log uses the coarse clock
+(`log_coarse_timestamps`), the history the fine one, so the history
+runs 1–2 ms behind. (The same clock explains `24.403` in #17 against
+`24.402` in §4.3.3.) The mon's
 own summary line (#26), "after 23.000089 >= grace 20.000000", is the
 third witness: 26.000 − 03.001 = 22.999.
 
@@ -2080,7 +2091,7 @@ The read side has no callback: `read` is a plain blocking call, and
 
 ### 5.1.5 OSD and mon — the OSD asks, the mon decides
 
-Every message from an OSD to the mon is a
+Every request an OSD makes to the OSDMonitor is a
 [`PaxosServiceMessage`](https://github.com/ceph/ceph/blob/v21.3.0/src/messages/PaxosServiceMessage.h#L14): a
 request that the mon may turn into a new map, or not. The failure of
 §4.3 used five of them:
@@ -2089,11 +2100,13 @@ request that the mon may turn into a new map, or not. The failure of
 |---|---|---|
 | [`MOSDFailure`](https://github.com/ceph/ceph/blob/v21.3.0/src/messages/MOSDFailure.h#L23) | "osd.N did not answer me for `failed_for` seconds" | nothing, until enough reporters agree: then a map with osd.N down |
 | [`MOSDAlive`](https://github.com/ceph/ceph/blob/v21.3.0/src/messages/MOSDAlive.h#L23) | "record `up_thru` = this epoch for me" | a map with the new `up_thru` |
-| [`MOSDMarkMeDead`](https://github.com/ceph/ceph/blob/v21.3.0/src/messages/MOSDMarkMeDead.h#L8) | "I was really dead until epoch E" | a map with my `dead_epoch` |
+| [`MOSDMarkMeDead`](https://github.com/ceph/ceph/blob/v21.3.0/src/messages/MOSDMarkMeDead.h#L8) | "I was really dead until epoch E" (ends the read-lease wait of my old PGs) | a map with my `dead_epoch` |
 | [`MOSDBoot`](https://github.com/ceph/ceph/blob/v21.3.0/src/messages/MOSDBoot.h#L25) | "mark me up, here are my addresses" | a map with me up |
 | [`MOSDBeacon`](https://github.com/ceph/ceph/blob/v21.3.0/src/messages/MOSDBeacon.h#L8) | "I am alive" (every 5 min) | nothing; silence for 15 min marks me down |
 
-Down comes one thing only: [`MOSDMap`](https://github.com/ceph/ceph/blob/v21.3.0/src/messages/MOSDMap.h#L25).
+The answer to all five is one thing: [`MOSDMap`](https://github.com/ceph/ceph/blob/v21.3.0/src/messages/MOSDMap.h#L25).
+(The mon also sends config, the monmap, subscription acks and version
+replies, but no other map.)
 The rule this interface carries is idea 3 of §3.1: an OSD never changes
 the map, it asks. And the answer has a clock: the mon batches proposals
 per `paxos_propose_interval` (1 s), so every one of these requests costs
@@ -2286,7 +2299,7 @@ The failure path of §4.3, in the order the failure meets it:
 | f13 | [`PeeringState::start_peering_interval`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.cc#L699) | |
 | f14 | [`PeeringState::build_prior`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.cc#L1452), [`OSD::queue_want_up_thru`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L7238) | `up_thru < same_interval_since` → ask the mon; the PG waits in `WaitUpThru` |
 | f15 | [`OSD::_committed_osd_maps`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L8621) | the "wrongly marked me down" branch, `OSD.cc:8751` |
-| f16 | [`start_waiting_for_healthy`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L7037), [`_is_healthy`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L7047), [`start_boot`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L6881) | boot only when ≥ 33 % of the heartbeat peers answer |
+| f16 | [`start_waiting_for_healthy`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L7037), [`_is_healthy`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L7047), [`start_boot`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L6881) | the heartbeat messengers are rebound and the peer table emptied; boot (tried once a second) only when ≥ 33 % of the peers answer again, front and back |
 
 The read's own functions: [`do_read`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L5934)
 (#21) chooses between the synchronous read of a replicated pool and
