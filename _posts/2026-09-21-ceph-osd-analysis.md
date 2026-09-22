@@ -1028,7 +1028,7 @@ own share of the write becomes visible.
 The op, as the primary's op tracker prints it (`dump_historic_ops`):
 
 ```
- osd_op(client.4359.0:1  8.2  8:477f3578:::o48:head  [writefull 0~16384]  snapc 0=[]  ondisk+write+...  e71)
+ osd_op(client.4502.0:1  8.2  8:477f3578:::o48:head  [writefull 0~16384]  snapc 0=[]  ondisk+write+...  e92)
         │                │    │                       │                   │                             │
         │                │    │                       │                   │       the client's map epoch┘
         │                │    │                       │                   └─ snapshot context: none (§3.7.3)
@@ -1471,7 +1471,7 @@ wosdopcollect.sh <build-dir> <outdir> get
                         #13–#20  do_request … do_osd_ops (read)     │
                         #21  do_read                                │ PG LOCKED
                         #22  objects_read_sync ─► the device        │ 1597 us
-                             ⋮   1527 us, the worker waits          │
+                             ⋮   1528 us, the worker waits          │
    2434                 #23  … returned 16384 B                     │
                         #24  complete_read_ctx: build the reply     │
    2463                 #26  PG unlocked                            ┘
@@ -1496,7 +1496,7 @@ other OSDs first, so it sends the reply later, from a callback.)
 ### 4.2.4 Lines 21–26 — the device, under the PG lock
 
 But look at the lock. The PG is locked from #11 to #26: **the whole
-read from the device, 1527 µs, happens under the PG lock**
+read from the device, 1528 µs, happens under the PG lock**
 (`objects_read_sync`, #22–#23). A write holds the PG for 377 µs and
 then waits for 4 ms *without* the lock. A read in a replicated pool
 that misses the cache waits for the device *with* the lock. Every other op of this PG waits
@@ -1517,9 +1517,24 @@ would come from the cache, and the lock would be held for microseconds.
 So the exact statement is: a read in a replicated pool that misses the
 cache waits for the device with the PG lock held.
 
-The op tracker saw the same read. Its record has four events after
-`queued_for_pg`, and they agree with the trace to the microsecond
-(`wosdopcheck.py`):
+The op tracker saw the same read:
+
+```
+osd_op(client.4514.0:1 8.2 8:477f3578:::o48:head [read 0~16384] snapc 0=[] ondisk+read+known_if_redirected+supports_pool_eio e92)
+duration 0.001679972
+   10:12:08.750230+0000 initiated
+   10:12:08.750230+0000 header_read
+   10:12:08.750231+0000 throttled
+   10:12:08.750237+0000 all_read
+   10:12:08.750239+0000 dispatched
+   10:12:08.750265+0000 queued_for_pg
+   10:12:08.750315+0000 reached_pg
+   10:12:08.750342+0000 started
+   10:12:08.751910+0000 done
+```
+
+Its record has four events after `queued_for_pg`, and they agree with
+the trace to the microsecond (`wosdopcheck.py`):
 
 ```
 event                              tracker us  bpftrace us   diff
@@ -1916,9 +1931,11 @@ The same rule sets a second knob, `queue/write_cache`, to
 every fdatasync of BlueStore becomes a cache-flush command to the
 device, and on this VM one flush costs 5–15 ms. With `write through`
 the kernel drops the flush. The barriers then cost what the I/O costs,
-and the OSD layer's share of a write becomes visible (§4.1.8). The
-setting is re-read from the device in the same way as the rotational
-flag, so it needs the same `nowatch` rule.
+and the OSD layer's share of a write becomes visible (§4.1.8). Unlike
+the rotational flag, this setting survives udev's partition re-read (a
+test on `/dev/sdb`, which the rule does not cover: the re-read set
+`rotational` back to 1 and left `write_cache` alone). The rule sets it
+anyway, so that both knobs live in one place.
 
 ## A.2 vstart can lose an OSD
 

@@ -77,9 +77,10 @@ bdev_type() {
 #                flush; the barriers then cost what the I/O costs, and the
 #                OSD layer's share of a write becomes visible.
 #
-# For a SCSI disk neither value stays by itself: udev answers every
-# close-after-write (vstart's dd, --mkfs, each OSD stop) with a partition
-# re-read, and sd then fetches both from the device again.  Install
+# For a SCSI disk the rotational flag does not stay by itself: udev
+# answers every close-after-write (vstart's dd, --mkfs, each OSD stop)
+# with a partition re-read, and sd then fetches the flag from the device
+# again (the cache setting survives that).  Install
 # 99-osdlab-rotational.rules (next to this script) first; check_ssd below
 # fails loudly if a value was lost.
 set_queue_attrs() {
