@@ -2518,20 +2518,20 @@ again, and the second 32 KiB gets blob B, at blob offset 32 KiB of a 64 KiB
 blob with `blob_start` 0. A and B are therefore on the same csum grid, and
 `allocated()` stores a hole followed by the two fragments, unchanged:
 
-```
- onode a    0x0000~0x8000 -> A @ 0      0x8000~0x8000 -> B @ 0x8000
+<div class="language-plaintext highlighter-rouge"><div class="highlight"><pre class="highlight"><code> onode a    0x0000~0x8000 -&gt; A @ 0      0x8000~0x8000 -&gt; B @ 0x8000
 
  blob B     private, llen 0x10000, blob_start 0
-            pextents [hole~0x8000][Q~0x3000][R~0x5000]   csum [ - , c1]
+            pextents [hole~0x8000]<span style="color:#d11">[Q~0x3000][R~0x5000]</span>   csum [ - , c1]
 
  csum grid   chunk 0: 0x0000-0x7fff  |  chunk 1: 0x8000-0xffff
- blob B      |<------ hole ------>|<-- Q 0x3000 -->|<---- R 0x5000 ---->|
-                                                   ^ pextent boundary at 0xb000,
-                                                     inside chunk 1
-```
+ blob B      |&lt;------ hole ------&gt;|<span style="color:#d11">&lt;-- Q 0x3000 --&gt;|&lt;---- R 0x5000 ----&gt;</span>|
+                                                   <span style="color:#d11">^ pextent boundary at 0xb000,</span>
+                                                     <span style="color:#d11">inside chunk 1</span>
+</code></pre></div></div>
 
-That boundary at `0xb000` is the bug. With `{0x8000}`, chunk 1 would be one
-pextent.
+The parts in red are the bug: chunk 1 of the csum grid is covered by two
+pextents, with the boundary at `0xb000`. With `{0x8000}`, chunk 1 would be
+one pextent.
 
 Call 4 covers A (shared) and B (private, same `blob_start`), and
 `can_merge_blob()` is asked whether B can be merged into A. Three outcomes:
