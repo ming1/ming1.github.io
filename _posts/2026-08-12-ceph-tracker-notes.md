@@ -2496,6 +2496,145 @@ sequence, opposite expectations (one merged blob instead of two surviving
 ones). The test wraps each call in assertions; the one that matters is
 `ASSERT_FALSE(can_merge_blob(...))`, just before the second clone.
 
+**What each call leaves behind.** The fixture has no device, so "on disk"
+below means the metadata a real write would persist: the onodes' logical
+extents, the blobs, the shared-blob reference maps and the physical
+extents. Physical addresses are written `P`, `Q`, `R`; the fixture's fake
+allocator happens to hand them out back to back, which is an artifact, not
+part of the bug.
+
+```
+lextent    logical~len -> blob @ blob_offset
+pextents   [P~len]  or  [hole~len]
+csum       one crc32c slot per 32 KiB chunk of the blob
+tracker    use counters, one per 32 KiB (release size = max(csum chunk, min_alloc))
+sbid       shared blob id; its ref_map counts owners per physical extent
+```
+
+*Call 1 — `write_blob(a, 0, 0, csum_chunk, {csum_chunk})`.* One blob, one
+chunk, one pextent.
+
+```
+ onode a    0x0000~0x8000 -> A @ 0
+ onode c1   (empty)
+ onode c2   (empty)
+
+ blob A     private, llen 0x8000
+            pextents  [P~0x8000]
+            csum      [c0]
+            tracker   [0x8000]
+
+ disk       P |########|
+```
+
+*Call 2 — `clone(a, c1, csum_chunk)`.* Nothing to merge into yet, so
+`make_blob_shared()` flags A shared under `sbid 1` with one reference per
+pextent; `dup_esb()` then hands `c1` its own copy of the blob metadata, `A'`,
+pointing at the same shared blob, and the copy adds the second reference.
+The tracker is per blob object, so it is copied, not doubled.
+
+```
+ onode a    0x0000~0x8000 -> A  @ 0
+ onode c1   0x0000~0x8000 -> A' @ 0            A' = metadata copy of A
+ onode c2   (empty)
+
+ blob A     SHARED sbid 1, llen 0x8000         blob A'  SHARED sbid 1 (same fields)
+            pextents  [P~0x8000]
+            csum      [c0]
+            tracker   [0x8000]
+
+ sbid 1     ref_map { P~0x8000: 2 }            owners: a, c1
+
+ disk       P |########|                       unchanged; A is now immutable
+```
+
+*Call 3 — `write_blob(a, 0, csum_chunk, 2 * csum_chunk, {0x3000, 0x5000})`.*
+A is shared and therefore immutable, so the second 32 KiB gets a new blob.
+`suggested_boff` places it at blob offset 32 KiB of a 64 KiB blob whose
+`blob_start` is also 0, so A and B share one csum grid. `allocated()` records
+the leading hole and then the allocator's two fragments exactly as given.
+
+```
+ onode a    0x0000~0x8000 -> A @ 0      0x8000~0x8000 -> B @ 0x8000
+ onode c1   0x0000~0x8000 -> A' @ 0
+ onode c2   (empty)
+
+ blob A     SHARED sbid 1            blob B   private, llen 0x10000, blob_start 0
+            [P~0x8000]                        pextents  [hole~0x8000][Q~0x3000][R~0x5000]
+            csum [c0]                         csum      [ -  , c1]
+            tracker [0x8000]                  tracker   [ 0  , 0x8000]
+
+ csum grid   chunk 0: 0x0000-0x7fff  |  chunk 1: 0x8000-0xffff
+ blob B      |<------ hole ------>|<-- Q 0x3000 -->|<---- R 0x5000 ---->|
+                                                   ^ pextent boundary at 0xb000,
+                                                     inside chunk 1
+
+ disk       P |########|   Q |###|   R |#####|
+```
+
+That boundary at `0xb000` is the whole bug. With `{0x8000}` instead, B is
+`[hole~0x8000][Q~0x8000]` and chunk 1 is a single pextent.
+
+*Call 4 — `clone(a, c2, 2 * csum_chunk)`.* The range covers A (shared) and
+B (private, same `blob_start`), so `find_mergable_companion()` offers B to A
+through `can_merge_blob()`. Three outcomes, depending on the fragments and on
+the fix.
+
+Aligned control, `{0x8000}`: merged. A grows to 64 KiB, B's chunk-1 csum slot
+and tracker counter are copied across, B's pextent joins `sbid 1`, and
+`reblob_extents()` repoints `a`'s second lextent at A and coalesces the two.
+
+```
+ onode a    0x0000~0x10000 -> A   @ 0
+ onode c1   0x0000~0x8000  -> A'  @ 0
+ onode c2   0x0000~0x10000 -> A'' @ 0          A'' = copy of the merged A
+
+ blob A     SHARED sbid 1, llen 0x10000
+            pextents  [P~0x8000][Q~0x8000]
+            csum      [c0, c1]                 c1 moved from B
+            tracker   [0x8000, 0x8000]         counter 1 added from B
+ blob B     dissolved
+
+ sbid 1     ref_map { P~0x8000: 3,  Q~0x8000: 2 }
+```
+
+Fragmented, unfixed tree: abort. `can_merge_blob()` says yes, and
+`merge_blob()` calls `move_data()` for B's first fragment:
+
+```
+ move_data(pos = 0x8000, len = 0x3000)
+   ceph_assert((len % 0x8000) == 0)         0x3000 % 0x8000 != 0  ->  abort
+```
+
+Nothing has been persisted at that point. Had the assert been relaxed, the
+tracker loop would run once per fragment and add B's counter 1 into A twice
+for the same 32 KiB slot, a use count that can never reach zero, so the AU is
+never released.
+
+Fragmented, fixed tree: refused. `can_merge_blob()` returns false at the
+`0x3000` fragment, B takes the ordinary `make_blob_shared()` path under
+`sbid 2`, and nothing is moved.
+
+```
+ onode a    0x0000~0x8000 -> A   @ 0     0x8000~0x8000 -> B  @ 0x8000
+ onode c1   0x0000~0x8000 -> A'  @ 0
+ onode c2   0x0000~0x8000 -> A'' @ 0     0x8000~0x8000 -> B' @ 0x8000
+
+ blob A     SHARED sbid 1                blob B   SHARED sbid 2, llen 0x10000
+            [P~0x8000]                            [hole~0x8000][Q~0x3000][R~0x5000]
+            csum [c0]                             csum [ - , c1]        still 0x11119111
+            tracker [0x8000]                      tracker [ 0 , 0x8000]
+
+ sbid 1     ref_map { P~0x8000: 3 }               owners: a, c1, c2
+ sbid 2     ref_map { Q~0x3000: 2, R~0x5000: 2 }  owners: a, c2
+
+ disk       P |########|   Q |###|   R |#####|    unchanged
+```
+
+The test's closing assertions read straight off that last picture: `a`'s
+two lextents still point at the two original blob objects, B is shared, and
+its chunk-1 csum slot still holds the value stamped in call 3.
+
 **Step 3 — build and run**, with the test commit from
 `wip-72848-merge-blob-csum` applied:
 
