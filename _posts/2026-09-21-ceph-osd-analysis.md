@@ -220,6 +220,12 @@ shape** of events in this post, not the microseconds.
 
 # 3. OSD basics
 
+![The OSD's place in Ceph: client, mon/mgr, pool, PG, OSDs; from a file to objects to a PG; a 4+2 EC write across 4 nodes; the write path; failure and recovery](/assets/images/ceph-osd.jpg)
+
+*One picture of what this section explains: pools, PGs and OSDs, how a
+file becomes objects and a PG, how a PG lands on OSDs, one write, and
+what happens when an OSD fails.*
+
 Every part of the OSD once: what it is, in one picture, then the code
 that does it. The case studies of §4 put real traces on this; the code
 analysis of §5 reads the details.
