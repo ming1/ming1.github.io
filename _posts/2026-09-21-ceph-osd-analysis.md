@@ -19,7 +19,7 @@ to the disk. This post covers everything above that call.
 The method is the same: run one real thing on a lab cluster, capture it,
 then read the code that did it. §3 is the **overview**: every
 part of the OSD once, in short text and pictures. Then come deep case
-studies, one per part: §4 holds the first two, §6 lists the rest.
+studies, one per part: §4 holds the first three, §6 lists the rest.
 
 - **Assumed:** you have used Ceph (`ceph -s`, pools, PGs).
   **Not assumed:** any knowledge of the code in `src/osd`.
@@ -512,6 +512,8 @@ Who notices a dead OSD, and how does that become a new epoch?
                                                                                   down in a NEW OSDMap epoch
  every OSD gets the new map  ─►  §3.5  ─►  the PGs of the dead OSD start a new interval  ─►  §3.6
 ```
+
+§4.3 runs this chain in the lab and puts times on every arrow.
 
 | # | Function |
 |---|---|
@@ -1567,6 +1569,381 @@ The functions of both traces:
 | `context_queue` | [`context_queue`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L1035), [`class ContextQueue`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/Finisher.h#L165), [`handle_oncommits`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L1818) |
 | the rest | §4.1.2 |
 
+## 4.3 One OSD failure
+
+One OSD stops answering. Nothing is killed: `kill -STOP` freezes the
+process, its sockets stay open, and no error comes back to anybody.
+That is the hardest case for detection, and the common one in
+practice (a hung disk, a stuck daemon). §3.4 gave the path in the code;
+this case runs it, and follows it on to the new map, the new interval
+of every PG, and the return of the frozen OSD.
+
+### 4.3.1 The workload and the trace
+
+```bash
+osdfailcollect.sh <build-dir> <outdir> 2      # freezes osd.2, waits, writes, thaws
+```
+
+[`osdfailcollect.sh`]({{ site.baseurl }}/code/ceph/osdfailcollect.sh)
+raises the debug levels of the two other OSDs and the mon
+(`debug_osd 10`, `debug_mon 10`, `debug_ms 1`), records the state
+before, freezes osd.2, polls the OSDMap until osd.2 is down, polls the
+PGs until all are active again, writes three objects into pool `pg1`
+while osd.2 is away, thaws it, and waits until all PGs are clean. It
+saves the log slices of all four daemons and the state histories of
+PG `9.0` (osd.1 primary, osd.2 a replica) and PG `8.2` (osd.2 primary).
+
+Here the debug logs are the trace. The chain takes 30 s and crosses
+four processes; bpftrace would add microseconds to steps that are
+seconds apart. All four daemons run on one host, so their timestamps
+are one clock. The lines below are the relevant ones, condensed to one
+line each, in time order. `(lab)` lines are the script's own stamps.
+
+Before the run: epoch 92, all up. Pings run on the back and the front
+network; the trace shows only the back ones, the front ones are
+identical. The mon's laggy history from an earlier incident:
+`laggy_probability 0.92, laggy_interval 0` for all three OSDs.
+
+```
+ #   time (UTC)    where   event
+  1  11:30:02.702  osd.1   <== osd_ping(ping_reply) from osd.2, back+front  the last answer
+  2  11:30:03.660  (lab)   kill -STOP osd.2                                     T0
+  3  11:30:04.402  osd.1   --> osd_ping(ping) to osd.2, back+front           no answer will come
+  4  11:30:04.596  osd.0   --> osd_ping(ping) to osd.2, back+front           no answer will come
+  5  11:30:08.696  osd.0   --> osd_ping(ping) to osd.2, back+front           no answer will come
+  6  11:30:09.702  osd.1   --> osd_ping(ping) to osd.2, back+front           no answer will come
+  7  11:30:10.202  osd.1   --> osd_ping(ping) to osd.2, back+front           no answer will come
+  8  11:30:10.997  osd.0   --> osd_ping(ping) to osd.2, back+front           no answer will come
+  9  11:30:12.697  osd.0   --> osd_ping(ping) to osd.2, back+front           no answer will come
+ 10  11:30:14.397  osd.0   --> osd_ping(ping) to osd.2, back+front           no answer will come
+ 11  11:30:14.903  osd.1   --> osd_ping(ping) to osd.2, back+front           no answer will come
+ 12  11:30:19.004  osd.1   --> osd_ping(ping) to osd.2, back+front           no answer will come
+ 13  11:30:19.697  osd.0   --> osd_ping(ping) to osd.2, back+front           no answer will come
+ 14  11:30:20.198  osd.0   --> osd_ping(ping) to osd.2, back+front           no answer will come
+ 15  11:30:24.303  osd.1   --> osd_ping(ping) to osd.2, back+front           no answer will come
+ 16  11:30:24.898  osd.0   --> osd_ping(ping) to osd.2, back+front           no answer will come
+ 17  11:30:24.980  osd.1   heartbeat_check: no reply from osd.2 (oldest deadline 11:30:24.403)
+ 18  11:30:25.331  osd.0   heartbeat_check: no reply from osd.2 (oldest deadline 11:30:24.597)
+ 19  11:30:25.331  osd.0   --> osd_failure(failed timeout osd.2 for 25sec) to mon
+ 20  11:30:25.364  mon     <== osd_failure(osd.2 for 25sec) from osd.0
+ 21  11:30:25.999  osd.1   heartbeat_check: no reply from osd.2 (oldest deadline 11:30:24.403)
+ 22  11:30:25.999  osd.1   --> osd_failure(failed timeout osd.2 for 23sec) to mon
+ 23  11:30:26.000  mon     <== osd_failure(osd.2 for 23sec) from osd.1
+ 24  11:30:26.000  mon     check_failure: 2 reporters, grace 20.000000 (20.000000 + 0 + 0), max_failed_since 11:30:03.001
+ 25  11:30:26.000  mon     we have enough reporters to mark osd.2 down
+ 26  11:30:26.000  mon     cluster log: osd.2 failed (2 reporters from different osd after 23.000089 >= grace 20.000000)
+ 27  11:30:26.372  osd.0   heartbeat_check: no reply from osd.2 (oldest deadline 11:30:24.597)
+ 28  11:30:26.375  mon     maybe_prime_pg_temp: estimate 118 pgs on 1 osds >= 0.2 of total 118 pgs, all
+ 29  11:30:26.418  mon     adding osd.2 to down_pending_out map
+ 30  11:30:26.418  mon     --> osd_map(93..93) to osd.1
+ 31  11:30:26.418  mon     --> osd_map(93..93) to osd.0
+ 32  11:30:26.418  mon     --> osd_map(93..93) to osd.2 (frozen)
+ 33  11:30:26.419  osd.1   <== osd_map(93..93) from the mon
+ 34  11:30:26.419  osd.0   <== osd_map(93..93) from the mon
+ 35  11:30:26.419  mon     cluster log: osdmap e93: 3 total, 2 up, 3 in
+ 36  11:30:26.420  osd.1   _committed_osd_maps 93
+ 37  11:30:26.421  osd.1   --> osd_alive(want up_thru 93) to mon
+ 38  11:30:26.421  mon     <== osd_alive(want up_thru 93) from osd.1
+ 39  11:30:26.423  osd.1   pg 9.0: start_peering_interval up [1,2,0] -> [1,0]
+ 40  11:30:26.424  osd.0   _committed_osd_maps 93
+ 41  11:30:26.424  osd.1   pg 9.0: enter Peering/GetInfo
+ 42  11:30:26.424  osd.1   pg 9.0: build_prior: up_thru 91 < same_interval_since 93, must notify monitor
+ 43  11:30:26.424  osd.1   pg 9.0: GetInfo, querying info from osd.0
+ 44  11:30:26.425  osd.0   --> osd_alive(want up_thru 93) to mon
+ 45  11:30:26.426  mon     <== osd_alive(want up_thru 93) from osd.0
+ 46  11:30:26.432  osd.1   pg 9.0: enter Peering/WaitUpThru
+ 47  11:30:26.440  osd.0   pg 8.2: start_peering_interval up [2,0,1] -> [0,1]
+ 48  11:30:26.440  osd.0   pg 8.2: enter Peering/GetInfo
+ 49  11:30:26.440  osd.0   pg 8.2: build_prior: up_thru 91 < same_interval_since 93, must notify monitor
+ 50  11:30:26.440  osd.0   pg 8.2: GetInfo, querying info from osd.1
+ 51  11:30:26.440  osd.0   pg 8.2: enter Peering/WaitUpThru
+ 52  11:30:27.451  osd.1   <== osd_map(94..94) from the mon
+ 53  11:30:27.451  osd.0   <== osd_map(94..94) from the mon
+ 54  11:30:27.452  mon     cluster log: osdmap e94: 3 total, 2 up, 3 in
+ 55  11:30:27.456  osd.1   pg 9.0: enter Active/Activating
+ 56  11:30:27.467  osd.0   pg 8.2: enter Active/Activating
+ 57  11:30:27.473  osd.1   pg 9.0: all_activated_and_committed
+ 58  11:30:27.473  osd.1   pg 9.0: enter Active/Clean
+ 59  11:30:27.478  osd.0   pg 8.2: all_activated_and_committed
+ 60  11:30:27.479  osd.0   pg 8.2: enter Active/Clean
+ 61  11:30:31.7    (lab)   rados put d1 d2 d3 into pool pg1 (acting [1,0])
+ 62  11:30:32.576  (lab)   kill -CONT osd.2                                     T4
+ 63  11:30:32.585  osd.2   cluster log: Monitor daemon marked osd.2 down, but it is still running
+ 64  11:30:32.585  osd.2   map e94 wrongly marked me down at e93
+ 65  11:30:32.585  osd.2   start_waiting_for_healthy
+ 66  11:30:32.586  mon     <== MOSDMarkMeDead(osd.2, epoch 94) from osd.2
+ 67  11:30:32.588  osd.2   is_healthy false: only 0/2 up peers (less than 33%)
+ 68  11:30:32.690  mon     cluster log: osdmap e95: 3 total, 2 up, 3 in
+ 69  11:30:33.609  osd.2   start_boot (at e95)
+ 70  11:30:33.612  mon     <== osd_boot(osd.2 booted 9, v95) from osd.2
+ 71  11:30:33.709  mon     _booted osd.2
+ 72  11:30:33.709  mon     cluster log: osdmap e96: 3 total, 3 up, 3 in
+ 73  11:30:33.716  osd.2   state: booting -> active (e96)
+ 74  11:30:33.721  mon     <== osd_alive(want up_thru 96) from osd.2
+ 75  11:30:33.722  osd.1   pg 9.0: start_peering_interval up [1,0] -> [1,2,0]
+ 76  11:30:33.722  osd.1   pg 9.0: enter Peering/GetInfo
+ 77  11:30:33.722  osd.1   pg 9.0: build_prior: up_thru 93 < same_interval_since 96, must notify monitor
+ 78  11:30:33.722  osd.1   pg 9.0: GetInfo, querying info from osd.0
+ 79  11:30:33.722  osd.1   pg 9.0: GetInfo, querying info from osd.2
+ 80  11:30:33.745  osd.1   pg 9.0: enter Peering/WaitUpThru
+ 81  11:30:33.745  osd.0   pg 8.2: start_peering_interval up [0,1] -> [2,0,1]
+ 82  11:30:34.743  mon     cluster log: osdmap e97: 3 total, 3 up, 3 in
+ 83  11:30:34.754  osd.1   pg 9.0: needs_recovery: osd.2 has 3 missing
+ 84  11:30:34.754  osd.1   pg 9.0: enter Active/Activating
+ 85  11:30:34.760  osd.1   pg 9.0: all_activated_and_committed
+ 86  11:30:34.773  osd.1   pg 9.0: enter Active/Recovering
+ 87  11:30:34.778  osd.1   pg 9.0: enter Active/Clean
+```
+
+### 4.3.2 The map — three OSDs and the mon, one clock
+
+```
+   time    osd.2 (frozen)      osd.1                          osd.0                          mon
+ 30:02.7                        #1 last ping answered
+ 30:03.7   ■ SIGSTOP ■
+ 30:04.4                        #3 ping ─► no answer          #4 ping ─► no answer
+    ⋮                              ⋮ 5 more pings              ⋮ 7 more pings
+                                   every 0.5–5.9 s               each with deadline = send + 20 s
+ 30:24.98                       #17 heartbeat_check: deadline of #3 passed
+ 30:25.33                                                      #18 heartbeat_check: deadline of #4 passed
+                                                               #19 osd_failure ─────────────────► #20 1 reporter
+ 30:26.00                       #22 osd_failure ──────────────────────────────────────────────► #23–#24 2 reporters,
+                                    (5 s report interval)                                          23.0 s ≥ grace 20
+                                                                                                #25 mark osd.2 down
+ 30:26.42                       #33 ◄────────────────────── osd_map(93) ─────────────────────── #30 e93 committed
+                                #36 _committed_osd_maps         #40 _committed_osd_maps          (0.42 s: paxos)
+                                #39 pg 9.0: new interval        #47 pg 8.2: new interval,
+                                    up [1,2,0] ─► [1,0]             up [2,0,1] ─► [0,1]: osd.0 is primary now
+                                #41–#46 GetInfo (8 ms)          #48–#51 GetInfo (0.6 ms)
+                                #37 osd_alive(up_thru 93) ──►   #44 ──────────────────────────► #38 #45
+                                #46 WaitUpThru                  #51 WaitUpThru                   (1.03 s: paxos)
+ 30:27.45                       #52 ◄────────────────────── osd_map(94) ─────────────────────── #54 e94: up_thru 93
+ 30:27.47                       #55–#58 Activating ─► Clean     #56–#60 Activating ─► Clean       all 118 PGs
+                                    acting [1,0]: I/O resumes,     undersized
+ 30:31.7                        #61 3 writes, replicated to osd.0 only
+ 30:32.58  ■ SIGCONT ■
+           #63–#64 e93, e94 arrive: "wrongly marked me down"
+           #66 MOSDMarkMeDead ───────────────────────────────────────────────────────────────► #68 e95: dead_epoch
+           #67 is_healthy: 0/2 peers ─► wait
+ 30:33.61  #69 start_boot ─► osd_boot ─────────────────────────────────────────────────────► #70–#72 e96: osd.2 up
+ 30:33.72  #73 booting ─► active
+                                #75 pg 9.0: new interval [1,0] ─► [1,2,0]; GetInfo asks osd.0 AND osd.2
+ 30:34.74                                                                                       #82 e97: up_thru 96
+ 30:34.75                       #83 osd.2 has 3 missing ─► #86 Recovering ─► #87 Clean (5 ms)
+```
+
+### 4.3.3 Lines 1–18 — the pings stop, and 21 s pass
+
+Each OSD pings each heartbeat peer at a random interval of 0.5–5.9 s
+(§3.4). osd.1's pings to osd.2 in the trace: 02.70, 04.40, 09.70,
+10.20, 14.90, 19.00, 24.30. Every ping gets a **deadline**: its send
+time plus [`osd_heartbeat_grace`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L6270) (20 s), set
+in `OSD::heartbeat`. A peer is unhealthy
+when *now* is past the deadline of its **oldest unanswered** ping
+([`is_unhealthy`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L1582)). The check runs once a second,
+from the tick
+([`heartbeat_check`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L6194), called by
+[`tick_without_osd_lock`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L6432)).
+
+```
+ osd.1                                                osd.0
+ last answered ping        02.702                     last answered ping        29:59.898
+ first unanswered ping     04.402  (0.74 s after T0)  first unanswered ping     04.596  (0.94 s after T0)
+ its deadline              24.402                     its deadline              24.596
+ first tick after it       24.980  ─► detected        first tick after it       25.331  ─► detected
+ T0 ─► detected            21.3 s                     T0 ─► detected            21.7 s
+```
+
+So detection takes the grace, plus the time to the next ping after the
+freeze, plus up to one tick. The log line names both: `since back …
+front …` is the last answer, `oldest deadline` is the ping that
+expired ([`heartbeat_check`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L6230)). The peer goes
+into [`failure_queue`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L2048) with its last-answer
+time.
+
+### 4.3.4 Lines 19–26 — two reports, one decision
+
+The report is not sent by the check. [`send_failures`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L7337)
+runs in the same tick ([`send_failures`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L6464) in
+`tick_without_osd_lock`), but only every `osd_mon_report_interval` (5 s). osd.0's report interval
+happened to be due in the tick that detected (#18, #19: same
+timestamp). osd.1 detected first (#17) but reported 1.02 s later (#22).
+The message is [`MOSDFailure`](https://github.com/ceph/ceph/blob/v21.3.0/src/messages/MOSDFailure.h#L23) with
+`failed_for` = now − last answer, **as an integer number of seconds**
+([`failed_for`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L7347)): 25 s from osd.0, 23 s from
+osd.1. It goes to the mon on the `client` messenger.
+
+On the mon, [`prepare_failure`](https://github.com/ceph/ceph/blob/v21.3.0/src/mon/OSDMonitor.cc#L3385) rebuilds
+[`failed_since`](https://github.com/ceph/ceph/blob/v21.3.0/src/mon/OSDMonitor.cc#L3404) `= receive time − failed_for` and adds the
+reporter. Then [`check_failure`](https://github.com/ceph/ceph/blob/v21.3.0/src/mon/OSDMonitor.cc#L3300) asks
+three questions:
+
+```
+ 1  enough reporters?     reporters are counted per subtree of level mon_osd_reporter_subtree_level
+                          (vstart: osd; default: host).  2 ≥ mon_osd_min_down_reporters (2)        #24
+ 2  how long is grace?    osd_heartbeat_grace + a term from the target's laggy history
+                          (get_grace_time): 20.000 + 0 + 0.  laggy_interval is 0 here, so the
+                          laggy_probability of 0.92 adds nothing                                   #24
+ 3  failed long enough?   failed_for = now − max_failed_since, the MOST RECENT failed_since of
+                          the reporters: 26.000 − 03.001 = 23.0 s ≥ 20 s ─► mark it down          #24, #25
+```
+
+[`get_grace_time`](https://github.com/ceph/ceph/blob/v21.3.0/src/mon/OSDMonitor.cc#L3253); the decision is at
+`OSDMonitor.cc:3335`. Two details from the
+numbers. `max_failed_since` is 03.001, not osd.1's real last answer
+02.703: the integer `failed_for` rounded it (26.000 − 23). And the mon
+takes the *latest* `failed_since` of all reporters, so the slowest
+reporter's view sets the clock. One reporter is never enough with the
+defaults, whatever it says.
+
+### 4.3.5 Lines 27–35 — one new epoch
+
+The decision at 26.000 becomes epoch 93 at 26.418. The 0.42 s are
+paxos: the mon does not commit each change at once, it batches them
+and proposes at most once per `paxos_propose_interval` (1 s;
+[`should_propose`](https://github.com/ceph/ceph/blob/v21.3.0/src/mon/PaxosService.cc#L190)). Two more things
+happen in the same commit:
+
+- [`maybe_prime_pg_temp`](https://github.com/ceph/ceph/blob/v21.3.0/src/mon/OSDMonitor.cc#L1391) (#28)
+  pre-computes `pg_temp` entries for PGs whose acting set would differ
+  from the new up set. Here none is needed: with three OSDs and one
+  down, CRUSH gives every PG the two survivors, in an order they
+  already have.
+- [`down_pending_out`](https://github.com/ceph/ceph/blob/v21.3.0/src/mon/OSDMonitor.cc#L942) (#29): osd.2 is
+  still `in`. If it stays down for `mon_osd_down_out_interval` (600 s),
+  the mon marks it `out`, CRUSH gives its PGs a new third OSD, and
+  backfill starts. In this run it came back after 29 s, so nothing
+  moved.
+
+The mon sent `osd_map(93)` to 15 connections: the three OSDs (the frozen
+one included: the message waits in its socket), the mgr, the MDS, the
+RGW, and every librados client that was connected (#30–#32). Both
+survivors had it 1 ms later (#33, #34).
+
+### 4.3.6 Lines 36–60 — 118 PGs start a new interval
+
+Each survivor walks §3.5: `handle_osd_map` → `_committed_osd_maps` →
+`consume_map` → one peering event per PG, 118 of them, all within
+26.42–26.45. For every PG the acting set lost osd.2, so every PG starts
+a new interval ([`start_peering_interval`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.cc#L699)).
+Two kinds:
+
+| | PG 9.0 | PG 8.2 |
+|---|---|---|
+| up / acting | `[1,2,0]` → `[1,0]` | `[2,0,1]` → `[0,1]` |
+| primary | stays osd.1 | **osd.2 was primary; osd.0 takes over**, as the first of the new up set |
+| GetInfo (#41–#46, #48–#51) | asks the prior set: osd.0 | asks osd.1 |
+| GetLog | primary has the only log | both at `92'23`; the primary's is newest, nothing to fetch |
+| time in Peering before WaitUpThru | 8 ms | 0.6 ms |
+
+Both then stop in `WaitUpThru` for 1.02 s. The reason is in the log
+(#42, #49): `build_prior: up_thru 91 < same_interval_since 93, must
+notify monitor` ([`build_prior`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.cc#L1452)).
+The primary's `up_thru` in the map is 91, older than the new interval.
+It asks the mon to record it
+([`queue_want_up_thru`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L7238) → `osd_alive`, #37, #44),
+and the mon answers with epoch 94 one paxos interval later (#52–#54).
+Only then may the PG go active (§3.6.2, #7). So the peering work took
+milliseconds; **the round trip to the mon for `up_thru` took a second,
+and it is paid once per OSD, not per PG**: all 118 PGs activated
+together at 27.45–27.48 (#55–#60).
+
+The PGs are `active+undersized`: two copies, `min_size` is 2, so I/O
+runs. The three writes at 31.7 (#61) show it: osd.1 sends one
+`MOSDRepOp`, to osd.0, and replies to the client with two commits.
+
+One tool note. The script's `ceph pg stat` saw "all active" only at
+31.68 (T2), four seconds after the PGs were active in their own logs.
+PG states reach the mgr with the OSDs' periodic stats reports. The log
+is the truth; `ceph -s` is late.
+
+### 4.3.7 Lines 61–87 — the frozen OSD comes back
+
+`kill -CONT` at 32.576. osd.2 first processes the maps that waited in
+its socket, e93 and e94, and finds itself marked down while it is
+alive. What happens next is in
+[`_committed_osd_maps`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L8621), at `OSD.cc:8751`:
+
+```
+  #64  "map e94 wrongly marked me down at e93"
+ #66  MOSDMarkMeDead(epoch 94) ─► mon        "I really was dead until now": the mon records dead_epoch = 94,
+                                             so that later peerings can trust that no write reached me     ─► e95
+ #65  start_waiting_for_healthy               do not boot at once
+ #67  is_healthy: 0/2 up peers (< 33 %)       my heartbeat table is stale; wait for answers from my peers
+ #69  1 s later: start_boot ─► osd_boot       _preboot, MOSDBoot with my addresses                          ─► e96
+ #73  "state: booting -> active"              I see myself up in e96
+```
+
+[`MOSDMarkMeDead`](https://github.com/ceph/ceph/blob/v21.3.0/src/messages/MOSDMarkMeDead.h#L8) ·
+[`prepare_mark_me_dead`](https://github.com/ceph/ceph/blob/v21.3.0/src/mon/OSDMonitor.cc#L3125) ·
+[`start_waiting_for_healthy`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L7037) ·
+[`_is_healthy`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L7047) (`osd_heartbeat_min_healthy_ratio`
+= 0.33) · [`start_boot`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L6881) ·
+[`prepare_boot`](https://github.com/ceph/ceph/blob/v21.3.0/src/mon/OSDMonitor.cc#L3650) ·
+[`_booted`](https://github.com/ceph/ceph/blob/v21.3.0/src/mon/OSDMonitor.cc#L3805).
+
+Epoch 96 starts a third interval on the survivors: `[1,0]` → `[1,2,0]`
+(#75). This time GetInfo asks osd.0 *and* osd.2 (#78, #79); osd.2
+answers from its old log, `WaitUpThru` costs one more epoch (97, #82),
+and at activation the primary sees that osd.2 misses the three objects
+written while it was away (#83). Recovery takes 5 ms (#86–#87): three
+pushes, log-based. That is the next case study's material (§6); the
+data is captured.
+
+One failure and one return cost five epochs: 93 (down), 94 (`up_thru`
+of the survivors), 95 (`dead_epoch`), 96 (up), 97 (`up_thru` of the
+returned OSD).
+
+### 4.3.8 Where the 22.9 s went
+
+From the freeze to "down in the map":
+
+| Part | s | |
+|---|---|---|
+| freeze → first unanswered ping | 0.74 | #2 → #3: the ping interval is random |
+| **grace** | **20.00** | `osd_heartbeat_grace` |
+| deadline → next tick | 0.58 | #17: `heartbeat_check` runs once a second |
+| detection → report | 1.02 | #17 → #22: `osd_mon_report_interval` is 5 s; osd.0 was luckier (#18 = #19) |
+| mon: two reports → decision | 0.00 | #23–#25 |
+| decision → epoch 93 committed | 0.42 | #25 → #30: paxos batching |
+| **total** | **22.76** | e93 at 26.418; the script saw it at 26.522 |
+
+Then one more second (#30 → #54, the `up_thru` round trip) before any
+PG that had osd.2 served I/O again. During those ~24 s, every write to
+every one of the 118 PGs waited: PGs with osd.2 as primary had no
+primary, PGs with osd.2 as replica waited for a `MOSDRepOpReply` that
+never came. The grace is 87 % of it. The rest is three timers of one
+second and one of five; each is a config option, and the trace shows
+which one to look at.
+
+### 4.3.9 The trace, checked against itself
+
+The state history the OSD keeps (`dump_pgstate_history`, as in §3.6.1)
+is a second record of the same peering, written by different code than
+the `enter`/`exit` log lines. PG 9.0 on osd.1, the first interval:
+
+```
+11:30:26.424651 11:30:26.424953 Reset
+11:30:26.424993 11:30:26.425001 Start
+11:30:26.425356 11:30:26.433485 Started/Primary/Peering/GetInfo
+11:30:26.433485 11:30:26.433505 Started/Primary/Peering/GetLog
+11:30:26.433506 11:30:26.433509 Started/Primary/Peering/GetMissing
+11:30:26.433509 11:30:27.457939 Started/Primary/Peering/WaitUpThru
+11:30:26.425006 11:30:27.457942 Started/Primary/Peering
+11:30:27.457960 11:30:27.474809 Started/Primary/Active/Activating
+11:30:27.474810 11:30:27.474824 Started/Primary/Active/Recovered
+11:30:27.474824 11:30:33.721792 Started/Primary/Active/Clean
+11:30:27.457942 11:30:33.721794 Started/Primary/Active
+11:30:26.425001 11:30:33.721823 Started/Primary
+11:30:26.424953 11:30:33.721826 Started
+```
+
+Against the log: `Reset` at #39 (26.423), `GetInfo` at #41 (26.424),
+`WaitUpThru` at #46 (26.432), `Activating` at #55 (27.456), `Clean` at
+#58 (27.473). They agree to the millisecond the log prints. The mon's
+own summary line (#26), "after 23.000089 >= grace 20.000000", is the
+third witness: 26.000 − 03.001 = 22.999.
+
 # 5. Code analysis
 
 The case studies of §4 answer *what happened*. This section reads the
@@ -1700,6 +2077,27 @@ reads it from the store's side. Two parts of it matter here:
 
 The read side has no callback: `read` is a plain blocking call, and
 §4.2.4 showed what that costs.
+
+### 5.1.5 OSD and mon — the OSD asks, the mon decides
+
+Every message from an OSD to the mon is a
+[`PaxosServiceMessage`](https://github.com/ceph/ceph/blob/v21.3.0/src/messages/PaxosServiceMessage.h#L14): a
+request that the mon may turn into a new map, or not. The failure of
+§4.3 used five of them:
+
+| OSD → mon | Asks for | Answer |
+|---|---|---|
+| [`MOSDFailure`](https://github.com/ceph/ceph/blob/v21.3.0/src/messages/MOSDFailure.h#L23) | "osd.N did not answer me for `failed_for` seconds" | nothing, until enough reporters agree: then a map with osd.N down |
+| [`MOSDAlive`](https://github.com/ceph/ceph/blob/v21.3.0/src/messages/MOSDAlive.h#L23) | "record `up_thru` = this epoch for me" | a map with the new `up_thru` |
+| [`MOSDMarkMeDead`](https://github.com/ceph/ceph/blob/v21.3.0/src/messages/MOSDMarkMeDead.h#L8) | "I was really dead until epoch E" | a map with my `dead_epoch` |
+| [`MOSDBoot`](https://github.com/ceph/ceph/blob/v21.3.0/src/messages/MOSDBoot.h#L25) | "mark me up, here are my addresses" | a map with me up |
+| [`MOSDBeacon`](https://github.com/ceph/ceph/blob/v21.3.0/src/messages/MOSDBeacon.h#L8) | "I am alive" (every 5 min) | nothing; silence for 15 min marks me down |
+
+Down comes one thing only: [`MOSDMap`](https://github.com/ceph/ceph/blob/v21.3.0/src/messages/MOSDMap.h#L25).
+The rule this interface carries is idea 3 of §3.1: an OSD never changes
+the map, it asks. And the answer has a clock: the mon batches proposals
+per `paxos_propose_interval` (1 s), so every one of these requests costs
+up to a second, and a chain of them costs several. §4.3.8 counts them.
 
 ## 5.2 Data structures — who owns what
 
@@ -1858,6 +2256,38 @@ Notes:
   for an OSD that is being backfilled: it is not in the acting set, but
   it gets every write.
 
+The failure path of §4.3, in the order the failure meets it:
+
+```
+ on every OSD, once a second              on the mon, per report                 on the reporters, per map
+ f1  heartbeat_check                     f6  prepare_failure                    f10 handle_osd_map
+ f2  └► HeartbeatInfo::is_unhealthy      f7  └► check_failure                   f11 └► _committed_osd_maps
+ f3     └► failure_queue[peer]           f8     ├► get_grace_time               f12    └► consume_map ─► per PG:
+ f4  send_failures  (every 5 s)          f9     └► pending_inc.new_state       f13       start_peering_interval
+ f5  └► MOSDFailure ─► mon                   … encode_pending ─► a new epoch    f14       build_prior ─► queue_want_up_thru
+
+ on the OSD that was frozen, when its maps arrive
+ f15 _committed_osd_maps: "wrongly marked me down" ─► MOSDMarkMeDead
+ f16 └► start_waiting_for_healthy ─► _is_healthy (each tick) ─► start_boot ─► _preboot ─► _send_boot
+```
+
+| step | Function | What to know |
+|---|---|---|
+| f1 | [`OSD::heartbeat_check`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L6194) | from `tick_without_osd_lock`, under `heartbeat_lock` |
+| f2 | [`HeartbeatInfo::is_unhealthy`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L1582) | *now* past the deadline of the oldest unanswered ping; the deadline is set when the ping is sent ([`osd_heartbeat_grace`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L6270) in `OSD::heartbeat`) |
+| f3 | [`failure_queue`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L2048) | peer → time of its last answer |
+| f4 | [`OSD::send_failures`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L7337) | `failed_for` is an integer number of seconds |
+| f5 | [`MOSDFailure`](https://github.com/ceph/ceph/blob/v21.3.0/src/messages/MOSDFailure.h#L23) | flags: `FAILED`, `IMMEDIATE` (connection refused), `ALIVE` (take my report back) |
+| f6 | [`OSDMonitor::prepare_failure`](https://github.com/ceph/ceph/blob/v21.3.0/src/mon/OSDMonitor.cc#L3385) | `failed_since = receive time − failed_for` |
+| f7 | [`OSDMonitor::check_failure`](https://github.com/ceph/ceph/blob/v21.3.0/src/mon/OSDMonitor.cc#L3300) | reporters per subtree; `failed_for = now − max_failed_since` |
+| f8 | [`OSDMonitor::get_grace_time`](https://github.com/ceph/ceph/blob/v21.3.0/src/mon/OSDMonitor.cc#L3253) | grace + the target's laggy term + the reporters' term |
+| f9 | [`OSDMonitor::encode_pending`](https://github.com/ceph/ceph/blob/v21.3.0/src/mon/OSDMonitor.cc#L1548) | the new epoch; [`should_propose`](https://github.com/ceph/ceph/blob/v21.3.0/src/mon/PaxosService.cc#L190) sets when |
+| f10–f12 | §3.5 | |
+| f13 | [`PeeringState::start_peering_interval`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.cc#L699) | |
+| f14 | [`PeeringState::build_prior`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.cc#L1452), [`OSD::queue_want_up_thru`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L7238) | `up_thru < same_interval_since` → ask the mon; the PG waits in `WaitUpThru` |
+| f15 | [`OSD::_committed_osd_maps`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L8621) | the "wrongly marked me down" branch, `OSD.cc:8751` |
+| f16 | [`start_waiting_for_healthy`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L7037), [`_is_healthy`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L7047), [`start_boot`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L6881) | boot only when ≥ 33 % of the heartbeat peers answer |
+
 The read's own functions: [`do_read`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L5934)
 (#21) chooses between the synchronous read of a replicated pool and
 the EC read paths; [`objects_read_sync`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L279)
@@ -1869,14 +2299,12 @@ the reply, logs the op's statistics and sends it.
 
 Each part above gets one deep case study in the style of the BlueStore
 post: one real run in the lab, a numbered trace, one lane map,
-zoom-ins. §4 holds the first two. The others:
+zoom-ins. §4 holds the first three. The others:
 
 | Study | Run in the lab |
 |---|---|
-| One OSD failure | `kill -STOP` one OSD: from the missed ping to the new map. (A killed OSD would take the "connection refused" shortcut of §3.4) |
-| One OSDMap epoch | `ceph osd out`, followed from the mon message to each PG |
-| One peering | stop osd.2 while writing to `pg1`, start it again |
-| One recovery | the objects written while osd.2 was down |
+| One peering, one recovery | the return of osd.2 in §4.3: the third interval, GetInfo with two peers, the three missing objects. Captured, not yet written |
+| One OSDMap epoch | `ceph osd out`: `down_pending_out` after 600 s, and what a CRUSH change does that a down OSD does not |
 | One backfill | add a fourth OSD, after the PG has trimmed its log (§1.4). Use pool `p1`, or `ceph osd pg-upmap-items`: CRUSH may not move the one PG of `pg1` to the new OSD |
 | One deep scrub, one repair | damage one copy with `ceph-objectstore-tool` |
 | One snapshot, one snap trim | an rbd snapshot, so that the `SnapContext` is visible in the op (§3.7.3); overwrite; remove the snapshot |
