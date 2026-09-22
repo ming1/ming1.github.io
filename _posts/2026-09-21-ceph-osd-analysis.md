@@ -189,7 +189,7 @@ BlueStore's job.
 | fast dispatch | the messenger thread calls the OSD's handler directly. There is no queue and no dispatch thread in between |
 | op shard | one part of the OSD's op queue (§2 #4). In this post "shard" alone always means this |
 | EC shard | in an erasure-coded pool, each OSD of the PG holds one chunk of every object. That position is the EC shard |
-| PG slot | the entry of one PG inside its op shard (§12.1). Not a reservation |
+| PG slot | the entry of one PG inside its op shard (§12.2). Not a reservation |
 | reservation | a permit for background work: a PG needs one before it may recover, backfill or scrub (§9) |
 | finisher | a thread that runs queued completion callbacks. Like a kernel workqueue |
 | collection | the ObjectStore's "directory" of objects. One per PG, plus one called `meta` (§10) |
@@ -291,7 +291,7 @@ Idea 3 gives the OSD its main loop. Sections 8 to 11 follow it:
 **Block-layer view:** an op shard is like a blk-mq hardware queue with
 its own scheduler, and `hash(PG id)` picks the shard like the CPU picks
 the hctx. The limits: the key is the PG, not the submitting CPU. And two
-threads serve one shard, so the queue alone does not keep the order. §12.1
+threads serve one shard, so the queue alone does not keep the order. §12.2
 shows what does.
 
 # 3. The lab
@@ -1151,7 +1151,8 @@ the moment the OSD records it. The four messenger events
 
 Before the trace, the path: which function calls which, in which
 thread, and where the op tracker events are set. Steps are `s1`…`s13`;
-the trace lines that follow have their own `#N`.
+the trace lines that follow have their own `#N`. §12.3 has one entry
+per step.
 
 ```
  context: msgr-worker thread, no PG lock
@@ -1160,7 +1161,7 @@ the trace lines that follow have their own `#N`.
         └► ShardedOpWQ::_enqueue       OSD.cc:11451               op shard = hash of the PG id; give the item to mClock
 
  context: tp_osd_tp thread, PG lock held
- s3  ShardedOpWQ::_process             OSD.cc:11114               take the next item from mClock; lock its PG (§12.1)
+ s3  ShardedOpWQ::_process             OSD.cc:11114               take the next item from mClock; lock its PG (§12.2)
      └► PGOpItem::run                  OpSchedulerItem.cc:23
  s4     └► dequeue_op                  OSD.cc:9978                event reached_pg
  s5        └► do_request               PrimaryLogPG.cc:1824       can the PG serve ops now? if not: a waiting_for_* list
@@ -1185,45 +1186,6 @@ the trace lines that follow have their own `#N`.
                                                                   in. Run the callback that execute_ctx registered
                                                                   (:4473): send MOSDOpReply; event commit_sent
 ```
-
-| step | Function | What to know |
-|---|---|---|
-| s1 | [`OSD::ms_fast_dispatch`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L7690) | it runs on the messenger thread, so it must be short and must not block |
-| s2 | [`OSD::enqueue_op`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L9920), [`_enqueue`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L11451) | a PG always maps to the same op shard |
-| s3 | [`_process`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L11114), [`PGOpItem::run`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scheduler/OpSchedulerItem.cc#L23) | the worker takes the PG lock *before* it runs the item (idea 1) |
-| s4 | [`OSD::dequeue_op`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L9978) | |
-| s5 | [`do_request`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L1824) | an op that cannot run now is parked in a `waiting_for_*` list (§12.1 #16) and queued again later |
-| s6 | [`do_op`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L2588), [`do_op_impl`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L2001), [`get_object_context`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L12138) | in v21 `do_op` is a thin wrapper. The code that older texts call `do_op` is now `do_op_impl` |
-| s7 | [`execute_ctx`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L4290) | |
-| s8 | [`prepare_transaction`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L9137), [`do_osd_ops`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L6163), [`finish_ctx`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L9208) | |
-| s9 | [`new_repop`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L11743), [`issue_repop`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L11696) | |
-| s10 | [`submit_transaction`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L591), [`issue_op`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L1210), [`append_log`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.cc#L4772) | see the notes below |
-| s11 | [`op_commit`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L681) | |
-| s12 | [`do_repop_reply`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L706) | |
-| s13 | [`eval_repop`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L11647) | |
-
-Notes:
-
-- **s10, the order.** The primary sends to the replicas first and
-  writes locally last, so all stores work in parallel. In between,
-  `log_operation` → `append_log` → `write_if_dirty` adds the log key and
-  the PG info to the local transaction. The replicas get the log entry
-  as a field of `MOSDRepOp`, and each adds its own keys the same way.
-- **s10, one transaction.** On each OSD the data and the log entry are
-  in the same ObjectStore transaction. They commit together or not at
-  all. This is why peering can trust the log.
-- **s11, how a commit comes back.** BlueStore does not put the commit
-  callback into the op queue. It puts it on a small list of the PG's op
-  shard, the `context_queue`
-  ([`set_collection_commit_queue`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/ObjectStore.h#L433)).
-  One of the shard's two workers runs that list next to its normal
-  items, so commits stay in order. The callback takes the PG lock
-  itself. mClock never sees it: a commit is never delayed by scheduling.
-  §11.1.7 shows it in a trace.
-- **s13, who is waited for.** The client gets its reply only when
-  **all** OSDs of the acting set have committed. The primary also waits
-  for an OSD that is being backfilled: it is not in the acting set, but
-  it gets every write.
 
 **On a replica**, s1–s5 are the same. Then `do_request` gives the
 message to the backend:
@@ -1578,10 +1540,125 @@ The functions of both traces:
 The case studies of §11 answer *what happened*. This section reads the
 code that made it happen, in the order the op met it.
 
-## 12.1 Data structures — who owns what
+## 12.1 Interfaces — the contracts the write crossed
+
+The write of §11.1 crossed four boundaries. Each is a C++ interface,
+and each carries a rule that the trace made visible.
+
+```
+ messenger ─(1) Dispatcher─► OSD ─(2) OpQueueable─► op queue ─► PG ─(3) PGBackend / Listener─► backend
+                                                                                                 │
+                                                                                      (4) ObjectStore
+                                                                                                 ▼
+                                                                          store ─► commit callback, back up
+```
+
+### 12.1.1 Dispatcher — the messenger calls the OSD
+
+[`class Dispatcher`](https://github.com/ceph/ceph/blob/v21.3.0/src/msg/Dispatcher.h#L33) is what a messenger
+talks to. It has two entry points, and the OSD implements both:
+
+| Entry | Thread | The OSD takes there |
+|---|---|---|
+| [`ms_fast_dispatch`](https://github.com/ceph/ceph/blob/v21.3.0/src/msg/Dispatcher.h#L88) | the `msgr-worker` that read the message | every op and every peering, recovery and scrub message: the list in [`OSD::ms_can_fast_dispatch`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L2110) |
+| [`ms_dispatch`](https://github.com/ceph/ceph/blob/v21.3.0/src/msg/Dispatcher.h#L125) | the messenger's `ms_dispatch` thread | everything else, above all `MOSDMap` (§7) |
+
+The rule comes with the interface. The comment on
+[`ms_can_fast_dispatch`](https://github.com/ceph/ceph/blob/v21.3.0/src/msg/Dispatcher.h#L71) says: handle the
+message *quickly, without taking long-term contended locks*, and be
+ready to get it before the connection is fully set up. So
+`OSD::ms_fast_dispatch` does only three things: make the `OpRequest`,
+read the PG id from the header, hand the item to the op queue (s1–s2;
+14 µs in §11.1.4). The rest of the message is decoded later, on a
+worker (`finish_decode`, s6). Heartbeat has its own small dispatcher,
+[`HeartbeatDispatcher`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L1671), on its own four
+messengers, so that a ping is never behind a data message.
+
+### 12.1.2 OpQueueable — what the op queue may hold
+
+Everything in the sharded queue is an
+[`OpSchedulerItem`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scheduler/OpSchedulerItem.h#L39) that
+wraps an [`OpQueueable`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scheduler/OpSchedulerItem.h#L42).
+The queue asks an item four questions and never looks inside it:
+
+| Question | Method | Used for |
+|---|---|---|
+| Which PG? | [`get_ordering_token`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scheduler/OpSchedulerItem.h#L51) | `hash(pg id) % shards` picks the op shard; the PG slot keeps the order (§12.2) |
+| How urgent? | [`get_scheduler_class`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scheduler/OpSchedulerItem.h#L76), plus priority and cost | mClock (§9.1) |
+| Need a PG? | [`peering_requires_pg`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scheduler/OpSchedulerItem.h#L64), [`is_peering`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scheduler/OpSchedulerItem.h#L61) | a peering event may create the PG, or run without one |
+| Which map? | [`get_map_epoch`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scheduler/OpSchedulerItem.h#L147) | an item for a newer epoch than the OSD has waits in the slot |
+
+Then the worker calls
+[`run(osd, shard, pg, handle)`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scheduler/OpSchedulerItem.h#L75)
+with the PG locked. A client op is a [`PGOpItem`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scheduler/OpSchedulerItem.h#L222)
+whose `run` is `dequeue_op` (s4). Recovery, scrub, snap trim and
+peering are other subclasses of the same interface (§9): that is what
+"one queue for all work" (§2, idea 2) means in code.
+
+Two things do **not** go through this interface, and the trace showed
+both: the store's commit callback (the `context_queue`, §11.1.7) and the
+messenger's own dispatch of `MOSDMap` (§7).
+
+### 12.1.3 PGBackend and its Listener — the PG and its backend
+
+The PG does not know if its pool is replicated or erasure coded. It
+talks to a [`PGBackend`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PGBackend.h#L64), and the backend
+talks back through
+[`PGBackend::Listener`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PGBackend.h#L79). Down:
+
+| PG → backend | Used in |
+|---|---|
+| [`submit_transaction`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PGBackend.h#L517): the `PGTransaction`, the log entries, `on_all_commit` | a write (s10) |
+| [`objects_read_sync`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PGBackend.h#L644), and the asynchronous read calls | a read (§11.2) |
+| [`handle_message`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PGBackend.h#L411) → [`_handle_message`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PGBackend.h#L416) | `MOSDRepOp`, `MOSDRepOpReply`, push, pull, … |
+| [`recover_object`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PGBackend.h#L395) | recovery (§9.2) |
+
+Up, the Listener has 83 virtual methods. The write used these:
+
+| backend → PG | Used in |
+|---|---|
+| [`log_operation`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PGBackend.h#L238): put these log entries into this transaction | s10, 2nd step; the replica's `do_repop` |
+| [`queue_transactions`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PGBackend.h#L176): give this transaction to the store | s10, 3rd step. [`PrimaryLogPG::queue_transactions`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.h#L384) is one line |
+| [`bless_context`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PGBackend.h#L165): wrap this callback so that it takes the PG lock | the commit callback (s11) |
+| [`send_message_osd_cluster`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PGBackend.h#L292) | the `MOSDRepOp` to each replica |
+| [`get_acting_recovery_backfill_shards`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PGBackend.h#L183) | who must commit before the reply (s13) |
+
+The rule is in the header comment above the Listener
+(`PGBackend.h:73`, above [`class Listener`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PGBackend.h#L79)): *the parent calls into
+the PGBackend holding a lock, and the callbacks are called under the
+same locks.* That is the PG lock. It is why `bless_context` exists: a
+callback that arrives from another thread, the store's, must take the
+lock itself before it may touch the PG.
+
+### 12.1.4 ObjectStore — the PG and the store
+
+The contract downwards is
+[`queue_transactions`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/ObjectStore.h#L241): a list of
+transactions on one collection, a hint (the `OpRequest`) for tracing,
+and the promise that the transactions commit **in the order given, each
+all or nothing**. The BlueStore post's
+[§4.1.1]({% post_url 2026-08-10-bluestore-io-analysis %}#411-queue_transactions--the-contract-rados-buys)
+reads it from the store's side. Two parts of it matter here:
+
+- **Callbacks.** The PG registers a `Context` on the transaction
+  ([`register_on_commit`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/Transaction.h#L317)). The store
+  calls it when the transaction is durable. Nothing says on which
+  thread.
+- **The commit queue.** So the OSD tells the store where to put the
+  callbacks: [`set_collection_commit_queue`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/ObjectStore.h#L433),
+  once per PG, points at the PG's op shard
+  ([`context_queue`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L1035)). BlueStore honours it, and
+  the callback lands on a `tp_osd_tp` worker of the right shard, 44 µs
+  after the commit (§11.1.7). Without it, the callback would run on the
+  store's own finisher thread.
+
+The read side has no callback: `read` is a plain blocking call, and
+§11.2.4 showed what that costs.
+
+## 12.2 Data structures — who owns what
 
 The tree behind the map of §2. Every section above walks over it; the
-traces of §10 put times on it.
+traces of §11 put times on it.
 
 ```
  OSD                                   one per process
@@ -1661,7 +1738,7 @@ The code has one comment about this order
 right, but its names are out of date: `ShardData::lock` is now
 `OSDShard::shard_lock`, and `OSD::pg_map_lock` no longer exists.
 
-### 12.1.1 The objects of one write, and how long each lives
+### 12.2.1 The objects of one write, and how long each lives
 
 Steps `sN` are the code path of §11.1.2:
 
@@ -1689,6 +1766,58 @@ Steps `sN` are the code path of §11.1.2:
 `RepGather` and `InProgressOp` look double. The first belongs to the PG
 and works for every backend. The second is the replicated backend's own
 bookkeeping.
+
+## 12.3 Function reference
+
+The functions of the write, in the order the op meets them. `sN` is the
+step in the tree of §11.1.2; in brackets, the trace lines of §11.1.1
+in which the function appears.
+
+| step (trace) | Function | What to know |
+|---|---|---|
+| s1 (#3) | [`OSD::ms_fast_dispatch`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L7690) | it runs on the messenger thread, so it must be short and must not block |
+| s2 (#8, #10) | [`OSD::enqueue_op`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L9920), [`_enqueue`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L11451) | a PG always maps to the same op shard |
+| s3 (#11) | [`_process`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L11114), [`PGOpItem::run`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scheduler/OpSchedulerItem.cc#L23) | the worker takes the PG lock *before* it runs the item (idea 1) |
+| s4 (#11) | [`OSD::dequeue_op`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L9978) | |
+| s5 (#13) | [`do_request`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L1824) | an op that cannot run now is parked in a `waiting_for_*` list (§12.2 #16) and queued again later |
+| s6 (#14–#17) | [`do_op`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L2588), [`do_op_impl`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L2001), [`get_object_context`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L12138) | in v21 `do_op` is a thin wrapper. The code that older texts call `do_op` is now `do_op_impl` |
+| s7 (#18) | [`execute_ctx`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L4290) | |
+| s8 (#19–#22) | [`prepare_transaction`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L9137), [`do_osd_ops`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L6163), [`finish_ctx`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L9208) | |
+| s9 (#23) | [`new_repop`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L11743), [`issue_repop`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L11696) | |
+| s10 (#24–#33) | [`submit_transaction`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L591), [`issue_op`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L1210), [`append_log`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.cc#L4772) | see the notes below |
+| s11 (#81–#84) | [`op_commit`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L681) | |
+| s12 (#73–#79, #96–#101) | [`do_repop_reply`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L706) | |
+| s13 (#102–#106) | [`eval_repop`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L11647) | |
+
+Notes:
+
+- **s10, the order.** The primary sends to the replicas first and
+  writes locally last, so all stores work in parallel. In between,
+  `log_operation` → `append_log` → `write_if_dirty` adds the log key and
+  the PG info to the local transaction. The replicas get the log entry
+  as a field of `MOSDRepOp`, and each adds its own keys the same way.
+- **s10, one transaction.** On each OSD the data and the log entry are
+  in the same ObjectStore transaction. They commit together or not at
+  all. This is why peering can trust the log.
+- **s11, how a commit comes back.** BlueStore does not put the commit
+  callback into the op queue. It puts it on a small list of the PG's op
+  shard, the `context_queue`
+  ([`set_collection_commit_queue`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/ObjectStore.h#L433)).
+  One of the shard's two workers runs that list next to its normal
+  items, so commits stay in order. The callback takes the PG lock
+  itself. mClock never sees it: a commit is never delayed by scheduling.
+  §11.1.7 shows it in a trace.
+- **s13, who is waited for.** The client gets its reply only when
+  **all** OSDs of the acting set have committed. The primary also waits
+  for an OSD that is being backfilled: it is not in the acting set, but
+  it gets every write.
+
+The read's own functions: [`do_read`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L5934)
+(#21) chooses between a synchronous read and an asynchronous one (EC
+pools); [`objects_read_sync`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L279)
+(#22–#23) is one call into the store;
+[`complete_read_ctx`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L9346) (#24) builds
+the reply, logs the op's statistics and sends it.
 
 # 13. What comes next
 
