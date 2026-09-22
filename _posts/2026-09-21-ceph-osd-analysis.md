@@ -131,7 +131,7 @@ primary. The objects themselves are not copied yet.
 ```
 
 In normal operation this state never appears: a write and its log entry
-are committed together on each OSD (§4.1.2). Real, from the healthy lab PG
+are committed together on each OSD (§4.2.2). Real, from the healthy lab PG
 (`ceph pg 8.2 query`):
 
 ```
@@ -437,7 +437,7 @@ How does everybody find the OSDs of an object, without asking anybody?
 
 Client and OSD run the same code, on the same map, and get the same
 answer. There is no lookup table and no server to ask. Every op carries
-the sender's map epoch (the `e71` in §4.1.2). If the OSD's map is older, the
+the sender's map epoch (the `e71` in §4.2.2). If the OSD's map is older, the
 op waits in `waiting_for_map` until the OSD has that epoch. If the
 client's map is older, the OSD sends it the newer map, and the client
 sends the op again if its target changed.
@@ -872,7 +872,7 @@ fixed kinds of work, not tenants.
  #13 SnapTrimmer                             a small state machine in the PG
  #14 └► SnapMapper                           which clones belong to the removed snap?
  #15    └► trim_object                       take the snap off each clone; remove the clone when no other snap
-                                             needs it. Done as a normal replicated write (§4.1.2)
+                                             needs it. Done as a normal replicated write (§4.2.2)
 ```
 
 | # | Source |
@@ -974,8 +974,8 @@ pgmeta objects. Now the two `P` records have names:
  one client write = ONE ObjectStore transaction on each OSD
    data of o48                              ─► the device
    xattr "_" of o48 (object_info_t)         ─► inside the O record
-   pgmeta key 0000000071.0000…0003          ─► P record 1: the PG log entry      (§4.1.2 s10, log_operation)
-   pgmeta key _fastinfo                     ─► P record 2: the new last_update   (§4.1.2 s10, log_operation)
+   pgmeta key 0000000071.0000…0003          ─► P record 1: the PG log entry      (§4.2.2 s10, log_operation)
+   pgmeta key _fastinfo                     ─► P record 2: the new last_update   (§4.2.2 s10, log_operation)
 ```
 
 # 4. Case studies
@@ -995,7 +995,7 @@ The instruments, shared by both cases:
 | Lanes | `primary` = osd.2 (`/dev/vdb`), `replicaA` = osd.0 (`/dev/nvme0n1`), `replicaB` = osd.1 (`/dev/sda`) |
 | Script | [`wosdop.bt`]({{ site.baseurl }}/code/ceph/wosdop.bt): 48 probes. BlueStore gets two lines (in, out). Every step of the OSD layer gets one |
 | Collector | [`wosdopcollect.sh`]({{ site.baseurl }}/code/ceph/wosdopcollect.sh)` <build> <outdir> put`, then `get`. It finds the three pids, writes the object once untraced, traces the second op, and saves the op tracker's record of the same op |
-| Checker | [`wosdopcheck.py`]({{ site.baseurl }}/code/ceph/wosdopcheck.py): trace against tracker (§4.1.9, §4.2.4) |
+| Checker | [`wosdopcheck.py`]({{ site.baseurl }}/code/ceph/wosdopcheck.py): trace against tracker (§4.2.9, §4.1.4) |
 
 Both cases use them the same way. Three things the script had to
 solve, because they say something about the OSD:
@@ -1015,13 +1015,163 @@ solve, because they say something about the OSD:
   `std::variant`, `get_object_context` a `shared_ptr`) gets the return
   slot as its first argument. So `this` is `arg1`, not `arg0`.
 
-## 4.1 One 16 KiB write, three OSDs
+## 4.1 One 16 KiB read
 
-One 16 KiB `rados put` of `o48`: first the path in the code, then the
-same write traced, with the threads, the PG lock, and the time each
-step took.
+One 16 KiB `rados get` of `o48`, the object of §1.1, on PG `8.2`. A
+read is the shortest path through the OSD: in a replicated pool it
+never leaves the primary. It also shows one cost that the write of
+§4.2 hides: the PG lock is held for the whole time the device works.
 
 ### 4.1.1 The workload and the trace
+
+```bash
+rados -p p1 put o48 /root/16k        # the collector writes first, so the read misses the cache
+wosdopcollect.sh <build-dir> <outdir> get
+```
+
+```
+  #         us     tid  proc     thread           function                             event
+  1          2   46501  client   rados            Objecter::_op_submit                 obj=o48 pool=8
+  2        731   46504  client   msgr-worker-0    ProtocolV2::write_message            MOSDOp tid=1 -> socket
+  3        799   35687  primary  msgr-worker-2    OSD::ms_fast_dispatch                osd_op tid=1 arrives, front+middle+data=219+0+0 B
+  4        809   35687  primary  msgr-worker-2    TrackedOp::mark_event                EVENT header_read
+  5        810   35687  primary  msgr-worker-2    TrackedOp::mark_event                EVENT throttled
+  6        811   35687  primary  msgr-worker-2    TrackedOp::mark_event                EVENT all_read
+  7        812   35687  primary  msgr-worker-2    TrackedOp::mark_event                EVENT dispatched
+  8        818   35687  primary  msgr-worker-2    OSD::enqueue_op                      op 0x564d6ef363c0, sent at epoch 92
+  9        820   35687  primary  msgr-worker-2    TrackedOp::mark_event                EVENT queued_for_pg
+ 10        822   35687  primary  msgr-worker-2    mClockScheduler::enqueue             item -> scheduler 0x564d6bcf1880 (one per op shard)
+ 11        866   36124  primary  tp_osd_tp        OSD::dequeue_op                      op 0x564d6ef363c0 from scheduler 0x564d6bcf1880: 32 us queued + 17 us to here (PG lock wait 9 us)
+ 12        870   36124  primary  tp_osd_tp        TrackedOp::mark_event                EVENT reached_pg
+ 13        872   36124  primary  tp_osd_tp        PrimaryLogPG::do_request             can the PG serve it now?
+ 14        877   36124  primary  tp_osd_tp        PrimaryLogPG::do_op                  finish_decode, then do_op_impl
+ 15        881   36124  primary  tp_osd_tp        PrimaryLogPG::do_op_impl             the checks
+ 16        890   36124  primary  tp_osd_tp        PrimaryLogPG::get_object_context     obj=o48 can_create=0
+ 17        897   36124  primary  tp_osd_tp        TrackedOp::mark_event                EVENT started
+ 18        899   36124  primary  tp_osd_tp        PrimaryLogPG::execute_ctx            OpContext 0x564d6c931200
+ 19        901   36124  primary  tp_osd_tp        PrimaryLogPG::prepare_transaction    do_osd_ops, then finish_ctx
+ 20        903   36124  primary  tp_osd_tp        PrimaryLogPG::do_osd_ops             first OSDOp code 0x1201 (read)
+ 21        905   36124  primary  tp_osd_tp        PrimaryLogPG::do_read                replicated pool: a synchronous read
+ 22        907   36124  primary  tp_osd_tp        ReplicatedBackend::objects_read_sync off=0 len=16384: read the local store, in this thread
+ 23       2434   36124  primary  tp_osd_tp        ReplicatedBackend::objects_read_sync returned 16384 after 1528 us
+ 24       2444   36124  primary  tp_osd_tp        PrimaryLogPG::complete_read_ctx      result=0: build and send the reply
+ 25       2446   36124  primary  tp_osd_tp        PrimaryLogPG::log_op_stats           reply -> client; the op was 1631 us in this OSD (in 0 B, out 16384 B)
+ 26       2463   36124  primary  tp_osd_tp        PGOpItem::run (return)               item done, PG unlocked
+ 27       2465   36124  primary  tp_osd_tp        TrackedOp::mark_event                EVENT done
+ 28       2470   35687  primary  msgr-worker-2    ProtocolV2::write_message            MOSDOpReply tid=1 -> socket, data 16384 B
+ 29       2638   46504  client   msgr-worker-0    Objecter::handle_osd_op_reply        MOSDOpReply tid=1, data 16384 B
+```
+
+### 4.1.2 The map — one OSD, one thread
+
+```
+     us  client         primary (osd.2)
+      2  #1 submit
+    731  #2 MOSDOp ───► #3   msgr-worker: ms_fast_dispatch
+                        #8   enqueue_op ─► #10 mClock
+                             ⋮ 32 us in the queue
+    866                 #11  tp_osd_tp 36124: dequeue_op            ┐
+                        #13–#20  do_request … do_osd_ops (read)     │
+                        #21  do_read                                │ PG LOCKED
+                        #22  objects_read_sync ─► the device        │ 1597 us
+                             ⋮   1528 us, the worker waits          │
+   2434                 #23  … returned 16384 B                     │
+                        #24  complete_read_ctx: build the reply     │
+   2463                 #26  PG unlocked                            ┘
+   2638  #29 ◄──────── #28 MOSDOpReply, 16384 B
+```
+
+No replica lane: nothing leaves osd.2 but the reply.
+
+### 4.1.3 Lines 1–20 — the same path as the write
+
+Lines #1–#20 name the same functions as the write of §4.2: dispatch,
+the op queue, the PG lock, `do_op`, `execute_ctx`, `do_osd_ops`. In the
+code (§4.2.2) the read leaves the write's path at step s8: the
+[`CEPH_OSD_OP_READ`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L6273) case calls
+[`do_read`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L5934) (#21), which reads from
+the local store ([`objects_read_sync`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L279),
+#22). Then a read is short: no `RepGather`, no transaction, no log
+entry, no replica is asked, no commit to wait for. The reply is built at
+#24, in the same thread, 1.6 ms after the message arrived. (In an EC pool
+the primary holds only one chunk of the object. It must read chunks from
+other OSDs first, so it sends the reply later, from a callback.)
+
+### 4.1.4 Lines 21–26 — the device, under the PG lock
+
+But look at the lock. The PG is locked from #11 to #26: **the whole
+read from the device, 1528 µs, happens under the PG lock**
+(`objects_read_sync`, #22–#23). A write holds the PG for 377 µs and
+then waits for 4 ms *without* the lock. A read in a replicated pool
+that misses the cache waits for the device *with* the lock. Every other op of this PG waits
+behind it. In another run of this same read, the device needed 97 ms,
+and the PG was locked for 97 ms.
+
+There can be a second cost. This read ran on thread 36124. Had it
+landed on 36116, the shard's callback worker (§4.2.7), as in other runs,
+the commits of **every PG of this op shard** would have waited for the
+device too, not only the ops of PG `8.2`: commit callbacks run only
+from that thread's loop.
+
+This trace always shows a cache miss. The object was written just
+before, and `bluestore_default_buffered_write` is false: BlueStore does
+not keep written data in its cache. It does keep data that was *read*
+(`bluestore_default_buffered_read` is true). A second read of `o48`
+would come from the cache, and the lock would be held for microseconds.
+So the exact statement is: a read in a replicated pool that misses the
+cache waits for the device with the PG lock held.
+
+The op tracker saw the same read:
+
+```
+osd_op(client.4514.0:1 8.2 8:477f3578:::o48:head [read 0~16384] snapc 0=[] ondisk+read+known_if_redirected+supports_pool_eio e92)
+duration 0.001679972
+   10:12:08.750230+0000 initiated
+   10:12:08.750230+0000 header_read
+   10:12:08.750231+0000 throttled
+   10:12:08.750237+0000 all_read
+   10:12:08.750239+0000 dispatched
+   10:12:08.750265+0000 queued_for_pg
+   10:12:08.750315+0000 reached_pg
+   10:12:08.750342+0000 started
+   10:12:08.751910+0000 done
+```
+
+Its record has four events after `queued_for_pg`, and they agree with
+the trace to the microsecond (`wosdopcheck.py`):
+
+```
+event                              tracker us  bpftrace us   diff
+queued_for_pg                               0            0      0
+reached_pg                                 50           50      0
+started                                   77           77      0
+done                                     1645         1645      0
+```
+
+The tracker has no event between `started` and `done`. The 1.5 ms in
+the device, the biggest part of this read, is invisible to it. That is
+the limit of the tracker: it marks the stage boundaries of the OSD
+layer, not what happens inside a stage.
+
+The functions of both traces:
+
+| Function in the trace | Source |
+|---|---|
+| `TrackedOp::mark_event` | [`TrackedOp::mark_event`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/TrackedOp.cc#L602) |
+| `mClockScheduler::enqueue`, `dequeue` | [`enqueue`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scheduler/mClockScheduler.cc#L76), [`dequeue`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scheduler/mClockScheduler.cc#L148) |
+| PG lock | [`PG::lock`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PG.cc#L241) |
+| `PGOpItem::run` | [`PGOpItem::run`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scheduler/OpSchedulerItem.cc#L23) |
+| the commit callback | [`BlessedContext`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L200), [`C_OSD_OnOpCommit`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L354), [`C_OSD_RepModifyCommit`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L89) |
+| `context_queue` | [`context_queue`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L1035), [`class ContextQueue`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/Finisher.h#L165), [`handle_oncommits`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L1818) |
+| the rest | §4.2.2 |
+
+## 4.2 One 16 KiB write, three OSDs
+
+The same object, the same PG, one 16 KiB `rados put`: first the path
+in the code, then the same write traced, with the threads, the PG
+lock, and the time each step took.
+
+### 4.2.1 The workload and the trace
 
 ```bash
 head -c 16384 /dev/urandom > /root/16k
@@ -1164,7 +1314,7 @@ the moment the OSD records it. The four messenger events
 110       6036   46350  client   msgr-worker-0    Objecter::handle_osd_op_reply        MOSDOpReply tid=1, data 0 B
 ```
 
-### 4.1.2 The path in the code
+### 4.2.2 The path in the code
 
 Before the trace, the path: which function calls which, in which
 thread, and where the op tracker events are set. Steps are `s1`…`s13`;
@@ -1214,7 +1364,7 @@ builds nothing, it applies what the primary built.
 [§3.3 of the BlueStore post]({% post_url 2026-08-10-bluestore-io-analysis %}#33-one-16-kib-write-replicated)
 traces both sides with bpftrace.
 
-### 4.1.3 The map — three OSDs, one clock
+### 4.2.3 The map — three OSDs, one clock
 
 Every `#N` is a trace line. Time runs down; the four lanes are the
 client and the three OSDs. `PG LOCKED` marks the spans in which a
@@ -1253,7 +1403,7 @@ worker holds that OSD's PG lock.
    6036  #110 ◄──────── #106 MOSDOpReply
 ```
 
-### 4.1.4 Lines 3–11, msgr-worker → tp_osd_tp — from the socket to the PG lock
+### 4.2.4 Lines 3–11, msgr-worker → tp_osd_tp — from the socket to the PG lock
 
 124 µs from the message to the locked PG:
 
@@ -1271,7 +1421,7 @@ can be seen. The 70 µs are a thread wake-up; in other runs it was 33 µs.
 Every message pays this toll again: the two replica ops (#34–#43,
 #38–#49) and the two replies (#73–#77, #92–#96).
 
-### 4.1.5 Lines 11–44, tp_osd_tp — under the PG lock
+### 4.2.5 Lines 11–44, tp_osd_tp — under the PG lock
 
 One worker holds the PG lock for 377 µs and does everything the primary
 has to do before it can wait:
@@ -1296,7 +1446,7 @@ has to do before it can wait:
   377  #44  PG unlocked
 ```
 
-This is step s10 of §4.1.2 in real data: **send first (#27, #29), then
+This is step s10 of §4.2.2 in real data: **send first (#27, #29), then
 the log entry (#30, #31), then the local store (#32)**. The messenger
 thread puts the first `MOSDRepOp` on the wire (#28) while the worker is
 still sending the second, and the second (#33) while it is already in
@@ -1307,9 +1457,9 @@ The lock is released at 1949 µs (#44). The local store commits at
 holds the PG lock**. The PG is free to start the next op. This is the
 pipeline that makes one PG lock bearable.
 
-### 4.1.6 Lines 34–65, the replicas
+### 4.2.6 Lines 34–65, the replicas
 
-A replica runs §4.1.4 again (#34–#43, #38–#49: 67 µs and 62 µs from the
+A replica runs §4.2.4 again (#34–#43, #38–#49: 67 µs and 62 µs from the
 socket to the PG lock). Then, under its PG lock, it does not run `do_op`.
 `do_repop` (#47, #52) decodes the transaction and the log entry the
 primary built, `append_log` and `write_if_dirty` (#53–#54, #56–#58) add
@@ -1326,7 +1476,7 @@ and with the write-through cache. The cause is on the store side and is
 not examined here. What it shows: **whatever `queue_transactions`
 costs, the PG pays it under its lock.**
 
-### 4.1.7 Lines 61–101, the commits come back two ways
+### 4.2.7 Lines 61–101, the commits come back two ways
 
 ```
  the local commit: a CALLBACK                         a replica's commit: a MESSAGE, so a QUEUE ITEM
@@ -1338,7 +1488,7 @@ costs, the PG pays it under its lock.**
             33 us from store to PG                               123 us from replica to PG
 ```
 
-mClock never sees the callback (§4.1.2, note s11). The thread that ran
+mClock never sees the callback (§4.2.2, note s11). The thread that ran
 the callbacks was the same in every run of this study: 36116 on the
 primary, 39150 on replicaA, 34909 on replicaB. In each OSD it is one
 fixed worker of the PG's op shard. The client op itself ran on either
@@ -1356,13 +1506,13 @@ primary's own store was the first to commit. In the write-back run of
 this study a replica was first. The order is not fixed. The reply to the
 client leaves when the set is empty (#102), whoever was last.
 
-### 4.1.8 Where the 6.0 ms went
+### 4.2.8 Where the 6.0 ms went
 
 | Part | µs | |
 |---|---|---|
 | client: submit → socket | 1311 | #1–#2: most likely `rados` opens its session to the OSD |
-| primary: socket → PG lock | 124 | §4.1.4 |
-| primary: under the PG lock | 377 | §4.1.5; 147 of it is the store's submit |
+| primary: socket → PG lock | 124 | §4.2.4 |
+| primary: under the PG lock | 377 | §4.2.5; 147 of it is the store's submit |
 | **three stores, in parallel** | **2597 · 3773 · 3488** | #61, #85, #66. The slowest one decides |
 | primary: 1 callback + 2 replies | about 130 | #61–#64, #73–#83, #92–#101: mostly the queue toll |
 | primary: last reply → `MOSDOpReply` on the socket | 25 | #101–#106 |
@@ -1373,7 +1523,7 @@ same disks the stores took 14–19 ms and the same 0.5–0.7 ms was 2.5 %.
 The cost is per op, not per byte, so it is the same in front of a fast
 device: there it is what is left to optimize.
 
-### 4.1.9 The trace, checked against the op tracker
+### 4.2.9 The trace, checked against the op tracker
 
 Two tools with two clocks saw the same op: bpftrace (monotonic clock,
 uprobes) and the OSD's own op tracker (wall clock, its own code). The
@@ -1415,159 +1565,11 @@ done                                     4466         4466      0
 
 They agree to 2 µs. So the tracker can be trusted for the primary's
 stage boundaries, and it needs no tooling. What it cannot show is
-everything else in §4.1.3: the replicas, the threads, the PG lock, the
+everything else in §4.2.3: the replicas, the threads, the PG lock, the
 two ways a commit comes back. One detail: `header_read`, `throttled`,
 `all_read` and `dispatched` are not live events. The OSD copies them
 from the message's own time stamps when it creates the `OpRequest`
 (#4–#7 are 3 µs apart).
-
-## 4.2 One 16 KiB read
-
-Same object, same PG, same three OSDs, one `rados get`. The read shows
-what a write hides: a read in a replicated pool never leaves the
-primary, and the PG lock is held for the whole time the device works.
-
-### 4.2.1 The workload and the trace
-
-```bash
-rados -p p1 put o48 /root/16k        # the collector writes first, so the read misses the cache
-wosdopcollect.sh <build-dir> <outdir> get
-```
-
-```
-  #         us     tid  proc     thread           function                             event
-  1          2   46501  client   rados            Objecter::_op_submit                 obj=o48 pool=8
-  2        731   46504  client   msgr-worker-0    ProtocolV2::write_message            MOSDOp tid=1 -> socket
-  3        799   35687  primary  msgr-worker-2    OSD::ms_fast_dispatch                osd_op tid=1 arrives, front+middle+data=219+0+0 B
-  4        809   35687  primary  msgr-worker-2    TrackedOp::mark_event                EVENT header_read
-  5        810   35687  primary  msgr-worker-2    TrackedOp::mark_event                EVENT throttled
-  6        811   35687  primary  msgr-worker-2    TrackedOp::mark_event                EVENT all_read
-  7        812   35687  primary  msgr-worker-2    TrackedOp::mark_event                EVENT dispatched
-  8        818   35687  primary  msgr-worker-2    OSD::enqueue_op                      op 0x564d6ef363c0, sent at epoch 92
-  9        820   35687  primary  msgr-worker-2    TrackedOp::mark_event                EVENT queued_for_pg
- 10        822   35687  primary  msgr-worker-2    mClockScheduler::enqueue             item -> scheduler 0x564d6bcf1880 (one per op shard)
- 11        866   36124  primary  tp_osd_tp        OSD::dequeue_op                      op 0x564d6ef363c0 from scheduler 0x564d6bcf1880: 32 us queued + 17 us to here (PG lock wait 9 us)
- 12        870   36124  primary  tp_osd_tp        TrackedOp::mark_event                EVENT reached_pg
- 13        872   36124  primary  tp_osd_tp        PrimaryLogPG::do_request             can the PG serve it now?
- 14        877   36124  primary  tp_osd_tp        PrimaryLogPG::do_op                  finish_decode, then do_op_impl
- 15        881   36124  primary  tp_osd_tp        PrimaryLogPG::do_op_impl             the checks
- 16        890   36124  primary  tp_osd_tp        PrimaryLogPG::get_object_context     obj=o48 can_create=0
- 17        897   36124  primary  tp_osd_tp        TrackedOp::mark_event                EVENT started
- 18        899   36124  primary  tp_osd_tp        PrimaryLogPG::execute_ctx            OpContext 0x564d6c931200
- 19        901   36124  primary  tp_osd_tp        PrimaryLogPG::prepare_transaction    do_osd_ops, then finish_ctx
- 20        903   36124  primary  tp_osd_tp        PrimaryLogPG::do_osd_ops             first OSDOp code 0x1201 (read)
- 21        905   36124  primary  tp_osd_tp        PrimaryLogPG::do_read                replicated pool: a synchronous read
- 22        907   36124  primary  tp_osd_tp        ReplicatedBackend::objects_read_sync off=0 len=16384: read the local store, in this thread
- 23       2434   36124  primary  tp_osd_tp        ReplicatedBackend::objects_read_sync returned 16384 after 1528 us
- 24       2444   36124  primary  tp_osd_tp        PrimaryLogPG::complete_read_ctx      result=0: build and send the reply
- 25       2446   36124  primary  tp_osd_tp        PrimaryLogPG::log_op_stats           reply -> client; the op was 1631 us in this OSD (in 0 B, out 16384 B)
- 26       2463   36124  primary  tp_osd_tp        PGOpItem::run (return)               item done, PG unlocked
- 27       2465   36124  primary  tp_osd_tp        TrackedOp::mark_event                EVENT done
- 28       2470   35687  primary  msgr-worker-2    ProtocolV2::write_message            MOSDOpReply tid=1 -> socket, data 16384 B
- 29       2638   46504  client   msgr-worker-0    Objecter::handle_osd_op_reply        MOSDOpReply tid=1, data 16384 B
-```
-
-### 4.2.2 The map — one OSD, one thread
-
-```
-     us  client         primary (osd.2)
-      2  #1 submit
-    731  #2 MOSDOp ───► #3   msgr-worker: ms_fast_dispatch
-                        #8   enqueue_op ─► #10 mClock
-                             ⋮ 32 us in the queue
-    866                 #11  tp_osd_tp 36124: dequeue_op            ┐
-                        #13–#20  do_request … do_osd_ops (read)     │
-                        #21  do_read                                │ PG LOCKED
-                        #22  objects_read_sync ─► the device        │ 1597 us
-                             ⋮   1528 us, the worker waits          │
-   2434                 #23  … returned 16384 B                     │
-                        #24  complete_read_ctx: build the reply     │
-   2463                 #26  PG unlocked                            ┘
-   2638  #29 ◄──────── #28 MOSDOpReply, 16384 B
-```
-
-No replica lane: nothing leaves osd.2 but the reply.
-
-### 4.2.3 Lines 1–20 — the same path as the write
-
-Lines #1–#20 name the same functions as the write. In the code the read
-leaves the write's path at step s8 of §4.1.2: the
-[`CEPH_OSD_OP_READ`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L6273) case calls
-[`do_read`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L5934) (#21), which reads from
-the local store ([`objects_read_sync`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L279),
-#22). Then a read is short: no `RepGather`, no transaction, no log
-entry, no replica is asked, no commit to wait for. The reply is built at
-#24, in the same thread, 1.6 ms after the message arrived. (In an EC pool
-the primary holds only one chunk of the object. It must read chunks from
-other OSDs first, so it sends the reply later, from a callback.)
-
-### 4.2.4 Lines 21–26 — the device, under the PG lock
-
-But look at the lock. The PG is locked from #11 to #26: **the whole
-read from the device, 1528 µs, happens under the PG lock**
-(`objects_read_sync`, #22–#23). A write holds the PG for 377 µs and
-then waits for 4 ms *without* the lock. A read in a replicated pool
-that misses the cache waits for the device *with* the lock. Every other op of this PG waits
-behind it. In another run of this same read, the device needed 97 ms,
-and the PG was locked for 97 ms.
-
-There can be a second cost. This read ran on thread 36124. Had it
-landed on 36116, the shard's callback worker (§4.1.7), as in other runs,
-the commits of **every PG of this op shard** would have waited for the
-device too, not only the ops of PG `8.2`: commit callbacks run only
-from that thread's loop.
-
-This trace always shows a cache miss. The object was written just
-before, and `bluestore_default_buffered_write` is false: BlueStore does
-not keep written data in its cache. It does keep data that was *read*
-(`bluestore_default_buffered_read` is true). A second read of `o48`
-would come from the cache, and the lock would be held for microseconds.
-So the exact statement is: a read in a replicated pool that misses the
-cache waits for the device with the PG lock held.
-
-The op tracker saw the same read:
-
-```
-osd_op(client.4514.0:1 8.2 8:477f3578:::o48:head [read 0~16384] snapc 0=[] ondisk+read+known_if_redirected+supports_pool_eio e92)
-duration 0.001679972
-   10:12:08.750230+0000 initiated
-   10:12:08.750230+0000 header_read
-   10:12:08.750231+0000 throttled
-   10:12:08.750237+0000 all_read
-   10:12:08.750239+0000 dispatched
-   10:12:08.750265+0000 queued_for_pg
-   10:12:08.750315+0000 reached_pg
-   10:12:08.750342+0000 started
-   10:12:08.751910+0000 done
-```
-
-Its record has four events after `queued_for_pg`, and they agree with
-the trace to the microsecond (`wosdopcheck.py`):
-
-```
-event                              tracker us  bpftrace us   diff
-queued_for_pg                               0            0      0
-reached_pg                                 50           50      0
-started                                   77           77      0
-done                                     1645         1645      0
-```
-
-The tracker has no event between `started` and `done`. The 1.5 ms in
-the device, the biggest part of this read, is invisible to it. That is
-the limit of the tracker: it marks the stage boundaries of the OSD
-layer, not what happens inside a stage.
-
-The functions of both traces:
-
-| Function in the trace | Source |
-|---|---|
-| `TrackedOp::mark_event` | [`TrackedOp::mark_event`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/TrackedOp.cc#L602) |
-| `mClockScheduler::enqueue`, `dequeue` | [`enqueue`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scheduler/mClockScheduler.cc#L76), [`dequeue`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scheduler/mClockScheduler.cc#L148) |
-| PG lock | [`PG::lock`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PG.cc#L241) |
-| `PGOpItem::run` | [`PGOpItem::run`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scheduler/OpSchedulerItem.cc#L23) |
-| the commit callback | [`BlessedContext`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L200), [`C_OSD_OnOpCommit`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L354), [`C_OSD_RepModifyCommit`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L89) |
-| `context_queue` | [`context_queue`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L1035), [`class ContextQueue`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/Finisher.h#L165), [`handle_oncommits`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L1818) |
-| the rest | §4.1.2 |
 
 ## 4.3 One OSD failure
 
@@ -1962,7 +1964,7 @@ code that made it happen, in the order the op met it.
 
 ## 5.1 Interfaces — the contracts the write crossed
 
-The write of §4.1 crossed four boundaries. Each is a C++ interface,
+The write of §4.2 crossed four boundaries. Each is a C++ interface,
 and each carries a rule that the trace made visible.
 
 ```
@@ -1989,7 +1991,7 @@ message *quickly, without taking long-term contended locks*, and be
 ready to get it before the connection is fully set up. So for a client
 op `OSD::ms_fast_dispatch` does three things: make the `OpRequest`, take
 the PG id that the messenger already decoded from the front of the
-message, hand the item to the op queue (s1–s2; 33 µs in §4.1.4). The
+message, hand the item to the op queue (s1–s2; 33 µs in §4.2.4). The
 rest of the message is decoded later, on a worker (`finish_decode`,
 s6). A peering message takes a shorter path in the same function: it
 becomes a peering event, with no `OpRequest`. Heartbeat has its own small dispatcher,
@@ -2022,7 +2024,7 @@ peering are other subclasses of the same interface (§3.7): that is what
 "one queue for all work" (§3.1, idea 2) means in code.
 
 Two things do **not** go through this interface, and the trace showed
-both: the store's commit callback (the `context_queue`, §4.1.7) and the
+both: the store's commit callback (the `context_queue`, §4.2.7) and the
 messenger's own dispatch of `MOSDMap` (§3.5).
 
 ### 5.1.3 PGBackend and its Listener — the PG and its backend
@@ -2035,7 +2037,7 @@ talks back through
 | PG → backend | Used in |
 |---|---|
 | [`submit_transaction`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PGBackend.h#L517): the `PGTransaction`, the log entries, `on_all_commit` | a write (s10) |
-| [`objects_read_sync`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PGBackend.h#L644), and the asynchronous read calls | a read (§4.2) |
+| [`objects_read_sync`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PGBackend.h#L644), and the asynchronous read calls | a read (§4.1) |
 | [`handle_message`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PGBackend.h#L411) → [`_handle_message`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PGBackend.h#L416) | `MOSDRepOp`, `MOSDRepOpReply`, push, pull, … |
 | [`recover_object`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PGBackend.h#L395) | recovery (§3.7.2) |
 
@@ -2084,10 +2086,10 @@ reads it from the store's side. Two parts of it matter here:
   once per PG, points at the PG's op shard
   ([`context_queue`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L1035)). BlueStore honours it, and
   the callback lands on a `tp_osd_tp` worker of the right shard, 33 µs
-  after the commit (§4.1.7).
+  after the commit (§4.2.7).
 
 The read side has no callback: `read` is a plain blocking call, and
-§4.2.4 showed what that costs.
+§4.1.4 showed what that costs.
 
 ### 5.1.5 OSD and mon — the OSD asks, the mon decides
 
@@ -2197,7 +2199,7 @@ right, but its names are out of date: `ShardData::lock` is now
 
 ### 5.2.1 The objects of one write, and how long each lives
 
-Steps `sN` are the code path of §4.1.2:
+Steps `sN` are the code path of §4.2.2:
 
 ```
  MOSDOp ── wrapped by ──► OpRequest            s1 … "done"      the message and its tracker events
@@ -2227,7 +2229,7 @@ bookkeeping.
 ## 5.3 Function reference
 
 The functions of the write, in the order the op meets them. `sN` is the
-step in the tree of §4.1.2; in brackets, the trace lines of §4.1.1
+step in the tree of §4.2.2; in brackets, the trace lines of §4.2.1
 in which the function appears.
 
 | step (trace) | Function | What to know |
@@ -2263,7 +2265,7 @@ Notes:
   One of the shard's two workers runs that list next to its normal
   items, so commits stay in order. The callback takes the PG lock
   itself. mClock never sees it: a commit is never delayed by scheduling.
-  §4.1.7 shows it in a trace.
+  §4.2.7 shows it in a trace.
 - **s13, who is waited for.** The client gets its reply only when
   **all** OSDs of the acting set have committed. The primary also waits
   for an OSD that is being backfilled: it is not in the acting set, but
@@ -2378,7 +2380,7 @@ The same rule sets a second knob, `queue/write_cache`, to
 every fdatasync of BlueStore becomes a cache-flush command to the
 device, and on this VM one flush costs 5–15 ms. With `write through`
 the kernel drops the flush. The barriers then cost what the I/O costs,
-and the OSD layer's share of a write becomes visible (§4.1.8). Unlike
+and the OSD layer's share of a write becomes visible (§4.2.8). Unlike
 the rotational flag, this setting survives udev's partition re-read (a
 test on `/dev/sdb`, which the rule does not cover: the re-read set
 `rotational` back to 1 and left `write_cache` alone). The rule sets it
