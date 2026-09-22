@@ -4,7 +4,7 @@
 # MDS and one RGW so that rbd / cephfs / rgw clients can all be traced
 # against the same OSDs.
 #
-# Usage:  osdlab.sh <ceph-build-dir> start|stop|repair|status|debug-on|debug-off
+# Usage:  osdlab.sh <ceph-build-dir> start|stop|repair|queue|status|debug-on|debug-off
 #
 #   DEVS=/dev/a,/dev/b,/dev/c   OSD devices (default: the blog's three)
 #
@@ -18,7 +18,7 @@
 set -eu
 
 BUILD=${1:?ceph build dir}
-CMD=${2:?start|stop|repair|status|debug-on|debug-off}
+CMD=${2:?start|stop|repair|queue|status|debug-on|debug-off}
 DEVS=${DEVS:-/dev/nvme0n1,/dev/sda,/dev/vdb}
 NOSD=$(echo "$DEVS" | tr ',' '\n' | wc -l)
 
@@ -65,20 +65,29 @@ bdev_type() {
 	python3 -c 'import json,sys; print(json.load(sys.stdin)["bluestore_bdev_type"])'
 }
 
-# Make every OSD see a non-rotational disk.  A virtio or emulated SCSI
-# disk says rotational=1, and BlueStore *and* the OSD read the flag at
-# start: HDD means deferred writes for anything <= 64 KiB, fewer op
-# threads, the hdd mClock profile -- replicas would not be comparable.
+# Two block-layer settings, so that the three virtual disks behave alike:
 #
-# For a SCSI disk the 0 written here does not stay by itself: udev
-# answers every close-after-write (vstart's dd, --mkfs, each OSD stop)
-# with a partition re-read, and sd then fetches the flag from the
-# device again.  Install 99-osdlab-rotational.rules (next to this
-# script) first; check_ssd below fails loudly if the flag was lost.
-clear_rotational() {
-	local d
+# rotational=0   A virtio or emulated SCSI disk says rotational=1, and
+#                BlueStore *and* the OSD read the flag at start: HDD means
+#                deferred writes for anything <= 64 KiB, fewer op threads,
+#                the hdd mClock profile -- replicas would not be comparable.
+# write through  The disks advertise a volatile write cache, so every
+#                fdatasync of BlueStore becomes a cache flush command to
+#                the device.  With "write through" the kernel drops the
+#                flush; the barriers then cost what the I/O costs, and the
+#                OSD layer's share of a write becomes visible.
+#
+# For a SCSI disk neither value stays by itself: udev answers every
+# close-after-write (vstart's dd, --mkfs, each OSD stop) with a partition
+# re-read, and sd then fetches both from the device again.  Install
+# 99-osdlab-rotational.rules (next to this script) first; check_ssd below
+# fails loudly if a value was lost.
+set_queue_attrs() {
+	local d q
 	for d in $(echo "$DEVS" | tr ',' ' '); do
-		echo 0 > "/sys/block/$(basename "$d")/queue/rotational"
+		q="/sys/block/$(basename "$d")/queue"
+		echo 0 > "$q/rotational"
+		echo "write through" > "$q/write_cache"
 	done
 }
 
@@ -92,6 +101,8 @@ check_ssd() {
 		[ "$(bdev_type "$i")" = ssd ] ||
 			{ echo "osd.$i detected $(bdev_type "$i") on $(dev_of "$i")" \
 			       "-- is 99-osdlab-rotational.rules installed?" >&2; exit 1; }
+		[ "$(cat "/sys/block/$(basename "$(dev_of "$i")")/queue/write_cache")" = "write through" ] ||
+			{ echo "$(dev_of "$i") is not write through -- is 99-osdlab-rotational.rules installed?" >&2; exit 1; }
 	done
 }
 
@@ -101,7 +112,7 @@ do_start() {
 		exit 1
 	fi
 
-	clear_rotational
+	set_queue_attrs
 
 	MON=1 MGR=1 OSD=$NOSD MDS=1 RGW=1 ../src/vstart.sh -n \
 		--without-dashboard --bluestore-devs "$DEVS" ||
@@ -141,9 +152,10 @@ do_status() {
 		bin/ceph osd metadata "$i" -f json | python3 -c '
 import json,sys
 m = json.load(sys.stdin)
-print("osd.%s  %-14s type=%s rotational=%s" % (m["id"],
+print("osd.%s  %-14s type=%s rotational=%s write_cache=%s" % (m["id"],
       m["bluestore_bdev_dev_node"], m["bluestore_bdev_type"],
-      m["bluestore_bdev_rotational"]))'
+      m["bluestore_bdev_rotational"],
+      open("/sys/block/%s/queue/write_cache" % m["bluestore_bdev_dev_node"].split("/")[-1]).read().strip()))'
 		echo "       osd_mclock_max_capacity_iops_ssd =" \
 			"$(bin/ceph config show osd."$i" osd_mclock_max_capacity_iops_ssd)"
 	done
@@ -178,6 +190,7 @@ do_debug() {
 
 case "$CMD" in
 start)     do_start ;;
+queue)     set_queue_attrs ;;
 stop)      do_stop ;;
 repair)    repair_osds ;;
 status)    do_status ;;
