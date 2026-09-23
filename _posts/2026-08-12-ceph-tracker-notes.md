@@ -1534,7 +1534,7 @@ clone(a, c2, 2 * csum_chunk);                                   // -> merge
 ```
 
 Blob B is written at blob offset 32 KiB of a 64 KiB blob that starts at 0
-(what `suggested_boff` does), so A and B share one csum grid. The
+(what `suggested_boff` does, §6.3.2), so A and B share one csum grid. The
 fragments `{0x3000, 0x5000}` are the bug; `{0x8000}` is the aligned
 control, and the test keeps both:
 
@@ -1684,6 +1684,34 @@ csum chunk 0x8000, min_alloc 0x1000
                                                            ^
                                                   pextent boundary inside item 1
 ```
+
+**Where the hole and the shared `blob_start` come from.** No 64 KiB blob
+is ever allocated. B gets 32 KiB of disk. The write path *places* B's data
+in the second half of a 64 KiB blob, so B lines up with A.
+`blob_start = logical_offset − blob_offset` (`BlueStore.h:918`):
+
+```
+2nd write: object 0x8000~0x8000; A is shared → can_reuse_blob() says no → new blob B
+
+_do_alloc_write(), new blob                                  (BlueStore.cc:17472)
+  suggested_boff = logical_offset % max_blob_size      (no padding: b_off0 == b_off, :17268)
+                 = 0x8000 % 0x10000 = 0x8000
+  checks: on the csum grid (0x8000 % 0x8000 == 0), fits in 64 KiB, > b_off 0
+  → B's data goes to blob offset 0x8000; the allocator is asked for 0x8000
+
+object offset  0x0000            0x8000            0x10000
+               |                 |                 |
+blob A         [ 32 KiB         ]                        blob_start = 0x0000 - 0x0000 = 0
+blob B         [ hole, no disk  ][0x3000 | 0x5000 ]      blob_start = 0x8000 - 0x8000 = 0
+                                  └ allocator's pieces (unit-case order)
+```
+
+The code comment says why: *"try to align blob with max_blob_size to
+improve its reuse ratio, e.g. in case of reverse write"* — a later write to
+`0x0~0x8000`, made before B is shared, could fill B's hole. A was not shifted: its `suggested_boff`
+is `0 % 0x10000 = 0`, not above `b_off 0`. The next clone looks for merge
+partners by `blob_start` (`find_mergable_companion()`), so A and B meet
+there, on one csum grid.
 
 `merge_blob()` walks the **pextent** row but copies the **csum** row in
 whole items:
