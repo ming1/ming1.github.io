@@ -12,12 +12,23 @@ issue, each covering symptom, root-cause chain, fix, and how the fix was
 validated. Written so the reasoning is reproducible later, not just the
 conclusion.
 
-# 1. Tracker #79141 — BlueFS assert aborts every OSD on 16K-page hosts
+Issues are grouped by the component where the root cause lives:
+
+| Part | Component | Sections |
+|---|---|---|
+| I | BlueStore and BlueFS | 1–7 |
+| II | OSD | 8–9 |
+| III | Messenger and the cluster network | 10–11 |
+| IV | RGW | 12 |
+
+# Part I — BlueStore and BlueFS
+
+## 1. Tracker #79141 — BlueFS assert aborts every OSD on 16K-page hosts
 
 [Issue](https://tracker.ceph.com/issues/79141) · v20.2.3 regression ·
 component BlueFS (WAL v2 "envelope mode")
 
-## 1.1 Symptom
+### 1.1 Symptom
 
 After upgrading a mixed cluster to v20.2.3, all OSDs on aarch64 hosts with a
 16K page size (Asahi Linux) abort in a loop at startup:
@@ -35,7 +46,7 @@ arm hosts to 20.2.2 with identical disks fixes them. Both host types report
 That version-pins the cause immediately: whatever asserts here arrived
 between 20.2.2 and 20.2.3, and it cares about the *page size*, not the data.
 
-## 1.2 The code under suspicion
+### 1.2 The code under suspicion
 
 The assert was added by upstream commit `4c03bbea4437` (backported as
 `7560ac9152f`), part of the WAL v2 "envelope mode" series
@@ -66,7 +77,7 @@ before reading further:
 So the assert demands: *the header's offset within a VM page of memory
 equals its offset within a page-sized window of the file.*
 
-## 1.3 What the code actually guarantees
+### 1.3 What the code actually guarantees
 
 The two cursors — file position and buffer memory position — are kept in
 lockstep by construction, but only **modulo the BlueFS block size (4K)**:
@@ -102,7 +113,7 @@ loop. One subtlety that makes the assert run on *every* envelope:
 (`buffer.length() - (pos - buffer_pos)`), so it reads 0 after every seal,
 not just for empty files.
 
-## 1.4 The question that unlocks the story
+### 1.4 The question that unlocks the story
 
 At this point the mechanism was clear but not the *intent*, so the right
 question to ask was:
@@ -160,7 +171,7 @@ And an irony worth recording: on a 16K host the allocator hands out
 *stronger* alignment (16K chunks) than x86 ever had; what fails is only the
 comparison of two 4K-locked cursors at 16K granularity.
 
-## 1.5 The fix
+### 1.5 The fix
 
 Assert the congruence the code actually maintains. The first cut used
 `super.block_size` alone; review (see §1.7) showed the correct modulus is
@@ -192,7 +203,7 @@ page size — would cost up to 16K/64K of padding per WAL sync to satisfy an
 assert whose real intent ("this write will not trigger a KernelDevice
 rebuild") is fully captured at block granularity.
 
-## 1.6 Reproducing on x86, no ARM hardware needed
+### 1.6 Reproducing on x86, no ARM hardware needed
 
 `ceph::_page_size` is a mutable global — the same property that caused the
 bug (a memory-management value leaking into a storage invariant) makes it
@@ -211,7 +222,7 @@ Two cases: the plain 16K-page case, and a small-alloc case
 (`bluefs_alloc_size=4096` < page) covering the truncation bug. Pre-fix,
 both abort within a second with the tracker's verbatim assert — on x86.
 
-## 1.7 Validation
+### 1.7 Validation
 
 TDD discipline, both machines:
 
@@ -234,7 +245,7 @@ Workaround for affected clusters until the fix ships:
 `bluefs_wal_envelope_mode = false` (set before the first successful boot on
 the new version; the option only affects newly created WAL files).
 
-## 1.8 Takeaways
+### 1.8 Takeaways
 
 - **"4096" means three different things** — device logical block, BlueFS
   block, VM page — and x86 aliases them all. Apple Silicon (16K) and
@@ -253,7 +264,7 @@ the new version; the option only affects newly created WAL files).
   x86 reproducer, which is what made red/green verification possible on
   every machine involved.
 
-## 1.9 Appendix — code paths under the reproducer
+### 1.9 Appendix — code paths under the reproducer
 
 The test workload is `many_small_writes()` (append a 4076/4077-byte chunk,
 `fsync`, repeat to 256K), a remount, then `many_small_reads()` with the same
@@ -323,13 +334,13 @@ The final `ASSERT_EQ(content, read_content)` closes the loop: header
 patching, padding, journal-less size recovery, and offset translation all
 have to agree byte-for-byte for the two 256K streams to match.
 
-# 2. ceph-bluestore-tool silently re-enables WAL envelope mode
+## 2. ceph-bluestore-tool silently re-enables WAL envelope mode
 
 Status: analysis confirmed on the lab; tracker issue not filed yet —
 needs review and confirmation first. Found while validating the #79141
 workaround, prompted by Igor Fedotov's review comment.
 
-## 2.1 Report
+### 2.1 Report
 
 Disabling WAL v2 envelope mode — the workaround for #79141, whether done
 via `ceph config set osd bluefs_wal_envelope_mode false` or via a
@@ -355,7 +366,7 @@ WAL created by repair: ENVELOPE
 BUG REPRODUCED
 ```
 
-## 2.2 Analysis
+### 2.2 Analysis
 
 Three pieces, each fine in isolation:
 
@@ -399,7 +410,7 @@ fixes. The daemon side is not at fault: an OSD started under the same
 setting reports it via asok and creates only plain WALs (verified
 separately) — only the tool bypasses the disable.
 
-## 2.3 Proposed fix
+### 2.3 Proposed fix
 
 Utilities should never *introduce* envelope files. In `BlueFS::mount()`,
 qualify the snapshot:
@@ -455,7 +466,7 @@ ceph-bluestore-tool --path ... --command repair --bluefs_wal_envelope_mode=false
 (`revert-wal-to-plain` itself needs no override — it force-marks its
 output files plain internally.)
 
-# 3. PR #70892 follow-up — a fix that needed two more commits
+## 3. PR #70892 follow-up — a fix that needed two more commits
 
 Status: commits local on the dev branch, PR not yet refreshed; the
 findings below came out of reviewing two cleanup commits stacked on the
@@ -463,7 +474,7 @@ still-unmerged #79068 fix (`72d06908f15`, PR
 [#70892](https://github.com/ceph/ceph/pull/70892)), reviewed at high
 effort with independent verifier agents.
 
-## 3.1 The dependency, in the unusual direction
+### 3.1 The dependency, in the unusual direction
 
 In git terms `72d06908f15` is the base of the stack and cannot depend on
 anything above it. The real relationship is a **correctness dependency**:
@@ -473,7 +484,7 @@ mode for another — and since the PR is unmerged, the three belong in one
 refreshed series rather than a merge-then-repair sequence that
 backporters could split.
 
-## 3.2 Hazard 1: the fix's own ordering creates a reserve-then-park window
+### 3.2 Hazard 1: the fix's own ordering creates a reserve-then-park window
 
 `72d06908f15`'s core move is: *reserve all log seqs atomically under
 `dirty.lock`, before anything else* — that is what closes #79068's
@@ -518,7 +529,7 @@ journal in reservation order — the invariant the fix wanted finally
 holds. The now-unreachable wait inside `_extend_log()` became an assert
 so the parked-reservation window cannot be silently reintroduced.
 
-## 3.3 Hazard 2: the wait can lose its wakeup
+### 3.3 Hazard 2: the wait can lose its wakeup
 
 The compactor cleared `log_forbidden_to_expand` and called
 `notify_all()` with **no lock held**, while waiters test the flag under
@@ -534,7 +545,7 @@ only true if it reliably wakes. Second follow-up: clear and notify under
 `log.lock` — a waiter is then either not yet parked and sees the cleared
 flag, or fully parked before the compactor can take the lock.
 
-## 3.4 The chain
+### 3.4 The chain
 
 ```
 79068 fix     closes the lost-bucket race, but reserve-early/wait-late
@@ -556,7 +567,7 @@ own tracker and a bucket-merge design), and a hardening assert
 survived 48/48 tests and 1766 forced log compactions on the lab OSD
 without a false positive.
 
-## 3.5 Takeaways
+### 3.5 Takeaways
 
 - **A fix can create the very state it set out to forbid.** Moving the
   reservation early was right; every code path between "reserved" and
@@ -569,14 +580,14 @@ without a false positive.
   two completions can land as one series, and no backport can pick up
   the window without its cure.
 
-# 4. Making BlueFS WAL flushes synchronous — and proving which callers can take it
+## 4. Making BlueFS WAL flushes synchronous — and proving which callers can take it
 
 Status: commit `c1f32446720` local on `kv-committing-local`, not pushed and
 not yet compiled. This section is a review note rather than a tracker issue:
 the interesting part is not the three-line change but the call-graph argument
 that decides *which* writers may take it.
 
-## 4.1 The observation
+### 4.1 The observation
 
 A BlueFS flush whose range falls inside a single physical extent produces
 exactly one disk write. Submitting that as aio buys no parallelism — there is
@@ -599,7 +610,7 @@ That condition is about *geometry*. The justification is about *the caller
 fsyncing right after*. Those are not the same thing, and the gap between them
 is where the review went.
 
-## 4.2 Who actually reaches `_flush_data()`
+### 4.2 Who actually reaches `_flush_data()`
 
 `_flush_data()` is the only `aio_write` submitter in BlueFS — every other
 `bdev->write()` in the file (superblock, `migrate_file`, device expand) was
@@ -737,7 +748,7 @@ comes from `_create_writer` instead and never gets a type, so it has to be
 caught by `ino <= 1`; compaction's `new_log` inherits `log_file->fnode.ino`,
 so it falls under the same test.
 
-## 4.3 Are the no-fsync paths reachable for the WAL?
+### 4.3 Are the no-fsync paths reachable for the WAL?
 
 Having excluded SST writers, the question becomes whether the WAL itself ever
 takes those two rows. Reading `BlueRocksEnv`'s `WritableFile` gives three
@@ -765,7 +776,7 @@ For the **journal** the answer is stronger: never, and it is enforced.
 route is `_flush_special`, which has three call sites, no `min_flush_size`
 check, and an fsync behind every one of them. 100% fsync-shaped.
 
-## 4.4 What actually changes — the `bluefs_buffered_io` subtlety
+### 4.4 What actually changes — the `bluefs_buffered_io` subtlety
 
 Worth knowing before measuring anything, because it makes most of the change a
 no-op on stock config. `KernelDevice::aio_write` begins:
@@ -789,7 +800,7 @@ Those are precisely the two the gate now targets. It is a happy coincidence
 rather than a design: the `buffered` fallback had been doing half the job
 invisibly for years.
 
-## 4.5 Why the single-segment test stays
+### 4.5 Why the single-segment test stays
 
 The first instinct on review was to relax it — for a WAL, two sequential sync
 writes on the same device looked cheaper than one aio completion bounce. That
@@ -812,7 +823,7 @@ away entirely and every flush is single-segment. Harmless either way, since a
 straddling flush just takes aio, but the code should not have been described as
 relying on a guarantee it does not have.
 
-## 4.6 Still open: the discarded return value
+### 4.6 Still open: the discarded return value
 
 `_flush_data` ignores what the write returns:
 
@@ -833,7 +844,7 @@ envelope WAL onto it — precisely where a dropped write is worst. Elsewhere in
 the same file the same call *is* checked (`int w = bdev[to_bdev]->write(...)`
 in `migrate_file`). Left out of the commit deliberately; it wants its own.
 
-## 4.7 Takeaways
+### 4.7 Takeaways
 
 - **A performance condition should test the property the justification names.**
   "Single segment" correlated with "the caller fsyncs next" often enough to
@@ -852,20 +863,1285 @@ in `migrate_file`). Left out of the commit deliberately; it wants its own.
   what serializing two device writes costs.
 
 
-# 5. The zero-copy path that never ran — every replicated write memcpys its payload on the replica
+## 5. Tracker #80501 — a `#ifdef` that made `fsync()` a no-op on FreeBSD for nine years
+
+Reported as a heap-use-after-free in `~FileWriter()` · affects BlueFS on
+every platform built with POSIX AIO (FreeBSD) — Linux is not affected ·
+component os/bluestore (BlueFS) · fix: a named `HAVE_AIO` guard, four lines in BlueFS ·
+Status: root cause differs from the report's; proposed PR #71766 fixes the
+symptom and leaves the durability hole open
+
+### 5.1 Report
+
+#### 5.1.1 The observation
+
+[Tracker #80501](https://tracker.ceph.com/issues/80501) (Willem Jan
+Withagen, 2026-09-13, FreeBSD): `unittest_bluefs
+--gtest_filter=BlueFS_wal.wal_v2_simulate_crash` crashes about once in
+200 runs. Under AddressSanitizer it is deterministic within ~120
+iterations:
+
+```
+==54046==ERROR: AddressSanitizer: heap-use-after-free
+READ of size 8 at 0x5130000061a8 thread T4
+    #0 aio_t::get_return_value()          src/blk/aio/aio.h:76
+    #1 KernelDevice::_aio_thread()        src/blk/kernel/KernelDevice.cc:730
+
+freed by thread T0 here:
+    #9  std::list<aio_t>::~list()
+    #10 IOContext::~IOContext()           src/blk/BlockDevice.h:79
+    #11 BlueFS::FileWriter::~FileWriter() src/os/bluestore/BlueFS.h:481
+    #12 BlueFS_wal_wal_v2_simulate_crash_Test::TestBody()
+                                          src/test/objectstore/test_bluefs.cc:1339
+previously allocated by thread T0 here:
+    #7  std::list<aio_t>::push_back(aio_t&&)
+    #8  KernelDevice::aio_write()         src/blk/kernel/KernelDevice.cc:1216
+    #9  BlueFS::_flush_data()             src/os/bluestore/BlueFS.cc:4230
+```
+
+The device's completion thread reads an `aio_t` that the writer's
+destructor has already freed. The reporter's reading: `fsync()` only
+*submits* aios and never waits for them, so a `FileWriter` deleted
+without `close_writer()` still has I/O in flight. Proposed fix
+([PR #71766](https://github.com/ceph/ceph/pull/71766)): call
+`aio_wait()` on each `IOContext` inside `~FileWriter()`.
+
+The test itself ([`test_bluefs.cc:1300`](https://github.com/ceph/ceph/blob/v21.3.0/src/test/objectstore/test_bluefs.cc#L1300))
+is a crash simulation — 100 rounds of `append_try_flush` + `fsync`,
+then a bare `delete writer` with the comment *"close without orderly
+shutdown, simulate failure"*, then remount and verify the data. The
+bare delete is deliberate: on a real crash nothing calls
+`close_writer()` either.
+
+#### 5.1.2 Reproducing it
+
+FreeBSD is not needed. The race is a property of a build configuration,
+and that configuration can be reproduced on Linux by hand (§5.2.1
+explains why these four lines are the whole difference):
+
+```bash
+# in src/os/bluestore/BlueFS.cc (3 sites) and BlueFS.h (1 site):
+sed -i 's|^#ifdef HAVE_LIBAIO$|#if 0 /* what FreeBSD sees */|' \
+    src/os/bluestore/BlueFS.cc src/os/bluestore/BlueFS.h
+
+cmake -DWITH_ASAN=ON -DWITH_TESTS=ON ..   # RelWithDebInfo
+ninja bin/unittest_bluefs
+export ASAN_OPTIONS=halt_on_error=1:abort_on_error=1
+for i in $(seq 1 200); do
+  bin/unittest_bluefs --gtest_filter='BlueFS_wal.wal_v2_simulate_crash' \
+    > /dev/null 2>&1 || { echo "crash at iteration $i"; break; }
+done
+```
+
+Two control arms decide the question: the same binary built from
+unmodified `main` (the guards in), and one built with the four guards
+widened to `defined(HAVE_LIBAIO) || defined(HAVE_POSIXAIO)` — the fix
+proposed in §5.3. Results in §5.3.3.
+
+### 5.2 Analysis
+
+#### 5.2.1 Root cause, top to bottom
+
+The report's chain starts one level too high. `fsync()` on Linux *does*
+wait; the question is why it does not on FreeBSD.
+
+```
+completion thread reads a freed aio_t
+ └─ why?   ~FileWriter() → ~IOContext() → list<aio_t>::~list() freed
+           it while the kernel still owned the I/O   (BlueFS.h:473)
+ └─ why was I/O still in flight after 100 fsync() calls?
+           on Linux it cannot be: _fsync → _flush_bdev(h) →
+           _wait_for_aio(h) → IOContext::aio_wait() blocks until
+           num_running == 0                          (BlueFS.cc:4479)
+ └─ so why is it in flight on FreeBSD?
+           that block — _claim_completed_aios + _wait_for_aio —
+           is wrapped in  #ifdef HAVE_LIBAIO,  and FreeBSD builds
+           with HAVE_POSIXAIO, not HAVE_LIBAIO     (CMakeLists.txt:250)
+           → on FreeBSD the wait is compiled out and fsync() returns
+             the moment the aios are *submitted*
+ └─ why did nothing notice for nine years?
+           until PR #71449 (2026-09, same author) KernelDevice::aio_write
+           was ALSO #ifdef HAVE_LIBAIO — so FreeBSD never submitted an
+           aio at all; every write fell through to the synchronous
+           path, and a wait for nothing was harmless
+                                                (KernelDevice.cc:1171)
+ └─ why is the guard wrong?
+           2017-09: FreeBSD POSIX-AIO support lands   (9ae94e48be8)
+           2017-11: "build bluestore w/o libaio" wraps the BlueFS
+                    waits in HAVE_LIBAIO             (57e792bcae2)
+           KernelDevice::aio_write was ALREADY #ifdef HAVE_LIBAIO
+           (since 2016, before the port), so FreeBSD I/O was
+           synchronous from day one and the BlueFS guards were
+           consistent with that. PR #71449 widens one side and not
+           the other — that is where the inconsistency is born
+```
+
+The bottom of the chain is a preprocessor condition that names one
+implementation of an interface instead of the interface. `IOContext`
+has its `pending_aios`/`running_aios` lists and its `aio_wait()`
+under the correct dual guard; BlueFS simply never calls them on the
+second backend.
+
+Three sites are affected, all with the same shape:
+
+| Site | What it skips on FreeBSD |
+|---|---|
+| [`BlueFS.cc:3333`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.cc#L3333) `_rewrite_log_and_layout_sync` | wait for the log rewrite before writing the new superblock |
+| [`BlueFS.cc:4200`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.cc#L4200) | the definitions of `_claim_completed_aios` / `_wait_for_aio` |
+| [`BlueFS.cc:4479`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.cc#L4479) `_flush_bdev(FileWriter*)` | the wait inside every `fsync()` |
+
+`_drain_writer()`
+([`BlueFS.cc:4848`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.cc#L4848))
+is *not* guarded — it calls `aio_wait()` directly — which is exactly why
+`close_writer()` is safe on FreeBSD and only the bare `delete` crashes.
+The report's "close_writer drains, the destructor doesn't" is a correct
+observation of the wrong boundary.
+
+#### 5.2.2 Why the crash is the small problem
+
+What `fsync()` promises and what it delivers, per backend, on the
+current tree with PR #71449 applied:
+
+```
+   Linux (HAVE_LIBAIO)                    FreeBSD (HAVE_POSIXAIO)
+
+   fsync(h)                               fsync(h)
+   ├─ _flush_F        submit aio          ├─ _flush_F        submit aio
+   ├─ _flush_bdev(h)                      ├─ _flush_bdev(h)
+   │  ├─ _wait_for_aio  ◄── blocks ──┐    │  │   #ifdef HAVE_LIBAIO
+   │  │    until num_running == 0    │    │  │   ... compiled out ...
+   │  └─ bdev->flush()  fdatasync    │    │  └─ bdev->flush()
+   └─ return 0                       │    │       io_since_flush is
+                                     │    │       still false (the
+   aio thread: kernel done ──────────┘    │       aio thread has not
+                                          │       run) → returns 0
+                                          │       WITHOUT fdatasync
+                                          └─ return 0
+                                                   ▲
+                                          aio thread: kernel done, later
+```
+
+Two things go wrong on the right, and only the second is visible:
+
+1. **The data is not durable when `fsync()` returns.** `KernelDevice::flush()`
+   ([`KernelDevice.cc:504`](https://github.com/ceph/ceph/blob/v21.3.0/src/blk/kernel/KernelDevice.cc#L504))
+   is gated on `io_since_flush`, a flag set by the *completion* thread.
+   If the aio has not completed yet, the flag is still false and
+   `flush()` returns without calling `fdatasync` at all
+   ([`:517`](https://github.com/ceph/ceph/blob/v21.3.0/src/blk/kernel/KernelDevice.cc#L517)).
+   So the write is neither complete nor synced, and RocksDB's WAL —
+   the caller — has been told it is. Its own comment says as much:
+   *"we are not really protecting data here."*
+2. **The `aio_t` outlives its I/O.** With no wait anywhere on the path,
+   the last `fsync()` before `delete writer` leaves the aio in flight;
+   `~IOContext` frees the list node; the completion thread dereferences
+   it. This is the ASan report.
+
+PR #71766 puts an `aio_wait()` in `~FileWriter()`. That closes (2) and
+nothing else: after it, `fsync()` on FreeBSD still returns before the
+data is on disk. A destructor is the last place a stale aio can bite, so
+waiting there makes the *test* pass; it does not make the *filesystem*
+correct.
+
+#### 5.2.3 Why Linux never sees it
+
+`HAVE_LIBAIO` is true on every Linux build with libaio present
+([`CMakeLists.txt:259`](https://github.com/ceph/ceph/blob/v21.3.0/CMakeLists.txt#L259)),
+so all three waits compile in. The wake/wait protocol between
+`try_aio_wake()`
+([`BlockDevice.h:122`](https://github.com/ceph/ceph/blob/v21.3.0/src/blk/BlockDevice.h#L122))
+and `aio_wait()`
+([`BlockDevice.cc:62`](https://github.com/ceph/ceph/blob/v21.3.0/src/blk/BlockDevice.cc#L62))
+is sound: the completion thread decrements `num_running` under the
+context lock and touches neither `ioc` nor `aio[]` afterwards
+(KernelDevice.cc:755, with a comment saying exactly that). A waiter that
+observed `num_running == 0` is guaranteed the completion thread is done
+with every node in the list. `_claim_completed_aios` splices
+`running_aios` out *before* the wait and frees the spliced list *after*
+it — relinking, not freeing, so the completion thread's pointers stay
+valid across the splice. No window on Linux.
+
+### 5.3 Proposed solution
+
+#### 5.3.1 The fix
+
+Two commits. The first is a refactor with no behaviour change: the
+condition "some AIO backend is present" was spelled out as
+`defined(HAVE_LIBAIO) || defined(HAVE_POSIXAIO)` at nine sites in
+`BlockDevice.{h,cc}` and once in cmake, so give it a name where the two
+backend flags already come from:
+
+```cmake
+# CMakeLists.txt, right after HAVE_LIBAIO / HAVE_POSIXAIO are decided
+if(HAVE_LIBAIO OR HAVE_POSIXAIO)
+  set(HAVE_AIO ON)
+endif()
+```
+
+emitted through `acconfig.h` as `#cmakedefine HAVE_AIO`, and every
+site that tested the pair now tests `#ifdef HAVE_AIO`. The backend
+*selectors* in `aio.h`/`aio.cc` (`#if HAVE_LIBAIO … #elif
+HAVE_POSIXAIO`) are untouched — those pick an implementation, this only
+says one exists. Preprocessed `BlockDevice.cc` before and after: byte-identical.
+
+The second commit is the fix, and it is still four lines:
+
+```diff
+ // src/os/bluestore/BlueFS.cc  (3 sites)  and  BlueFS.h  (1 site)
+-#ifdef HAVE_LIBAIO
++#ifdef HAVE_AIO
+```
+
+Now the guard says what these sites mean — *there are aios to wait
+for* — instead of naming one backend, so a third backend cannot
+re-create this bug. It restores `fsync()`'s wait on the platform that
+PR #71449 has just made asynchronous. On Linux `HAVE_AIO` and
+`HAVE_LIBAIO` coincide, so nothing changes.
+
+The `aio_wait()` in `~FileWriter()` from PR #71766 is complementary, not
+redundant. Public `flush()` submits without waiting on every platform,
+so `flush(); delete writer;` — flushed but never fsynced — would hit the
+same UAF on Linux today; nothing in-tree does that, and `close_writer()`
+is the documented contract (`// NOTE: caller must call
+BlueFS::close_writer()`, [`BlueFS.h:467`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.h#L467)),
+but the destructor wait is the only thing that covers it. What it does
+not do is make `fsync()` honest; that needs the guard.
+
+#### 5.3.2 Why it is safe
+
+**On Linux it is a no-op.** `HAVE_LIBAIO` is already defined; the
+widened condition evaluates identically. Byte-for-byte the same object
+code.
+
+**On FreeBSD it enables code that already compiles.**
+`_claim_completed_aios` and `_wait_for_aio` use only `IOContext`
+members (`running_aios`, `aio_wait()`) that `BlockDevice.h` already
+provides under `HAVE_POSIXAIO`. There is no libaio-specific type in
+either function.
+
+**It does not change behaviour on a FreeBSD tree *without* PR #71449.**
+There, `aio_write` still takes the synchronous fallback, `num_running`
+is always 0, and `aio_wait()` returns immediately.
+
+**It closes both problems at once.** With the wait in place, the
+`io_since_flush` flag is guaranteed set by the time `flush()` is called
+(the completion thread has run — that is what the wait waited for), so
+`fdatasync` is issued; and the `aio_t` list is empty by the time the
+destructor runs.
+
+#### 5.3.3 Validation
+
+Three builds of `unittest_bluefs` on the same host (c28, Fedora 42,
+gcc 15, RelWithDebInfo + ASan, `main` at `a2c71ca9282`), each run 200×
+with `ASAN_OPTIONS=halt_on_error=1`:
+
+| Build | Guards | Simulates | Result |
+|---|---|---|---|
+| A · `main` unmodified | in | Linux today | **0** crashes |
+| B · guards forced to `#if 0` | out | FreeBSD + PR #71449 | **23** crashes, first at iteration 2 |
+| C · guards widened (§5.3.1) | in, both backends | FreeBSD with this fix | **0** crashes — binary byte-identical to A (same md5) |
+| D · `HAVE_AIO` form (§5.3.1), rebased on `44fded082ce` | in, both backends | the two commits as proposed | **0** crashes; `_flush_bdev` under FreeBSD macros contains the wait; `-fsyntax-only` clean |
+
+Arm B reproduces the tracker at ~11 % per run — some 20× the reporter's
+1-in-200, ASan and a faster host widening the window. The ASan stack on
+Linux is the tracker's stack with one extra frame of information: the
+freed `aio_t` was allocated in `KernelDevice::aio_write` called from
+`_flush_data` ← `_flush_envelope_F` ← `_flush_F` ← **`BlueFS::_fsync`**
+← `many_small_writes:1050` — i.e. it was submitted by the *last*
+`fsync()`, which returned without waiting for it. The UAF site is one
+frame earlier than on FreeBSD (`get_next_completed` writing
+`paio[i]->rval`, [`aio.cc:110`](https://github.com/ceph/ceph/blob/v21.3.0/src/blk/aio/aio.cc#L110),
+rather than `get_return_value` reading it): libaio's `io_event.obj`
+still points at the freed node, so the first touch faults instead of the
+second.
+
+That `_wait_for_aio` is genuinely absent from B and present in A and C
+is checked with `nm -C`: 2 symbols, 0, 2.
+
+**The durability hole, measured.** A bpftrace script on the same
+binaries — uprobes on `BlueFS::fsync` entry/return, `libc:fdatasync`,
+and the return of `aio_queue_t::get_next_completed` — over five runs
+each:
+
+| | `fsync()` calls | returned **without any `fdatasync`** |
+|---|---|---|
+| A · guards in | 95 | **0** |
+| B · guards out | 95 | **13** |
+
+One `fsync()` in seven returns 0 having neither waited for its aio nor
+issued `fdatasync`, because `KernelDevice::flush()` saw
+`io_since_flush == false` — the completion thread had not run yet — and
+took its early exit. In A, the wait guarantees the completion thread
+*has* run before `flush()` is called, and the flag is always set.
+
+PR #71766's destructor `aio_wait()` would take arm B's crash count from
+23 to 0 and leave the 13 exactly where it is.
+
+#### 5.3.4 Takeaways
+
+- **A guard that names an implementation is a latent bug on every
+  other implementation.** `HAVE_LIBAIO` meant "we have async I/O" in
+  2017 because libaio was the only async I/O. The day a second backend
+  arrived, every such guard became a question: does this block belong
+  to *libaio* or to *async*? The FreeBSD port answered it correctly in
+  `BlockDevice.h`; `BlueFS.cc` and `KernelDevice.cc` were never asked,
+  and stayed consistent with each other only by both being wrong the
+  same way. Naming the condition (`HAVE_AIO`) is what stops the
+  question being asked site by site.
+- **A dead code path can hide a wrong guard indefinitely.** For nine
+  years FreeBSD's `aio_write` was synchronous, so the missing wait
+  waited for nothing. PR #71449 made the I/O real and the missing wait
+  became a missing wait. The two PRs are from the same author, weeks
+  apart, and the second is diagnosing a consequence of the first.
+- **Fix where the promise is made, not where the corpse is found.**
+  The UAF is in the destructor; the broken promise is `fsync()`
+  returning early. Waiting in the destructor makes the test green and
+  leaves the WAL non-durable. The ASan trace pointed at the freed
+  object's *last* touch; the bug is at the *first* place the wait was
+  supposed to happen.
+- **Read the platform's build flags before the platform's stack
+  trace.** Everything here follows from one line of `CMakeLists.txt`.
+
+## 6. Tracker #72848 — a blob merge that assumes checksum chunks are never split
+
+[Issue](https://tracker.ceph.com/issues/72848) · one abort in a rados qa run
+· tentacle dev `20.3.0-2326-g0672d1a6` · component BlueStore (elastic shared
+blobs) · fix: one guard · Status: fix and regression test local on
+`wip-72848-merge-blob-csum`, upstream PR pending, tracker still New
+
+### 6.1 Report
+
+#### 6.1.1 The observation
+
+`ceph_test_objectstore` aborts inside a clone:
+
+```
+BlueStore.cc: 2835: FAILED ceph_assert((len % (1 << csum_chunk_order)) == 0)
+ in function 'BlueStore::Blob::merge_blob(...)::<lambda(uint32_t, uint32_t)>'
+
+ 3: BlueStore::ExtentMap::make_range_shared_maybe_merge(...)+0x1d7
+ 4: BlueStore::ExtentMap::dup_esb(...)+0x12f
+ 5: BlueStore::_do_clone_range(...)+0x1ed
+ 6: BlueStore::_clone(...)+0x7f3
+ 7: BlueStore::_txc_add_transaction(...)+0x15fb
+11: StoreTestBase::doSyntheticTest(...)+0x560
+```
+
+One occurrence, in the randomised synthetic workload. The abort is not in
+cloning as such. `dup_esb` is the elastic-shared-blob clone path
+(`bluestore_elastic_shared_blobs`, default `true`), and before it can
+duplicate an extent map it has to make every source blob shared — taking an
+optional shortcut whenever it finds a mergeable neighbour:
+
+```
+_clone -> _do_clone_range -> dup_esb              (elastic shared blobs)
+                                │
+                 make_range_shared_maybe_merge()  (frame 3)
+                                │
+     for every blob in the cloned range not already shared:
+                                │
+                    find_mergable_companion()
+                                │   (an already-shared blob
+                                │    at the same blob_start)
+              ┌─────────────────┴─────────────────┐
+      no candidate, or                    can_merge_blob()
+  can_merge_blob() says no                    says yes
+              │                                   │
+     make_blob_shared()                     merge_blob()
+    one more shared blob,                         │
+       always correct             move_data() per allocated pextent
+                                                  │
+                                 ceph_assert(len % csum_chunk == 0)
+                                              -> abort
+```
+
+The left branch is the fallback and always works. The right branch is the
+optimisation, and the assert sits at the bottom of it. That shape is already
+half the fix: `can_merge_blob()` is the gate between the two, so a `false`
+from it lands on a path BlueStore takes constantly anyway.
+
+#### 6.1.2 Reproducing it
+
+`ExtentMapFixture` in `src/test/objectstore/test_bluestore_types.cc` builds
+an unmounted `BlueStore`, creates onodes by hand and calls
+`ExtentMap::dup_esb()` directly. No device, no KV store, no cluster, and
+allocation units (AUs) are handed out in order. The reproducer is one
+small, deterministic gtest case.
+
+**Step 1: a helper that acts like a write.** It does only what the real
+write path does to a new blob: set the csum chunk size, mark one csum slot,
+store the allocator's fragments unchanged, add the logical extent, take a
+reference. Every call writes exactly one 32 KiB csum chunk; `fragments` says
+how the allocator split that chunk.
+
+```cpp
+constexpr uint32_t csum_chunk_order = 15;                 // 32 KiB chunks
+constexpr uint32_t csum_chunk = 1 << csum_chunk_order;
+
+auto write_blob = [&](t_onode& o, uint32_t blob_start, uint32_t b_off,
+                      uint32_t blob_length,
+                      const std::vector<uint32_t>& fragments) {
+  BlueStore::BlobRef b(coll->new_blob());
+  bluestore_blob_t& bb = b->dirty_blob();
+  bb.init_csum(Checksummer::CSUM_CRC32C, csum_chunk_order, blob_length);
+  bb.set_csum_item(b_off / csum_chunk, 0x11111111 + b_off);
+  PExtentVector pex;
+  for (auto len : fragments)                     // what the allocator returned
+    pex.emplace_back(allocate(len / au_size) * au_size, len);
+  bb.allocated(b_off, csum_chunk, pex);          // stored unchanged
+  auto* e = new BlueStore::Extent(blob_start + b_off, b_off, csum_chunk, b);
+  o.onode->extent_map.extent_map.insert(*e);
+  b->get_ref(coll.get(), b_off, csum_chunk);
+  return b;
+};
+
+// clone(from, to, len) = dup_esb(&store, &txc, coll, from.onode, to.onode,
+//                               off = 0, len, dstoff = 0) on a fresh TransContext
+```
+
+**Step 2: four calls.** Each one is a step the object went through in the
+real workload:
+
+```cpp
+t_onode a = create(), c1 = create(), c2 = create();
+
+write_blob(a, 0, 0, csum_chunk, {csum_chunk});                  // blob A
+clone(a, c1, csum_chunk);                                       // A -> shared
+write_blob(a, 0, csum_chunk, 2 * csum_chunk, {0x3000, 0x5000}); // blob B
+clone(a, c2, 2 * csum_chunk);                                   // -> merge
+```
+
+| call | what it stands for |
+|---|---|
+| write #1 | a 32 KiB write at offset 0, with the 32 KiB csum chunk the alloc hint gives |
+| clone to `c1` | makes blob A shared, so the next write cannot reuse it |
+| write #2 | the next 32 KiB, placed by `suggested_boff` (§6.2.2) at blob offset 32 KiB of a 64 KiB blob; the allocator returned two fragments |
+| clone to `c2` | `make_range_shared_maybe_merge()` offers the two blobs to `can_merge_blob()` |
+
+Only `{0x3000, 0x5000}` triggers the bug. With `{0x8000}` the same four
+calls are the aligned control case that the committed test also keeps. The
+one assertion that matters is `ASSERT_FALSE(can_merge_blob(...))`, right
+before the second clone.
+
+**What the calls leave behind.** "On disk" here means the metadata a real
+write would persist. `P`, `Q`, `R` are physical addresses, `sbid` is a
+shared blob id, and a shared blob's `ref_map` counts owners per physical
+extent.
+
+After call 2, A is shared. `make_blob_shared()` gives it `sbid 1`, and
+`dup_esb()` gives `c1` a copy of A's metadata, `A'`, on the same shared blob:
+
+```
+ onode a    0x0000~0x8000 -> A  @ 0
+ onode c1   0x0000~0x8000 -> A' @ 0
+
+ blob A     SHARED sbid 1, llen 0x8000, pextents [P~0x8000], csum [c0]
+ sbid 1     ref_map { P~0x8000: 2 }                     owners: a, c1
+```
+
+After call 3, the state that matters. A is shared, so it cannot be written
+again, and the second 32 KiB gets blob B, at blob offset 32 KiB of a 64 KiB
+blob with `blob_start` 0. A and B are therefore on the same csum grid, and
+`allocated()` stores a hole followed by the two fragments, unchanged:
+
+<div class="language-plaintext highlighter-rouge"><div class="highlight"><pre class="highlight"><code> onode a    0x0000~0x8000 -&gt; A @ 0      0x8000~0x8000 -&gt; B @ 0x8000
+
+ blob A     SHARED sbid 1, llen 0x8000, pextents [P~0x8000], csum [c0]
+ blob B     private, llen 0x10000, blob_start 0
+            pextents [hole~0x8000]<span style="color:#d11">[Q~0x3000][R~0x5000]</span>   csum [ - , c1]
+
+ csum grid   chunk 0: 0x0000-0x7fff  |  chunk 1: 0x8000-0xffff
+ blob A      |&lt;----- P 0x8000 -----&gt;|
+ blob B      |&lt;------ hole ------&gt;|<span style="color:#d11">&lt;-- Q 0x3000 --&gt;|&lt;---- R 0x5000 ----&gt;</span>|
+                                                   <span style="color:#d11">^ pextent boundary at 0xb000,</span>
+                                                     <span style="color:#d11">inside chunk 1</span>
+</code></pre></div></div>
+
+The parts in red are the bug: chunk 1 of the csum grid is covered by two
+pextents, with the boundary at `0xb000`. With `{0x8000}`, chunk 1 would be
+one pextent.
+
+Call 4 covers A (shared) and B (private, same `blob_start`), and
+`can_merge_blob()` is asked whether B can be merged into A. Three outcomes:
+
+- Aligned control, `{0x8000}`: merged. A grows to 64 KiB, B's chunk-1 csum
+  slot and use count are copied into A, B's pextent joins `sbid 1`, and
+  `a` ends up with one lextent `0x0000~0x10000 -> A @ 0`. B is gone.
+- Fragmented, without the fix: abort. `can_merge_blob()` says yes, and
+  `merge_blob()` calls `move_data(pos = 0x8000, len = 0x3000)` for the first
+  fragment, where `len % 0x8000 != 0` trips the assert. Nothing has been
+  persisted at that point. If the assert were simply removed, the use-count
+  loop would run once per fragment and add B's chunk-1 count into A twice;
+  that count could never reach zero, so the AU would never be freed.
+- Fragmented, with the fix: refused. `can_merge_blob()` returns false at
+  the `0x3000` fragment, and B is made shared on its own:
+
+```
+ onode a    0x0000~0x8000 -> A   @ 0     0x8000~0x8000 -> B  @ 0x8000
+ onode c1   0x0000~0x8000 -> A'  @ 0
+ onode c2   0x0000~0x8000 -> A'' @ 0     0x8000~0x8000 -> B' @ 0x8000
+
+ blob A     SHARED sbid 1   [P~0x8000]                        csum [c0]
+ blob B     SHARED sbid 2   [hole~0x8000][Q~0x3000][R~0x5000] csum [ - , c1]
+
+ sbid 1     ref_map { P~0x8000: 3 }               owners: a, c1, c2
+ sbid 2     ref_map { Q~0x3000: 2, R~0x5000: 2 }  owners: a, c2
+```
+
+The test's last assertions check exactly this picture: `a`'s two lextents
+still point at the two original blobs, B is shared, and B's chunk-1 csum
+slot still holds the value written in call 3.
+
+**Step 3: build and run**, with the test commit from
+`wip-72848-merge-blob-csum` applied:
+
+```bash
+ninja -C build unittest_bluestore_types
+build/bin/unittest_bluestore_types \
+  --gtest_filter=ExtentMapFixture.merge_blob_csum_chunk_unaligned
+```
+
+Without the fix the test stops at that assertion, because
+`can_merge_blob()` returns true. Change it to `EXPECT_FALSE` so gtest goes on
+into the clone, and the reported abort appears:
+
+```
+BlueStore.cc: FAILED ceph_assert((len % (1 << csum_chunk_order)) == 0)
+ 5: BlueStore::Blob::merge_blob(...)
+ 6: BlueStore::ExtentMap::make_range_shared_maybe_merge(...)
+ 7: BlueStore::ExtentMap::dup_esb(...)+0x12f
+```
+
+Same assert, same call chain, even the same `dup_esb+0x12f` frame offset.
+With the fix: `[ OK ]`.
+
+**An end-to-end reproducer needs an aged store.** The same sequence through
+`queue_transactions()`, with a real BlueStore and a real allocator, does not
+fail on a fresh store. With `min_alloc_size` 4096, crc32c, `max_blob_size`
+64 KiB, `bluestore_allocator = stupid` and
+`bluestore_debug_small_allocations = 4` (the only knob that injects
+fragmentation, and only the stupid allocator honours it), the hinted
+write-clone-write-clone sequence over 32 objects gives 32 merges and 0
+aborts. The debug log shows every precondition of §6.2.2 in place except
+the fragmentation: the knob shortens each `allocate_int()` result, but on a
+fresh device the next result is physically adjacent and
+`StupidAllocator::allocate()` merges it back into one pextent. The knob can
+only fragment free space that is already fragmented.
+
+So fragment the free space for real, and skip the knob. On a 2 GiB data
+device, with RocksDB on its own `block.db` so that filling the data device
+does not starve it:
+
+0. On the fresh store, write the hinted `0~0x8000` and clone it, so that
+   blob A is shared before there is anything to merge into.
+1. Write 1 MiB objects until less than 5 MiB is free, then 64 KiB objects,
+   then 32 KiB objects, until less than 32 KiB is free. Now no free run of
+   32 KiB exists anywhere.
+2. Zero a checkerboard into 32 of the 64 KiB fillers, 16 KiB punched and
+   4 KiB kept. Every run this frees is smaller than one csum chunk.
+3. Write the hinted `0x8000~0x8000`, then clone.
+
+The write is served from two fragments, and the clone aborts on a tree
+without the fix, through the production path and with no debug knob:
+
+```
+BlueStore.cc: 2845: FAILED ceph_assert((len % (1 << csum_chunk_order)) == 0)
+ 2: BlueStore::ExtentMap::make_range_shared_maybe_merge(...)
+ 3: BlueStore::ExtentMap::dup_esb(...)
+ 4: BlueStore::_do_clone_range(...)
+ 5: BlueStore::_clone(...)
+ 7: BlueStore::queue_transactions(...)
+```
+
+Every frame here is also in the tracker's backtrace. It takes 82 seconds
+against milliseconds for the unit case, which is why the unit case is the
+one in the test suite. But it proves the bug is reachable by ordinary
+means, and the store it leaves behind is the fragmented one at the end of
+§6.1.3.
+
+#### 6.1.3 The two blobs on disk
+
+The pair that merge are ordinary records; nothing about them is malformed.
+A real BlueStore (`min_alloc_size` 4096, crc32c, `max_blob_size` 64 KiB)
+holding exactly the objects of the *fresh-store* run in §6.1.2 carries
+three keys (format reference:
+[§7 of the on-disk format post]({% post_url 2026-08-07-bluestore-v21-ondisk-format %})):
+
+| Record | Key | Value |
+|---|---|---|
+| onode, head | `<ghobject>'o'` | 94 B |
+| onode, clone | `<ghobject>'o'` | 58 B |
+| shared blob | `X` + BE u64 `00 00 00 00 00 00 00 01` | 11 B |
+
+The 94-byte head value is 31 B onode + 2 B empty spanning section + 4 + 57 B
+inline extent map. The onode struct is where the alloc hint lands on disk:
+
+```
+02 01 19 00 00 00   DENC frame: struct_v 2, compat 1, payload 0x19 (25)
+01                  nid = 1
+80 80 04            size = 0x10000                          (varint)
+00 00 00 00         attrs: le32 count = 0
+00                  flags = 0x00
+00 00 00 00         extent_map_shards: le32 count = 0        (map is inline)
+80 80 80 02         expected_object_size = 4 MiB             (varint)
+80 80 08            expected_write_size  = 128 KiB           (varint)
+24                  alloc_hint_flags = 0x24
+                      = SEQUENTIAL_READ (0x04) | IMMUTABLE (0x20)
+00 00 00 00         zone_offset_refs: 0
+```
+
+That one byte, `24`, is the whole precondition. It is what made
+`_choose_write_options()` take `ctz(expected_write_size)` instead of
+`block_size_order`, and the consequence shows up two records later as
+`csum_chunk_order = 15`.
+
+The 57 inline bytes are the two blobs, annotated in full:
+
+```
+02                       struct_v 2
+02                       n = 2 extents
+-- extent 0: logical 0x0~0x8000, blob_offset 0 --
+03                       CONTIGUOUS | ZEROOFFSET, inline blob follows
+23                       length = 0x8000                     (varint_lowz)
+   01                    extents: 1
+   44 10 00 00           lba 0x822000
+   23                    length = 0x8000
+   14                    flags = FLAG_SHARED | FLAG_CSUM
+   04                    csum_type = crc32c
+   0f                    csum_chunk_order = 15  -> 32 KiB chunks
+   04                    csum_data: 4 B = ONE crc32c item
+   0b 59 88 63             chunk 0
+   01 00 00 00 00 00 00 00  le64 sbid = 1        (-> the X record)
+-- extent 1: logical 0x8000~0x8000, blob_offset 0x8000 --
+05                       CONTIGUOUS | SAMELENGTH, blob_offset follows
+23                       blob_offset = 0x8000
+   02                    extents: 2
+   ff ff ff ff ff ff ff ff ff 01   lba INVALID_OFFSET (hole)
+   23                    length = 0x8000
+   54 10 00 00           lba 0x82a000
+   23                    length = 0x8000
+   04                    flags = FLAG_CSUM        (not shared yet)
+   04                    csum_type = crc32c
+   0f                    csum_chunk_order = 15  -> 32 KiB chunks
+   08                    csum_data: 8 B = TWO crc32c items
+   00 00 00 00             chunk 0 — never computed, the hole
+   b1 41 77 79             chunk 1 — the data
+```
+
+BlueStore's own readback agrees with this decode:
+`blob([0x822000~8000] ... crc32c/0x8000/4)`,
+`blob([!~8000,0x82a000~8000] ... crc32c/0x8000/8)` — plus
+`use_tracker(0x2*0x8000 0x[0,8000])`, the ref map that is not encoded inline
+but rebuilt from the lextents: two 32 KiB AUs, the first unreferenced.
+
+**The facts, read off the disk.** Two blobs, both starting at logical 0.
+Blob A has one allocated range, 32 KiB at `0x822000`, and one checksum
+covering 32 KiB; it is shared, sbid 1. Blob B has two ranges — a 32 KiB
+hole, then 32 KiB of data at `0x82a000` — and two checksums of 32 KiB each,
+the first all zeros because nothing was ever written there. Both use crc32c
+with a 32 KiB checksum chunk, and their data does not overlap. Every
+condition `can_merge_blob()` tests is satisfied by these bytes.
+
+**What has to be true before they can be merged.** `merge_blob()` moves
+blob B's checksums into blob A one whole checksum at a time, once per
+allocated range. So each allocated range in B has to start and end exactly
+on a 32 KiB boundary — otherwise there is no whole checksum to move. In this
+specimen it does: the single data range starts at blob offset `0x8000` and
+is `0x8000` long. The merge is legal here, and succeeds.
+
+**What goes wrong on a real OSD.** Age the store until no 32 KiB run is left
+(§6.1.2) and the same write comes back fragmented. Blob B's record, captured
+from that store, is five bytes longer:
+
+```
+   03                    extents: 3                          (was 02)
+   ff ff ff ff ff ff ff ff ff 01   lba INVALID_OFFSET (hole)
+   23                    length = 0x8000
+   52 ff 07 00           lba 0x3ffa9000
+   17                    length = 0x5000                     (varint_lowz)
+   34 ff 07 00           lba 0x3ff9a000
+   0f                    length = 0x3000
+   04 04 0f              FLAG_CSUM, crc32c, csum_chunk_order 15
+   08                    csum_data: 8 B = TWO items          (unchanged)
+   00 00 00 00 b1 41 77 79
+```
+
+The count byte goes `02` → `03` and one 5-byte pextent record becomes two.
+`csum_data` is byte-for-byte what it was: two 32 KiB checksums for data that
+now lives in two pieces, 20 KiB and 12 KiB (the order is whatever the
+allocator returned — the unit case in §6.1.2 builds the mirror image). The
+first piece is `0x5000` long, so `merge_blob()` is asked to move `0x5000` of
+a `0x8000` checksum, and no such thing exists. That is the assert. Nothing
+is malformed — the record has no field that ties the ranges to the
+checksums.
+
+Two things the record does *not* contain, which is why no consistency check
+on disk could have caught this:
+
+* **A logical length.** For an uncompressed blob it is not encoded at all —
+  the decoder recomputes it as the sum of the pextent lengths
+  (`get_ondisk_capacity()`). Blob B's `llen=0x10000` is 0x8000 of hole plus
+  0x8000 of data, inferred.
+* **A chunk count.** The number of csum items is `csum_data.length() /
+  get_csum_value_size()` — 8 / 4 = 2. That `08` and the `02` extent count
+  are independent fields, written by independent code paths, with no rule
+  relating them. The invariant `merge_blob()` depends on is nowhere in the
+  format; it is an emergent property of the three mechanisms in §6.2.2.
+
+### 6.2 Analysis
+
+#### 6.2.1 Root cause, top to bottom
+
+```
+clone aborts inside merge_blob
+ └─ why?   move_data() relocates csum data in whole csum-chunk units and
+           asserts the pextent it was handed is chunk-aligned
+                                                    (BlueStore.cc:2845)
+ └─ why was it handed an unaligned one?
+           merge_blob's main loop calls move_data(src_pos, src_it->length)
+           once per allocated pextent — pextents are min_alloc_size
+           granular, csum items are not
+ └─ why is the csum chunk coarser than the pextents?
+           the object carried a SEQUENTIAL_READ + IMMUTABLE alloc hint, so
+           _choose_write_options() set csum_order from
+           ctz(expected_write_size) instead of block_size_order
+                                                    (BlueStore.cc:17876)
+ └─ why did that produce split extents?
+           _do_alloc_write() stores the allocator's PExtentVector as-is;
+           on fragmented free space 32K comes back as two fragments —
+           0x5000 + 0x3000 in the captured store
+                                                    (BlueStore.cc:17645)
+ └─ why was the merge attempted at all?
+           can_merge_blob() accepts any pair with the same csum order, the
+           same tracker au_size and disjoint extents — it never checks that
+           the disjointness lands on csum-chunk boundaries
+                                                    (BlueStore.cc:2720)
+```
+
+The bottom of the chain is a missing precondition, not a broken computation.
+
+#### 6.2.2 Three granularities, and what anchors each
+
+A blob describes the same logical range three times, at three granularities.
+Here is the blob that aborts:
+
+```
+the blob being dissolved: logical length 0x10000, csum chunk 0x8000, min_alloc 0x1000
+
+               0                               0x8000      0xb000       0x10000
+  csum_data    [====== item 0: no data =======][====== item 1: the data ======]
+  pextents     [========== invalid ===========][= 0x3000 =][===== 0x5000 =====]
+  use tracker  [============ au 0 ============][============ au 1 ============]
+                                                           ^
+                                                           `-- a pextent boundary
+                                                               inside csum item 1
+```
+
+Two rows agree on every boundary; the pextent row carries one extra seam,
+because the allocator split the blob's 0x8000 of data into 0x3000 + 0x5000.
+
+`merge_blob()` has to move all three rows into the survivor, and it walks
+the **pextent** row while copying the **csum** row in whole items — so it
+asks to move 0x3000 of an item that is 0x8000 wide:
+
+```cpp
+auto move_data = [&](uint32_t pos, uint32_t len) {
+  if (src_blob.has_csum()) {
+    ceph_assert((pos % (1 << csum_chunk_order)) == 0);
+    ceph_assert((len % (1 << csum_chunk_order)) == 0);   // <-- 72848
+    ...
+    memcpy(dst_csum_ptr + item_no * csum_value_size,
+           src_csum_ptr + item_no * csum_value_size,
+           item_cnt * csum_value_size);
+  }
+  ...
+};
+...
+move_data(src_pos, src_it->length);      // called per pextent
+```
+
+The unwritten contract is *every pextent starts and ends on a csum chunk
+boundary*. Three unrelated mechanisms normally supply it — and the scorecard
+is where the bug lives:
+
+| mechanism | what it guarantees | still holds under a `SEQUENTIAL_READ + IMMUTABLE` hint? |
+|---|---|---|
+| `get_release_size()` = `max(csum chunk, min_alloc)`, uncompressed | `put_ref()` can never punch a hole *inside* a csum chunk | yes |
+| allocator granularity | pextent lengths are `min_alloc_size` multiples | yes |
+| `wctx->csum_order = block_size_order` | csum chunk ≤ `min_alloc_size`, so any `min_alloc` boundary is also a chunk boundary | **no — this is the door** |
+| `can_merge_blob()` | — | **never checked it at all** |
+
+`_choose_write_options()` opens the third row. An object hinted
+`SEQUENTIAL_READ` without `RANDOM_READ`, carrying `IMMUTABLE` or
+`APPEND_ONLY`, and not `RANDOM_WRITE`, gets
+`csum_order = max(min_alloc_size_order, ctz(expected_write_size))` instead of
+`block_size_order` — so its csum chunk can go *above* `min_alloc_size`, up to
+`expected_write_size`. (Compressed blobs take their order from
+`ctz(compressed length)` and can exceed `min_alloc_size` too, but they are
+excluded from this merge on both sides — `scan_shared_blobs()` skips them as
+candidates and `make_range_shared_maybe_merge()` never offers them.)
+
+`_do_alloc_write()` caps each blob's own order at `ctz(write length)` and
+then stores what the allocator returned as-is, slicing only the tail extent
+at the blob boundary — which is how a chunk-sized write ends up in two
+pieces. The last ingredient is that both blobs share a `blob_start`, handed
+over for free by `suggested_boff`: a 32K write at logical 32K goes to *blob
+offset* 32K of a 64K blob starting at logical 0, to align with
+`max_blob_size`.
+
+```
+logical   0              0x8000   0x10000
+blob A    |==== data ====|                    shared,     csum chunk 0x8000
+blob B    |    (hole)    |==== data ====|     not shared, csum chunk 0x8000
+                          \__ 0x3000 + 0x5000   (both blobs start at logical 0)
+
+can_merge_blob(A, B) -> true   (disjoint, same csum order, same au size)
+merge_blob(A <- B)   -> move_data(0x8000, 0x3000) -> 0x3000 % 0x8000 -> abort
+```
+
+The near-miss is instructive. `can_reuse_blob()`, the sibling gate on the
+write path, treats csum-chunk alignment as a precondition and even says why:
+
+```cpp
+// Currently for the sake of simplicity we omit blob reuse if data is
+// unaligned with csum chunk. Later we can perform padding if needed.
+if (get_blob().has_csum() &&
+   ((b_offset % get_blob().get_csum_chunk_size()) != 0 ||
+    (end % get_blob().get_csum_chunk_size()) != 0)) {
+  return false;                                   // can_reuse_blob()
+}
+```
+
+But that guards the *logical* offsets of an incoming write — in the failing
+scenario blob B's write is at `b_off 0x8000` for `0x8000`, both ends chunk
+aligned, and it passes. What breaks is the *physical* extent boundary the
+allocator introduced, which no offset test can see. `can_merge_blob()`
+needed a stricter member of the same family, and grew none.
+
+#### 6.2.3 Why the qa test finds it and a cluster rarely does
+
+`SyntheticWorkloadState::touch()` stamps a random alloc hint on *every*
+object it creates:
+
+```cpp
+boost::uniform_int<> u(17, 22);
+boost::uniform_int<> v(12, 17);
+t.set_alloc_hint(cid, new_obj, 1ull << u(*rng), 1ull << v(*rng),
+                 get_random_alloc_hints());
+```
+
+`expected_write_size` is 4K–128K, and `get_random_alloc_hints()` rolls
+`SEQUENTIAL_READ` without `RANDOM_READ` (1/4), an
+`IMMUTABLE`/`APPEND_ONLY` bit (3/5) and no `RANDOM_WRITE` (3/4) — 9/80 ≈ 11%
+of objects, of which 5/6 draw an `expected_write_size` above a 4K
+`min_alloc_size`, so ~9% end up with an oversized csum chunk. Add 10 000
+ops, half of them write/zero/truncate/unlink to fragment the device, and 10%
+`clone`/`clone_range` (`StoreTest.Synthetic`; the matrix rows go to 50 000),
+and the collision becomes a matter of time — which fits the single
+occurrence on the tracker.
+
+Production needs the same two coincidences: an object hinted immutable and
+sequential-read (RGW and CephFS do issue these), and free space fragmented
+enough that its blob is split mid-chunk. Both are ordinary on an aged OSD
+and absent on a fresh one, which is why this survived years of qa.
+
+### 6.3 Proposed solution
+
+#### 6.3.1 The fix
+
+`can_merge_blob()` already walks the dissolved blob's valid extents once,
+with each extent's blob offset in hand, for the disjointness test. The
+alignment check rides that loop — two compares per valid extent
+(`csum_chunk_size` is 0 when the dissolved blob has no csum), and only for
+the dissolved blob, since `merge_blob()` never moves the survivor's
+extents:
+
+```cpp
+  while (xi != xe.end() && yi != ye.end()) {
+    if (xp <= yp) {
+      if (yp < xp + xi->length) {
+        // collision
+        can_merge = false;
+        break;
+      }
++     if (csum_chunk_size != 0 &&
++         ((xp % csum_chunk_size) != 0 ||
++          (xi->length % csum_chunk_size) != 0)) {
++       // x's extent splits a csum chunk; move_data() could not move it
++       can_merge = false;
++       break;
++     }
+      xp += xi->length;
+      ++xi;
+```
+
+(plus the same test in the trailing loop that scans x's extents y never
+reached). Merging is only an optimisation, so the gatekeeper may refuse: the
+caller falls back to `make_blob_shared()`, which is always correct.
+
+#### 6.3.2 Why it is safe
+
+**Refusing is a no-op, structurally.** `make_range_shared_maybe_merge()`
+already has the branch — `find_mergable_companion()` returning `nullptr` is
+the normal case for the first blob at any `blob_start`. A `false` from
+`can_merge_blob()` reaches exactly that path.
+
+**Relaxing the assert instead is not free.** The use-tracker loop under it
+rounds the same way, and one invariant decides both halves of what happens
+next. Because a sub-AU hole cannot exist, two fragments at `0x3000` and
+`0x5000` inside one AU must *both* be valid — so both are visited and each
+adds `src_tracker_aus[i]`, leaving a count that `put()` can never drive to
+zero and an AU that is never released. The csum copy is subtler. Rounding to whole items would actually copy the
+right item, because a chunk that any of the dissolved blob's bytes touch is
+entirely its own: writes into a csummed blob are chunk-aligned, and
+`get_release_size()` forbids sub-chunk holes, so no chunk is ever co-owned.
+`Blob::copy_from()` already relies on exactly that — it copies csum items
+with the same `p2align`/`p2roundup` rounding, and is correct for the same
+reason. But the invariant is written down nowhere, which is the shape of
+this bug; a crash fix is the wrong place to start leaning on it.
+
+**The cost is bounded and rare.** It gives up the elastic-shared-blob win
+only when the blob being dissolved is chunk-split — which requires the
+alloc hint *and* fragmentation, i.e. the ~9% of objects above on an aged
+device. Everything else still merges; the regression test pins that down.
+
+**The alternative was worked out and deferred.** `move_data()` could keep
+the win instead: copy each csum item at most once behind a watermark, and
+move the tracker as a single whole-array add rather than per call. That is
+about fifteen lines and deletes both asserts — but it is precisely the
+change that leans on the never-co-owned invariant above, so it wants its own
+guardrail and test surface, not a ride on a crash fix.
+
+#### 6.3.3 Validation
+
+The regression test carries both directions in one case: the aligned pair
+must still merge into one blob, the fragmented pair must be refused.
+
+| | without the fix | with the fix |
+|---|---|---|
+| `can_merge_blob()` on the fragmented pair | true | **false** |
+| the clone | abort at `BlueStore.cc:2845` | two shared blobs, csum item intact |
+| `unittest_bluestore_types` | — | **154/154** |
+| `ceph_test_objectstore`, the qa job's own filter | — | 180 passed, 4 skipped, 68 min |
+| of which synthetic matrix tests | — | **61/61 passed** (44 min) |
+| aborts / signals in that run | — | **0** |
+| guard rejections in that run | — | **0** |
+| aged-store end-to-end clone (§6.1.2) | abort in `queue_transactions()` | clone succeeds, data verified |
+
+Four `ceph_test_objectstore` tests fail on that branch (`CompressionTest`,
+`BlueStoreReconstructAllocationsTest`, `BluestoreStatFSTest`,
+`garbageCollection`) — identical failures with and without the patch, so
+pre-existing and unrelated.
+
+The last row is the honest one. Instrumenting the guard shows the qa
+workload does build blobs whose csum chunk exceeds `min_alloc_size`
+(`csum_chunk=0x2000, min_alloc=0x1000`) — but never a fragmented one, so the
+guard was never asked to refuse anything. Nothing in the suite drains its
+scratch device, so chunk-split blobs stay rare: the tracker's abort was one
+occurrence across many such runs, and 68 minutes did not buy another. What
+this run establishes is that the guard costs nothing; the two reproducers
+are what pin the mechanism.
+
+#### 6.3.4 Takeaways
+
+- **A blob keeps three views of one range at three granularities.** Any
+  code that moves one of them has to respect the coarsest. `merge_blob()`
+  iterates at pextent granularity and copies at csum granularity, and the
+  assert is the only thing writing that contract down.
+- **The invariant was held up by three unrelated mechanisms** — release
+  size, allocation size, and the default csum order — none of which is
+  documented as guaranteeing it. One alloc hint removes the third and the
+  other two are not enough.
+- **`can_reuse_blob()` treated csum-chunk alignment as a precondition;
+  `can_merge_blob()` did not consider it at all.** When adding a second
+  consumer of a shared representation, the first consumer's guards are the
+  checklist — even when the second consumer needs a stricter version of the
+  same guard.
+- **An assert is not a fix.** Deleting these two would have turned a crash
+  into an inflated use tracker — the same AU counted once per fragment, so
+  it is never released. No crash, no error returned to the client, just
+  space that does not come back: far harder to attribute than an abort.
+- **A knob named "force small allocations" does not force small
+  allocations.** It is honoured only by `StupidAllocator` — not the default
+  `hybrid` — and even there coalescing undoes it on unfragmented free space
+  (§6.1.2). Worth knowing before trusting it in a reproducer.
+
+## 7. Tracker #78144 — a unit test that aborts because a syscall was denied
+
+[Issue](https://tracker.ceph.com/issues/78144) · `unittest_bluefs_ex` under
+`make check` on Ubuntu 24.04 · component BlueStore (test) · one of five
+tickets from one environment defect · Status: probe-and-skip patch local and
+validated, not submitted; the sibling ticket's PR does not cover this one
+
+### 7.1 Report
+
+#### 7.1.1 The observation
+
+`unittest_bluefs_ex` fails on noble and passes everywhere else. The test
+never gets to run: BlueFS opens a block device, the device's polling thread
+calls `io_getevents(2)`, the container's syscall filter denies it with
+`EPERM`, and `KernelDevice::_aio_thread()` treats every error it does not
+recognise as fatal.
+
+```
+BlueFS_ex.test_interrupted_compaction
+KernelDevice.cc: 718: ceph_abort_msg("got unexpected error from io_getevents")
+ 3: KernelDevice::_aio_thread()
+ 4: KernelDevice::AioCompletionThread::entry()
+...
+test_bluefs_ex.cc:180: Failure
+Value of: (((stat) & 0xff00) >> 8) == 0
+```
+
+(line 718 is the reporter's tree; the same abort is at 699-701 on main today.)
+
+Those two halves are three processes apart, which is most of why the report
+is hard to read. The test forks twice, and the abort lands in the innermost
+process:
+
+```
+unittest_bluefs_ex                        (gtest, outer)
+ └─ fork_for_test
+     │   parent: waitpid -> WIFEXITED && WEXITSTATUS == 0   <- line 180 fails here
+     │
+     └─ child: create the bdev, fork again
+         │   parent: waitpid -> expects exit code 107
+         │
+         └─ grandchild: add_block_device -> KernelDevice::open -> _aio_start
+                        bstore_aio: io_getevents -> -EPERM -> ceph_abort
+                        SIGABRT, instead of the _exit(107) it was going to do
+```
+
+The grandchild is supposed to kill itself mid-compaction with `_exit(107)` —
+that is the whole point of the test, which checks that BlueFS recovers from
+an interrupted log compaction. It never reaches the compaction. Opening the
+device starts the polling thread, and the very first `io_getevents()` is
+denied — so it dies before even `mkfs()`. The middle process sees
+`WIFEXITED` false, exits 107 itself, and the outer process reports a bad
+exit status at line 180. Nothing in that last message mentions aio.
+
+#### 7.1.2 Reproducing it
+
+The denial is environmental, so on any working machine you inject it. libaio
+returns `-errno`, so the whole shim is one function:
+
+```c
+/* deny_aio.c — what the noble container's syscall filter does */
+#define _GNU_SOURCE
+#include <libaio.h>
+#include <errno.h>
+int io_getevents(io_context_t ctx, long min_nr, long nr,
+                 struct io_event *events, struct timespec *timeout)
+{
+    return -EPERM;
+}
+```
+
+```bash
+gcc -shared -fPIC -o deny_aio.so deny_aio.c
+LD_PRELOAD=$PWD/deny_aio.so bin/unittest_bluefs_ex
+```
+
+That reproduces the ticket exactly on a machine where aio works — the same
+abort, then the same `Actual: false` at line 180. Fedora 42 without the
+shim: 8 runs, 8 passes, ~50 s each. The test is fine; the environment is
+not.
+
+### 7.2 Analysis
+
+#### 7.2.1 Root cause, top to bottom
+
+```
+unittest_bluefs_ex reports a bad exit status at line 180
+ └─ why?   the grandchild died of SIGABRT rather than _exit(107), so
+           WIFEXITED is false and the middle process exits 107 itself
+ └─ why did it abort?
+           get_next_completed() retries -EINTR internally (aio.cc:105);
+           _aio_thread() treats every other negative return as fatal
+                                              (KernelDevice.cc:699-701)
+ └─ what did it get?
+           -EPERM from io_getevents(2), on the first poll after the
+           device was opened
+ └─ why EPERM?
+           the kernel's io_getevents has no EPERM of its own — its errors
+           are EINVAL, EFAULT, EINTR, ENOSYS — so it came from a syscall
+           filter (seccomp, or an AppArmor/LSM policy) in the noble
+           build container
+
+#78144's own log does not carry the errno: the fixture sets
+`log_to_stderr false`. `EPERM` is proven for #78148 — `_aio_thread got (1)
+Operation not permitted`, same builder run 24 seconds earlier — and inferred
+here from the identical abort site. The shim of 7.1.2 reproduces #78144's
+output exactly, which is as close to proof as the log allows.
+ └─ why does every poll hit it?
+           BlueStore polls with bdev_aio_poll_ms = 250, and any non-zero
+           timeout issues the syscall (7.2.2)
+```
+
+#### 7.2.2 Which call is denied, and which is not
+
+The sibling ticket describes this as the kernel having two paths, one of
+them policy-checked. It is simpler than that, and the split is in userspace.
+Disassembling libaio 0.3.111 (Fedora 42):
+
+```
+io_getevents@@LIBAIO_0.4:
+   cmpl  $0xa10a10a1,0x10(%rdi)   ; ring->magic == AIO_RING_MAGIC ?
+   cmpq  $0x0,(%r8)               ; timeout->tv_sec  == 0 ?
+   cmpq  $0x0,0x8(%r8)            ; timeout->tv_nsec == 0 ?
+   mov   0xc(%rdi),%eax
+   cmp   %eax,0x8(%rdi)           ; ring->head == ring->tail ?
+   je    -> xor %eax,%eax ; ret   ; all yes: return 0, no syscall at all
+   jmp   -> syscall
+```
+
+```
+io_getevents(ctx, min_nr, nr, events, timeout)
+   │
+   ├── timeout == {0,0} AND ring empty ──> return 0   no syscall issued, so
+   │                                                  a zero-timeout probe
+   │                                                  reports aio as healthy
+   │
+   └── anything else ────────────────────> syscall ─> denied, -EPERM, so every
+                                                      250 ms BlueStore poll dies
+```
+
+Hence the probe in 7.3.1 uses a 1 ms timeout rather than the cheaper zero.
+
+**A zero-timeout poll loop is not a workaround.** The left branch cannot
+harvest anything — it only answers "the ring is empty". I checked by
+submitting a write, waiting for it to land, and then polling with a zero
+timeout: it returned the completion, which means it took the syscall. So
+such a loop would work only while there is nothing to collect.
+
+#### 7.2.3 One cause, five tickets, two fixes
+
+`io_setup(2)` succeeds and `io_getevents(2)` does not, so every test that
+opens a BlueStore block device dies the same way. Five were filed separately
+on the same day, and #78144 and #78148 are 24 seconds apart in one builder
+run:
+
+| ticket | test | project | needs |
+|---|---|---|---|
+| #78148 | `safe-to-destroy.sh` | RADOS | shell-level skip — has [PR #70572](https://github.com/ceph/ceph/pull/70572) |
+| #78144 | `unittest_bluefs_ex` | bluestore | gtest-level skip — **this section** |
+| #78145/6/7 | `run-rbd-unit-tests-*.sh` | rbd | same abort, unaddressed |
+| #77592 | umbrella: `unittest_bluefs`, `unittest_bdev`, and more | Dashboard | filed 2026-06-23; also lists tox failures with other causes |
+
+PR #70572 fixes #78148, and it improves #78144 without fixing it: its probe
+in `aio_queue_t::init()` turns the abort into an error return, so
+`KernelDevice::open()` fails and `add_block_device()` fails. The grandchild
+then reports `test_bluefs_ex.cc:140: Failure` and exits 0 instead of 107, the
+middle process still `exit(107)`s, and the outer `ASSERT_TRUE` still fails at
+line 180. Better diagnostics — a named source line and a new
+`io_getevents(2) is not permitted` message instead of a `SIGABRT` — and the
+same red test. Its CTest skip is an `exit 77` in a shell script; a gtest
+binary gets nothing from it. So #78144 shares a cause with #78148 but not a fix, and closing it
+as a duplicate would mark it resolved while it still fails.
+
+### 7.3 Proposed solution
+
+#### 7.3.1 The fix
+
+Probe once, in the outer process, before either fork — a skip decided in the
+grandchild cannot be reported, it can only change an exit code:
+
+```cpp
+static int probe_libaio()
+{
+#if defined(HAVE_LIBAIO)
+  io_context_t ctx = 0;
+  int r = io_setup(1, &ctx);
+  if (r < 0) {
+    return r;
+  }
+  io_event event;
+  struct timespec timeout = {0, 1000 * 1000}; // 1ms — must be non-zero
+  r = io_getevents(ctx, 1, 1, &event, &timeout);
+  io_destroy(ctx);
+  if (r < 0) {
+    return r;
+  }
+#endif
+  return 0;
+}
+```
+
+```cpp
+TEST_F(BlueFS_ex, test_interrupted_compaction)
+{
+  int aio_probe = probe_libaio();
+  if (aio_probe < 0) {
+    GTEST_SKIP() << "libaio is unusable in this environment ("
+                 << cpp_strerror(aio_probe)
+                 << "); BlueFS cannot open a block device here";
+  }
+```
+
+`GTEST_SKIP` exits 0, so CTest records a pass and the skip shows up in the
+test's own output. That is deliberate: `exit 77` only reads as a skip when
+the test carries CMake's `SKIP_RETURN_CODE` property, and `SKIP_RETURN_CODE`
+appears nowhere in Ceph's build — `safe-to-destroy.sh` is registered with a
+plain `add_ceph_test`, so PR #70572's `exit 77` would currently be reported
+as a failure.
+
+#### 7.3.2 What was ruled out
+
+**`bdev_aio = false`.** The option exists, is documented `advanced`, and
+`KernelDevice::open()` answers it with
+`ceph_abort_msg("non-aio not supported")` (KernelDevice.cc:227). Verified by
+running it: the test dies on that abort instead. The option is a trap.
+
+**A zero-timeout poll loop.** Ruled out in 7.2.2 — it cannot collect
+completions.
+
+**Waiting for PR #70572.** Ruled out in 7.2.3 — it leaves this test failing.
+
+#### 7.3.3 Validation
+
+With the shim standing in for the noble policy:
+
+| scenario | result |
+|---|---|
+| unpatched + shim | `ceph_abort_msg(...)`, then `Actual: false` at line 180 — the ticket, exactly |
+| patched + shim | `[ SKIPPED ]` with the reason, exit 0 |
+| patched, no shim | `[ OK ] ... (48620 ms)`, exit 0 — the test still really runs |
+| unpatched, no shim | 8 runs, 8 passes |
+
+#### 7.3.4 Takeaways
+
+- **The fix is a skip, and a skip is not a fix.** A green `make check` on
+  noble then means BlueStore was never tested there. The environment is the
+  thing to repair; skipping only stops one broken environment from looking
+  like a code bug.
+- **`EPERM` from a syscall that has no `EPERM` is a filter, not a bug.**
+  The kernel's `io_getevents` returns EINVAL, EFAULT, EINTR or ENOSYS.
+  Reading the man page's error list ruled out the whole aio subsystem in one
+  step and pointed straight at seccomp/AppArmor.
+- **A probe has to take the same branch as the real caller.** libaio answers
+  a zero timeout without a syscall, so the natural cheap probe is exactly
+  the one that cannot detect this.
+- **Fork depth hides the cause.** The abort was two `fork()`s below the
+  assertion that reported it, and by the time it surfaced it was an integer.
+  Probing before the fork is not just tidier — it is the only place a
+  diagnosis can be printed.
+
+# Part II — OSD
+
+## 8. The zero-copy path that never ran — every replicated write memcpys its payload on the replica
 
 Found by a bpftrace memory-copy census, not by a bug report · affects
 every replicated client write · component OSD (ReplicatedBackend /
 os/Transaction, consumer BlueStore's throttle) · fix: one line, plus a
 size-estimate correction that code review surfaced · open: the aligned
-format assumes both ends share a page size (5.4.2) · Status: upstream
+format assumes both ends share a page size (8.4.2) · Status: upstream
 [PR #71355](https://github.com/ceph/ceph/pull/71355) open with the
 one-liner; the size-estimate commit sits ahead of it on the local
 branch, not yet pushed; both verified on a 2-OSD lab; the EC sibling
-patch is local, A/B-verified on five OSDs (5.6); tracker ticket for
+patch is local, A/B-verified on five OSDs (8.6); tracker ticket for
 tentacle + umbrella backports pending
 
-## 5.1 The story in one view
+### 8.1 The story in one view
 
 The encoding that makes a replica write zero-copy has been in the tree
 since 2025-04. The classic OSD's client-write path never switched it on.
@@ -919,15 +2195,15 @@ since 2025-04. The classic OSD's client-write path never switched it on.
    the correction is ordered ahead of the one-liner.
 
 ```
-#1–#5  the copy         §5.2 report → §5.3 analysis → §5.4 fix
-#6     the accounting   §5.5
-       the EC sibling   §5.6   same gap, same fix, A/B on five OSDs
-       lessons          §5.7
+#1–#5  the copy         §8.2 report → §8.3 analysis → §8.4 fix
+#6     the accounting   §8.5
+       the EC sibling   §8.6   same gap, same fix, A/B on five OSDs
+       lessons          §8.7
 ```
 
-## 5.2 Report
+### 8.2 Report
 
-### 5.2.1 The observation
+#### 8.2.1 The observation
 
 Counting real copies of I/O data inside `ceph-osd` (uprobes on
 `buffer::ptr::copy_in` and `list::rebuild`, two-OSD vstart cluster,
@@ -945,7 +2221,7 @@ copies nothing, and whichever is replica copies everything. Deferred
 wrong functionally — data is correct, scrubs are clean — the cluster
 just spends a full-payload memcpy per replica per write, forever.
 
-### 5.2.2 Reproducing it
+#### 8.2.2 Reproducing it
 
 Any vstart cluster where writes actually replicate:
 
@@ -967,7 +2243,7 @@ grep -c "rebuilding buffer to be aligned" out/osd.*.log
 
 Unpatched: the count lands on whichever OSD was the *replica* for
 each object — about 2 per write (one per 64 KiB blob), zero on the
-primary. Patched (the one-liner in 5.4.1): zero everywhere. (`osd map p1 rep-N` tells you
+primary. Patched (the one-liner in 8.4.1): zero everywhere. (`osd map p1 rep-N` tells you
 who was primary for each object.)
 
 **Signal 2 — the wire format is v10 yet still copies.** With
@@ -999,9 +2275,9 @@ Unpatched, the replica prints `off_in_raw=336` (and `65872` for the
 second blob); the primary prints `0`/`65536`. Patched, everyone
 prints page-multiples.
 
-## 5.3 Analysis
+### 8.3 Analysis
 
-### 5.3.1 Root cause, top to bottom
+#### 8.3.1 Root cause, top to bottom
 
 Each answer below was measured before moving down a level, DWARF
 call stacks first, then dumping the buffer geometry at the probe:
@@ -1035,7 +2311,7 @@ replica memcpys every write payload
 ```
 
 The bottom of the chain is a wiring gap. Commit `a0c9fec7f451`
-(authored 2025-03, merged 2025-04, dissected in 5.3.2) put the
+(authored 2025-03, merged 2025-04, dissected in 8.3.2) put the
 feature-aware constructor on the recovery paths (`_do_push`,
 `_do_pull_response`,
 [`ReplicatedBackend.cc:989`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L989))
@@ -1071,7 +2347,7 @@ Alignment of the *buffer* is useless when the *payload* starts 336
 bytes into it; only the encode-side split can fix the offset, and
 the split was switched off.
 
-### 5.3.2 What `a0c9fec7f451` actually built — and where it was wired
+#### 8.3.2 What `a0c9fec7f451` actually built — and where it was wired
 
 The commit behind this whole story
 ([a0c9fec7f451](https://github.com/ceph/ceph/commit/a0c9fec7f451),
@@ -1095,7 +2371,7 @@ is a packed struct appended to the wire verbatim, and the padding
 keeps the on-wire layout identical.
 
 **What it added.** Three layers that only work as a chain (byte
-layouts in 5.3.3):
+layouts in 8.3.3):
 
 ```
 sender: Transaction::write(off, len, data)          [split at DESTINATION
@@ -1114,7 +2390,7 @@ receiver: decode_bl() rebuilds each write as views: [prefix][middle][suffix]
           → the middle is page-aligned in memory → aio submits it as-is
 ```
 
-Plus the safety rails checked in 5.4.2: the `data_features` member set at
+Plus the safety rails checked in 8.4.2: the `data_features` member set at
 construction, `is_format_aligned()` gating the split, the
 encode-version assert, and the `append()` feature-equality assert.
 The same commit gave erasure coding the equivalent treatment:
@@ -1131,7 +2407,7 @@ that is where coverage at v21.3.0 is uneven:
 | crimson client writes (`ops_executer`) | yes — `txn(pg->min_peer_features())` |
 | classic recovery (`_do_push`, `_do_pull_response`) | yes — but local transactions, never encoded for the wire |
 | classic replica-side local txn (`RepModify::localt`) | yes — local pg-log transaction, never encoded |
-| **classic replicated client writes** (`submit_transaction`) | **no — default ctor, §5.3.1** |
+| **classic replicated client writes** (`submit_transaction`) | **no — default ctor, §8.3.1** |
 | **classic EC client writes, optimized** (`ECCommon::RMWPipeline::cache_ready`) | **no — `trans[shard]` default-constructs every per-shard transaction** |
 | **classic EC client writes, legacy** (`ECCommonL::RMWPipeline::try_reads_to_commit`) | **no — `trans[i->shard]`, same** |
 
@@ -1149,7 +2425,7 @@ pools without `allow_ec_optimizations`) was never wired at all. Both
 containers' `operator[]` value-initialize (`shard_id_map`, and a plain
 `std::map` in the legacy one), so `data_features` is 0 for every shard
 transaction; the ECSubWrite v5 wire format is just as dormant as
-MOSDRepOp's; closing it is 5.6.
+MOSDRepOp's; closing it is 8.6.
 
 So in the classic OSD — the one every production cluster runs — no
 write path ships an aligned payload. Crimson's does, but its receiver
@@ -1162,7 +2438,7 @@ Why the tests didn't catch it: they prove the format *round-trips*
 production write path *produces* transactions carrying features, so
 every test passed while every client write took the legacy branch.
 
-### 5.3.3 The two encodings — v9 and v10, byte by byte
+#### 8.3.3 The two encodings — v9 and v10, byte by byte
 
 Line numbers are
 [`Transaction.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/Transaction.h)
@@ -1291,10 +2567,10 @@ three pages in `data_aligned_bl`, suffix 1.
 (`common/page.cc:28`), and it is not on the wire: v10 carries
 `data_features` and two lengths, nothing else. The split is therefore
 only the *same* split when both ends have the same page size — the
-open hazard in 5.4.2.
+open hazard in 8.4.2.
 
 **The measured 128 KiB write, in each encoding** — the replica's view;
-the middle row is Signal 2 of 5.2.2 (`1196+375+131408`; attrs 332 =
+the middle row is Signal 2 of 8.2.2 (`1196+375+131408`; attrs 332 =
 the measured 336 less the write's own length word), the other two are
 derived from the code above:
 
@@ -1320,9 +2596,9 @@ split *unit* is not.
 `t.encode(p_bl, d_bl, features)`, v4 puts everything in one stream
 ([`ECMsgTypes.cc:35`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ECMsgTypes.cc#L35)).
 
-## 5.4 Proposed solution
+### 8.4 Proposed solution
 
-### 5.4.1 The fix
+#### 8.4.1 The fix
 
 ```cpp
 // ReplicatedBackend::submit_transaction
@@ -1341,7 +2617,7 @@ first ([`Transaction.h:1379`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/T
 ([`Transaction.h:717`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/Transaction.h#L717)).
 `rebuild_aligned_size_and_memory` then finds nothing to rebuild.
 
-### 5.4.2 Why it is safe — and where it is not yet
+#### 8.4.2 Why it is safe — and where it is not yet
 
 Five hazards were checked before trusting one line. Four are closed;
 the last is not:
@@ -1383,7 +2659,7 @@ metadata *behind* the payload instead of in front of it.
 `CEPH_PAGE_SIZE` twice: in `write()` on the primary
 ([`Transaction.h:904`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/Transaction.h#L904))
 and again in `decode_bl()` on the replica (`:727`), each with its own
-host's page size, which nothing exchanges (5.3.3). Simulated on x86 by
+host's page size, which nothing exchanges (8.3.3). Simulated on x86 by
 flipping the mutable `ceph::_page_size`/`_page_mask` between encode and
 decode — the §1.6 trick — with a standalone program linked against the
 lab build:
@@ -1415,7 +2691,7 @@ later argument in that transaction is shifted.
 
 The 128 KiB write at offset 0 splits identically under 4K, 16K and 64K
 pages — which is why every measurement in this section passed; the
-4 KiB deferred and 64 K bench rows of 5.4.3 pass only because both lab
+4 KiB deferred and 64 K bench rows of 8.4.3 pass only because both lab
 OSDs share a page size.
 
 This is a design assumption of `a0c9fec7f451`, latent in the classic
@@ -1441,10 +2717,10 @@ Precedent covers half of the rest. The construction pattern is the one
 routing and the local `decode_bl` have been in production since it
 merged. The other half — a replica decoding a v10 message whose
 aligned bufferlist is *not* empty — has the commit's round-trip unit
-tests and the lab runs in 5.4.3 behind it, and no production history
+tests and the lab runs in 8.4.3 behind it, and no production history
 in the classic OSD.
 
-### 5.4.3 Validation
+#### 8.4.3 Validation
 
 Same census, patched build, probes re-verified live (metadata
 counters non-zero):
@@ -1462,11 +2738,11 @@ counters non-zero):
 At pool `size=3` the line removes two full-payload memcpys
 cluster-wide from every client write.
 
-## 5.5 What review found — the throttle sees two kilobytes of a 128 KiB write
+### 8.5 What review found — the throttle sees two kilobytes of a 128 KiB write
 
-### 5.5.1 The observation
+#### 8.5.1 The observation
 
-Reviewing the one-liner in 5.4.1 for PR #71355, Kefu Chai pointed at
+Reviewing the one-liner in 8.4.1 for PR #71355, Kefu Chai pointed at
 a second consumer of the transaction that the aligned format had
 quietly broken:
 
@@ -1494,7 +2770,7 @@ and scrubs are clean; only the accounting is wrong. Without the
 one-liner the same writes are costed in full — because without it
 they are not aligned-format transactions at all.
 
-### 5.5.2 Reproducing it
+#### 8.5.2 Reproducing it
 
 **Signal 1 — a unit test that fails.** Build an aligned-format
 transaction and compare the fast size against a real encode:
@@ -1526,7 +2802,7 @@ grep -o "_txc_calc_cost .*bytes)" out/osd.*.log | tail -2
 `bytes` should be at least the payload. It is the metadata plus the
 sub-page fragments, and nothing else.
 
-### 5.5.3 Root cause — the size estimate that never learned about the second buffer
+#### 8.5.3 Root cause — the size estimate that never learned about the second buffer
 
 ```
 BlueStore admits far more payload bytes in flight than its throttle allows
@@ -1565,7 +2841,7 @@ bufferlists and `decode()` restores both. The blind spot is one
 arithmetic expression that was written when the transaction had one
 payload buffer and never revisited when it grew a second.
 
-### 5.5.4 What the number is for, and who consumes it
+#### 8.5.4 What the number is for, and who consumes it
 
 `get_encoded_bytes()` was written as a *fast estimate of the encoded
 wire size* — the comment still says "layout version 9" — so the OSD
@@ -1607,15 +2883,15 @@ gone the 64 MiB byte throttle degenerates into a counter of roughly
 five thousand transactions of any size. That is the sentence "this
 gets worse with SSD media" in the review, made concrete.
 
-### 5.5.5 Why nobody saw it, and what "exact" means
+#### 8.5.5 Why nobody saw it, and what "exact" means
 
 Two things kept the bug quiet since April 2025.
 
 **Only recovery built aligned-format transactions** (the scorecard in
-5.3.2). Recovery traffic is paced by its own knobs (`osd_recovery_max_active`,
+8.3.2). Recovery traffic is paced by its own knobs (`osd_recovery_max_active`,
 `osd_max_backfills`) long before the BlueStore throttle would bite,
 so an undercharged recovery push changes nothing observable. The
-one-liner in 5.4.1 is what moves the undercount onto the hot path —
+one-liner in 8.4.1 is what moves the undercount onto the hot path —
 which is exactly why the estimate has to be fixed first.
 
 **The test compared two copies of the same mistake.** `GetNumBytes`
@@ -1643,7 +2919,7 @@ by the transaction's own features — the one case that is unambiguous,
 and the one that carries payload in `data_aligned_bl` — and documents
 that choice.
 
-### 5.5.6 The fix — count both payload bufferlists
+#### 8.5.6 The fix — count both payload bufferlists
 
 A commit ordered ahead of the one-liner on the PR branch (local, not
 yet pushed to #71355), so the one-liner never ships without it:
@@ -1746,7 +3022,7 @@ a.encode(p_bl, d_bl, CEPH_FEATUREMASK_SERVER_TENTACLE);
 ASSERT_EQ(a.get_encoded_bytes(), p_bl.length() + d_bl.length());
 ```
 
-### 5.5.7 Why it is safe
+#### 8.5.7 Why it is safe
 
 **The cost only goes up, and only by real bytes.** Every term added is
 either payload the transaction actually carries or a header the
@@ -1766,7 +3042,7 @@ non-decreasing under `append()`/`write()`, so it still does.
 670000 the payload term was and remains a small fraction of the cost.
 The correction matters where the review said it would — on SSD.
 
-### 5.5.8 Validation
+#### 8.5.8 Validation
 
 `unittest_transaction`: 20/20, including the two new equality checks
 against real encodes; before the fix the aligned case reports
@@ -1788,11 +3064,11 @@ The deferred rows show `1 ios` (the kv commit only) with the same
 bytes as the direct rows: the accounting is independent of which
 BlueStore path the write takes, as it should be.
 
-## 5.6 The EC sibling — same gap, same fix, measured
+### 8.6 The EC sibling — same gap, same fix, measured
 
-### 5.6.1 The gap
+#### 8.6.1 The gap
 
-The two EC **no** rows of the 5.3.2 scorecard. Both EC write pipelines
+The two EC **no** rows of the 8.3.2 scorecard. Both EC write pipelines
 value-initialize their per-shard transactions, so every shard
 transaction is legacy-format and `ECSubWrite` v5 ships an empty aligned
 stream:
@@ -1814,10 +3090,10 @@ shard — one not held by the primary OSD — that a client write touches.
 (The optimized pipeline skips untouched shards; "non-primary shard" is
 avoided here because optimized EC defines it differently.)
 
-### 5.6.2 The fix
+#### 8.6.2 The fix
 
 Same one-line idea, once per pipeline — local commit on top of the two
-in 5.4.1 and 5.5.6, not yet posted:
+in 8.4.1 and 8.5.6, not yet posted:
 
 ```cpp
 // ECCommon.cc — RMWPipeline::cache_ready()
@@ -1830,11 +3106,11 @@ in 5.4.1 and 5.5.6, not yet posted:
 ```
 
 Both pipelines share `ECSubWrite` and `MOSDECSubOpWrite`, so the v5
-split of 5.3.3 serves legacy pools too.
+split of 8.3.3 serves legacy pools too.
 
-### 5.6.3 Why it is safe — and where it is not yet
+#### 8.6.3 Why it is safe — and where it is not yet
 
-**The encode-version assert — weaker than in 5.4.2.** The replicated
+**The encode-version assert — weaker than in 8.4.2.** The replicated
 path reads `min_peer_features()` twice in one synchronous chain. EC
 reads two *different* sources:
 
@@ -1855,17 +3131,17 @@ in that set, and a peer changing version forces a new interval. No
 reachable mismatch was found; that is an argument, not a proof.
 
 **Mixed page sizes — open, and EC is the worst case for it.** The
-hazard of 5.4.2 applies unchanged, and EC shard writes are exactly the
+hazard of 8.4.2 applies unchanged, and EC shard writes are exactly the
 failing shape: small multiples of the 4 KiB chunk — for a 16 KiB
 object at k=3, 8 KiB on every shard in the legacy pipeline (padded to
 the 12 KiB stripe), 8/4/4 KiB data and 8 KiB parity in the optimized
 one — which a 16K-page peer re-splits differently.
 
-The rest of 5.4.2 carries over: `append()` never sees these
+The rest of 8.4.2 carries over: `append()` never sees these
 transactions, sub-page writes stay in the misaligned stream, an old
 peer drops the TENTACLE bit and restores today's behavior.
 
-### 5.6.4 Validation
+#### 8.6.4 Validation
 
 One host, five OSDs on real block devices, two EC pools — the legacy
 and the optimized pipeline side by side:
@@ -1884,7 +3160,7 @@ bin/ceph osd pool set eco allow_ec_optimizations true
 
 A = the two commits of this section; B = A + the EC patch; `ceph-osd`
 rebuilt per arm (the rebuilt EC plugins carry the git version, so a
-saved A binary refuses them). Signal: Signal 1 of 5.2.2, the
+saved A binary refuses them). Signal: Signal 1 of 8.2.2, the
 `debug_bdev 20` rebuild line, counted per OSD.
 
 Workload per pool — 22 client writes, 44 in all: puts of 4 × 16 KiB,
@@ -1930,9 +3206,9 @@ a second copy inside the legacy read-modify-write path, which the
 patch neither causes nor removes. Not root-caused here.
 
 Not covered: every peer in this lab has TENTACLE and a 4 KiB page, so
-neither hazard of 5.6.3 is exercised.
+neither hazard of 8.6.3 is exercised.
 
-## 5.7 Takeaways
+### 8.7 Takeaways
 
 The copy:
 
@@ -1956,10 +3232,10 @@ The copy:
 - **Attribute the leftovers, don't subtract them.** 214 → 5 rebuilds
   reads as "98 % fixed". One write type at a time put all five on
   primaries; twenty overwrites per arm showed that copy is there with
-  or without the patch — a different copy altogether (5.6.4).
+  or without the patch — a different copy altogether (8.6.4).
 - **A reproducer can be the one input that cannot fail.** Every
   measurement passed because 128 KiB at offset 0 splits identically
-  under every page size in use. The mixed-page-size hazard (5.4.2)
+  under every page size in use. The mixed-page-size hazard (8.4.2)
   surfaced only when the encoding was written down field by field and
   the question became "what is *not* on the wire?".
 - Removing `header.data_off` and adding the split in one commit left
@@ -1989,1318 +3265,7 @@ The accounting:
   the one-liner on the same branch means no commit on it makes
   the throttle worse.
 
-# 6. OSDs that froze for minutes — TCP retransmits, PG read leases, and where they meet
-
-Found in a field diagnostics collection, not a bug report · affects any
-cluster whose cluster network drops packets · component OSD
-(PeeringState / AsyncMessenger) plus the fabric under it · fix: none
-upstream — configuration and topology · Status: chain measured end to
-end; fabric-vs-host localisation still open
-
-A 4-node ARM64 cluster (2 sockets × 64 cores/node, 100 GbE, 32 NVMe
-OSDs, 3× replication) under an RBD benchmark: 18 GiB/s of 4 MiB
-`writefull`. Health looked almost clean. It was not.
-
-Every figure below comes from the collection **except** the core count,
-the link speed and the statement that both VLANs share one bond — those
-are environment facts from outside it. A standard Ceph collection
-carries no usable CPU or interface detail —
-`orch host ls --detail` reports CPU as `N/A` and the NIC column as a bare
-count — which turns out to matter in §6.4. The ~40 bluestore/kv/finisher
-threads in §6.4 are an estimate too.
-
-## 6.1 Report
-
-### 6.1.1 The observation
-
-`ceph health detail` reported three warnings, all cosmetic — a failed
-prometheus placement, four dead node-exporters, one old crash. The real
-fault was not latched at collection time and only showed in the history:
-
-```
-SLOW_OPS   first 10:05   last 17:11   count 26   active Yes
-```
-
-`ceph pg dump` had 2 of 1025 PGs in `active+clean+laggy`. Individual
-OSDs were freezing solid for **1.5 to 16 minutes**, one or two at a
-time, roving across all four hosts every few minutes.
-
-### 6.1.2 Reproducing it
-
-Nothing here needs a live cluster — every figure below comes out of a
-`ceph_diagnostics` collection, provided it was captured with `--tcp-info`
-(the collector passes it by default):
-
-```bash
-cds ceph healthcheck history ls                 # the SLOW_OPS health detail misses
-cds ceph pg dump | grep laggy                   # PGs whose read lease has expired
-cds historic_ops group-by-event-intervals -s    # where op time actually goes
-cds historic_ops show -s -T -d osd.N            # per-op event timelines
-```
-
-The TCP side is one `getsockopt` per connection, stored by the collector
-as `osd_info-osd.N-messenger_dump_<msgr>`. Summarising it per network
-takes a short script — retransmits normalised by bytes moved, plus any
-socket currently in RTO backoff:
-
-```bash
-./ceph-net-retrans.py <collection-dir> --pairs --backoff
-```
-
-## 6.2 Analysis
-
-### 6.2.1 Root cause, top to bottom
-
-`cds historic_ops group-by-event-intervals -s` aggregates every
-daemon's op tracker by pipeline stage — the single most useful command
-here, and it points straight at the answer:
-
-```
-AVG_DURATION  TOTAL_DURATION  COUNT  INTERVAL
-     247.783       14619.170     59  waiting for readable -> reached_pg
-      88.622       36512.229    412  header_read -> throttled
-      37.485       25002.702    667  sub_op_commit_rec -> sub_op_commit_rec
-```
-
-Meanwhile every layer below the PG was fast: `txc_commit_lat`
-1.1–1.9 ms, `kv_sync_lat` 0.13–0.44 ms, device commit 2–4 ms,
-`op_w_prepare_latency` 0.9 ms. Client-visible `op_w_latency` was 20–275
-ms. All of the damage
-is queueing above the object store.
-
-### 6.2.2 What "waiting for readable" means
-
-Two op-tracker marks bracket the stall. `reached_pg` is stamped in
-`OSD::dequeue_op()` when a shard worker pulls the op off the scheduler.
-`waiting for readable` is `mark_delayed()` from `PrimaryLogPG::check_laggy()`
-— the op is parked on the PG's `waiting_for_readable` list and the
-worker thread moves on. `reached_pg` then appears a *second* time,
-because the release path re-queues the op through `dequeue_op()`.
-
-"Readable" is the Octopus-era **PG read lease**, not object I/O. A
-primary may only serve while it can prove it is still primary, and its
-lease is the minimum across the acting set:
-
-```c
-/* PeeringState::recalc_readable_until() */
-ceph::signedspan min = readable_until_ub_sent;
-for (unsigned i = 0; i < acting.size(); ++i)
-    if (acting_readable_until_ub[i] < min) min = acting_readable_until_ub[i];
-readable_until = min;          /* the slowest replica sets the lease */
-```
-
-`check_laggy()` runs from `do_op_impl()` for **every** op, immediately
-before the caps check — writes included, despite the name. One slow
-replica revokes the whole PG.
-
-The amplification is what turns a lease blip into an outage. With 4 MiB
-objects and `osd_client_message_size_cap` at 500 MiB, only ~125 client
-ops fit in flight. Once those are parked on one laggy PG, the OSD stops
-reading *any* client message off the socket. Observed in-flight counts:
-124, 126, 123. The release is all-at-once: on osd.28 all 20 tracked ops
-completed inside **1.09 s** after a 15m42s stall, 11 of them carrying a
-`waiting for readable` event. That simultaneity is what distinguishes a
-lease stall from ordinary congestion. (osd.5's 9m42s stall looks similar
-but is mostly throttle backlog — only 1 of its 20 ops ever waited on the
-lease, and its release spread over 6.7 s.)
-
-### 6.2.3 The socket that killed the lease
-
-The collector captures per-connection `getsockopt(SOL_TCP, TCP_INFO)`
-via `ceph daemon <d> messenger dump <msgr> --tcp-info` (field reference:
-[the TCP_INFO section of the network post]({% post_url 2026-05-09-network-diagnostics %})).
-Across the cluster network:
-
-| Network | Conns | Total retrans | Bytes moved | Retrans / TB |
-|---|---|---|---|---|
-| cluster | 764 | 166,361,880 | 277.9 TB | **598,550** |
-| public | 2,006 | 7,084 | 138.9 TB | 51 |
-| same-host (lo) | 65 | 0 | — | — |
-
-Same hosts, same 21-hour window, same workload: an 11,700× difference.
-And exactly two sockets in the whole cluster were in RTO backoff — the
-two directions between the acting pair of both laggy PGs:
-
-```
-osd.16 -> osd.28    retransmits=11  backoff=6  rto=13.056s
-                    unacked=471     last_data_sent=24,256 ms
-osd.28 -> osd.16    retransmits=3   backoff=3  rto=1.632s
-                    unacked=1       last_ack_recv=10,820 ms
-```
-
-Nothing left that socket for **24.3 seconds**. The read lease is
-`osd_pool_default_read_lease_ratio` × `osd_heartbeat_grace` = 0.8 × 20 =
-**16 seconds**. Lease renewal could not get through; `readable_until`
-expired; the PG went `LAGGY`.
-
-`retransmits` exceeding `backoff` is its own signal. In
-`tcp_retransmit_timer()` the kernel bumps `icsk_retransmits` on the RTO
-path but skips `icsk_backoff` when the retry is dropped locally (v6.18
-below; on the 6.6 kernel these hosts run it is an open-coded
-`icsk->icsk_retransmits++`, same behaviour):
-
-```
-tcp_update_rto_stats()        icsk_retransmits++
-if (tcp_retransmit_skb() > 0)          /* NET_XMIT_DROP */
-        /* "Retransmission failed because of local congestion" */
-        goto out                       /* skips the backoff bump */
-```
-
-11 against 6 means ~5 retries never left the host — so at least one
-sender was also dropping locally. Both counters are instantaneous and
-reset on an ACK of new data, so this is one snapshot of one socket; the
-166 M cumulative retransmits carry no fabric-vs-local attribution at all.
-
-Two details tie the numbers together. MTU is 9000 with `snd_mss` 8948 on
-both VLANs, so 598,550 retrans/TB is a loss rate of **~0.5%**. And
-`unacked=471` is almost exactly one 4 MiB message at that MSS
-(4 MiB / 8948 = 469) — the stalled socket was sitting on a single
-outstanding repop.
-
-### 6.2.4 Why every built-in check stayed silent
-
-The OSD map had not changed in 21 hours, so no OSD was marked down in
-the entire window under study. `OSD_SLOW_PING_TIME_*` never fired, and
-`dump_osd_network` reported zero peers above its 1 s threshold on all 32
-OSDs — and that check averages over at most 15 minutes
-(`OSD.cc` compares the 1/5/15-minute means), so it was looking at a
-window that contained stalls. Over the whole tracked span **26 of the
-32 OSDs** recorded slow ops, with more than a dozen stall episodes past
-100 s and the longest single op at **15m42s**. (Episode counts depend
-on how you cluster ops into episodes — anywhere from 35 to 85 depending
-on the grouping rule — so treat the count as a range and the per-op
-durations as the hard numbers.)
-
-Heartbeats and leases diverge inside the OSD:
-
-```
-MSG_OSD_PING       -> heartbeat_dispatch() -> handle_osd_ping()
-                      dedicated messengers, own sockets, handled inline,
-                      no PG lock, tiny packets -> never enters backoff
-
-MSG_OSD_PG_LEASE   -> enqueue_peering_evt() -> op scheduler -> PG lock
-                      shared cluster messenger, over the backed-off sockets
-```
-
-Heartbeats are not loss-free — the heartbeat messengers took ~8,800
-retransmits between them. What saves them is a dedicated socket, one
-small message per ping, and 20 s of grace, so they never accumulate
-enough consecutive loss to enter backoff. Healthy heartbeats prove the
-*wire* is up; they say nothing about whether leases are arriving.
-**This failure mode is invisible to every built-in network health
-check.**
-
-One more measured item: `tcpi_options` shows `sack, timestamps, wscale`
-on all 4,391 connections and `ecn` on none. A switch cannot ECN-mark a
-packet that was never ECT-marked, so under congestion its only option is
-to drop — which is what the retransmit counters record. Linux defaults
-to `net.ipv4.tcp_ecn=2` ("accept if asked, never ask"), so two default
-hosts never negotiate it.
-
-### 6.2.5 What the evidence cannot separate
-
-A sender's `tcp_info` records that a segment was lost, never *where*. A
-switch buffer, a NIC receive ring and the receiver's socket queue all
-produce the same signature.
-
-The 11,700× VLAN split rules out a *load-independent* shared fault — a
-bad optic, a dead switch queue — since both VLANs are believed to share
-the bond. It does **not** rule out buffer exhaustion, because the two
-VLANs are not comparable loads: the cluster side moves 364 GB per socket
-against the public side's 69 GB, and its traffic is synchronous fan-out,
-two 4 MiB messages emitted at once per client write. Switch-buffer loss
-is strongly superlinear in per-flow burst rate, so incast remains a fully
-adequate explanation on its own.
-
-The thread budget makes a host-side drain the leading *host-side*
-candidate, alongside incast rather than instead of it:
-
-| Per node | Threads | Source |
-|---|---|---|
-| OSD op threads | 128 | 8 shards × 2, × 8 OSDs |
-| messenger workers | **24** | `ms_async_op_threads=3` — all TCP rides these |
-| bluestore / kv / finishers | ~40 | kv_sync, kv_finalize, aio |
-| **total vs 128 cores** | **~192** | **1.5× oversubscribed** |
-
-Those 24 workers carry 155 Gbps of cluster traffic alone — 6.4 Gbps
-each, every byte also `crc32c`'d (`ms_crc_data=true`); with public
-ingress it is nearer 8 Gbps per worker. The mechanism is *not* a full
-socket receive queue: that produces a zero window, i.e. flow control,
-not loss — and the zero-window branch of `tcp_retransmit_timer()` never
-bumps `icsk_retransmits`, so this socket's `retransmits=11` proves the
-window was open and the segments were genuinely lost. What survives is
-softirq starvation: NIC ring overflow, `softnet` backlog drops, or the
-qdisc — which is what the four commands below probe.
-`osd_numa_auto_affinity` is `true` but inert: the metadata lists
-`network_numa_unknown_ifaces`, so Ceph never resolved the interface (a
-bond defeats its `/sys/class/net` walk) and `osd_numa_node` stays `-1`.
-
-## 6.3 Proposed solution
-
-### 6.3.1 The fix
-
-The outage was not caused by loss but by loss outlasting a 16-second
-lease. The obvious move —
-raising `osd_pool_default_read_lease_ratio` — is the wrong one. Upstream
-is explicit:
-
-> This should be <= 1.0 so that the read lease will have expired by the
-> time we decide to mark a peer OSD down.
-> — `src/common/options/global.yaml.in`
-
-Push the ratio above 1.0 and a dead OSD's lease outlives the decision to
-mark it down, which is the exact hazard leases exist to prevent. Widen
-the grace instead and leave the ratio alone:
-
-```bash
-ceph config set global osd_heartbeat_grace 40          # lease 0.8 x 40 = 32s
-ceph config set global mon_warn_on_slow_ping_time 1000  # pin, see 6.3.2
-```
-
-A 32-second lease survives a 24.3-second silent socket. Loss continues
-and costs throughput, but the OSD does not freeze.
-
-### 6.3.2 Why it is safe
-
-Keeping the ratio at 0.8 preserves the invariant upstream asks for: the
-lease still expires before the mark-down decision, so the ordering the
-lease exists to guarantee is untouched. What the wider grace does change
-is honest and bounded — a genuinely dead peer takes 40 s rather than
-20 s to be declared down.
-
-The second command is there because of a coupling that is easy to miss.
-`osd_heartbeat_grace` is also the base of the slow-ping warning: the
-threshold is `mon_warn_on_slow_ping_ratio` (0.05) × grace, which is
-exactly the 1000 ms `dump_osd_network` reports. Double the grace and
-that check silently doubles to 2 s — making the health check §6.2.4
-already showed to be blind blinder still. A non-zero
-`mon_warn_on_slow_ping_time` overrides the ratio and pins it. Both go in
-`global`, not `osd` — upstream requires the grace to be readable by the
-mon as well as the OSDs, and `OSDMonitor` does read it.
-
-### 6.3.3 Cutting the load instead
-
-Topology can cut offered load and CPU pressure. It cannot make an
-oversubscribed fabric stop dropping. At ~0.5% loss the cluster is just
-past the cliff, not far past it, so headroom may be enough.
-
-**Cut bytes on the cluster network.** Per-node cluster egress at 18 GiB/s
-of client writes:
-
-| Scheme | Cluster egress | Raw used | Note |
-|---|---|---|---|
-| replication size=3 | 77.3 Gbps | 3.0× | current |
-| replication size=2 | 38.7 Gbps | 2.0× | −50% network |
-| EC 2+2 | 58.0 Gbps | 2.0× | −25% network, 2 MiB chunks |
-
-EC also halves the per-message burst, which may help incast granularity
-(caveat below), and `writefull` is the ideal EC case — full-object
-overwrite, no read-modify-write. But the failure domain count is a hard wall:
-
-```
-EC 4+2 needs 6 domains -> impossible on 4 hosts
-EC 3+2 needs 5         -> impossible
-EC 2+2 needs 4         -> exactly fits
-```
-
-Two operational caveats before anyone tries it: RBD on an EC data pool
-needs `allow_ec_overwrites`, and with 4 hosts EC 2+2 consumes every
-failure domain — one host down leaves the pool degraded with nowhere to
-recover into until it comes back. EC also halves the per-*message* size
-but raises fan-out from 2 peers to 3, so whether incast improves depends
-on per-port buffering; that one is plausible, not shown.
-
-And EC costs CPU, which is the resource already suspected. **EC is a bet
-on the fabric hypothesis; cutting CRC and op shards is a bet on the host
-one.** They pull against each other — hence §6.4 first.
-
-**A test pool that takes the fabric out of the path.** A CRUSH rule
-placing all three replicas on the *same host* puts replication on
-loopback. Two conditions make or
-break it: the pool has to carry comparable per-OSD load, or a quiet pool
-simply will not reproduce a load-driven failure; and co-locating three
-replicas triples that host's NVMe and CPU load, so "stalls persist"
-does not cleanly imply CPU — it may just be the new I/O load. Read a
-*negative* result (stalls vanish) as strong and a positive one as
-inconclusive. Note the existing loopback sockets prove nothing here: the
-CRUSH rule is `chooseleaf firstn 0 type host`, so replicas are never
-co-resident and those sockets carry no replication traffic.
-
-### 6.3.4 Validation
-
-The fix is not validated on this cluster, and the Status line says why:
-nothing here separates a fabric drop from a host-side one, and the two
-lead to different work. That localisation comes first, on a node
-**while** `SLOW_OPS` is firing:
-
-```bash
-nstat -az | grep -iE 'TCPRcvQDrop|PruneCalled|RcvPruned|TCPBacklogDrop'
-awk '{print NR-1, $2, $3}' /proc/net/softnet_stat   # dropped, time_squeeze
-ethtool -S <if> | grep -iE 'rx_no_buffer|rx_missed|rx_fifo|tx_dropped'
-tc -s qdisc show dev <bond>
-```
-
-Host counters clean and switch discards high → the fabric, and §6.3.3's
-ranking applies. The reverse → the drops never left the node, and no
-switch work will help.
-
-Then confirm rather than assume: re-run `ceph-net-retrans.py --backoff`
-and watch the per-TB retransmit rate, and re-check `healthcheck history
-ls` for `SLOW_OPS`. The §6.3.1 lease change should stop the freezes
-while loss continues, so the two signals move independently —
-retransmits flat while `SLOW_OPS` goes quiet is the expected outcome,
-not a contradiction.
-
-### 6.3.5 Takeaways
-
-- **`ceph health detail` reported three cosmetic warnings and missed a
-  cluster freezing for minutes.** The real signal was in
-  `healthcheck history ls` — active, 26 occurrences — and in two PGs
-  carrying a `laggy` flag nothing else surfaced.
-- **Healthy heartbeats do not mean a healthy path.** Heartbeats run on
-  dedicated sockets with no PG lock and never entered backoff, so no OSD
-  was marked down and no ping-time warning fired, while the sockets
-  carrying leases were silent for 24 seconds. Any diagnosis that reasons
-  "no OSD flapped, so the network is fine" is reasoning from the wrong
-  evidence.
-- **One laggy PG takes an entire OSD offline for clients.** 4 MiB
-  objects against a 500 MiB throttle means ~125 ops in flight; parked on
-  one PG, they pin the throttle and the OSD stops reading its sockets.
-  The blast radius is set by throttle ÷ object size, not by the PG.
-- **`tcp_info` localises loss to a connection, never to a hop.** Switch,
-  NIC ring and socket queue are indistinguishable from the sender. A
-  second VLAN on the same wire narrows it for free — but only if the two
-  carry comparable per-socket load, which here they did not.
-- **`retransmits > backoff` is a host-side drop detector**, and it is
-  printed by plain `ss -i`. Given enough samples it distinguishes "the fabric
-  dropped it" from "we never got it out of the box", with no switch
-  access at all.
-
-# 7. Tracker #72848 — a blob merge that assumes checksum chunks are never split
-
-[Issue](https://tracker.ceph.com/issues/72848) · one abort in a rados qa run
-· tentacle dev `20.3.0-2326-g0672d1a6` · component BlueStore (elastic shared
-blobs) · fix: one guard · Status: fix and regression test local on
-`wip-72848-merge-blob-csum`, upstream PR pending, tracker still New
-
-## 7.1 Report
-
-### 7.1.1 The observation
-
-`ceph_test_objectstore` aborts inside a clone:
-
-```
-BlueStore.cc: 2835: FAILED ceph_assert((len % (1 << csum_chunk_order)) == 0)
- in function 'BlueStore::Blob::merge_blob(...)::<lambda(uint32_t, uint32_t)>'
-
- 3: BlueStore::ExtentMap::make_range_shared_maybe_merge(...)+0x1d7
- 4: BlueStore::ExtentMap::dup_esb(...)+0x12f
- 5: BlueStore::_do_clone_range(...)+0x1ed
- 6: BlueStore::_clone(...)+0x7f3
- 7: BlueStore::_txc_add_transaction(...)+0x15fb
-11: StoreTestBase::doSyntheticTest(...)+0x560
-```
-
-One occurrence, in the randomised synthetic workload. The abort is not in
-cloning as such. `dup_esb` is the elastic-shared-blob clone path
-(`bluestore_elastic_shared_blobs`, default `true`), and before it can
-duplicate an extent map it has to make every source blob shared — taking an
-optional shortcut whenever it finds a mergeable neighbour:
-
-```
-_clone -> _do_clone_range -> dup_esb              (elastic shared blobs)
-                                │
-                 make_range_shared_maybe_merge()  (frame 3)
-                                │
-     for every blob in the cloned range not already shared:
-                                │
-                    find_mergable_companion()
-                                │   (an already-shared blob
-                                │    at the same blob_start)
-              ┌─────────────────┴─────────────────┐
-      no candidate, or                    can_merge_blob()
-  can_merge_blob() says no                    says yes
-              │                                   │
-     make_blob_shared()                     merge_blob()
-    one more shared blob,                         │
-       always correct             move_data() per allocated pextent
-                                                  │
-                                 ceph_assert(len % csum_chunk == 0)
-                                              -> abort
-```
-
-The left branch is the fallback and always works. The right branch is the
-optimisation, and the assert sits at the bottom of it. That shape is already
-half the fix: `can_merge_blob()` is the gate between the two, so a `false`
-from it lands on a path BlueStore takes constantly anyway.
-
-### 7.1.2 Reproducing it
-
-`ExtentMapFixture` in `src/test/objectstore/test_bluestore_types.cc` builds
-an unmounted `BlueStore`, creates onodes by hand and calls
-`ExtentMap::dup_esb()` directly. No device, no KV store, no cluster, and
-allocation units (AUs) are handed out in order. The reproducer is one
-small, deterministic gtest case.
-
-**Step 1: a helper that acts like a write.** It does only what the real
-write path does to a new blob: set the csum chunk size, mark one csum slot,
-store the allocator's fragments unchanged, add the logical extent, take a
-reference. Every call writes exactly one 32 KiB csum chunk; `fragments` says
-how the allocator split that chunk.
-
-```cpp
-constexpr uint32_t csum_chunk_order = 15;                 // 32 KiB chunks
-constexpr uint32_t csum_chunk = 1 << csum_chunk_order;
-
-auto write_blob = [&](t_onode& o, uint32_t blob_start, uint32_t b_off,
-                      uint32_t blob_length,
-                      const std::vector<uint32_t>& fragments) {
-  BlueStore::BlobRef b(coll->new_blob());
-  bluestore_blob_t& bb = b->dirty_blob();
-  bb.init_csum(Checksummer::CSUM_CRC32C, csum_chunk_order, blob_length);
-  bb.set_csum_item(b_off / csum_chunk, 0x11111111 + b_off);
-  PExtentVector pex;
-  for (auto len : fragments)                     // what the allocator returned
-    pex.emplace_back(allocate(len / au_size) * au_size, len);
-  bb.allocated(b_off, csum_chunk, pex);          // stored unchanged
-  auto* e = new BlueStore::Extent(blob_start + b_off, b_off, csum_chunk, b);
-  o.onode->extent_map.extent_map.insert(*e);
-  b->get_ref(coll.get(), b_off, csum_chunk);
-  return b;
-};
-
-// clone(from, to, len) = dup_esb(&store, &txc, coll, from.onode, to.onode,
-//                               off = 0, len, dstoff = 0) on a fresh TransContext
-```
-
-**Step 2: four calls.** Each one is a step the object went through in the
-real workload:
-
-```cpp
-t_onode a = create(), c1 = create(), c2 = create();
-
-write_blob(a, 0, 0, csum_chunk, {csum_chunk});                  // blob A
-clone(a, c1, csum_chunk);                                       // A -> shared
-write_blob(a, 0, csum_chunk, 2 * csum_chunk, {0x3000, 0x5000}); // blob B
-clone(a, c2, 2 * csum_chunk);                                   // -> merge
-```
-
-| call | what it stands for |
-|---|---|
-| write #1 | a 32 KiB write at offset 0, with the 32 KiB csum chunk the alloc hint gives |
-| clone to `c1` | makes blob A shared, so the next write cannot reuse it |
-| write #2 | the next 32 KiB, placed by `suggested_boff` (§7.2.2) at blob offset 32 KiB of a 64 KiB blob; the allocator returned two fragments |
-| clone to `c2` | `make_range_shared_maybe_merge()` offers the two blobs to `can_merge_blob()` |
-
-Only `{0x3000, 0x5000}` triggers the bug. With `{0x8000}` the same four
-calls are the aligned control case that the committed test also keeps. The
-one assertion that matters is `ASSERT_FALSE(can_merge_blob(...))`, right
-before the second clone.
-
-**What the calls leave behind.** "On disk" here means the metadata a real
-write would persist. `P`, `Q`, `R` are physical addresses, `sbid` is a
-shared blob id, and a shared blob's `ref_map` counts owners per physical
-extent.
-
-After call 2, A is shared. `make_blob_shared()` gives it `sbid 1`, and
-`dup_esb()` gives `c1` a copy of A's metadata, `A'`, on the same shared blob:
-
-```
- onode a    0x0000~0x8000 -> A  @ 0
- onode c1   0x0000~0x8000 -> A' @ 0
-
- blob A     SHARED sbid 1, llen 0x8000, pextents [P~0x8000], csum [c0]
- sbid 1     ref_map { P~0x8000: 2 }                     owners: a, c1
-```
-
-After call 3, the state that matters. A is shared, so it cannot be written
-again, and the second 32 KiB gets blob B, at blob offset 32 KiB of a 64 KiB
-blob with `blob_start` 0. A and B are therefore on the same csum grid, and
-`allocated()` stores a hole followed by the two fragments, unchanged:
-
-<div class="language-plaintext highlighter-rouge"><div class="highlight"><pre class="highlight"><code> onode a    0x0000~0x8000 -&gt; A @ 0      0x8000~0x8000 -&gt; B @ 0x8000
-
- blob A     SHARED sbid 1, llen 0x8000, pextents [P~0x8000], csum [c0]
- blob B     private, llen 0x10000, blob_start 0
-            pextents [hole~0x8000]<span style="color:#d11">[Q~0x3000][R~0x5000]</span>   csum [ - , c1]
-
- csum grid   chunk 0: 0x0000-0x7fff  |  chunk 1: 0x8000-0xffff
- blob A      |&lt;----- P 0x8000 -----&gt;|
- blob B      |&lt;------ hole ------&gt;|<span style="color:#d11">&lt;-- Q 0x3000 --&gt;|&lt;---- R 0x5000 ----&gt;</span>|
-                                                   <span style="color:#d11">^ pextent boundary at 0xb000,</span>
-                                                     <span style="color:#d11">inside chunk 1</span>
-</code></pre></div></div>
-
-The parts in red are the bug: chunk 1 of the csum grid is covered by two
-pextents, with the boundary at `0xb000`. With `{0x8000}`, chunk 1 would be
-one pextent.
-
-Call 4 covers A (shared) and B (private, same `blob_start`), and
-`can_merge_blob()` is asked whether B can be merged into A. Three outcomes:
-
-- Aligned control, `{0x8000}`: merged. A grows to 64 KiB, B's chunk-1 csum
-  slot and use count are copied into A, B's pextent joins `sbid 1`, and
-  `a` ends up with one lextent `0x0000~0x10000 -> A @ 0`. B is gone.
-- Fragmented, without the fix: abort. `can_merge_blob()` says yes, and
-  `merge_blob()` calls `move_data(pos = 0x8000, len = 0x3000)` for the first
-  fragment, where `len % 0x8000 != 0` trips the assert. Nothing has been
-  persisted at that point. If the assert were simply removed, the use-count
-  loop would run once per fragment and add B's chunk-1 count into A twice;
-  that count could never reach zero, so the AU would never be freed.
-- Fragmented, with the fix: refused. `can_merge_blob()` returns false at
-  the `0x3000` fragment, and B is made shared on its own:
-
-```
- onode a    0x0000~0x8000 -> A   @ 0     0x8000~0x8000 -> B  @ 0x8000
- onode c1   0x0000~0x8000 -> A'  @ 0
- onode c2   0x0000~0x8000 -> A'' @ 0     0x8000~0x8000 -> B' @ 0x8000
-
- blob A     SHARED sbid 1   [P~0x8000]                        csum [c0]
- blob B     SHARED sbid 2   [hole~0x8000][Q~0x3000][R~0x5000] csum [ - , c1]
-
- sbid 1     ref_map { P~0x8000: 3 }               owners: a, c1, c2
- sbid 2     ref_map { Q~0x3000: 2, R~0x5000: 2 }  owners: a, c2
-```
-
-The test's last assertions check exactly this picture: `a`'s two lextents
-still point at the two original blobs, B is shared, and B's chunk-1 csum
-slot still holds the value written in call 3.
-
-**Step 3: build and run**, with the test commit from
-`wip-72848-merge-blob-csum` applied:
-
-```bash
-ninja -C build unittest_bluestore_types
-build/bin/unittest_bluestore_types \
-  --gtest_filter=ExtentMapFixture.merge_blob_csum_chunk_unaligned
-```
-
-Without the fix the test stops at that assertion, because
-`can_merge_blob()` returns true. Change it to `EXPECT_FALSE` so gtest goes on
-into the clone, and the reported abort appears:
-
-```
-BlueStore.cc: FAILED ceph_assert((len % (1 << csum_chunk_order)) == 0)
- 5: BlueStore::Blob::merge_blob(...)
- 6: BlueStore::ExtentMap::make_range_shared_maybe_merge(...)
- 7: BlueStore::ExtentMap::dup_esb(...)+0x12f
-```
-
-Same assert, same call chain, even the same `dup_esb+0x12f` frame offset.
-With the fix: `[ OK ]`.
-
-**An end-to-end reproducer needs an aged store.** The same sequence through
-`queue_transactions()`, with a real BlueStore and a real allocator, does not
-fail on a fresh store. With `min_alloc_size` 4096, crc32c, `max_blob_size`
-64 KiB, `bluestore_allocator = stupid` and
-`bluestore_debug_small_allocations = 4` (the only knob that injects
-fragmentation, and only the stupid allocator honours it), the hinted
-write-clone-write-clone sequence over 32 objects gives 32 merges and 0
-aborts. The debug log shows every precondition of §7.2.2 in place except
-the fragmentation: the knob shortens each `allocate_int()` result, but on a
-fresh device the next result is physically adjacent and
-`StupidAllocator::allocate()` merges it back into one pextent. The knob can
-only fragment free space that is already fragmented.
-
-So fragment the free space for real, and skip the knob. On a 2 GiB data
-device, with RocksDB on its own `block.db` so that filling the data device
-does not starve it:
-
-0. On the fresh store, write the hinted `0~0x8000` and clone it, so that
-   blob A is shared before there is anything to merge into.
-1. Write 1 MiB objects until less than 5 MiB is free, then 64 KiB objects,
-   then 32 KiB objects, until less than 32 KiB is free. Now no free run of
-   32 KiB exists anywhere.
-2. Zero a checkerboard into 32 of the 64 KiB fillers, 16 KiB punched and
-   4 KiB kept. Every run this frees is smaller than one csum chunk.
-3. Write the hinted `0x8000~0x8000`, then clone.
-
-The write is served from two fragments, and the clone aborts on a tree
-without the fix, through the production path and with no debug knob:
-
-```
-BlueStore.cc: 2845: FAILED ceph_assert((len % (1 << csum_chunk_order)) == 0)
- 2: BlueStore::ExtentMap::make_range_shared_maybe_merge(...)
- 3: BlueStore::ExtentMap::dup_esb(...)
- 4: BlueStore::_do_clone_range(...)
- 5: BlueStore::_clone(...)
- 7: BlueStore::queue_transactions(...)
-```
-
-Every frame here is also in the tracker's backtrace. It takes 82 seconds
-against milliseconds for the unit case, which is why the unit case is the
-one in the test suite. But it proves the bug is reachable by ordinary
-means, and the store it leaves behind is the fragmented one at the end of
-§7.1.3.
-
-### 7.1.3 The two blobs on disk
-
-The pair that merge are ordinary records; nothing about them is malformed.
-A real BlueStore (`min_alloc_size` 4096, crc32c, `max_blob_size` 64 KiB)
-holding exactly the objects of the *fresh-store* run in §7.1.2 carries
-three keys (format reference:
-[§7 of the on-disk format post]({% post_url 2026-08-07-bluestore-v21-ondisk-format %})):
-
-| Record | Key | Value |
-|---|---|---|
-| onode, head | `<ghobject>'o'` | 94 B |
-| onode, clone | `<ghobject>'o'` | 58 B |
-| shared blob | `X` + BE u64 `00 00 00 00 00 00 00 01` | 11 B |
-
-The 94-byte head value is 31 B onode + 2 B empty spanning section + 4 + 57 B
-inline extent map. The onode struct is where the alloc hint lands on disk:
-
-```
-02 01 19 00 00 00   DENC frame: struct_v 2, compat 1, payload 0x19 (25)
-01                  nid = 1
-80 80 04            size = 0x10000                          (varint)
-00 00 00 00         attrs: le32 count = 0
-00                  flags = 0x00
-00 00 00 00         extent_map_shards: le32 count = 0        (map is inline)
-80 80 80 02         expected_object_size = 4 MiB             (varint)
-80 80 08            expected_write_size  = 128 KiB           (varint)
-24                  alloc_hint_flags = 0x24
-                      = SEQUENTIAL_READ (0x04) | IMMUTABLE (0x20)
-00 00 00 00         zone_offset_refs: 0
-```
-
-That one byte, `24`, is the whole precondition. It is what made
-`_choose_write_options()` take `ctz(expected_write_size)` instead of
-`block_size_order`, and the consequence shows up two records later as
-`csum_chunk_order = 15`.
-
-The 57 inline bytes are the two blobs, annotated in full:
-
-```
-02                       struct_v 2
-02                       n = 2 extents
--- extent 0: logical 0x0~0x8000, blob_offset 0 --
-03                       CONTIGUOUS | ZEROOFFSET, inline blob follows
-23                       length = 0x8000                     (varint_lowz)
-   01                    extents: 1
-   44 10 00 00           lba 0x822000
-   23                    length = 0x8000
-   14                    flags = FLAG_SHARED | FLAG_CSUM
-   04                    csum_type = crc32c
-   0f                    csum_chunk_order = 15  -> 32 KiB chunks
-   04                    csum_data: 4 B = ONE crc32c item
-   0b 59 88 63             chunk 0
-   01 00 00 00 00 00 00 00  le64 sbid = 1        (-> the X record)
--- extent 1: logical 0x8000~0x8000, blob_offset 0x8000 --
-05                       CONTIGUOUS | SAMELENGTH, blob_offset follows
-23                       blob_offset = 0x8000
-   02                    extents: 2
-   ff ff ff ff ff ff ff ff ff 01   lba INVALID_OFFSET (hole)
-   23                    length = 0x8000
-   54 10 00 00           lba 0x82a000
-   23                    length = 0x8000
-   04                    flags = FLAG_CSUM        (not shared yet)
-   04                    csum_type = crc32c
-   0f                    csum_chunk_order = 15  -> 32 KiB chunks
-   08                    csum_data: 8 B = TWO crc32c items
-   00 00 00 00             chunk 0 — never computed, the hole
-   b1 41 77 79             chunk 1 — the data
-```
-
-BlueStore's own readback agrees with this decode:
-`blob([0x822000~8000] ... crc32c/0x8000/4)`,
-`blob([!~8000,0x82a000~8000] ... crc32c/0x8000/8)` — plus
-`use_tracker(0x2*0x8000 0x[0,8000])`, the ref map that is not encoded inline
-but rebuilt from the lextents: two 32 KiB AUs, the first unreferenced.
-
-**The facts, read off the disk.** Two blobs, both starting at logical 0.
-Blob A has one allocated range, 32 KiB at `0x822000`, and one checksum
-covering 32 KiB; it is shared, sbid 1. Blob B has two ranges — a 32 KiB
-hole, then 32 KiB of data at `0x82a000` — and two checksums of 32 KiB each,
-the first all zeros because nothing was ever written there. Both use crc32c
-with a 32 KiB checksum chunk, and their data does not overlap. Every
-condition `can_merge_blob()` tests is satisfied by these bytes.
-
-**What has to be true before they can be merged.** `merge_blob()` moves
-blob B's checksums into blob A one whole checksum at a time, once per
-allocated range. So each allocated range in B has to start and end exactly
-on a 32 KiB boundary — otherwise there is no whole checksum to move. In this
-specimen it does: the single data range starts at blob offset `0x8000` and
-is `0x8000` long. The merge is legal here, and succeeds.
-
-**What goes wrong on a real OSD.** Age the store until no 32 KiB run is left
-(§7.1.2) and the same write comes back fragmented. Blob B's record, captured
-from that store, is five bytes longer:
-
-```
-   03                    extents: 3                          (was 02)
-   ff ff ff ff ff ff ff ff ff 01   lba INVALID_OFFSET (hole)
-   23                    length = 0x8000
-   52 ff 07 00           lba 0x3ffa9000
-   17                    length = 0x5000                     (varint_lowz)
-   34 ff 07 00           lba 0x3ff9a000
-   0f                    length = 0x3000
-   04 04 0f              FLAG_CSUM, crc32c, csum_chunk_order 15
-   08                    csum_data: 8 B = TWO items          (unchanged)
-   00 00 00 00 b1 41 77 79
-```
-
-The count byte goes `02` → `03` and one 5-byte pextent record becomes two.
-`csum_data` is byte-for-byte what it was: two 32 KiB checksums for data that
-now lives in two pieces, 20 KiB and 12 KiB (the order is whatever the
-allocator returned — the unit case in §7.1.2 builds the mirror image). The
-first piece is `0x5000` long, so `merge_blob()` is asked to move `0x5000` of
-a `0x8000` checksum, and no such thing exists. That is the assert. Nothing
-is malformed — the record has no field that ties the ranges to the
-checksums.
-
-Two things the record does *not* contain, which is why no consistency check
-on disk could have caught this:
-
-* **A logical length.** For an uncompressed blob it is not encoded at all —
-  the decoder recomputes it as the sum of the pextent lengths
-  (`get_ondisk_capacity()`). Blob B's `llen=0x10000` is 0x8000 of hole plus
-  0x8000 of data, inferred.
-* **A chunk count.** The number of csum items is `csum_data.length() /
-  get_csum_value_size()` — 8 / 4 = 2. That `08` and the `02` extent count
-  are independent fields, written by independent code paths, with no rule
-  relating them. The invariant `merge_blob()` depends on is nowhere in the
-  format; it is an emergent property of the three mechanisms in §7.2.2.
-
-## 7.2 Analysis
-
-### 7.2.1 Root cause, top to bottom
-
-```
-clone aborts inside merge_blob
- └─ why?   move_data() relocates csum data in whole csum-chunk units and
-           asserts the pextent it was handed is chunk-aligned
-                                                    (BlueStore.cc:2845)
- └─ why was it handed an unaligned one?
-           merge_blob's main loop calls move_data(src_pos, src_it->length)
-           once per allocated pextent — pextents are min_alloc_size
-           granular, csum items are not
- └─ why is the csum chunk coarser than the pextents?
-           the object carried a SEQUENTIAL_READ + IMMUTABLE alloc hint, so
-           _choose_write_options() set csum_order from
-           ctz(expected_write_size) instead of block_size_order
-                                                    (BlueStore.cc:17876)
- └─ why did that produce split extents?
-           _do_alloc_write() stores the allocator's PExtentVector as-is;
-           on fragmented free space 32K comes back as two fragments —
-           0x5000 + 0x3000 in the captured store
-                                                    (BlueStore.cc:17645)
- └─ why was the merge attempted at all?
-           can_merge_blob() accepts any pair with the same csum order, the
-           same tracker au_size and disjoint extents — it never checks that
-           the disjointness lands on csum-chunk boundaries
-                                                    (BlueStore.cc:2720)
-```
-
-The bottom of the chain is a missing precondition, not a broken computation.
-
-### 7.2.2 Three granularities, and what anchors each
-
-A blob describes the same logical range three times, at three granularities.
-Here is the blob that aborts:
-
-```
-the blob being dissolved: logical length 0x10000, csum chunk 0x8000, min_alloc 0x1000
-
-               0                               0x8000      0xb000       0x10000
-  csum_data    [====== item 0: no data =======][====== item 1: the data ======]
-  pextents     [========== invalid ===========][= 0x3000 =][===== 0x5000 =====]
-  use tracker  [============ au 0 ============][============ au 1 ============]
-                                                           ^
-                                                           `-- a pextent boundary
-                                                               inside csum item 1
-```
-
-Two rows agree on every boundary; the pextent row carries one extra seam,
-because the allocator split the blob's 0x8000 of data into 0x3000 + 0x5000.
-
-`merge_blob()` has to move all three rows into the survivor, and it walks
-the **pextent** row while copying the **csum** row in whole items — so it
-asks to move 0x3000 of an item that is 0x8000 wide:
-
-```cpp
-auto move_data = [&](uint32_t pos, uint32_t len) {
-  if (src_blob.has_csum()) {
-    ceph_assert((pos % (1 << csum_chunk_order)) == 0);
-    ceph_assert((len % (1 << csum_chunk_order)) == 0);   // <-- 72848
-    ...
-    memcpy(dst_csum_ptr + item_no * csum_value_size,
-           src_csum_ptr + item_no * csum_value_size,
-           item_cnt * csum_value_size);
-  }
-  ...
-};
-...
-move_data(src_pos, src_it->length);      // called per pextent
-```
-
-The unwritten contract is *every pextent starts and ends on a csum chunk
-boundary*. Three unrelated mechanisms normally supply it — and the scorecard
-is where the bug lives:
-
-| mechanism | what it guarantees | still holds under a `SEQUENTIAL_READ + IMMUTABLE` hint? |
-|---|---|---|
-| `get_release_size()` = `max(csum chunk, min_alloc)`, uncompressed | `put_ref()` can never punch a hole *inside* a csum chunk | yes |
-| allocator granularity | pextent lengths are `min_alloc_size` multiples | yes |
-| `wctx->csum_order = block_size_order` | csum chunk ≤ `min_alloc_size`, so any `min_alloc` boundary is also a chunk boundary | **no — this is the door** |
-| `can_merge_blob()` | — | **never checked it at all** |
-
-`_choose_write_options()` opens the third row. An object hinted
-`SEQUENTIAL_READ` without `RANDOM_READ`, carrying `IMMUTABLE` or
-`APPEND_ONLY`, and not `RANDOM_WRITE`, gets
-`csum_order = max(min_alloc_size_order, ctz(expected_write_size))` instead of
-`block_size_order` — so its csum chunk can go *above* `min_alloc_size`, up to
-`expected_write_size`. (Compressed blobs take their order from
-`ctz(compressed length)` and can exceed `min_alloc_size` too, but they are
-excluded from this merge on both sides — `scan_shared_blobs()` skips them as
-candidates and `make_range_shared_maybe_merge()` never offers them.)
-
-`_do_alloc_write()` caps each blob's own order at `ctz(write length)` and
-then stores what the allocator returned as-is, slicing only the tail extent
-at the blob boundary — which is how a chunk-sized write ends up in two
-pieces. The last ingredient is that both blobs share a `blob_start`, handed
-over for free by `suggested_boff`: a 32K write at logical 32K goes to *blob
-offset* 32K of a 64K blob starting at logical 0, to align with
-`max_blob_size`.
-
-```
-logical   0              0x8000   0x10000
-blob A    |==== data ====|                    shared,     csum chunk 0x8000
-blob B    |    (hole)    |==== data ====|     not shared, csum chunk 0x8000
-                          \__ 0x3000 + 0x5000   (both blobs start at logical 0)
-
-can_merge_blob(A, B) -> true   (disjoint, same csum order, same au size)
-merge_blob(A <- B)   -> move_data(0x8000, 0x3000) -> 0x3000 % 0x8000 -> abort
-```
-
-The near-miss is instructive. `can_reuse_blob()`, the sibling gate on the
-write path, treats csum-chunk alignment as a precondition and even says why:
-
-```cpp
-// Currently for the sake of simplicity we omit blob reuse if data is
-// unaligned with csum chunk. Later we can perform padding if needed.
-if (get_blob().has_csum() &&
-   ((b_offset % get_blob().get_csum_chunk_size()) != 0 ||
-    (end % get_blob().get_csum_chunk_size()) != 0)) {
-  return false;                                   // can_reuse_blob()
-}
-```
-
-But that guards the *logical* offsets of an incoming write — in the failing
-scenario blob B's write is at `b_off 0x8000` for `0x8000`, both ends chunk
-aligned, and it passes. What breaks is the *physical* extent boundary the
-allocator introduced, which no offset test can see. `can_merge_blob()`
-needed a stricter member of the same family, and grew none.
-
-### 7.2.3 Why the qa test finds it and a cluster rarely does
-
-`SyntheticWorkloadState::touch()` stamps a random alloc hint on *every*
-object it creates:
-
-```cpp
-boost::uniform_int<> u(17, 22);
-boost::uniform_int<> v(12, 17);
-t.set_alloc_hint(cid, new_obj, 1ull << u(*rng), 1ull << v(*rng),
-                 get_random_alloc_hints());
-```
-
-`expected_write_size` is 4K–128K, and `get_random_alloc_hints()` rolls
-`SEQUENTIAL_READ` without `RANDOM_READ` (1/4), an
-`IMMUTABLE`/`APPEND_ONLY` bit (3/5) and no `RANDOM_WRITE` (3/4) — 9/80 ≈ 11%
-of objects, of which 5/6 draw an `expected_write_size` above a 4K
-`min_alloc_size`, so ~9% end up with an oversized csum chunk. Add 10 000
-ops, half of them write/zero/truncate/unlink to fragment the device, and 10%
-`clone`/`clone_range` (`StoreTest.Synthetic`; the matrix rows go to 50 000),
-and the collision becomes a matter of time — which fits the single
-occurrence on the tracker.
-
-Production needs the same two coincidences: an object hinted immutable and
-sequential-read (RGW and CephFS do issue these), and free space fragmented
-enough that its blob is split mid-chunk. Both are ordinary on an aged OSD
-and absent on a fresh one, which is why this survived years of qa.
-
-## 7.3 Proposed solution
-
-### 7.3.1 The fix
-
-`can_merge_blob()` already walks the dissolved blob's valid extents once,
-with each extent's blob offset in hand, for the disjointness test. The
-alignment check rides that loop — two compares per valid extent
-(`csum_chunk_size` is 0 when the dissolved blob has no csum), and only for
-the dissolved blob, since `merge_blob()` never moves the survivor's
-extents:
-
-```cpp
-  while (xi != xe.end() && yi != ye.end()) {
-    if (xp <= yp) {
-      if (yp < xp + xi->length) {
-        // collision
-        can_merge = false;
-        break;
-      }
-+     if (csum_chunk_size != 0 &&
-+         ((xp % csum_chunk_size) != 0 ||
-+          (xi->length % csum_chunk_size) != 0)) {
-+       // x's extent splits a csum chunk; move_data() could not move it
-+       can_merge = false;
-+       break;
-+     }
-      xp += xi->length;
-      ++xi;
-```
-
-(plus the same test in the trailing loop that scans x's extents y never
-reached). Merging is only an optimisation, so the gatekeeper may refuse: the
-caller falls back to `make_blob_shared()`, which is always correct.
-
-### 7.3.2 Why it is safe
-
-**Refusing is a no-op, structurally.** `make_range_shared_maybe_merge()`
-already has the branch — `find_mergable_companion()` returning `nullptr` is
-the normal case for the first blob at any `blob_start`. A `false` from
-`can_merge_blob()` reaches exactly that path.
-
-**Relaxing the assert instead is not free.** The use-tracker loop under it
-rounds the same way, and one invariant decides both halves of what happens
-next. Because a sub-AU hole cannot exist, two fragments at `0x3000` and
-`0x5000` inside one AU must *both* be valid — so both are visited and each
-adds `src_tracker_aus[i]`, leaving a count that `put()` can never drive to
-zero and an AU that is never released. The csum copy is subtler. Rounding to whole items would actually copy the
-right item, because a chunk that any of the dissolved blob's bytes touch is
-entirely its own: writes into a csummed blob are chunk-aligned, and
-`get_release_size()` forbids sub-chunk holes, so no chunk is ever co-owned.
-`Blob::copy_from()` already relies on exactly that — it copies csum items
-with the same `p2align`/`p2roundup` rounding, and is correct for the same
-reason. But the invariant is written down nowhere, which is the shape of
-this bug; a crash fix is the wrong place to start leaning on it.
-
-**The cost is bounded and rare.** It gives up the elastic-shared-blob win
-only when the blob being dissolved is chunk-split — which requires the
-alloc hint *and* fragmentation, i.e. the ~9% of objects above on an aged
-device. Everything else still merges; the regression test pins that down.
-
-**The alternative was worked out and deferred.** `move_data()` could keep
-the win instead: copy each csum item at most once behind a watermark, and
-move the tracker as a single whole-array add rather than per call. That is
-about fifteen lines and deletes both asserts — but it is precisely the
-change that leans on the never-co-owned invariant above, so it wants its own
-guardrail and test surface, not a ride on a crash fix.
-
-### 7.3.3 Validation
-
-The regression test carries both directions in one case: the aligned pair
-must still merge into one blob, the fragmented pair must be refused.
-
-| | without the fix | with the fix |
-|---|---|---|
-| `can_merge_blob()` on the fragmented pair | true | **false** |
-| the clone | abort at `BlueStore.cc:2845` | two shared blobs, csum item intact |
-| `unittest_bluestore_types` | — | **154/154** |
-| `ceph_test_objectstore`, the qa job's own filter | — | 180 passed, 4 skipped, 68 min |
-| of which synthetic matrix tests | — | **61/61 passed** (44 min) |
-| aborts / signals in that run | — | **0** |
-| guard rejections in that run | — | **0** |
-| aged-store end-to-end clone (§7.1.2) | abort in `queue_transactions()` | clone succeeds, data verified |
-
-Four `ceph_test_objectstore` tests fail on that branch (`CompressionTest`,
-`BlueStoreReconstructAllocationsTest`, `BluestoreStatFSTest`,
-`garbageCollection`) — identical failures with and without the patch, so
-pre-existing and unrelated.
-
-The last row is the honest one. Instrumenting the guard shows the qa
-workload does build blobs whose csum chunk exceeds `min_alloc_size`
-(`csum_chunk=0x2000, min_alloc=0x1000`) — but never a fragmented one, so the
-guard was never asked to refuse anything. Nothing in the suite drains its
-scratch device, so chunk-split blobs stay rare: the tracker's abort was one
-occurrence across many such runs, and 68 minutes did not buy another. What
-this run establishes is that the guard costs nothing; the two reproducers
-are what pin the mechanism.
-
-### 7.3.4 Takeaways
-
-- **A blob keeps three views of one range at three granularities.** Any
-  code that moves one of them has to respect the coarsest. `merge_blob()`
-  iterates at pextent granularity and copies at csum granularity, and the
-  assert is the only thing writing that contract down.
-- **The invariant was held up by three unrelated mechanisms** — release
-  size, allocation size, and the default csum order — none of which is
-  documented as guaranteeing it. One alloc hint removes the third and the
-  other two are not enough.
-- **`can_reuse_blob()` treated csum-chunk alignment as a precondition;
-  `can_merge_blob()` did not consider it at all.** When adding a second
-  consumer of a shared representation, the first consumer's guards are the
-  checklist — even when the second consumer needs a stricter version of the
-  same guard.
-- **An assert is not a fix.** Deleting these two would have turned a crash
-  into an inflated use tracker — the same AU counted once per fragment, so
-  it is never released. No crash, no error returned to the client, just
-  space that does not come back: far harder to attribute than an abort.
-- **A knob named "force small allocations" does not force small
-  allocations.** It is honoured only by `StupidAllocator` — not the default
-  `hybrid` — and even there coalescing undoes it on unfragmented free space
-  (§7.1.2). Worth knowing before trusting it in a reproducer.
-
-# 8. Tracker #78144 — a unit test that aborts because a syscall was denied
-
-[Issue](https://tracker.ceph.com/issues/78144) · `unittest_bluefs_ex` under
-`make check` on Ubuntu 24.04 · component BlueStore (test) · one of five
-tickets from one environment defect · Status: probe-and-skip patch local and
-validated, not submitted; the sibling ticket's PR does not cover this one
-
-## 8.1 Report
-
-### 8.1.1 The observation
-
-`unittest_bluefs_ex` fails on noble and passes everywhere else. The test
-never gets to run: BlueFS opens a block device, the device's polling thread
-calls `io_getevents(2)`, the container's syscall filter denies it with
-`EPERM`, and `KernelDevice::_aio_thread()` treats every error it does not
-recognise as fatal.
-
-```
-BlueFS_ex.test_interrupted_compaction
-KernelDevice.cc: 718: ceph_abort_msg("got unexpected error from io_getevents")
- 3: KernelDevice::_aio_thread()
- 4: KernelDevice::AioCompletionThread::entry()
-...
-test_bluefs_ex.cc:180: Failure
-Value of: (((stat) & 0xff00) >> 8) == 0
-```
-
-(line 718 is the reporter's tree; the same abort is at 699-701 on main today.)
-
-Those two halves are three processes apart, which is most of why the report
-is hard to read. The test forks twice, and the abort lands in the innermost
-process:
-
-```
-unittest_bluefs_ex                        (gtest, outer)
- └─ fork_for_test
-     │   parent: waitpid -> WIFEXITED && WEXITSTATUS == 0   <- line 180 fails here
-     │
-     └─ child: create the bdev, fork again
-         │   parent: waitpid -> expects exit code 107
-         │
-         └─ grandchild: add_block_device -> KernelDevice::open -> _aio_start
-                        bstore_aio: io_getevents -> -EPERM -> ceph_abort
-                        SIGABRT, instead of the _exit(107) it was going to do
-```
-
-The grandchild is supposed to kill itself mid-compaction with `_exit(107)` —
-that is the whole point of the test, which checks that BlueFS recovers from
-an interrupted log compaction. It never reaches the compaction. Opening the
-device starts the polling thread, and the very first `io_getevents()` is
-denied — so it dies before even `mkfs()`. The middle process sees
-`WIFEXITED` false, exits 107 itself, and the outer process reports a bad
-exit status at line 180. Nothing in that last message mentions aio.
-
-### 8.1.2 Reproducing it
-
-The denial is environmental, so on any working machine you inject it. libaio
-returns `-errno`, so the whole shim is one function:
-
-```c
-/* deny_aio.c — what the noble container's syscall filter does */
-#define _GNU_SOURCE
-#include <libaio.h>
-#include <errno.h>
-int io_getevents(io_context_t ctx, long min_nr, long nr,
-                 struct io_event *events, struct timespec *timeout)
-{
-    return -EPERM;
-}
-```
-
-```bash
-gcc -shared -fPIC -o deny_aio.so deny_aio.c
-LD_PRELOAD=$PWD/deny_aio.so bin/unittest_bluefs_ex
-```
-
-That reproduces the ticket exactly on a machine where aio works — the same
-abort, then the same `Actual: false` at line 180. Fedora 42 without the
-shim: 8 runs, 8 passes, ~50 s each. The test is fine; the environment is
-not.
-
-## 8.2 Analysis
-
-### 8.2.1 Root cause, top to bottom
-
-```
-unittest_bluefs_ex reports a bad exit status at line 180
- └─ why?   the grandchild died of SIGABRT rather than _exit(107), so
-           WIFEXITED is false and the middle process exits 107 itself
- └─ why did it abort?
-           get_next_completed() retries -EINTR internally (aio.cc:105);
-           _aio_thread() treats every other negative return as fatal
-                                              (KernelDevice.cc:699-701)
- └─ what did it get?
-           -EPERM from io_getevents(2), on the first poll after the
-           device was opened
- └─ why EPERM?
-           the kernel's io_getevents has no EPERM of its own — its errors
-           are EINVAL, EFAULT, EINTR, ENOSYS — so it came from a syscall
-           filter (seccomp, or an AppArmor/LSM policy) in the noble
-           build container
-
-#78144's own log does not carry the errno: the fixture sets
-`log_to_stderr false`. `EPERM` is proven for #78148 — `_aio_thread got (1)
-Operation not permitted`, same builder run 24 seconds earlier — and inferred
-here from the identical abort site. The shim of 8.1.2 reproduces #78144's
-output exactly, which is as close to proof as the log allows.
- └─ why does every poll hit it?
-           BlueStore polls with bdev_aio_poll_ms = 250, and any non-zero
-           timeout issues the syscall (8.2.2)
-```
-
-### 8.2.2 Which call is denied, and which is not
-
-The sibling ticket describes this as the kernel having two paths, one of
-them policy-checked. It is simpler than that, and the split is in userspace.
-Disassembling libaio 0.3.111 (Fedora 42):
-
-```
-io_getevents@@LIBAIO_0.4:
-   cmpl  $0xa10a10a1,0x10(%rdi)   ; ring->magic == AIO_RING_MAGIC ?
-   cmpq  $0x0,(%r8)               ; timeout->tv_sec  == 0 ?
-   cmpq  $0x0,0x8(%r8)            ; timeout->tv_nsec == 0 ?
-   mov   0xc(%rdi),%eax
-   cmp   %eax,0x8(%rdi)           ; ring->head == ring->tail ?
-   je    -> xor %eax,%eax ; ret   ; all yes: return 0, no syscall at all
-   jmp   -> syscall
-```
-
-```
-io_getevents(ctx, min_nr, nr, events, timeout)
-   │
-   ├── timeout == {0,0} AND ring empty ──> return 0   no syscall issued, so
-   │                                                  a zero-timeout probe
-   │                                                  reports aio as healthy
-   │
-   └── anything else ────────────────────> syscall ─> denied, -EPERM, so every
-                                                      250 ms BlueStore poll dies
-```
-
-Hence the probe in 8.3.1 uses a 1 ms timeout rather than the cheaper zero.
-
-**A zero-timeout poll loop is not a workaround.** The left branch cannot
-harvest anything — it only answers "the ring is empty". I checked by
-submitting a write, waiting for it to land, and then polling with a zero
-timeout: it returned the completion, which means it took the syscall. So
-such a loop would work only while there is nothing to collect.
-
-### 8.2.3 One cause, five tickets, two fixes
-
-`io_setup(2)` succeeds and `io_getevents(2)` does not, so every test that
-opens a BlueStore block device dies the same way. Five were filed separately
-on the same day, and #78144 and #78148 are 24 seconds apart in one builder
-run:
-
-| ticket | test | project | needs |
-|---|---|---|---|
-| #78148 | `safe-to-destroy.sh` | RADOS | shell-level skip — has [PR #70572](https://github.com/ceph/ceph/pull/70572) |
-| #78144 | `unittest_bluefs_ex` | bluestore | gtest-level skip — **this section** |
-| #78145/6/7 | `run-rbd-unit-tests-*.sh` | rbd | same abort, unaddressed |
-| #77592 | umbrella: `unittest_bluefs`, `unittest_bdev`, and more | Dashboard | filed 2026-06-23; also lists tox failures with other causes |
-
-PR #70572 fixes #78148, and it improves #78144 without fixing it: its probe
-in `aio_queue_t::init()` turns the abort into an error return, so
-`KernelDevice::open()` fails and `add_block_device()` fails. The grandchild
-then reports `test_bluefs_ex.cc:140: Failure` and exits 0 instead of 107, the
-middle process still `exit(107)`s, and the outer `ASSERT_TRUE` still fails at
-line 180. Better diagnostics — a named source line and a new
-`io_getevents(2) is not permitted` message instead of a `SIGABRT` — and the
-same red test. Its CTest skip is an `exit 77` in a shell script; a gtest
-binary gets nothing from it. So #78144 shares a cause with #78148 but not a fix, and closing it
-as a duplicate would mark it resolved while it still fails.
-
-## 8.3 Proposed solution
-
-### 8.3.1 The fix
-
-Probe once, in the outer process, before either fork — a skip decided in the
-grandchild cannot be reported, it can only change an exit code:
-
-```cpp
-static int probe_libaio()
-{
-#if defined(HAVE_LIBAIO)
-  io_context_t ctx = 0;
-  int r = io_setup(1, &ctx);
-  if (r < 0) {
-    return r;
-  }
-  io_event event;
-  struct timespec timeout = {0, 1000 * 1000}; // 1ms — must be non-zero
-  r = io_getevents(ctx, 1, 1, &event, &timeout);
-  io_destroy(ctx);
-  if (r < 0) {
-    return r;
-  }
-#endif
-  return 0;
-}
-```
-
-```cpp
-TEST_F(BlueFS_ex, test_interrupted_compaction)
-{
-  int aio_probe = probe_libaio();
-  if (aio_probe < 0) {
-    GTEST_SKIP() << "libaio is unusable in this environment ("
-                 << cpp_strerror(aio_probe)
-                 << "); BlueFS cannot open a block device here";
-  }
-```
-
-`GTEST_SKIP` exits 0, so CTest records a pass and the skip shows up in the
-test's own output. That is deliberate: `exit 77` only reads as a skip when
-the test carries CMake's `SKIP_RETURN_CODE` property, and `SKIP_RETURN_CODE`
-appears nowhere in Ceph's build — `safe-to-destroy.sh` is registered with a
-plain `add_ceph_test`, so PR #70572's `exit 77` would currently be reported
-as a failure.
-
-### 8.3.2 What was ruled out
-
-**`bdev_aio = false`.** The option exists, is documented `advanced`, and
-`KernelDevice::open()` answers it with
-`ceph_abort_msg("non-aio not supported")` (KernelDevice.cc:227). Verified by
-running it: the test dies on that abort instead. The option is a trap.
-
-**A zero-timeout poll loop.** Ruled out in 8.2.2 — it cannot collect
-completions.
-
-**Waiting for PR #70572.** Ruled out in 8.2.3 — it leaves this test failing.
-
-### 8.3.3 Validation
-
-With the shim standing in for the noble policy:
-
-| scenario | result |
-|---|---|
-| unpatched + shim | `ceph_abort_msg(...)`, then `Actual: false` at line 180 — the ticket, exactly |
-| patched + shim | `[ SKIPPED ]` with the reason, exit 0 |
-| patched, no shim | `[ OK ] ... (48620 ms)`, exit 0 — the test still really runs |
-| unpatched, no shim | 8 runs, 8 passes |
-
-### 8.3.4 Takeaways
-
-- **The fix is a skip, and a skip is not a fix.** A green `make check` on
-  noble then means BlueStore was never tested there. The environment is the
-  thing to repair; skipping only stops one broken environment from looking
-  like a code bug.
-- **`EPERM` from a syscall that has no `EPERM` is a filter, not a bug.**
-  The kernel's `io_getevents` returns EINVAL, EFAULT, EINTR or ENOSYS.
-  Reading the man page's error list ruled out the whole aio subsystem in one
-  step and pointed straight at seccomp/AppArmor.
-- **A probe has to take the same branch as the real caller.** libaio answers
-  a zero timeout without a syscall, so the natural cheap probe is exactly
-  the one that cannot detect this.
-- **Fork depth hides the cause.** The abort was two `fork()`s below the
-  assertion that reported it, and by the time it surfaced it was an integer.
-  Probing before the fork is not just tidier — it is the only place a
-  diagnosis can be printed.
-
-# 9. One hot op-queue shard freezes the whole OSD — `osd_client_message_cap` as a cluster-wide stall amplifier
+## 9. One hot op-queue shard freezes the whole OSD — `osd_client_message_cap` as a cluster-wide stall amplifier
 
 Found in two field diagnostics collections of a 4K random-read benchmark,
 not a bug report · affects any replicated pool under a high-IOPS,
@@ -3322,9 +3287,9 @@ Every figure below comes from `ceph-collect` snapshots taken while fio ran
 `dump_historic_ops`, `messenger dump --tcp-info`, `pg dump`). Source
 references are to the `tentacle-dev` tree at `20a5b81442e`.
 
-## 9.1 Report
+### 9.1 Report
 
-### 9.1.1 The observation
+#### 9.1.1 The observation
 
 Day two, taken at 15:41:17 while the reads ran (1.92 M op/s):
 
@@ -3346,7 +3311,7 @@ throttled, 251 ops queued on shard 0, waits of 2.6–3.9 s, 12 ms read
 latency). Between the two days that OSD had been marked `out` and the pool
 recreated — the freeze simply moved.
 
-### 9.1.2 Reproducing it — or rather, catching it
+#### 9.1.2 Reproducing it — or rather, catching it
 
 There is no reproducer beyond "run enough 4 KiB reads at enough clients";
 the signature is what to look for. On a live OSD:
@@ -3376,9 +3341,9 @@ were analysed with two scripts (`gen_cluster_report.py`,
 `gen_4k_randread_report.py`) that compute the tables above from any pair of
 `ceph-collect` snapshots.
 
-## 9.2 Analysis
+### 9.2 Analysis
 
-### 9.2.1 Root cause, top to bottom
+#### 9.2.1 Root cause, top to bottom
 
 ```
 cluster delivers 1.9 M instead of 3.0 M read IOPS
@@ -3412,7 +3377,7 @@ Each level was measured before going down: the client idle times, the
 messenger connection states, the in-flight dump by shard, the PG map, the
 per-OSD process latency, the device wait per drive model.
 
-### 9.2.2 The two waits, in the code
+#### 9.2.2 The two waits, in the code
 
 A read passes through two threads inside the OSD: the messenger worker
 that owns the socket, then a shard thread that runs the PG. The clock
@@ -3477,7 +3442,7 @@ when:
   node that ran every thread late (155 µs process time on a drive model
   that takes 142 µs elsewhere). Not the case on day two.
 
-### 9.2.3 How [B] on one shard becomes [A] for everyone
+#### 9.2.3 How [B] on one shard becomes [A] for everyone
 
 The message throttle does not know about shards. In steady state its 256
 slots are spread over the 8 shards in proportion to how long each shard
@@ -3516,7 +3481,7 @@ backs up again. On day two the 20 retained waits spanned 38 s; on day one
 the victim had at least 58 s of freeze in a 508 s span (a lower bound —
 only 20 ops are kept).
 
-### 9.2.4 Why this OSD, and why a different one the next day
+#### 9.2.4 Why this OSD, and why a different one the next day
 
 Ranking every OSD by the utilisation of its busiest shard —
 `per-OSD IOPS × primary share ÷ (2 ÷ op_r_process_latency)` — reproduces
@@ -3539,13 +3504,13 @@ for the drive — had 11 of 40 (94 %) and froze. Marking osd.38 out and
 recreating the pool re-rolled the PG map and handed the worst shard to
 osd.32. The hot spot follows the map, not the hardware.
 
-### 9.2.5 What was ruled out
+#### 9.2.5 What was ruled out
 
 - **Network.** On every socket of every OSD, both days: `tcpi_retransmits`,
   `tcpi_backoff`, `tcpi_lost`, `tcpi_retrans` all 0; RTO at the 200 ms
   floor; at most 3 unacked segments; the victim's client sockets identical
   to its neighbours' except for holding fewer replies in flight. The
-  cluster network does lose packets under replication load (§6), but reads
+  cluster network does lose packets under replication load (§10), but reads
   never touch it.
 - **The drive.** 119 µs device wait on the victim, the same as every other
   model-B OSD; the 8 ms is queueing in front of it.
@@ -3556,7 +3521,7 @@ osd.32. The hot spot follows the map, not the hardware.
   read policy had been configured but in the wrong section (`osd`), so no
   client used it — reads went to primaries only, as the shard math assumes.
 
-### 9.2.6 Confirming each link on a live cluster
+#### 9.2.6 Confirming each link on a live cluster
 
 Everything above came from snapshots. Before changing anything on the
 cluster, each link of the chain in §9.2.1 can be watched directly while the
@@ -3711,9 +3676,9 @@ IOPS dip each time the throttled count jumps and recover when it returns
 to zero. That is the stop-and-go cycle seen live, end to end; only then do
 the changes in §9.3 have a number they are expected to move.
 
-## 9.3 Proposed solution
+### 9.3 Proposed solution
 
-### 9.3.1 Mitigations, in the order they act
+#### 9.3.1 Mitigations, in the order they act
 
 Both apply at runtime, no restart:
 
@@ -3738,7 +3703,7 @@ utilisation down on the shard that backs up:
 The memory cost of a larger cap is bounded by the byte throttle
 (`osd_client_message_size_cap`, 500 MB), which stays in place.
 
-### 9.3.2 What a code fix would look like
+#### 9.3.2 What a code fix would look like
 
 The configuration hides the amplifier; it does not remove it. Three
 candidate changes, cheapest first:
@@ -3760,7 +3725,7 @@ candidate changes, cheapest first:
 Any of the three turns the observed behaviour from "one shard at 87 %
 stalls the cluster" into "one shard at 87 % has 20 ms latency".
 
-### 9.3.3 Validation
+#### 9.3.3 Validation
 
 Not yet done on the cluster — none of the settings had been applied
 between the two collections. The measurement plan for the next run, so
@@ -3778,7 +3743,7 @@ Collect twice *inside* the fio run (about 2 min after start and 1 min
 before the end) so the counter window holds nothing but the workload and
 `dump_historic_ops` covers 600 s of it.
 
-### 9.3.4 Takeaways
+#### 9.3.4 Takeaways
 
 - **An OSD-wide cap on top of per-shard queues is a stall amplifier.**
   Slots migrate to the slowest shard on their own, and the first thing an
@@ -3799,7 +3764,396 @@ before the end) so the counter window holds nothing but the workload and
   `op_r_latency − op_r_process_latency` for the wait and the historic-ops
   event stamps for the split between throttle and queue.
 
-# 10. Tracker #80404 / PR #71663 — dead cluster sockets, parked ops, and the laggy latch that never lets go
+# Part III — Messenger and the cluster network
+
+## 10. OSDs that froze for minutes — TCP retransmits, PG read leases, and where they meet
+
+Found in a field diagnostics collection, not a bug report · affects any
+cluster whose cluster network drops packets · component OSD
+(PeeringState / AsyncMessenger) plus the fabric under it · fix: none
+upstream — configuration and topology · Status: chain measured end to
+end; fabric-vs-host localisation still open
+
+A 4-node ARM64 cluster (2 sockets × 64 cores/node, 100 GbE, 32 NVMe
+OSDs, 3× replication) under an RBD benchmark: 18 GiB/s of 4 MiB
+`writefull`. Health looked almost clean. It was not.
+
+Every figure below comes from the collection **except** the core count,
+the link speed and the statement that both VLANs share one bond — those
+are environment facts from outside it. A standard Ceph collection
+carries no usable CPU or interface detail —
+`orch host ls --detail` reports CPU as `N/A` and the NIC column as a bare
+count — which turns out to matter in §10.2.5. The ~40 bluestore/kv/finisher
+threads in §10.2.5 are an estimate too.
+
+### 10.1 Report
+
+#### 10.1.1 The observation
+
+`ceph health detail` reported three warnings, all cosmetic — a failed
+prometheus placement, four dead node-exporters, one old crash. The real
+fault was not latched at collection time and only showed in the history:
+
+```
+SLOW_OPS   first 10:05   last 17:11   count 26   active Yes
+```
+
+`ceph pg dump` had 2 of 1025 PGs in `active+clean+laggy`. Individual
+OSDs were freezing solid for **1.5 to 16 minutes**, one or two at a
+time, roving across all four hosts every few minutes.
+
+#### 10.1.2 Reproducing it
+
+Nothing here needs a live cluster — every figure below comes out of a
+`ceph_diagnostics` collection, provided it was captured with `--tcp-info`
+(the collector passes it by default):
+
+```bash
+cds ceph healthcheck history ls                 # the SLOW_OPS health detail misses
+cds ceph pg dump | grep laggy                   # PGs whose read lease has expired
+cds historic_ops group-by-event-intervals -s    # where op time actually goes
+cds historic_ops show -s -T -d osd.N            # per-op event timelines
+```
+
+The TCP side is one `getsockopt` per connection, stored by the collector
+as `osd_info-osd.N-messenger_dump_<msgr>`. Summarising it per network
+takes a short script — retransmits normalised by bytes moved, plus any
+socket currently in RTO backoff:
+
+```bash
+./ceph-net-retrans.py <collection-dir> --pairs --backoff
+```
+
+### 10.2 Analysis
+
+#### 10.2.1 Root cause, top to bottom
+
+`cds historic_ops group-by-event-intervals -s` aggregates every
+daemon's op tracker by pipeline stage — the single most useful command
+here, and it points straight at the answer:
+
+```
+AVG_DURATION  TOTAL_DURATION  COUNT  INTERVAL
+     247.783       14619.170     59  waiting for readable -> reached_pg
+      88.622       36512.229    412  header_read -> throttled
+      37.485       25002.702    667  sub_op_commit_rec -> sub_op_commit_rec
+```
+
+Meanwhile every layer below the PG was fast: `txc_commit_lat`
+1.1–1.9 ms, `kv_sync_lat` 0.13–0.44 ms, device commit 2–4 ms,
+`op_w_prepare_latency` 0.9 ms. Client-visible `op_w_latency` was 20–275
+ms. All of the damage
+is queueing above the object store.
+
+#### 10.2.2 What "waiting for readable" means
+
+Two op-tracker marks bracket the stall. `reached_pg` is stamped in
+`OSD::dequeue_op()` when a shard worker pulls the op off the scheduler.
+`waiting for readable` is `mark_delayed()` from `PrimaryLogPG::check_laggy()`
+— the op is parked on the PG's `waiting_for_readable` list and the
+worker thread moves on. `reached_pg` then appears a *second* time,
+because the release path re-queues the op through `dequeue_op()`.
+
+"Readable" is the Octopus-era **PG read lease**, not object I/O. A
+primary may only serve while it can prove it is still primary, and its
+lease is the minimum across the acting set:
+
+```c
+/* PeeringState::recalc_readable_until() */
+ceph::signedspan min = readable_until_ub_sent;
+for (unsigned i = 0; i < acting.size(); ++i)
+    if (acting_readable_until_ub[i] < min) min = acting_readable_until_ub[i];
+readable_until = min;          /* the slowest replica sets the lease */
+```
+
+`check_laggy()` runs from `do_op_impl()` for **every** op, immediately
+before the caps check — writes included, despite the name. One slow
+replica revokes the whole PG.
+
+The amplification is what turns a lease blip into an outage. With 4 MiB
+objects and `osd_client_message_size_cap` at 500 MiB, only ~125 client
+ops fit in flight. Once those are parked on one laggy PG, the OSD stops
+reading *any* client message off the socket. Observed in-flight counts:
+124, 126, 123. The release is all-at-once: on osd.28 all 20 tracked ops
+completed inside **1.09 s** after a 15m42s stall, 11 of them carrying a
+`waiting for readable` event. That simultaneity is what distinguishes a
+lease stall from ordinary congestion. (osd.5's 9m42s stall looks similar
+but is mostly throttle backlog — only 1 of its 20 ops ever waited on the
+lease, and its release spread over 6.7 s.)
+
+#### 10.2.3 The socket that killed the lease
+
+The collector captures per-connection `getsockopt(SOL_TCP, TCP_INFO)`
+via `ceph daemon <d> messenger dump <msgr> --tcp-info` (field reference:
+[the TCP_INFO section of the network post]({% post_url 2026-05-09-network-diagnostics %})).
+Across the cluster network:
+
+| Network | Conns | Total retrans | Bytes moved | Retrans / TB |
+|---|---|---|---|---|
+| cluster | 764 | 166,361,880 | 277.9 TB | **598,550** |
+| public | 2,006 | 7,084 | 138.9 TB | 51 |
+| same-host (lo) | 65 | 0 | — | — |
+
+Same hosts, same 21-hour window, same workload: an 11,700× difference.
+And exactly two sockets in the whole cluster were in RTO backoff — the
+two directions between the acting pair of both laggy PGs:
+
+```
+osd.16 -> osd.28    retransmits=11  backoff=6  rto=13.056s
+                    unacked=471     last_data_sent=24,256 ms
+osd.28 -> osd.16    retransmits=3   backoff=3  rto=1.632s
+                    unacked=1       last_ack_recv=10,820 ms
+```
+
+Nothing left that socket for **24.3 seconds**. The read lease is
+`osd_pool_default_read_lease_ratio` × `osd_heartbeat_grace` = 0.8 × 20 =
+**16 seconds**. Lease renewal could not get through; `readable_until`
+expired; the PG went `LAGGY`.
+
+`retransmits` exceeding `backoff` is its own signal. In
+`tcp_retransmit_timer()` the kernel bumps `icsk_retransmits` on the RTO
+path but skips `icsk_backoff` when the retry is dropped locally (v6.18
+below; on the 6.6 kernel these hosts run it is an open-coded
+`icsk->icsk_retransmits++`, same behaviour):
+
+```
+tcp_update_rto_stats()        icsk_retransmits++
+if (tcp_retransmit_skb() > 0)          /* NET_XMIT_DROP */
+        /* "Retransmission failed because of local congestion" */
+        goto out                       /* skips the backoff bump */
+```
+
+11 against 6 means ~5 retries never left the host — so at least one
+sender was also dropping locally. Both counters are instantaneous and
+reset on an ACK of new data, so this is one snapshot of one socket; the
+166 M cumulative retransmits carry no fabric-vs-local attribution at all.
+
+Two details tie the numbers together. MTU is 9000 with `snd_mss` 8948 on
+both VLANs, so 598,550 retrans/TB is a loss rate of **~0.5%**. And
+`unacked=471` is almost exactly one 4 MiB message at that MSS
+(4 MiB / 8948 = 469) — the stalled socket was sitting on a single
+outstanding repop.
+
+#### 10.2.4 Why every built-in check stayed silent
+
+The OSD map had not changed in 21 hours, so no OSD was marked down in
+the entire window under study. `OSD_SLOW_PING_TIME_*` never fired, and
+`dump_osd_network` reported zero peers above its 1 s threshold on all 32
+OSDs — and that check averages over at most 15 minutes
+(`OSD.cc` compares the 1/5/15-minute means), so it was looking at a
+window that contained stalls. Over the whole tracked span **26 of the
+32 OSDs** recorded slow ops, with more than a dozen stall episodes past
+100 s and the longest single op at **15m42s**. (Episode counts depend
+on how you cluster ops into episodes — anywhere from 35 to 85 depending
+on the grouping rule — so treat the count as a range and the per-op
+durations as the hard numbers.)
+
+Heartbeats and leases diverge inside the OSD:
+
+```
+MSG_OSD_PING       -> heartbeat_dispatch() -> handle_osd_ping()
+                      dedicated messengers, own sockets, handled inline,
+                      no PG lock, tiny packets -> never enters backoff
+
+MSG_OSD_PG_LEASE   -> enqueue_peering_evt() -> op scheduler -> PG lock
+                      shared cluster messenger, over the backed-off sockets
+```
+
+Heartbeats are not loss-free — the heartbeat messengers took ~8,800
+retransmits between them. What saves them is a dedicated socket, one
+small message per ping, and 20 s of grace, so they never accumulate
+enough consecutive loss to enter backoff. Healthy heartbeats prove the
+*wire* is up; they say nothing about whether leases are arriving.
+**This failure mode is invisible to every built-in network health
+check.**
+
+One more measured item: `tcpi_options` shows `sack, timestamps, wscale`
+on all 4,391 connections and `ecn` on none. A switch cannot ECN-mark a
+packet that was never ECT-marked, so under congestion its only option is
+to drop — which is what the retransmit counters record. Linux defaults
+to `net.ipv4.tcp_ecn=2` ("accept if asked, never ask"), so two default
+hosts never negotiate it.
+
+#### 10.2.5 What the evidence cannot separate
+
+A sender's `tcp_info` records that a segment was lost, never *where*. A
+switch buffer, a NIC receive ring and the receiver's socket queue all
+produce the same signature.
+
+The 11,700× VLAN split rules out a *load-independent* shared fault — a
+bad optic, a dead switch queue — since both VLANs are believed to share
+the bond. It does **not** rule out buffer exhaustion, because the two
+VLANs are not comparable loads: the cluster side moves 364 GB per socket
+against the public side's 69 GB, and its traffic is synchronous fan-out,
+two 4 MiB messages emitted at once per client write. Switch-buffer loss
+is strongly superlinear in per-flow burst rate, so incast remains a fully
+adequate explanation on its own.
+
+The thread budget makes a host-side drain the leading *host-side*
+candidate, alongside incast rather than instead of it:
+
+| Per node | Threads | Source |
+|---|---|---|
+| OSD op threads | 128 | 8 shards × 2, × 8 OSDs |
+| messenger workers | **24** | `ms_async_op_threads=3` — all TCP rides these |
+| bluestore / kv / finishers | ~40 | kv_sync, kv_finalize, aio |
+| **total vs 128 cores** | **~192** | **1.5× oversubscribed** |
+
+Those 24 workers carry 155 Gbps of cluster traffic alone — 6.4 Gbps
+each, every byte also `crc32c`'d (`ms_crc_data=true`); with public
+ingress it is nearer 8 Gbps per worker. The mechanism is *not* a full
+socket receive queue: that produces a zero window, i.e. flow control,
+not loss — and the zero-window branch of `tcp_retransmit_timer()` never
+bumps `icsk_retransmits`, so this socket's `retransmits=11` proves the
+window was open and the segments were genuinely lost. What survives is
+softirq starvation: NIC ring overflow, `softnet` backlog drops, or the
+qdisc — which is what the four commands below probe.
+`osd_numa_auto_affinity` is `true` but inert: the metadata lists
+`network_numa_unknown_ifaces`, so Ceph never resolved the interface (a
+bond defeats its `/sys/class/net` walk) and `osd_numa_node` stays `-1`.
+
+### 10.3 Proposed solution
+
+#### 10.3.1 The fix
+
+The outage was not caused by loss but by loss outlasting a 16-second
+lease. The obvious move —
+raising `osd_pool_default_read_lease_ratio` — is the wrong one. Upstream
+is explicit:
+
+> This should be <= 1.0 so that the read lease will have expired by the
+> time we decide to mark a peer OSD down.
+> — `src/common/options/global.yaml.in`
+
+Push the ratio above 1.0 and a dead OSD's lease outlives the decision to
+mark it down, which is the exact hazard leases exist to prevent. Widen
+the grace instead and leave the ratio alone:
+
+```bash
+ceph config set global osd_heartbeat_grace 40          # lease 0.8 x 40 = 32s
+ceph config set global mon_warn_on_slow_ping_time 1000  # pin, see 10.3.2
+```
+
+A 32-second lease survives a 24.3-second silent socket. Loss continues
+and costs throughput, but the OSD does not freeze.
+
+#### 10.3.2 Why it is safe
+
+Keeping the ratio at 0.8 preserves the invariant upstream asks for: the
+lease still expires before the mark-down decision, so the ordering the
+lease exists to guarantee is untouched. What the wider grace does change
+is honest and bounded — a genuinely dead peer takes 40 s rather than
+20 s to be declared down.
+
+The second command is there because of a coupling that is easy to miss.
+`osd_heartbeat_grace` is also the base of the slow-ping warning: the
+threshold is `mon_warn_on_slow_ping_ratio` (0.05) × grace, which is
+exactly the 1000 ms `dump_osd_network` reports. Double the grace and
+that check silently doubles to 2 s — making the health check §10.2.4
+already showed to be blind blinder still. A non-zero
+`mon_warn_on_slow_ping_time` overrides the ratio and pins it. Both go in
+`global`, not `osd` — upstream requires the grace to be readable by the
+mon as well as the OSDs, and `OSDMonitor` does read it.
+
+#### 10.3.3 Cutting the load instead
+
+Topology can cut offered load and CPU pressure. It cannot make an
+oversubscribed fabric stop dropping. At ~0.5% loss the cluster is just
+past the cliff, not far past it, so headroom may be enough.
+
+**Cut bytes on the cluster network.** Per-node cluster egress at 18 GiB/s
+of client writes:
+
+| Scheme | Cluster egress | Raw used | Note |
+|---|---|---|---|
+| replication size=3 | 77.3 Gbps | 3.0× | current |
+| replication size=2 | 38.7 Gbps | 2.0× | −50% network |
+| EC 2+2 | 58.0 Gbps | 2.0× | −25% network, 2 MiB chunks |
+
+EC also halves the per-message burst, which may help incast granularity
+(caveat below), and `writefull` is the ideal EC case — full-object
+overwrite, no read-modify-write. But the failure domain count is a hard wall:
+
+```
+EC 4+2 needs 6 domains -> impossible on 4 hosts
+EC 3+2 needs 5         -> impossible
+EC 2+2 needs 4         -> exactly fits
+```
+
+Two operational caveats before anyone tries it: RBD on an EC data pool
+needs `allow_ec_overwrites`, and with 4 hosts EC 2+2 consumes every
+failure domain — one host down leaves the pool degraded with nowhere to
+recover into until it comes back. EC also halves the per-*message* size
+but raises fan-out from 2 peers to 3, so whether incast improves depends
+on per-port buffering; that one is plausible, not shown.
+
+And EC costs CPU, which is the resource already suspected. **EC is a bet
+on the fabric hypothesis; cutting CRC and op shards is a bet on the host
+one.** They pull against each other — hence §10.2.5 first.
+
+**A test pool that takes the fabric out of the path.** A CRUSH rule
+placing all three replicas on the *same host* puts replication on
+loopback. Two conditions make or
+break it: the pool has to carry comparable per-OSD load, or a quiet pool
+simply will not reproduce a load-driven failure; and co-locating three
+replicas triples that host's NVMe and CPU load, so "stalls persist"
+does not cleanly imply CPU — it may just be the new I/O load. Read a
+*negative* result (stalls vanish) as strong and a positive one as
+inconclusive. Note the existing loopback sockets prove nothing here: the
+CRUSH rule is `chooseleaf firstn 0 type host`, so replicas are never
+co-resident and those sockets carry no replication traffic.
+
+#### 10.3.4 Validation
+
+The fix is not validated on this cluster, and the Status line says why:
+nothing here separates a fabric drop from a host-side one, and the two
+lead to different work. That localisation comes first, on a node
+**while** `SLOW_OPS` is firing:
+
+```bash
+nstat -az | grep -iE 'TCPRcvQDrop|PruneCalled|RcvPruned|TCPBacklogDrop'
+awk '{print NR-1, $2, $3}' /proc/net/softnet_stat   # dropped, time_squeeze
+ethtool -S <if> | grep -iE 'rx_no_buffer|rx_missed|rx_fifo|tx_dropped'
+tc -s qdisc show dev <bond>
+```
+
+Host counters clean and switch discards high → the fabric, and §10.3.3's
+ranking applies. The reverse → the drops never left the node, and no
+switch work will help.
+
+Then confirm rather than assume: re-run `ceph-net-retrans.py --backoff`
+and watch the per-TB retransmit rate, and re-check `healthcheck history
+ls` for `SLOW_OPS`. The §10.3.1 lease change should stop the freezes
+while loss continues, so the two signals move independently —
+retransmits flat while `SLOW_OPS` goes quiet is the expected outcome,
+not a contradiction.
+
+#### 10.3.5 Takeaways
+
+- **`ceph health detail` reported three cosmetic warnings and missed a
+  cluster freezing for minutes.** The real signal was in
+  `healthcheck history ls` — active, 26 occurrences — and in two PGs
+  carrying a `laggy` flag nothing else surfaced.
+- **Healthy heartbeats do not mean a healthy path.** Heartbeats run on
+  dedicated sockets with no PG lock and never entered backoff, so no OSD
+  was marked down and no ping-time warning fired, while the sockets
+  carrying leases were silent for 24 seconds. Any diagnosis that reasons
+  "no OSD flapped, so the network is fine" is reasoning from the wrong
+  evidence.
+- **One laggy PG takes an entire OSD offline for clients.** 4 MiB
+  objects against a 500 MiB throttle means ~125 ops in flight; parked on
+  one PG, they pin the throttle and the OSD stops reading its sockets.
+  The blast radius is set by throttle ÷ object size, not by the PG.
+- **`tcp_info` localises loss to a connection, never to a hop.** Switch,
+  NIC ring and socket queue are indistinguishable from the sender. A
+  second VLAN on the same wire narrows it for free — but only if the two
+  carry comparable per-socket load, which here they did not.
+- **`retransmits > backoff` is a host-side drop detector**, and it is
+  printed by plain `ss -i`. Given enough samples it distinguishes "the fabric
+  dropped it" from "we never got it out of the box", with no switch
+  access at all.
+
+## 11. Tracker #80404 / PR #71663 — dead cluster sockets, parked ops, and the laggy latch that never lets go
 
 Found live in a `ceph_diagnostics` collection
 (`ceph-collect_20260909_140230`, captured mid-incident) and reported
@@ -3809,22 +4163,22 @@ upstream from an independent cluster:
 Ster · collection cluster: 48 OSDs, tentacle 20.2.2, 6 hosts × 8
 NVMe, 3× replication, 4 MiB RBD writes · component OSD
 (PeeringState / PrimaryLogPG) plus the fabric under the cluster
-network — the §6 disease with the §9 amplifier · fix: PR #71663
+network — the §10 disease with the §9 amplifier · fix: PR #71663
 upstream (reviewed below against main `5e757b85eaa`: correct),
 configuration and fabric work on the cluster · Status: PR under
-review; fabric localisation (§6.3.4) still to run on the hosts
+review; fabric localisation (§10.3.4) still to run on the hosts
 
 One issue, seen from two sides. The collection shows the wedge
 *while it is happening*: replication sockets dead in TCP backoff,
 ops parked behind them, health almost silent. The tracker shows what
 can happen *after* the network recovers: the PG has latched
 `PG_STATE_LAGGY`, and there is a code path where nothing ever clears
-it — the PG stays wedged until someone restarts an OSD. §10.2.1–.3
-walk the live capture; §10.2.4–.5 walk the upstream bug and the fix.
+it — the PG stays wedged until someone restarts an OSD. §11.2.1–.3
+walk the live capture; §11.2.4–.5 walk the upstream bug and the fix.
 
-## 10.1 Report
+### 11.1 Report
 
-### 10.1.1 The observation
+#### 11.1.1 The observation
 
 `ceph -s` during a 4 MiB write benchmark: everything `active+clean`,
 48/48 OSDs up, and
@@ -3855,15 +4209,15 @@ dropped. Raising `osd_client_message_size_cap` only enlarged the
 wedge — 124 stuck ops at 500M, 255 at 1024M — and the only recovery
 was restarting the OSDs.
 
-### 10.1.2 Reproducing it
+#### 11.1.2 Reproducing it
 
 From the collection, no live cluster needed:
 
 ```bash
 cds ceph -s ; cds ceph health detail            # the six OSDs
 cds ceph healthcheck history ls                 # 68 x SLOW_OPS, 32 x OSD_DOWN
-ops_in_flight summary                           # §10.2.1 - flag points per OSD
-./ceph-net-retrans.py <dir> --pairs --backoff   # §10.2.2 - the smoking gun
+ops_in_flight summary                           # §11.2.1 - flag points per OSD
+./ceph-net-retrans.py <dir> --pairs --backoff   # §11.2.2 - the smoking gun
 cds ceph config dump | grep -E 'grace|message_size_cap|objecter'
 ```
 
@@ -3874,9 +4228,9 @@ standalone test (`qa/standalone/osd/osd-lease-laggy.sh`). A write
 issued after lease expiry blocks forever without the fix and
 completes ~2 s after the latch with it.
 
-## 10.2 Analysis
+### 11.2 Analysis
 
-### 10.2.1 What the parked ops are waiting for
+#### 11.2.1 What the parked ops are waiting for
 
 Aggregating `dump_ops_in_flight` across all 48 OSDs: **1428 in-flight
 ops, and every single one has flag point `waiting for sub ops`** —
@@ -3898,7 +4252,7 @@ slow peer turns into a daemon-wide client freeze. It is even the
 same number as the tracker cluster, which counted 255 stuck ops at
 the same 1 GiB cap.
 
-### 10.2.2 Three mutual pairs, six dead sockets
+#### 11.2.2 Three mutual pairs, six dead sockets
 
 Grouping each stuck op by which peer its ack is missing from:
 
@@ -3930,7 +4284,7 @@ stops delivering, A's sub-ops to B and B's sub-ops to A strand
 together.
 
 The `--tcp-info` messenger dumps make this exact — the artifact the
-§6 collection never had. Cluster-wide:
+§10 collection never had. Cluster-wide:
 
 ```
 Network     Conns   Total retrans   RTT p50
@@ -3941,7 +4295,7 @@ client      4,442             242   3.43 ms
 Eight million retransmits on the cluster VLAN against 242 on the
 client VLAN, spread across *every* host pair (3.7–5.4 k per
 connection) — the fabric under the cluster network is dropping
-broadly, as in §6. But only six sockets were in RTO backoff at
+broadly, as in §10. But only six sockets were in RTO backoff at
 capture time, and they are precisely the three pairs, both
 directions:
 
@@ -3959,12 +4313,12 @@ have delivered nothing for over a minute, which matches the oldest
 op age (76 s) to within collection skew. Six sockets out of 1,902
 explain all 1,428 parked ops. And all six terminate on ceph4, which
 makes that host's NIC, cabling and switch port the first place to
-look (§10.3.2).
+look (§11.3.2).
 
-### 10.2.3 Why the cluster's safety nets were off
+#### 11.2.3 Why the cluster's safety nets were off
 
 None of Ceph's self-healing reacted, and this time it is not only
-the §6 "heartbeats ride healthy dedicated sockets" story. The
+the §10 "heartbeats ride healthy dedicated sockets" story. The
 cluster runs `osd_heartbeat_grace = 600` — presumably a past attempt
 to stop flapping — and that one setting quietly disabled three
 different protections:
@@ -3975,12 +4329,12 @@ different protections:
 - **The read lease became 0.8 × 600 = 480 s.** A PG only goes
   `laggy` when `mnow > readable_until`; with an 8-minute lease these
   wedges never live long enough. That is why this collection has
-  *zero* laggy PGs while §6's cluster (default 16 s lease) showed
+  *zero* laggy PGs while §10's cluster (default 16 s lease) showed
   them: same disease, different presentation. The lease still
   expires *before* mark-down (ratio 0.8 < 1.0), so correctness
   holds; what is lost is every early-warning signal on the way to a
   10-minute stall.
-- **The slow-ping health check moved to 30 s.** The §6.3.2
+- **The slow-ping health check moved to 30 s.** The §10.3.2
   coupling, observed in the wild: `mon_warn_on_slow_ping_ratio`
   (0.05) × 600 = 30 s, and indeed every one of the 48
   `dump_osd_network` files in the collection says
@@ -3997,7 +4351,7 @@ client sockets → cluster-wide write throughput collapses — while
 health shows `active+clean`, no laggy flag, no slow-ping warning,
 and nothing will time out for 10 minutes.
 
-### 10.2.4 The latch that outlives the outage
+#### 11.2.4 The latch that outlives the outage
 
 On a cluster with a default 16 s lease — like the tracker's — the
 same dead sockets take one more step: `readable_until` expires, the
@@ -4104,7 +4458,7 @@ exit is `Started::exit()` (`src/osd/PeeringState.cc:5482`), which
 clears `WAIT | LAGGY` on an interval change — and that never comes,
 because the OSD's heartbeats are fine.
 
-### 10.2.5 The fix in PR #71663 — and is it correct?
+#### 11.2.5 The fix in PR #71663 — and is it correct?
 
 The PR adds a second, independent loop that runs only while the PG
 is laggy: it re-checks readability periodically, and — the part that
@@ -4146,10 +4500,10 @@ of them hold:
 | Claim | Where verified |
 |---|---|
 | Once LAGGY, `check_laggy()` skips the time test | `PrimaryLogPG.cc:857` — the `else if (!state_test(PG_STATE_LAGGY))` shape above |
-| For acting > 1, only `proc_lease_ack()` clears it | all four `recheck_readable()` callers enumerated in §10.2.4 |
+| For acting > 1, only `proc_lease_ack()` clears it | all four `recheck_readable()` callers enumerated in §11.2.4 |
 | The renewal chain re-arms only itself | chain start is `all_activated_and_committed()`, once per interval; after that only `proc_renew_lease()` → `schedule_renew_lease()` |
 | Only an interval change clears the flag otherwise | `Started::exit()`, `PeeringState.cc:5482` |
-| The OSD is never marked down meanwhile | heartbeats use dedicated sockets, no PG lock — the §6 takeaway |
+| The OSD is never marked down meanwhile | heartbeats use dedicated sockets, no PG lock — the §10 takeaway |
 
 The watchdog itself is safe on the points that matter:
 
@@ -4165,7 +4519,7 @@ The watchdog itself is safe on the points that matter:
   (`recalc_readable_until()` takes the min *including* the sent
   bound), and a live chain keeps the sent bound at least
   `interval/2` ahead. Conversely, when replicas simply stop acking —
-  the §10.2.2 sockets — the sent bound stays fresh, so the watchdog
+  the §11.2.2 sockets — the sent bound stays fresh, so the watchdog
   correctly does *not* spam renewals; it just keeps re-checking
   until acks return.
 - **Restart is idempotent enough.** `proc_renew_lease()` moves
@@ -4186,9 +4540,9 @@ The watchdog itself is safe on the points that matter:
 
 Verdict: the diagnosis is accurate and the fix is correct.
 
-## 10.3 Proposed solution
+### 11.3 Proposed solution
 
-### 10.3.1 Upstream — the PR, plus four review comments
+#### 11.3.1 Upstream — the PR, plus four review comments
 
 The shape of PR #71663 is right. The two obvious alternatives are
 worse: removing the latch from `check_laggy()` would re-test the
@@ -4226,23 +4580,23 @@ the ones worth posting as review comments:
    `recheck_readable()` with the same latch-and-clear structure.
    Same trap, separate fix needed — worth a note on the tracker.
 
-### 10.3.2 On the cluster
+#### 11.3.2 On the cluster
 
 **First, localise on ceph4, while it is happening.** Every backoff
-socket has one end there; that is a strong prior the §6 collection
-never produced. The §6.3.4 commands apply verbatim on ceph4 (host
+socket has one end there; that is a strong prior the §10 collection
+never produced. The §10.3.4 commands apply verbatim on ceph4 (host
 counters vs switch discards decide fabric-vs-host); with switch
 access, the port counters for ceph4's cluster-VLAN uplink are the
 single most valuable read.
 
 **Second, undo the grace tuning.** `osd_heartbeat_grace = 600` is
-the §6.3.1 fix overshot by 15×, and §10.2.3 is the bill: it does not
+the §10.3.1 fix overshot by 15×, and §11.2.3 is the bill: it does not
 prevent the wedge (TCP backoff, not heartbeats, is the mechanism),
-it only hides it and slows recovery. The §6.3.1 values — grace 40–60
+it only hides it and slows recovery. The §10.3.1 values — grace 40–60
 with `mon_warn_on_slow_ping_time 1000` pinned — keep the
 freeze-survival margin while restoring mark-down, laggy visibility,
 and ping warnings. With a sane lease these wedges *would* latch
-`laggy`, which is also what makes the §10.2.5 watchdog directly
+`laggy`, which is also what makes the §11.2.5 watchdog directly
 relevant to this cluster: without it, any lost renewal event turns a
 minutes-long network event into a permanent wedge.
 
@@ -4263,7 +4617,9 @@ PR #71663 merged, the same event degrades throughput instead of
 freezing six OSDs behind three dead sockets — and can no longer
 leave a PG laggy forever after the network heals.
 
-# 11. PR #71209 — S3 over RDMA served directly from the OSDs
+# Part IV — RGW
+
+## 12. PR #71209 — S3 over RDMA served directly from the OSDs
 
 [PR #71209](https://github.com/ceph/ceph/pull/71209) · RFC against `main`
 (Umbrella) · 30 commits, ~4,000 added lines across rgw/osdc/osd/common ·
@@ -4275,7 +4631,7 @@ Objecter → OSD → RDMA NIC → client memory — and uses the commits and sou
 only to show how that architecture is implemented. It is written from the
 code at the branch tip (`wip-rgw-cuobj-osd`), not from the PR description.
 
-## 11.1 One-minute summary
+### 12.1 One-minute summary
 
 An S3 client that speaks the NVIDIA cuObject protocol sends an opaque RDMA
 descriptor (`x-amz-rdma-token`) with its GET. Instead of reading the object
@@ -4294,7 +4650,7 @@ stripe as the signal to restart the whole GET in a fallback mode. Every
 degradation path is plain, correct, in-band data; there is no protocol error
 anywhere.
 
-## 11.2 The problem
+### 12.2 The problem
 
 RGW is a proxy on the data path. For a GET, every object byte crosses the
 fabric twice and is staged in gateway memory in between:
@@ -4334,7 +4690,7 @@ For GPU-direct workloads (training clusters reading from S3 into GPU
 memory), the gateway hop is pure overhead: the client's window is already
 registered with its NIC, and the OSDs already hold the bytes.
 
-## 11.3 New data path
+### 12.3 New data path
 
 ```text
 S3 Client
@@ -4366,7 +4722,7 @@ fabric traffic halves. This is exactly the "gateway instructs data nodes,
 data nodes push via RDMA_WRITE" reference flow in NVIDIA's cuObject
 documentation (§1.3.3).
 
-## 11.4 The concepts, one at a time
+### 12.4 The concepts, one at a time
 
 ```text
 Concept            What it means                          Why it is needed
@@ -4423,7 +4779,7 @@ inline fallback    Refusal == normal read reply.          One degradation path f
                                                           same bytes the client asked for.
 ```
 
-## 11.5 End-to-end GET flow
+### 12.5 End-to-end GET flow
 
 ```text
 Client
@@ -4477,7 +4833,7 @@ every stripe op, every RDMA write from every OSD still in contact has
 landed. The drained reply *is* the completion interlock; the HTTP response
 is the client's only completion signal.
 
-## 11.6 RGW changes
+### 12.6 RGW changes
 
 `src/rgw/rgw_op.{h,cc}`, `src/rgw/rgw_rest_s3.cc`,
 `src/rgw/driver/rados/rgw_rados.{h,cc}`, `src/rgw/rgw_sal.h`.
@@ -4536,7 +4892,7 @@ when a token arrived but data went over HTTP. RDMA bytes are accounted in
 the beast access log, ops log and usage log (`rgw_log.cc`,
 `s->rdma_bytes_transferred`).
 
-## 11.7 librados / Objecter changes
+### 12.7 librados / Objecter changes
 
 `src/include/rados/librados.hpp`, `src/librados/librados_cxx.cc`,
 `src/osdc/Objecter.{h,cc}`.
@@ -4561,16 +4917,16 @@ out-pointers). Two places matter:
 * `Objecter::_prepare_osd_op()` — stamps the descriptors onto the `MOSDOp`,
   but **only** when `osdmap->require_osd_release >= umbrella`. This is
   re-evaluated on *every* send, resends included; the OSD-side
-  retransmission refusal keeps re-stamped descriptors inert (§11.14).
+  retransmission refusal keeps re-stamped descriptors inert (§12.14).
 * `Objecter::handle_osd_op_reply()` — copies `oob_results[i]` from the
   reply into each registered result slot; an inline reply (no vector) reads
   back as all-zero results.
 
 There is also `IoCtx::pool_rdma_delivery_lease(double*)`, which reads the
 pool's lease from the client's own OSDMap — the same value the OSDs
-enforce, which is the point (§11.13).
+enforce, which is the point (§12.13).
 
-## 11.8 MOSDOp protocol changes
+### 12.8 MOSDOp protocol changes
 
 `src/messages/MOSDOp.h` (v9 → **v10**), `src/messages/MOSDOpReply.h`
 (v8 → **v9**), `src/common/rdma_token.h` (the encoded types).
@@ -4612,7 +4968,7 @@ Why the descriptor belongs on `MOSDOp` rather than in an op:
   wire-format hazards the commit message of `59a1146c2d0` calls out
   explicitly.
 
-Compatibility encoding (§11.16 has the full story): the encoder emits v10
+Compatibility encoding (§12.16 has the full story): the encoder emits v10
 only to peers with the `SERVER_UMBRELLA` feature and silently downgrades to
 v9 otherwise — losing the descriptors, which is safe *because they are
 advisory*. The reply's `oob_results` likewise encodes only to umbrella
@@ -4622,7 +4978,7 @@ The lease is deliberately **not** on the wire: it is the pool option
 `rdma_delivery_lease`, so the OSD that enforces it and the client that
 sizes its fence from it read the same OSDMap value and cannot disagree.
 
-## 11.9 The OSD delivery path
+### 12.9 The OSD delivery path
 
 `src/osd/PrimaryLogPG.{h,cc}`, `src/osd/osd_cuobj.{h,cc}`, `src/osd/OSD.cc`.
 
@@ -4649,7 +5005,7 @@ re-entry, and cache-tier proxy reads with one shim (commit `e07b3f8d7d7`).
 returns the data inline:
 
 1. descriptor vector doesn't mirror `ops` → malformed, inline;
-2. `m->get_retry_attempt() > 0` → retransmitted request, inline (§11.14);
+2. `m->get_retry_attempt() > 0` → retransmitted request, inline (§12.14);
 3. `osd->get_mnow() > recovery_state.get_readable_until()` → the PG read
    lease lapsed *after* dispatch (a read can stall between `check_laggy`
    and the reply); past `readable_until` another acting set may already be
@@ -4661,7 +5017,7 @@ returns the data inline:
 Then per op, `deliver_op_oob()`: unknown flag bits → inline; op is not
 READ/SYNC_READ/SPARSE_READ → inline (descriptors on guards or stat ops are
 ignored); failed or empty read → inline. Otherwise it builds a placement
-plan (§11.10), calls `OSDCuObj::execute_plan()`, and on success clears
+plan (§12.10), calls `OSDCuObj::execute_plan()`, and on success clears
 `outdata` (a sparse read keeps its extent map inline with an empty data
 blob) and fills `oob_results[i]`.
 
@@ -4692,7 +5048,7 @@ return total bytes only if every write completed, else negative errno
       -> caller delivers inline
 ```
 
-## 11.10 Placement planning
+### 12.10 Placement planning
 
 `src/osd/oob_placement.{h,cc}` — pure functions, no OSD or RDMA
 dependencies, so the interleave math unit-tests standalone
@@ -4763,7 +5119,7 @@ The plan builders are tested against the client-side stripe walk
 (`ECStripeIterator`) as the oracle across randomized geometries — the two
 independent implementations of the same layout math must agree.
 
-## 11.11 Replicated pools
+### 12.11 Replicated pools
 
 The common case is boring on purpose. RGW reads go to the primary; the
 whole stripe read produces one contiguous reply; `linear_plan()` collapses
@@ -4801,7 +5157,7 @@ whose `out_bl`/`out_ec` slots aliased the same `Details` entry, and the
 second reply silently overwrote the first chunk's data. Ceiling division
 fixes the count. Worth knowing about even if you never enable RDMA.
 
-## 11.12 EC pools
+### 12.12 EC pools
 
 Two distinct read paths, and the distinction is a property of the pool and
 read policy, not of this PR:
@@ -4844,7 +5200,7 @@ a listed follow-up), as does any pool whose `sinfo` lacks
 EC stripes (`rgw_obj_stripe_size == stripe_width`), each shard holds one
 contiguous range and the "interleave" collapses to a single write anyway.
 
-## 11.13 Correctness: lease, fencing, interlock
+### 12.13 Correctness: lease, fencing, interlock
 
 One-sided RDMA breaks an assumption RADOS retry machinery relies on: a
 request the client gave up on can still have *side effects in client
@@ -4874,7 +5230,7 @@ re-sends reads after peering; the resend carries `retry_attempt > 0` and
 the OSD refuses to push it. So at most one attempt of an op ever writes the
 window — the superseded attempt's write may still be in flight on another
 OSD, and two writers to one range would race. This also keeps the
-Objecter's re-stamped descriptors (§11.7) harmless.
+Objecter's re-stamped descriptors (§12.7) harmless.
 
 **3. Lease + fence (OSDs that vanished).** The pool's
 `rdma_delivery_lease` (default 5 s, `ceph osd pool set <pool>
@@ -4906,11 +5262,11 @@ This is why the mechanism is called **advisory**: the OSD promises nothing.
 Every "no" — and every crash — converges on the same outcome the client
 can always handle: inline data, or no reply and a fenced retry.
 
-## 11.14 Retry and failure handling, concretely
+### 12.14 Retry and failure handling, concretely
 
 * **One OSD lacks the feature** → its stripe arrives inline →
   `flush_rdma()` returns `-EOPNOTSUPP` → RGW cancels/drains the remaining
-  stripe ops, fences (§11.13), restarts the GET staged or plain-HTTP.
+  stripe ops, fences (§12.13), restarts the GET staged or plain-HTTP.
   Client ranges already RDMA-written get harmlessly rewritten; no HTTP
   byte had been committed, so the restart is invisible.
 * **OSD crashes mid-request** → the Objecter resends after peering; the
@@ -4930,7 +5286,7 @@ can always handle: inline data, or no reply and a fenced retry.
   passthrough that claimed success) → `-EIO`, request fails; this is a
   should-never-happen consistency check, not a fallback.
 
-## 11.15 Integrity: CRC64-NVME end to end
+### 12.15 Integrity: CRC64-NVME end to end
 
 The gateway never touches passthrough data, so verification moves to where
 the data is. With `rgw_cuobj_crc64nvme` (default on), each OSD checksums
@@ -4969,7 +5325,7 @@ sparse reads "skip verification" — text that predates the final per-range
 CRC commit — while the *Configuration* section correctly describes the
 range-fold. The code implements the range-fold.
 
-## 11.16 Mixed-version compatibility
+### 12.16 Mixed-version compatibility
 
 ```text
 New RGW (umbrella librados)
@@ -5013,7 +5369,7 @@ Old RGW / new OSD needs nothing: no token, no descriptor, no change.
 reserved-unused op slot (`src/include/rados.h`, RD|DATA 34) so nothing ever
 reuses those bytes against a build of the interim series.
 
-## 11.17 RGW fallback ladder
+### 12.17 RGW fallback ladder
 
 ```text
 S3 GET
@@ -5067,7 +5423,7 @@ everything), which keeps the client contract binary — either
 `x-amz-rdma-reply: 200` and all bytes are in the window, or the body has
 everything.
 
-## 11.18 Performance implications
+### 12.18 Performance implications
 
 ```text
 old:   OSD ----data----> RGW ----data----> Client        2 fabric crossings,
@@ -5114,7 +5470,7 @@ planned:  NVMe --DMA--> registered hugepage pool --NIC DMA--> client memory
   sentence — the PR explicitly wants a 2-OSD hardware PoC before
   graduating from RFC.
 
-## 11.19 Important source files and the commit layers
+### 12.19 Important source files and the commit layers
 
 The 30 commits, grouped by architectural layer (not in order):
 
@@ -5213,7 +5569,7 @@ get_obj_data::flush_rdma() / drain           fallback detection, CRC fold
 RGWGetObj_ObjStore_S3::send_response_data()  x-amz-rdma-reply header
 ```
 
-## 11.20 A complete 64 MiB GET, replicated pool
+### 12.20 A complete 64 MiB GET, replicated pool
 
 Client registers a 64 MiB window, sends
 `GET /bucket/model.bin` + `x-amz-rdma-token`. RGW's manifest walk yields 16
@@ -5271,7 +5627,7 @@ with `x-amz-rdma-reply: 501`. Stripes 0 and 1, already sitting in client
 memory, are simply rewritten with identical bytes. The client sees one
 slower GET, nothing else.
 
-## 11.21 Key takeaways
+### 12.21 Key takeaways
 
 1. **RGW stops being the GET data path.** Control plane (auth, manifest,
    HTTP, accounting) stays; the bytes go OSD→client once, and GET
@@ -5315,342 +5671,3 @@ slower GET, nothing else.
 10. **Still an RFC:** no benchmark numbers in the PR, crimson out of
     scope, EC-direct sparse reads inline, and the multi-initiator
     single-window pattern awaits a 2-OSD hardware PoC on ConnectX-5+.
-
-# 12. Tracker #80501 — a `#ifdef` that made `fsync()` a no-op on FreeBSD for nine years
-
-Reported as a heap-use-after-free in `~FileWriter()` · affects BlueFS on
-every platform built with POSIX AIO (FreeBSD) — Linux is not affected ·
-component os/bluestore (BlueFS) · fix: a named `HAVE_AIO` guard, four lines in BlueFS ·
-Status: root cause differs from the report's; proposed PR #71766 fixes the
-symptom and leaves the durability hole open
-
-## 12.1 Report
-
-### 12.1.1 The observation
-
-[Tracker #80501](https://tracker.ceph.com/issues/80501) (Willem Jan
-Withagen, 2026-09-13, FreeBSD): `unittest_bluefs
---gtest_filter=BlueFS_wal.wal_v2_simulate_crash` crashes about once in
-200 runs. Under AddressSanitizer it is deterministic within ~120
-iterations:
-
-```
-==54046==ERROR: AddressSanitizer: heap-use-after-free
-READ of size 8 at 0x5130000061a8 thread T4
-    #0 aio_t::get_return_value()          src/blk/aio/aio.h:76
-    #1 KernelDevice::_aio_thread()        src/blk/kernel/KernelDevice.cc:730
-
-freed by thread T0 here:
-    #9  std::list<aio_t>::~list()
-    #10 IOContext::~IOContext()           src/blk/BlockDevice.h:79
-    #11 BlueFS::FileWriter::~FileWriter() src/os/bluestore/BlueFS.h:481
-    #12 BlueFS_wal_wal_v2_simulate_crash_Test::TestBody()
-                                          src/test/objectstore/test_bluefs.cc:1339
-previously allocated by thread T0 here:
-    #7  std::list<aio_t>::push_back(aio_t&&)
-    #8  KernelDevice::aio_write()         src/blk/kernel/KernelDevice.cc:1216
-    #9  BlueFS::_flush_data()             src/os/bluestore/BlueFS.cc:4230
-```
-
-The device's completion thread reads an `aio_t` that the writer's
-destructor has already freed. The reporter's reading: `fsync()` only
-*submits* aios and never waits for them, so a `FileWriter` deleted
-without `close_writer()` still has I/O in flight. Proposed fix
-([PR #71766](https://github.com/ceph/ceph/pull/71766)): call
-`aio_wait()` on each `IOContext` inside `~FileWriter()`.
-
-The test itself ([`test_bluefs.cc:1300`](https://github.com/ceph/ceph/blob/v21.3.0/src/test/objectstore/test_bluefs.cc#L1300))
-is a crash simulation — 100 rounds of `append_try_flush` + `fsync`,
-then a bare `delete writer` with the comment *"close without orderly
-shutdown, simulate failure"*, then remount and verify the data. The
-bare delete is deliberate: on a real crash nothing calls
-`close_writer()` either.
-
-### 12.1.2 Reproducing it
-
-FreeBSD is not needed. The race is a property of a build configuration,
-and that configuration can be reproduced on Linux by hand (§12.2.1
-explains why these four lines are the whole difference):
-
-```bash
-# in src/os/bluestore/BlueFS.cc (3 sites) and BlueFS.h (1 site):
-sed -i 's|^#ifdef HAVE_LIBAIO$|#if 0 /* what FreeBSD sees */|' \
-    src/os/bluestore/BlueFS.cc src/os/bluestore/BlueFS.h
-
-cmake -DWITH_ASAN=ON -DWITH_TESTS=ON ..   # RelWithDebInfo
-ninja bin/unittest_bluefs
-export ASAN_OPTIONS=halt_on_error=1:abort_on_error=1
-for i in $(seq 1 200); do
-  bin/unittest_bluefs --gtest_filter='BlueFS_wal.wal_v2_simulate_crash' \
-    > /dev/null 2>&1 || { echo "crash at iteration $i"; break; }
-done
-```
-
-Two control arms decide the question: the same binary built from
-unmodified `main` (the guards in), and one built with the four guards
-widened to `defined(HAVE_LIBAIO) || defined(HAVE_POSIXAIO)` — the fix
-proposed in §12.3. Results in §12.3.3.
-
-## 12.2 Analysis
-
-### 12.2.1 Root cause, top to bottom
-
-The report's chain starts one level too high. `fsync()` on Linux *does*
-wait; the question is why it does not on FreeBSD.
-
-```
-completion thread reads a freed aio_t
- └─ why?   ~FileWriter() → ~IOContext() → list<aio_t>::~list() freed
-           it while the kernel still owned the I/O   (BlueFS.h:473)
- └─ why was I/O still in flight after 100 fsync() calls?
-           on Linux it cannot be: _fsync → _flush_bdev(h) →
-           _wait_for_aio(h) → IOContext::aio_wait() blocks until
-           num_running == 0                          (BlueFS.cc:4479)
- └─ so why is it in flight on FreeBSD?
-           that block — _claim_completed_aios + _wait_for_aio —
-           is wrapped in  #ifdef HAVE_LIBAIO,  and FreeBSD builds
-           with HAVE_POSIXAIO, not HAVE_LIBAIO     (CMakeLists.txt:250)
-           → on FreeBSD the wait is compiled out and fsync() returns
-             the moment the aios are *submitted*
- └─ why did nothing notice for nine years?
-           until PR #71449 (2026-09, same author) KernelDevice::aio_write
-           was ALSO #ifdef HAVE_LIBAIO — so FreeBSD never submitted an
-           aio at all; every write fell through to the synchronous
-           path, and a wait for nothing was harmless
-                                                (KernelDevice.cc:1171)
- └─ why is the guard wrong?
-           2017-09: FreeBSD POSIX-AIO support lands   (9ae94e48be8)
-           2017-11: "build bluestore w/o libaio" wraps the BlueFS
-                    waits in HAVE_LIBAIO             (57e792bcae2)
-           KernelDevice::aio_write was ALREADY #ifdef HAVE_LIBAIO
-           (since 2016, before the port), so FreeBSD I/O was
-           synchronous from day one and the BlueFS guards were
-           consistent with that. PR #71449 widens one side and not
-           the other — that is where the inconsistency is born
-```
-
-The bottom of the chain is a preprocessor condition that names one
-implementation of an interface instead of the interface. `IOContext`
-has its `pending_aios`/`running_aios` lists and its `aio_wait()`
-under the correct dual guard; BlueFS simply never calls them on the
-second backend.
-
-Three sites are affected, all with the same shape:
-
-| Site | What it skips on FreeBSD |
-|---|---|
-| [`BlueFS.cc:3333`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.cc#L3333) `_rewrite_log_and_layout_sync` | wait for the log rewrite before writing the new superblock |
-| [`BlueFS.cc:4200`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.cc#L4200) | the definitions of `_claim_completed_aios` / `_wait_for_aio` |
-| [`BlueFS.cc:4479`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.cc#L4479) `_flush_bdev(FileWriter*)` | the wait inside every `fsync()` |
-
-`_drain_writer()`
-([`BlueFS.cc:4848`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.cc#L4848))
-is *not* guarded — it calls `aio_wait()` directly — which is exactly why
-`close_writer()` is safe on FreeBSD and only the bare `delete` crashes.
-The report's "close_writer drains, the destructor doesn't" is a correct
-observation of the wrong boundary.
-
-### 12.2.2 Why the crash is the small problem
-
-What `fsync()` promises and what it delivers, per backend, on the
-current tree with PR #71449 applied:
-
-```
-   Linux (HAVE_LIBAIO)                    FreeBSD (HAVE_POSIXAIO)
-
-   fsync(h)                               fsync(h)
-   ├─ _flush_F        submit aio          ├─ _flush_F        submit aio
-   ├─ _flush_bdev(h)                      ├─ _flush_bdev(h)
-   │  ├─ _wait_for_aio  ◄── blocks ──┐    │  │   #ifdef HAVE_LIBAIO
-   │  │    until num_running == 0    │    │  │   ... compiled out ...
-   │  └─ bdev->flush()  fdatasync    │    │  └─ bdev->flush()
-   └─ return 0                       │    │       io_since_flush is
-                                     │    │       still false (the
-   aio thread: kernel done ──────────┘    │       aio thread has not
-                                          │       run) → returns 0
-                                          │       WITHOUT fdatasync
-                                          └─ return 0
-                                                   ▲
-                                          aio thread: kernel done, later
-```
-
-Two things go wrong on the right, and only the second is visible:
-
-1. **The data is not durable when `fsync()` returns.** `KernelDevice::flush()`
-   ([`KernelDevice.cc:504`](https://github.com/ceph/ceph/blob/v21.3.0/src/blk/kernel/KernelDevice.cc#L504))
-   is gated on `io_since_flush`, a flag set by the *completion* thread.
-   If the aio has not completed yet, the flag is still false and
-   `flush()` returns without calling `fdatasync` at all
-   ([`:517`](https://github.com/ceph/ceph/blob/v21.3.0/src/blk/kernel/KernelDevice.cc#L517)).
-   So the write is neither complete nor synced, and RocksDB's WAL —
-   the caller — has been told it is. Its own comment says as much:
-   *"we are not really protecting data here."*
-2. **The `aio_t` outlives its I/O.** With no wait anywhere on the path,
-   the last `fsync()` before `delete writer` leaves the aio in flight;
-   `~IOContext` frees the list node; the completion thread dereferences
-   it. This is the ASan report.
-
-PR #71766 puts an `aio_wait()` in `~FileWriter()`. That closes (2) and
-nothing else: after it, `fsync()` on FreeBSD still returns before the
-data is on disk. A destructor is the last place a stale aio can bite, so
-waiting there makes the *test* pass; it does not make the *filesystem*
-correct.
-
-### 12.2.3 Why Linux never sees it
-
-`HAVE_LIBAIO` is true on every Linux build with libaio present
-([`CMakeLists.txt:259`](https://github.com/ceph/ceph/blob/v21.3.0/CMakeLists.txt#L259)),
-so all three waits compile in. The wake/wait protocol between
-`try_aio_wake()`
-([`BlockDevice.h:122`](https://github.com/ceph/ceph/blob/v21.3.0/src/blk/BlockDevice.h#L122))
-and `aio_wait()`
-([`BlockDevice.cc:62`](https://github.com/ceph/ceph/blob/v21.3.0/src/blk/BlockDevice.cc#L62))
-is sound: the completion thread decrements `num_running` under the
-context lock and touches neither `ioc` nor `aio[]` afterwards
-(KernelDevice.cc:755, with a comment saying exactly that). A waiter that
-observed `num_running == 0` is guaranteed the completion thread is done
-with every node in the list. `_claim_completed_aios` splices
-`running_aios` out *before* the wait and frees the spliced list *after*
-it — relinking, not freeing, so the completion thread's pointers stay
-valid across the splice. No window on Linux.
-
-## 12.3 Proposed solution
-
-### 12.3.1 The fix
-
-Two commits. The first is a refactor with no behaviour change: the
-condition "some AIO backend is present" was spelled out as
-`defined(HAVE_LIBAIO) || defined(HAVE_POSIXAIO)` at nine sites in
-`BlockDevice.{h,cc}` and once in cmake, so give it a name where the two
-backend flags already come from:
-
-```cmake
-# CMakeLists.txt, right after HAVE_LIBAIO / HAVE_POSIXAIO are decided
-if(HAVE_LIBAIO OR HAVE_POSIXAIO)
-  set(HAVE_AIO ON)
-endif()
-```
-
-emitted through `acconfig.h` as `#cmakedefine HAVE_AIO`, and every
-site that tested the pair now tests `#ifdef HAVE_AIO`. The backend
-*selectors* in `aio.h`/`aio.cc` (`#if HAVE_LIBAIO … #elif
-HAVE_POSIXAIO`) are untouched — those pick an implementation, this only
-says one exists. Preprocessed `BlockDevice.cc` before and after: byte-identical.
-
-The second commit is the fix, and it is still four lines:
-
-```diff
- // src/os/bluestore/BlueFS.cc  (3 sites)  and  BlueFS.h  (1 site)
--#ifdef HAVE_LIBAIO
-+#ifdef HAVE_AIO
-```
-
-Now the guard says what these sites mean — *there are aios to wait
-for* — instead of naming one backend, so a third backend cannot
-re-create this bug. It restores `fsync()`'s wait on the platform that
-PR #71449 has just made asynchronous. On Linux `HAVE_AIO` and
-`HAVE_LIBAIO` coincide, so nothing changes.
-
-The `aio_wait()` in `~FileWriter()` from PR #71766 is complementary, not
-redundant. Public `flush()` submits without waiting on every platform,
-so `flush(); delete writer;` — flushed but never fsynced — would hit the
-same UAF on Linux today; nothing in-tree does that, and `close_writer()`
-is the documented contract (`// NOTE: caller must call
-BlueFS::close_writer()`, [`BlueFS.h:467`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.h#L467)),
-but the destructor wait is the only thing that covers it. What it does
-not do is make `fsync()` honest; that needs the guard.
-
-### 12.3.2 Why it is safe
-
-**On Linux it is a no-op.** `HAVE_LIBAIO` is already defined; the
-widened condition evaluates identically. Byte-for-byte the same object
-code.
-
-**On FreeBSD it enables code that already compiles.**
-`_claim_completed_aios` and `_wait_for_aio` use only `IOContext`
-members (`running_aios`, `aio_wait()`) that `BlockDevice.h` already
-provides under `HAVE_POSIXAIO`. There is no libaio-specific type in
-either function.
-
-**It does not change behaviour on a FreeBSD tree *without* PR #71449.**
-There, `aio_write` still takes the synchronous fallback, `num_running`
-is always 0, and `aio_wait()` returns immediately.
-
-**It closes both problems at once.** With the wait in place, the
-`io_since_flush` flag is guaranteed set by the time `flush()` is called
-(the completion thread has run — that is what the wait waited for), so
-`fdatasync` is issued; and the `aio_t` list is empty by the time the
-destructor runs.
-
-### 12.3.3 Validation
-
-Three builds of `unittest_bluefs` on the same host (c28, Fedora 42,
-gcc 15, RelWithDebInfo + ASan, `main` at `a2c71ca9282`), each run 200×
-with `ASAN_OPTIONS=halt_on_error=1`:
-
-| Build | Guards | Simulates | Result |
-|---|---|---|---|
-| A · `main` unmodified | in | Linux today | **0** crashes |
-| B · guards forced to `#if 0` | out | FreeBSD + PR #71449 | **23** crashes, first at iteration 2 |
-| C · guards widened (§12.3.1) | in, both backends | FreeBSD with this fix | **0** crashes — binary byte-identical to A (same md5) |
-| D · `HAVE_AIO` form (§12.3.1), rebased on `44fded082ce` | in, both backends | the two commits as proposed | **0** crashes; `_flush_bdev` under FreeBSD macros contains the wait; `-fsyntax-only` clean |
-
-Arm B reproduces the tracker at ~11 % per run — some 20× the reporter's
-1-in-200, ASan and a faster host widening the window. The ASan stack on
-Linux is the tracker's stack with one extra frame of information: the
-freed `aio_t` was allocated in `KernelDevice::aio_write` called from
-`_flush_data` ← `_flush_envelope_F` ← `_flush_F` ← **`BlueFS::_fsync`**
-← `many_small_writes:1050` — i.e. it was submitted by the *last*
-`fsync()`, which returned without waiting for it. The UAF site is one
-frame earlier than on FreeBSD (`get_next_completed` writing
-`paio[i]->rval`, [`aio.cc:110`](https://github.com/ceph/ceph/blob/v21.3.0/src/blk/aio/aio.cc#L110),
-rather than `get_return_value` reading it): libaio's `io_event.obj`
-still points at the freed node, so the first touch faults instead of the
-second.
-
-That `_wait_for_aio` is genuinely absent from B and present in A and C
-is checked with `nm -C`: 2 symbols, 0, 2.
-
-**The durability hole, measured.** A bpftrace script on the same
-binaries — uprobes on `BlueFS::fsync` entry/return, `libc:fdatasync`,
-and the return of `aio_queue_t::get_next_completed` — over five runs
-each:
-
-| | `fsync()` calls | returned **without any `fdatasync`** |
-|---|---|---|
-| A · guards in | 95 | **0** |
-| B · guards out | 95 | **13** |
-
-One `fsync()` in seven returns 0 having neither waited for its aio nor
-issued `fdatasync`, because `KernelDevice::flush()` saw
-`io_since_flush == false` — the completion thread had not run yet — and
-took its early exit. In A, the wait guarantees the completion thread
-*has* run before `flush()` is called, and the flag is always set.
-
-PR #71766's destructor `aio_wait()` would take arm B's crash count from
-23 to 0 and leave the 13 exactly where it is.
-
-### 12.3.4 Takeaways
-
-- **A guard that names an implementation is a latent bug on every
-  other implementation.** `HAVE_LIBAIO` meant "we have async I/O" in
-  2017 because libaio was the only async I/O. The day a second backend
-  arrived, every such guard became a question: does this block belong
-  to *libaio* or to *async*? The FreeBSD port answered it correctly in
-  `BlockDevice.h`; `BlueFS.cc` and `KernelDevice.cc` were never asked,
-  and stayed consistent with each other only by both being wrong the
-  same way. Naming the condition (`HAVE_AIO`) is what stops the
-  question being asked site by site.
-- **A dead code path can hide a wrong guard indefinitely.** For nine
-  years FreeBSD's `aio_write` was synchronous, so the missing wait
-  waited for nothing. PR #71449 made the I/O real and the missing wait
-  became a missing wait. The two PRs are from the same author, weeks
-  apart, and the second is diagnosing a consequence of the first.
-- **Fix where the promise is made, not where the corpse is found.**
-  The UAF is in the destructor; the broken promise is `fsync()`
-  returning early. Waiting in the destructor makes the test green and
-  leaves the WAL non-durable. The ASan trace pointed at the freed
-  object's *last* touch; the bug is at the *first* place the wait was
-  supposed to happen.
-- **Read the platform's build flags before the platform's stack
-  trace.** Everything here follows from one line of `CMakeLists.txt`.

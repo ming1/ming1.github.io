@@ -2297,7 +2297,7 @@ receive buffer *is* page-aligned, and `Transaction::encode` *has* an
 that would put the payload at offset 0; it is simply never engaged for
 client writes, because `op_t` is built without the peers' features.
 §7.4 has the census and the one-line fix, and
-[§5 of the tracker-notes post]({% post_url 2026-08-12-ceph-tracker-notes %})
+[§8 of the tracker-notes post]({% post_url 2026-08-12-ceph-tracker-notes %})
 the root-cause chain; §3.3.8 below shows this trace with the fix in.
 
 ### 3.3.5 Lines 20–31, two pipelines in parallel
@@ -2499,7 +2499,7 @@ of the trace is not the microseconds; it is that the replica lane lost
 exactly one line, and that line was a full-payload copy on every
 replicated write. §7.4 has the copy census at 128 KiB and 4 KiB
 deferred; the [tracker-notes post]({% post_url 2026-08-12-ceph-tracker-notes %})
-(§5) the root cause and the fix's safety argument.
+(§8) the root cause and the fix's safety argument.
 
 ## 3.4 One 16 KiB write to an erasure-coded pool
 
