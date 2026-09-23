@@ -1443,6 +1443,33 @@ Only the block-21 cut falls inside a 64 KiB window:
 | 2 | 32–47 | 61443 | shard 1 | inline, local |
 | 3 | 48–63 | 61444 | shard 2 | inline, local |
 
+**Why the cut is at 0x15000.** `ExtentMap::reshard()` walks the extents
+in order and adds `extent_avg` (encoded bytes ÷ extent count) per extent.
+It cuts before an extent when:
+
+```
+estimate + extent_avg > 500          no blob crosses here   (target)
+estimate + extent_avg > 500 + 100    a blob crosses here    (+ slop, 20% of target)
+```
+
+The capture fits one whole-object reshard with `extent_avg` = 28. It ran
+when the inline map first passed 1200 B: after the write to block 40,
+with 43 extents (43 × 28 ≈ 1204–1246 B). Window 2 was half written then,
+so 21 extents lay between blocks 21 and 48:
+
+```
+extent at   blob crosses?     estimate + 28        limit   result
+block 16    no                16 x 28 + 28 = 476   500     no cut
+block 20    yes               20 x 28 + 28 = 588   600     no cut
+block 21    yes               21 x 28 + 28 = 616   600     cut 0x15000
+block 32    no                11 x 28 + 28 = 336   500     no cut
+block 48    no                21 x 28 + 28 = 616   500     cut 0x30000
+```
+
+The window edge at block 16 is 24 B short of the target, so the cut moves
+into window 1. This is inferred from the code and the capture, not traced:
+only `extent_avg` = 28 gives both cuts (27 → blocks 22, 48; 29 → 20, 40).
+
 Both §6.2 outcomes meet at the block-21 cut:
 
 ```
