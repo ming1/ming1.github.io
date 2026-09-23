@@ -1437,64 +1437,51 @@ blobs) · fix: one guard · Status: fix and regression test local on
 
 ### 6.1 The story in one view
 
-`merge_blob()` walks a blob's allocated pextents, but copies its checksums
-in whole csum chunks. An alloc hint can make the csum chunk larger than
-`min_alloc_size`. Fragmented free space can then split one chunk across two
-pextents. `can_merge_blob()` does not check for this, so the clone aborts.
+`merge_blob()` walks a blob's pextents, but copies its checksums in whole
+csum chunks. If one csum chunk is split across two pextents, there is no
+whole chunk to copy, and the OSD aborts. `can_merge_blob()` never checks
+for this.
 
 ```
       write path (object a)                  clone path (dup_esb)
       ------------------------------------   -----------------------------------
  #1   alloc hint SEQUENTIAL_READ+IMMUTABLE
       -> csum chunk 32K > min_alloc 4K
- #2   A shared by a clone; next 32K write
-      -> new blob B, same blob_start as A;
-      fragmented free space -> the 32K
-      chunk is stored as 0x3000 + 0x5000
+ #2   blob A is shared by a clone, so the
+      next 32K goes to a new blob B, same
+      blob_start as A; fragmented free
+      space -> 32K stored as two pextents
  #3                                          make_range_shared_maybe_merge():
-                                             B, plus shared A at same blob_start
+                                             B + shared A at the same blob_start
  #4                                          can_merge_blob(A, B) -> true
-                                             (never checks csum alignment)
- #5                                          merge_blob -> move_data(0x8000,0x3000)
+                                             (no csum alignment check)
+ #5                                          merge_blob -> move_data(len 0x3000)
                                              0x3000 % 0x8000 != 0 -> assert, abort
  #6   fix                                    can_merge_blob -> false
                                              -> make_blob_shared(B), always correct
 ```
 
-1. **Normal path.** The csum chunk is `block_size`, which is ≤
-   `min_alloc_size`. So every pextent boundary is also a csum chunk
-   boundary. **#1 breaks this:** with a `SEQUENTIAL_READ + IMMUTABLE` hint,
-   `_choose_write_options()` takes the csum order from
-   `ctz(expected_write_size)` — here 32 KiB.
-2. A clone makes blob A shared, so the next 32 KiB goes to a new blob B.
-   `suggested_boff` puts B at blob offset `0x8000`, with the same
-   `blob_start` as A. On fragmented free space the allocator returns the
-   32 KiB in two pieces, and `_do_alloc_write()` stores them unchanged. Now
-   a pextent boundary lies inside a csum chunk.
-3. The next clone must make B shared. `make_range_shared_maybe_merge()`
-   finds A as a merge partner.
-4. `can_merge_blob()` checks: disjoint extents, same csum order, same
-   tracker AU size. All hold, so it says yes.
-5. **Cost.** `merge_blob()` calls `move_data()` once per pextent. The
-   `0x3000` piece is not a whole chunk, and the assert aborts the OSD.
-   Without the assert it is worse: the AU is counted once per fragment and
-   is never freed.
-6. **What should have prevented it.** `can_reuse_blob()` checks csum-chunk
-   alignment, but only for logical offsets. **The gap:** `can_merge_blob()`
-   checks no alignment at all. **Fix:** refuse the merge when a pextent of
-   the dissolved blob is not chunk-aligned. The caller falls back to
+1. **Normally** the csum chunk is `block_size` ≤ `min_alloc_size`, so every
+   pextent boundary is also a chunk boundary. **#1** breaks that: the hint
+   makes the chunk 32 KiB.
+2. **#2** puts a pextent boundary *inside* a chunk.
+3. **#3–#5**: the next clone tries to merge B into A, and the merge aborts.
+   Without the assert it is worse: an AU that is never freed.
+4. **The gap:** `can_reuse_blob()` checks chunk alignment of logical
+   offsets; `can_merge_blob()` checks none. **Fix (#6):** refuse the merge; the caller falls back to
    `make_blob_shared()`.
 
-Where each step is proven:
-- §6.2 — the abort, a unit reproducer and an aged-store reproducer (#1–#5), and the two blobs on disk.
-- §6.3 — the `why?` tree, the three mechanisms that normally keep pextents chunk-aligned (#1, #2, #4), and why qa rarely hits it.
-- §6.4 — the fix (#6), why it is safe, and validation.
+Proof: §6.2 reproduces #1–#5 (a unit test and an aged store) and shows
+blob B on disk. §6.3 shows
+why the chunk can be split and why qa finds it. §6.4 is the fix and its
+validation.
 
 ### 6.2 Report
 
-#### 6.2.1 The observation
+#### 6.2.1 The abort
 
-`ceph_test_objectstore` aborts inside a clone:
+`ceph_test_objectstore` aborted once, inside a clone, in the randomised
+synthetic workload:
 
 ```
 BlueStore.cc: 2835: FAILED ceph_assert((len % (1 << csum_chunk_order)) == 0)
@@ -1508,79 +1495,33 @@ BlueStore.cc: 2835: FAILED ceph_assert((len % (1 << csum_chunk_order)) == 0)
 11: StoreTestBase::doSyntheticTest(...)+0x560
 ```
 
-It happened once, in the randomised synthetic workload. `dup_esb` is the
-elastic-shared-blob clone path (`bluestore_elastic_shared_blobs`, default
-`true`). Before it copies an extent map, it must make every source blob
-shared. When it finds a mergeable neighbour, it takes an optional shortcut.
-The assert is on that shortcut:
+`dup_esb` is the elastic-shared-blob clone path
+(`bluestore_elastic_shared_blobs`, default `true`). It must make every
+source blob shared. Merging with a neighbour is an optional shortcut:
 
 ```
-_clone -> _do_clone_range -> dup_esb              (elastic shared blobs)
-                                │
-                 make_range_shared_maybe_merge()  (frame 3)
-                                │
-     for every blob in the cloned range not already shared:
-                                │
-                    find_mergable_companion()
-                                │   (an already-shared blob
-                                │    at the same blob_start)
-              ┌─────────────────┴─────────────────┐
-      no candidate, or                    can_merge_blob()
-  can_merge_blob() says no                    says yes
-              │                                   │
-     make_blob_shared()                     merge_blob()
-    one more shared blob,                         │
-       always correct             move_data() per allocated pextent
-                                                  │
-                                 ceph_assert(len % csum_chunk == 0)
-                                              -> abort
+dup_esb -> make_range_shared_maybe_merge()
+             for each unshared blob in the range:
+               find_mergable_companion()   (a shared blob, same blob_start)
+                 ├─ none, or can_merge_blob() = false
+                 │    -> make_blob_shared()        normal path, always correct
+                 └─ can_merge_blob() = true
+                      -> merge_blob()
+                           -> move_data() per pextent
+                                -> ceph_assert(len % csum_chunk == 0)   abort
 ```
 
-The left branch is the fallback; it always works. The right branch is an
-optimisation. `can_merge_blob()` chooses between them, so a `false` from it
-leads to a path BlueStore takes all the time.
+So `can_merge_blob()` returning `false` is always safe: it leads to the
+path BlueStore takes all the time.
 
-#### 6.2.2 Reproducing it
+#### 6.2.2 Unit reproducer
 
 `ExtentMapFixture` in `src/test/objectstore/test_bluestore_types.cc` builds
-an unmounted `BlueStore`, creates onodes by hand and calls
-`ExtentMap::dup_esb()` directly. There is no device, no KV store and no
-cluster. Allocation units (AUs) are handed out in order. The reproducer is
-one small, deterministic gtest case.
-
-**Step 1: a helper that acts like a write.** It does only what the real
-write path does to a new blob: set the csum chunk size, set one csum slot,
-store the allocator's fragments unchanged, add the logical extent, take a
-reference. Each call writes one 32 KiB csum chunk. `fragments` says how the
-allocator split that chunk.
-
-```cpp
-constexpr uint32_t csum_chunk_order = 15;                 // 32 KiB chunks
-constexpr uint32_t csum_chunk = 1 << csum_chunk_order;
-
-auto write_blob = [&](t_onode& o, uint32_t blob_start, uint32_t b_off,
-                      uint32_t blob_length,
-                      const std::vector<uint32_t>& fragments) {
-  BlueStore::BlobRef b(coll->new_blob());
-  bluestore_blob_t& bb = b->dirty_blob();
-  bb.init_csum(Checksummer::CSUM_CRC32C, csum_chunk_order, blob_length);
-  bb.set_csum_item(b_off / csum_chunk, 0x11111111 + b_off);
-  PExtentVector pex;
-  for (auto len : fragments)                     // what the allocator returned
-    pex.emplace_back(allocate(len / au_size) * au_size, len);
-  bb.allocated(b_off, csum_chunk, pex);          // stored unchanged
-  auto* e = new BlueStore::Extent(blob_start + b_off, b_off, csum_chunk, b);
-  o.onode->extent_map.extent_map.insert(*e);
-  b->get_ref(coll.get(), b_off, csum_chunk);
-  return b;
-};
-
-// clone(from, to, len) = dup_esb(&store, &txc, coll, from.onode, to.onode,
-//                               off = 0, len, dstoff = 0) on a fresh TransContext
-```
-
-**Step 2: four calls.** Each is a step the object went through in the real
-workload:
+an unmounted `BlueStore` and calls `ExtentMap::dup_esb()` directly — no
+device, no KV store, deterministic. A helper `write_blob()` does what the
+write path does to a new blob: set a 32 KiB csum chunk, set one csum slot,
+store the allocator's fragments unchanged, add the lextent, take a ref.
+Four calls:
 
 ```cpp
 t_onode a = create(), c1 = create(), c2 = create();
@@ -1589,83 +1530,21 @@ write_blob(a, 0, 0, csum_chunk, {csum_chunk});                  // blob A
 clone(a, c1, csum_chunk);                                       // A -> shared
 write_blob(a, 0, csum_chunk, 2 * csum_chunk, {0x3000, 0x5000}); // blob B
 clone(a, c2, 2 * csum_chunk);                                   // -> merge
+// clone(from, to, len) = dup_esb(from, to, off 0, len, dstoff 0)
 ```
 
-| call | what it stands for |
-|---|---|
-| write #1 | a 32 KiB write at offset 0, with the 32 KiB csum chunk the alloc hint gives |
-| clone to `c1` | makes blob A shared, so the next write cannot reuse it |
-| write #2 | the next 32 KiB, placed by `suggested_boff` (§6.3.2) at blob offset 32 KiB of a 64 KiB blob; the allocator returned two fragments |
-| clone to `c2` | `make_range_shared_maybe_merge()` offers the two blobs to `can_merge_blob()` |
-
-Only `{0x3000, 0x5000}` triggers the bug. With `{0x8000}`, the same four
-calls are the aligned control case; the committed test keeps it too. The
-key assertion is `ASSERT_FALSE(can_merge_blob(...))`, just before the
-second clone.
-
-**What the calls leave behind.** "On disk" here means the metadata a real
-write would persist. `P`, `Q`, `R` are physical addresses. `sbid` is a
-shared blob id. A shared blob's `ref_map` counts owners per physical extent.
-
-After call 2, A is shared. `make_blob_shared()` gives it `sbid 1`, and
-`dup_esb()` gives `c1` a copy of A's metadata, `A'`, on the same shared blob:
-
-```
- onode a    0x0000~0x8000 -> A  @ 0
- onode c1   0x0000~0x8000 -> A' @ 0
-
- blob A     SHARED sbid 1, llen 0x8000, pextents [P~0x8000], csum [c0]
- sbid 1     ref_map { P~0x8000: 2 }                     owners: a, c1
-```
-
-After call 3 — the state that matters. A is shared, so it cannot be written
-again. The second 32 KiB gets blob B: blob offset 32 KiB of a 64 KiB blob,
-`blob_start` 0. So A and B are on the same csum grid. `allocated()` stores a
-hole, then the two fragments, unchanged:
-
-<div class="language-plaintext highlighter-rouge"><div class="highlight"><pre class="highlight"><code> onode a    0x0000~0x8000 -&gt; A @ 0      0x8000~0x8000 -&gt; B @ 0x8000
-
- blob A     SHARED sbid 1, llen 0x8000, pextents [P~0x8000], csum [c0]
- blob B     private, llen 0x10000, blob_start 0
-            pextents [hole~0x8000]<span style="color:#d11">[Q~0x3000][R~0x5000]</span>   csum [ - , c1]
-
- csum grid   chunk 0: 0x0000-0x7fff  |  chunk 1: 0x8000-0xffff
- blob A      |&lt;----- P 0x8000 -----&gt;|
- blob B      |&lt;------ hole ------&gt;|<span style="color:#d11">&lt;-- Q 0x3000 --&gt;|&lt;---- R 0x5000 ----&gt;</span>|
-                                                   <span style="color:#d11">^ pextent boundary at 0xb000,</span>
-                                                     <span style="color:#d11">inside chunk 1</span>
-</code></pre></div></div>
-
-The red parts are the bug: two pextents cover chunk 1, with the boundary at
-`0xb000`. With `{0x8000}`, chunk 1 would be one pextent.
-
-Call 4 covers A (shared) and B (private, same `blob_start`).
-`can_merge_blob()` is asked if B can be merged into A:
+Blob B is written at blob offset 32 KiB of a 64 KiB blob that starts at 0
+(what `suggested_boff` does), so A and B share one csum grid. The
+fragments `{0x3000, 0x5000}` are the bug; `{0x8000}` is the aligned
+control, and the test keeps both:
 
 | case | `can_merge_blob()` | result |
 |---|---|---|
-| aligned control, `{0x8000}` | true | merged. A grows to 64 KiB. B's chunk-1 csum slot and use count are copied into A. B's pextent joins `sbid 1`. `a` has one lextent `0x0000~0x10000 -> A @ 0`. B is gone. |
-| fragmented, no fix | true | abort. `merge_blob()` calls `move_data(pos = 0x8000, len = 0x3000)` for the first fragment; `len % 0x8000 != 0` trips the assert. Nothing is persisted yet. Without the assert, the use-count loop runs once per fragment and adds B's chunk-1 count into A twice. That count never reaches zero, so the AU is never freed. |
-| fragmented, with fix | false, at the `0x3000` fragment | B is made shared on its own (below) |
+| aligned, `{0x8000}` | true | merged: A grows to 64 KiB, B is gone |
+| fragmented, no fix | true | abort: `move_data(pos 0x8000, len 0x3000)` |
+| fragmented, with fix | false | B becomes its own shared blob (`sbid 2`); csum item intact |
 
-```
- onode a    0x0000~0x8000 -> A   @ 0     0x8000~0x8000 -> B  @ 0x8000
- onode c1   0x0000~0x8000 -> A'  @ 0
- onode c2   0x0000~0x8000 -> A'' @ 0     0x8000~0x8000 -> B' @ 0x8000
-
- blob A     SHARED sbid 1   [P~0x8000]                        csum [c0]
- blob B     SHARED sbid 2   [hole~0x8000][Q~0x3000][R~0x5000] csum [ - , c1]
-
- sbid 1     ref_map { P~0x8000: 3 }               owners: a, c1, c2
- sbid 2     ref_map { Q~0x3000: 2, R~0x5000: 2 }  owners: a, c2
-```
-
-The test's last assertions check this picture: `a`'s two lextents still
-point at the two original blobs, B is shared, and B's chunk-1 csum slot
-still holds the value written in call 3.
-
-**Step 3: build and run**, with the test commit from
-`wip-72848-merge-blob-csum` applied:
+Run it with the test commit from `wip-72848-merge-blob-csum`:
 
 ```bash
 ninja -C build unittest_bluestore_types
@@ -1673,9 +1552,9 @@ build/bin/unittest_bluestore_types \
   --gtest_filter=ExtentMapFixture.merge_blob_csum_chunk_unaligned
 ```
 
-Without the fix, the test stops at that assertion, because
-`can_merge_blob()` returns true. Change it to `EXPECT_FALSE` so gtest
-continues into the clone, and the reported abort appears:
+Without the fix, the test stops at `ASSERT_FALSE(can_merge_blob(...))`.
+Change it to `EXPECT_FALSE` and the clone gives the reported abort — same
+chain, same `dup_esb+0x12f` offset:
 
 ```
 BlueStore.cc: FAILED ceph_assert((len % (1 << csum_chunk_order)) == 0)
@@ -1684,41 +1563,37 @@ BlueStore.cc: FAILED ceph_assert((len % (1 << csum_chunk_order)) == 0)
  7: BlueStore::ExtentMap::dup_esb(...)+0x12f
 ```
 
-Same assert, same call chain, even the same `dup_esb+0x12f` frame offset.
 With the fix: `[ OK ]`.
 
-**End to end, it needs an aged store.** The same sequence through
-`queue_transactions()`, with a real BlueStore and a real allocator, does not
-fail on a fresh store:
+#### 6.2.3 End to end: it needs an aged store
+
+The same hinted write-clone-write-clone through `queue_transactions()` on a
+fresh real store does not fail, even with the fragmentation knob:
 
 | setting | value |
 |---|---|
 | config | `min_alloc_size` 4096, crc32c, `max_blob_size` 64 KiB, `bluestore_allocator = stupid`, `bluestore_debug_small_allocations = 4` |
-| workload | hinted write-clone-write-clone over 32 objects |
-| result | 32 merges, 0 aborts |
+| result | 32 objects, 32 merges, 0 aborts |
 
-`bluestore_debug_small_allocations` is the only knob that injects
-fragmentation, and only the stupid allocator honours it. The debug log shows
-every precondition of §6.3.2 except fragmentation. The knob shortens each
-`allocate_int()` result. But on a fresh device the next result is physically
-adjacent, and `StupidAllocator::allocate()` merges it back into one pextent.
-The knob can only fragment free space that is already fragmented.
+The knob shortens each `allocate_int()` result, and only the `stupid`
+allocator honours it. But on a fresh device the next result is physically
+adjacent, and `StupidAllocator::allocate()` merges it back into one
+pextent. The knob can only fragment space that is already fragmented.
 
-So fragment the free space for real, without the knob. Use a 2 GiB data
-device, with RocksDB on its own `block.db` so that filling the data device
-does not starve it:
+So fragment the free space for real (2 GiB data device, RocksDB on its own
+`block.db` so that filling the data device does not starve it):
 
-0. On the fresh store, write the hinted `0~0x8000` and clone it. Blob A is
-   now shared before there is anything to merge into.
-1. Write 1 MiB objects until less than 5 MiB is free, then 64 KiB objects,
-   then 32 KiB objects, until less than 32 KiB is free. No free run of
-   32 KiB is left.
-2. Zero a checkerboard into 32 of the 64 KiB fillers: 16 KiB punched,
-   4 KiB kept. Every freed run is smaller than one csum chunk.
-3. Write the hinted `0x8000~0x8000`, then clone.
+```
+0. fresh store: write hinted 0~0x8000, clone     -> blob A shared
+1. fill: 1 MiB objects until < 5 MiB free,
+         then 64 KiB, then 32 KiB until < 32 KiB free
+2. checkerboard 32 of the 64 KiB fillers:
+   16 KiB zeroed, 4 KiB kept                     -> every free run < 32 KiB
+3. write hinted 0x8000~0x8000, clone             -> 2 pextents -> abort
+```
 
-The write gets two fragments. On a tree without the fix, the clone aborts
-through the production path, with no debug knob:
+On a tree without the fix, step 3 aborts through the production path, with
+no debug knob:
 
 ```
 BlueStore.cc: 2845: FAILED ceph_assert((len % (1 << csum_chunk_order)) == 0)
@@ -1729,139 +1604,46 @@ BlueStore.cc: 2845: FAILED ceph_assert((len % (1 << csum_chunk_order)) == 0)
  7: BlueStore::queue_transactions(...)
 ```
 
-Every frame here is also in the tracker's backtrace. The run takes 82
-seconds, against milliseconds for the unit case, so the unit case is the one
-in the test suite. But it proves ordinary use can reach the bug. The store it
-leaves is the fragmented one at the end of §6.2.3.
+It takes 82 s (the unit case takes milliseconds, so the unit case is the one
+in the suite), but it proves ordinary use reaches the bug.
 
-#### 6.2.3 The two blobs on disk
+#### 6.2.4 Blob B on disk
 
-The two blobs are ordinary records; nothing is malformed. A real BlueStore
-(`min_alloc_size` 4096, crc32c, `max_blob_size` 64 KiB) holding exactly the
-objects of the *fresh-store* run in §6.2.2 has three keys (format reference:
-[§7 of the on-disk format post]({% post_url 2026-08-07-bluestore-v21-ondisk-format %})):
-
-| Record | Key | Value |
-|---|---|---|
-| onode, head | `<ghobject>'o'` | 94 B |
-| onode, clone | `<ghobject>'o'` | 58 B |
-| shared blob | `X` + BE u64 `00 00 00 00 00 00 00 01` | 11 B |
-
-The 94-byte head value = 31 B onode + 2 B empty spanning section + 4 + 57 B
-inline extent map. The alloc hint is stored in the onode struct:
+Nothing on disk is malformed. The onode (same in both stores) carries the hint in one byte
+(format: [§7 of the on-disk format post]({% post_url 2026-08-07-bluestore-v21-ondisk-format %})):
 
 ```
-02 01 19 00 00 00   DENC frame: struct_v 2, compat 1, payload 0x19 (25)
-01                  nid = 1
-80 80 04            size = 0x10000                          (varint)
-00 00 00 00         attrs: le32 count = 0
-00                  flags = 0x00
-00 00 00 00         extent_map_shards: le32 count = 0        (map is inline)
-80 80 80 02         expected_object_size = 4 MiB             (varint)
-80 80 08            expected_write_size  = 128 KiB           (varint)
-24                  alloc_hint_flags = 0x24
-                      = SEQUENTIAL_READ (0x04) | IMMUTABLE (0x20)
-00 00 00 00         zone_offset_refs: 0
+80 80 04            size = 0x10000
+80 80 80 02         expected_object_size = 4 MiB
+80 80 08            expected_write_size  = 128 KiB
+24                  alloc_hint_flags = SEQUENTIAL_READ (0x04) | IMMUTABLE (0x20)
 ```
 
-The one byte `24` is the whole precondition. It made
-`_choose_write_options()` take `ctz(expected_write_size)` instead of
-`block_size_order`. The result shows two records later as
-`csum_chunk_order = 15`.
-
-The 57 inline bytes are the two blobs:
+That byte `24` makes `_choose_write_options()` use `ctz(expected_write_size)`
+instead of `block_size_order`; `_do_alloc_write()` then caps it at
+`ctz(write length)` = 15 here. Blob B from the
+aged store:
 
 ```
-02                       struct_v 2
-02                       n = 2 extents
--- extent 0: logical 0x0~0x8000, blob_offset 0 --
-03                       CONTIGUOUS | ZEROOFFSET, inline blob follows
-23                       length = 0x8000                     (varint_lowz)
-   01                    extents: 1
-   44 10 00 00           lba 0x822000
-   23                    length = 0x8000
-   14                    flags = FLAG_SHARED | FLAG_CSUM
-   04                    csum_type = crc32c
-   0f                    csum_chunk_order = 15  -> 32 KiB chunks
-   04                    csum_data: 4 B = ONE crc32c item
-   0b 59 88 63             chunk 0
-   01 00 00 00 00 00 00 00  le64 sbid = 1        (-> the X record)
--- extent 1: logical 0x8000~0x8000, blob_offset 0x8000 --
-05                       CONTIGUOUS | SAMELENGTH, blob_offset follows
-23                       blob_offset = 0x8000
-   02                    extents: 2
-   ff ff ff ff ff ff ff ff ff 01   lba INVALID_OFFSET (hole)
-   23                    length = 0x8000
-   54 10 00 00           lba 0x82a000
-   23                    length = 0x8000
-   04                    flags = FLAG_CSUM        (not shared yet)
-   04                    csum_type = crc32c
-   0f                    csum_chunk_order = 15  -> 32 KiB chunks
-   08                    csum_data: 8 B = TWO crc32c items
-   00 00 00 00             chunk 0 — never computed, the hole
-   b1 41 77 79             chunk 1 — the data
-```
-
-BlueStore's own readback agrees:
-`blob([0x822000~8000] ... crc32c/0x8000/4)`,
-`blob([!~8000,0x82a000~8000] ... crc32c/0x8000/8)`, plus
-`use_tracker(0x2*0x8000 0x[0,8000])`. The use tracker (ref map) is not
-encoded inline; it is rebuilt from the lextents: two 32 KiB AUs, the first
-unreferenced.
-
-**The facts, read off the disk:**
-
-| | blob A | blob B |
-|---|---|---|
-| logical start | 0 | 0 |
-| allocated ranges | 32 KiB at `0x822000` | 32 KiB hole, then 32 KiB at `0x82a000` |
-| checksums | 1 × 32 KiB crc32c | 2 × 32 KiB crc32c; the first is all zeros (never written) |
-| shared | yes, sbid 1 | no |
-
-The data does not overlap. Every condition `can_merge_blob()` tests holds.
-
-`merge_blob()` moves B's checksums into A one whole checksum at a time, once
-per allocated range. So each allocated range of B must start and end on a
-32 KiB boundary; otherwise there is no whole checksum to move. Here the one
-data range starts at blob offset `0x8000` and is `0x8000` long. The merge is
-legal, and succeeds.
-
-**On an aged store** (§6.2.2) the same write comes back fragmented. Blob B's
-record, captured from that store, is five bytes longer:
-
-```
-   03                    extents: 3                          (was 02)
+   03                    extents: 3
    ff ff ff ff ff ff ff ff ff 01   lba INVALID_OFFSET (hole)
    23                    length = 0x8000
    52 ff 07 00           lba 0x3ffa9000
-   17                    length = 0x5000                     (varint_lowz)
+   17                    length = 0x5000
    34 ff 07 00           lba 0x3ff9a000
    0f                    length = 0x3000
-   04 04 0f              FLAG_CSUM, crc32c, csum_chunk_order 15
-   08                    csum_data: 8 B = TWO items          (unchanged)
+   04 04 0f              FLAG_CSUM, crc32c, csum_chunk_order 15 (32 KiB)
+   08                    csum_data: 8 B = TWO items
    00 00 00 00 b1 41 77 79
 ```
 
-The count byte goes `02` → `03`, and one 5-byte pextent record becomes two.
-`csum_data` is byte-for-byte the same: two 32 KiB checksums, for data that
-now lives in two pieces of 20 KiB and 12 KiB. (The order is what the
-allocator returned; the unit case in §6.2.2 builds the mirror image.) The
-first piece is `0x5000` long, so `merge_blob()` is asked to move `0x5000` of
-a `0x8000` checksum. No such thing exists: that is the assert. The record is
-still not malformed — it has no field that ties the ranges to the checksums.
-
-The record does *not* contain two things. So no consistency check on disk
-could catch this:
-
-* **A logical length.** For an uncompressed blob it is not encoded. The
-  decoder recomputes it as the sum of the pextent lengths
-  (`get_ondisk_capacity()`). Blob B's `llen=0x10000` is 0x8000 of hole plus
-  0x8000 of data, inferred.
-* **A chunk count.** The number of csum items is `csum_data.length() /
-  get_csum_value_size()` — 8 / 4 = 2. That `08` and the `02` extent count
-  are independent fields, written by independent code paths, with no rule
-  relating them. The invariant `merge_blob()` depends on is not in the
-  format. It only emerges from the three mechanisms in §6.3.2.
+Two csum items, three pextents (a hole, then 20 KiB + 12 KiB of data). This
+order is what the allocator returned; the unit case (§6.2.2) builds the
+mirror image, `0x3000` + `0x5000`, which the diagrams use. Either way the
+first `move_data()` gets less than one whole chunk. On a fresh store the same blob has one 32 KiB data pextent (`extents: 2`) and
+byte-identical `csum_data`. No field ties pextents to csum items: for an
+uncompressed blob the logical length is not stored (it is the sum of pextents), and the item count
+is just `csum_data.length() / 4`. So no on-disk check can catch this.
 
 ### 6.3 Analysis
 
@@ -1869,56 +1651,42 @@ could catch this:
 
 ```
 clone aborts inside merge_blob
- └─ why?   move_data() relocates csum data in whole csum-chunk units and
-           asserts the pextent it was handed is chunk-aligned
-                                                    (BlueStore.cc:2845)
- └─ why was it handed an unaligned one?
-           merge_blob's main loop calls move_data(src_pos, src_it->length)
-           once per allocated pextent — pextents are min_alloc_size
-           granular, csum items are not
- └─ why is the csum chunk coarser than the pextents?
-           the object carried a SEQUENTIAL_READ + IMMUTABLE alloc hint, so
-           _choose_write_options() set csum_order from
-           ctz(expected_write_size) instead of block_size_order
-                                                    (BlueStore.cc:17876)
- └─ why did that produce split extents?
+ └─ why?   move_data() copies csum data in whole chunks and asserts the
+           pextent it gets is chunk-aligned               (BlueStore.cc:2845)
+ └─ why an unaligned pextent?
+           merge_blob calls move_data(src_pos, src_it->length) once per
+           pextent; pextents are min_alloc granular, csum items are not
+ └─ why is the chunk bigger than min_alloc?
+           SEQUENTIAL_READ + IMMUTABLE hint -> _choose_write_options() sets
+           csum_order from ctz(expected_write_size); _do_alloc_write()
+           caps it at ctz(write length)                   (BlueStore.cc:17876)
+ └─ why is one chunk split?
            _do_alloc_write() stores the allocator's PExtentVector as-is;
-           on fragmented free space 32K comes back as two fragments —
-           0x5000 + 0x3000 in the captured store
-                                                    (BlueStore.cc:17645)
- └─ why was the merge attempted at all?
-           can_merge_blob() accepts any pair with the same csum order, the
-           same tracker au_size and disjoint extents — it never checks that
-           the disjointness lands on csum-chunk boundaries
-                                                    (BlueStore.cc:2720)
+           fragmented space returns 32K as 0x5000 + 0x3000 (BlueStore.cc:17645)
+ └─ why was the merge tried?
+           can_merge_blob() checks same csum order, same tracker au_size,
+           disjoint extents — never chunk alignment       (BlueStore.cc:2720)
 ```
 
-The bottom of the chain is a missing precondition, not a wrong computation.
+The cause is a missing precondition, not a wrong computation.
 
-#### 6.3.2 Three granularities, and what anchors each
+#### 6.3.2 One blob, three views
 
-A blob describes one logical range three times, at three granularities.
-This is the blob that aborts:
+A blob describes its range three times. For blob B of the unit case (§6.2.2):
 
 ```
-the blob being dissolved: logical length 0x10000, csum chunk 0x8000, min_alloc 0x1000
+csum chunk 0x8000, min_alloc 0x1000
 
                0                               0x8000      0xb000       0x10000
   csum_data    [====== item 0: no data =======][====== item 1: the data ======]
-  pextents     [========== invalid ===========][= 0x3000 =][===== 0x5000 =====]
+  pextents     [========== hole ==============][= 0x3000 =][===== 0x5000 =====]
   use tracker  [============ au 0 ============][============ au 1 ============]
                                                            ^
-                                                           `-- a pextent boundary
-                                                               inside csum item 1
+                                                  pextent boundary inside item 1
 ```
 
-The csum and tracker rows agree on every boundary. The pextent row has one
-extra seam, because the allocator split the 0x8000 of data into
-0x3000 + 0x5000.
-
-`merge_blob()` must move all three rows into the survivor. It walks the
-**pextent** row but copies the **csum** row in whole items. So it asks to
-move 0x3000 of an item that is 0x8000 wide:
+`merge_blob()` walks the **pextent** row but copies the **csum** row in
+whole items:
 
 ```cpp
 auto move_data = [&](uint32_t pos, uint32_t len) {
@@ -1926,9 +1694,6 @@ auto move_data = [&](uint32_t pos, uint32_t len) {
     ceph_assert((pos % (1 << csum_chunk_order)) == 0);
     ceph_assert((len % (1 << csum_chunk_order)) == 0);   // <-- 72848
     ...
-    memcpy(dst_csum_ptr + item_no * csum_value_size,
-           src_csum_ptr + item_no * csum_value_size,
-           item_cnt * csum_value_size);
   }
   ...
 };
@@ -1936,36 +1701,24 @@ auto move_data = [&](uint32_t pos, uint32_t len) {
 move_data(src_pos, src_it->length);      // called per pextent
 ```
 
-The unwritten contract: *every pextent starts and ends on a csum chunk
-boundary*. Three unrelated mechanisms normally supply it. The table shows
-where it fails:
+It needs *every pextent to start and end on a chunk boundary*. Nothing
+states this. Three mechanisms usually give it:
 
-| mechanism | what it guarantees | still holds under a `SEQUENTIAL_READ + IMMUTABLE` hint? |
+| mechanism | gives | holds with the hint? |
 |---|---|---|
-| `get_release_size()` = `max(csum chunk, min_alloc)`, uncompressed | `put_ref()` can never punch a hole *inside* a csum chunk | yes |
-| allocator granularity | pextent lengths are `min_alloc_size` multiples | yes |
-| `wctx->csum_order = block_size_order` | csum chunk ≤ `min_alloc_size`, so any `min_alloc` boundary is also a chunk boundary | **no — this is the door** |
-| `can_merge_blob()` | — | **never checked it at all** |
+| `get_release_size()` = `max(csum chunk, min_alloc)` | no hole *inside* a chunk | yes |
+| allocator granularity | pextents are `min_alloc_size` multiples | yes |
+| `csum_order = block_size_order` | chunk ≤ `min_alloc_size` | **no** |
+| `can_merge_blob()` | — | **never checked** |
 
-`_choose_write_options()` breaks the third row. The condition: the object is
-hinted `SEQUENTIAL_READ` without `RANDOM_READ`, has `IMMUTABLE` or
-`APPEND_ONLY`, and has no `RANDOM_WRITE`. Then it gets
-`csum_order = max(min_alloc_size_order, ctz(expected_write_size))` instead of
-`block_size_order`. So its csum chunk can go *above* `min_alloc_size`, up to
-`expected_write_size`. (Compressed blobs take their order from
-`ctz(compressed length)` and can also exceed `min_alloc_size`. But they are
-excluded from this merge on both sides: `scan_shared_blobs()` skips them as
-candidates, and `make_range_shared_maybe_merge()` never offers them.)
+The hint rule in `_choose_write_options()`: `SEQUENTIAL_READ` without
+`RANDOM_READ`, plus `IMMUTABLE` or `APPEND_ONLY`, and no `RANDOM_WRITE`
+→ `csum_order = max(min_alloc_size_order, ctz(expected_write_size))`.
+(Compressed blobs can also have big chunks, but they are never merge
+candidates: `scan_shared_blobs()` and `make_range_shared_maybe_merge()`
+skip them.)
 
-`_do_alloc_write()` caps each blob's own order at `ctz(write length)`. Then
-it stores what the allocator returned as-is, and slices only the tail extent
-at the blob boundary. That is how a chunk-sized write ends up in two pieces.
-The last ingredient is the shared `blob_start`, which `suggested_boff` gives
-for free: to align with `max_blob_size`, a 32K write at logical 32K goes to
-*blob offset* 32K of a 64K blob that starts at logical 0.
-
-The sibling gate on the write path, `can_reuse_blob()`, does treat
-csum-chunk alignment as a precondition, and says why:
+The write path already has the right guard, in `can_reuse_blob()`:
 
 ```cpp
 // Currently for the sake of simplicity we omit blob reuse if data is
@@ -1977,16 +1730,13 @@ if (get_blob().has_csum() &&
 }
 ```
 
-But it checks the *logical* offsets of an incoming write. Blob B's write is
-at `b_off 0x8000` for `0x8000`; both ends are chunk-aligned, so it passes.
-What breaks is the *physical* extent boundary added by the allocator, and no
-offset test can see it. `can_merge_blob()` needed a stricter check of the
-same kind, and has none.
+But it checks *logical* offsets. B's write (`b_off 0x8000`, length `0x8000`)
+passes. The split is a *physical* boundary that the allocator adds later.
+`can_merge_blob()` needs the physical version of this check.
 
-#### 6.3.3 Why the qa test finds it and a cluster rarely does
+#### 6.3.3 Why qa finds it and a cluster rarely does
 
-`SyntheticWorkloadState::touch()` puts a random alloc hint on *every*
-object it creates:
+`SyntheticWorkloadState::touch()` gives *every* object a random alloc hint:
 
 ```cpp
 boost::uniform_int<> u(17, 22);
@@ -2000,30 +1750,27 @@ t.set_alloc_hint(cid, new_obj, 1ull << u(*rng), 1ull << v(*rng),
 | `SEQUENTIAL_READ` without `RANDOM_READ` | 1/4 |
 | an `IMMUTABLE`/`APPEND_ONLY` bit | 3/5 |
 | no `RANDOM_WRITE` | 3/4 |
-| → hint that raises the csum order | 9/80 ≈ 11% of objects |
-| `expected_write_size` (4K–128K) above a 4K `min_alloc_size` | 5/6 of those |
+| → hint that raises the csum order | 9/80 ≈ 11% |
+| `expected_write_size` (4K–128K) above 4K `min_alloc_size` | 5/6 of those |
 | → oversized csum chunk | ~9% of objects |
 
-`StoreTest.Synthetic` runs 10 000 ops (the matrix rows go to 50 000). Half
-are write/zero/truncate/unlink, which fragment the device; 10% are
-`clone`/`clone_range`. So the collision is only a matter of time. That fits
-the single occurrence on the tracker.
+`StoreTest.Synthetic` runs 10 000 ops (matrix rows: 50 000); half fragment
+the device (write/zero/truncate/unlink), 10% clone. A hit is only a matter
+of time — one so far.
 
-Production needs the same two things: an object hinted immutable and
-sequential-read (RGW and CephFS do issue these), and free space fragmented
-enough to split its blob mid-chunk. Both are normal on an aged OSD and absent
-on a fresh one. That is why this survived years of qa.
+In production it needs the same two things: an immutable, sequential-read
+hint (RGW and CephFS issue these) and fragmented free space. Both are normal
+on an aged OSD and absent on a fresh one. That is how it survived years of
+qa.
 
 ### 6.4 Proposed solution
 
 #### 6.4.1 The fix
 
-`can_merge_blob()` already walks the dissolved blob's valid extents once,
-with each extent's blob offset in hand, for the disjointness test. The
-alignment check goes into that loop: two compares per valid extent.
-`csum_chunk_size` is 0 when the dissolved blob has no csum. Only the
-dissolved blob is checked, because `merge_blob()` never moves the
-survivor's extents:
+`can_merge_blob()` already walks the dissolved blob's valid extents for the
+disjointness test. Add the alignment check there — two compares per extent.
+`csum_chunk_size` is 0 when the blob has no csum. Only the dissolved blob is
+checked: `merge_blob()` never moves the survivor's extents.
 
 ```cpp
   while (xi != xe.end() && yi != ye.end()) {
@@ -2044,98 +1791,54 @@ survivor's extents:
       ++xi;
 ```
 
-The same test also goes into the trailing loop, which scans the x extents
-that y never reached. Merging is only an optimisation, so the gate may
-refuse. The caller then falls back to `make_blob_shared()`, which is always
-correct.
+The same test goes into the trailing loop (x extents that y never reached).
 
 #### 6.4.2 Why it is safe
 
-**Refusing changes no structure.** `make_range_shared_maybe_merge()`
-already has this branch: `find_mergable_companion()` returning `nullptr` is
-the normal case for the first blob at any `blob_start`. A `false` from
-`can_merge_blob()` reaches exactly that path.
-
-**Relaxing the assert instead is not free.** The use-tracker loop under it
-rounds the same way, and one invariant decides both halves:
-
-- **Use tracker — wrong.** A sub-AU hole cannot exist. So two fragments at
-  `0x3000` and `0x5000` inside one AU must *both* be valid. Both are visited,
-  and each adds `src_tracker_aus[i]`. `put()` can never drive that count to
-  zero, and the AU is never released.
-- **Csum copy — would be right, but only through an unwritten invariant.** Rounding to whole items would copy
-  the right item. A chunk that any byte of the dissolved blob touches belongs
-  only to that blob: writes into a csummed blob are chunk-aligned, and
-  `get_release_size()` forbids sub-chunk holes, so no chunk is ever
-  co-owned. `Blob::copy_from()` already relies on this: it copies csum items
-  with the same `p2align`/`p2roundup` rounding, and is correct for the same
-  reason. But this invariant is written down nowhere — the same shape as
-  this bug. A crash fix is the wrong place to start depending on it.
-
-**The cost is bounded and rare.** The elastic-shared-blob win is lost only
-when the dissolved blob is chunk-split. That needs the alloc hint *and*
-fragmentation: the ~9% of objects above, on an aged device. Everything else
-still merges; the regression test checks that.
-
-**The alternative was worked out and deferred.** `move_data()` could keep
-the win: copy each csum item at most once, behind a watermark, and move the
-tracker as one whole-array add instead of per call. That is about fifteen
-lines and deletes both asserts. But it is exactly the change that depends on
-the never-co-owned invariant above. It needs its own guardrail and tests, not
-a ride on a crash fix.
+| question | answer |
+|---|---|
+| does refusing change anything? | No. `find_mergable_companion()` returning `nullptr` already takes the same `make_blob_shared()` path; it is the normal case. |
+| why not just relax the assert? | **Use tracker: wrong.** Both fragments sit in one AU and are both valid (a sub-AU hole cannot exist); each adds `src_tracker_aus[i]`, so the count never reaches zero and the AU is never freed. **Csum copy: right only by an unwritten invariant** (no chunk is ever co-owned, which `Blob::copy_from()` also relies on). A crash fix should not start depending on it. |
+| what does it cost? | The merge is skipped only for chunk-split blobs: hinted objects (~9% in qa) on fragmented space. Everything else still merges; the test checks it. |
+| a better fix later? | Make `move_data()` copy each csum item at most once (watermark) and add the tracker as one array. ~15 lines, deletes both asserts — but it depends on that same invariant, so it needs its own tests. Deferred. |
 
 #### 6.4.3 Validation
 
-The regression test checks both directions in one case: the aligned pair
-must still merge into one blob; the fragmented pair must be refused.
-
 | | without the fix | with the fix |
 |---|---|---|
-| `can_merge_blob()` on the fragmented pair | true | **false** |
+| `can_merge_blob()`, fragmented pair | true | **false** |
 | the clone | abort at `BlueStore.cc:2845` | two shared blobs, csum item intact |
+| aligned pair | merges | still merges |
 | `unittest_bluestore_types` | — | **154/154** |
-| `ceph_test_objectstore`, the qa job's own filter | — | 180 passed, 4 skipped, 68 min |
-| of which synthetic matrix tests | — | **61/61 passed** (44 min) |
+| `ceph_test_objectstore`, qa filter | — | 180 passed, 4 skipped, 68 min |
+| — synthetic matrix tests | — | **61/61** (44 min) |
 | aborts / signals in that run | — | **0** |
 | guard rejections in that run | — | **0** |
-| aged-store end-to-end clone (§6.2.2) | abort in `queue_transactions()` | clone succeeds, data verified |
+| aged-store clone (§6.2.3) | abort in `queue_transactions()` | succeeds, data verified |
 
 Four `ceph_test_objectstore` tests fail on that branch (`CompressionTest`,
 `BlueStoreReconstructAllocationsTest`, `BluestoreStatFSTest`,
-`garbageCollection`). They fail the same way with and without the patch, so
-they are pre-existing and unrelated.
+`garbageCollection`), the same way with and without the patch.
 
-"Guard rejections: 0" needs a note. Instrumenting the guard shows the qa
-workload does build blobs whose csum chunk exceeds `min_alloc_size`
-(`csum_chunk=0x2000, min_alloc=0x1000`). But it never builds a fragmented
-one, so the guard never had to refuse. Nothing in the suite drains its
-scratch device, so chunk-split blobs stay rare: the tracker's abort was one
-occurrence across many such runs, and 68 minutes did not produce another.
-This run shows the guard costs nothing. The two reproducers are what prove
-the mechanism.
+Zero rejections: the qa run does build oversized chunks
+(`csum_chunk=0x2000, min_alloc=0x1000`) but never fragments one, since
+nothing drains the device. So the run shows the guard is free; the two
+reproducers prove the mechanism.
 
 #### 6.4.4 Takeaways
 
-- **A blob keeps three views of one range, at three granularities.** Code
-  that moves one of them must respect the coarsest. `merge_blob()` iterates
-  at pextent granularity and copies at csum granularity; the assert was the
-  only place that contract was written down.
-- **The invariant rested on three unrelated mechanisms** — release size,
-  allocation size and the default csum order. None is documented as
-  guaranteeing it. One alloc hint removes the third, and the other two are
-  not enough.
-- **`can_reuse_blob()` treated csum-chunk alignment as a precondition;
-  `can_merge_blob()` ignored it.** When you add a second user of a shared
-  representation, use the first user's guards as a checklist — even when
-  the second user needs a stricter version of the same guard.
-- **An assert is not a fix.** Deleting these two would turn a crash into an
-  inflated use tracker: the same AU counted once per fragment, so it is never
-  released. No crash and no error to the client, just space that never comes
-  back — much harder to trace than an abort.
-- **A knob named "force small allocations" does not force small
-  allocations.** Only `StupidAllocator` honours it — not the default
-  `hybrid` — and even there, coalescing undoes it on unfragmented free space
-  (§6.2.2). Know this before using it in a reproducer.
+- **Code that moves one view of a blob must respect the coarsest view.**
+  `merge_blob()` walks pextents and copies csum chunks; only an assert held
+  that contract.
+- **An invariant built from three unrelated mechanisms breaks when one
+  changes.** One alloc hint removed the third.
+- **Copy the first user's guards.** `can_reuse_blob()` had the alignment
+  check; `can_merge_blob()`, a second user of the same layout, did not.
+- **Deleting the assert is not a fix.** It turns a crash into space that is
+  never freed — much harder to find.
+- **`bluestore_debug_small_allocations` does not fragment a fresh store.**
+  Only `StupidAllocator` honours it (not the default `hybrid`), and it
+  coalesces adjacent results.
 
 ## 7. Tracker #78144 — a unit test that aborts because a syscall was denied
 
