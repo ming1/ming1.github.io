@@ -2868,233 +2868,215 @@ paragraph, on both EC pipelines, is in §7.4's companion
 
 # 4. Code analysis
 
-The trace sections answer *what happened*; this section reads the code
-that made it happen.
+§1–§3 show *what happened*. This section reads the code that made it
+happen, in three parts:
+
+```
+ 4.1 Interfaces           what BlueStore promises its caller, and why
+ 4.2 Data structures      the objects one write lives in
+ 4.3 Function reference   the functions of the write path, in the order a write meets them
+```
+
+All code is at the v21.3.0 tag. A link's text names the symbol it
+points to. A bare `:NNNN` is a line in the file named at the top of
+the subsection.
 
 ## 4.1 Interfaces
 
-What the store promises its caller. References here span several
-files, so every line number is qualified with its file — unlike
-§4.3's function reference, where bare `:NNNN` means `BlueStore.cc`.
-
 ### 4.1.1 queue_transactions — the contract RADOS buys
 
-[`ObjectStore.h:241`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/ObjectStore.h#L241)
-— §4.3.9 walks through what the function *does*; this section is what the
-caller is *entitled to*. From the interface's viewpoint
-`queue_transactions` is a contract with six clauses — documented in
-[`Transaction.h:20`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/Transaction.h#L20)
-and
-[`ObjectStore.h:135`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/ObjectStore.h#L135)
-— and everything §4.3 traces exists to honor them.
+The OSD hands work to the store through one call,
+[`ObjectStore::queue_transactions`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/ObjectStore.h#L241).
+§4.3.9 shows what BlueStore *does* in it. This subsection is what the
+caller may *count on*. The rules are written in two comments: above
+[`class Transaction`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/Transaction.h#L107)
+(`Transaction.h:20`) and above
+[`CollectionImpl`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/ObjectStore.h#L142)
+(`ObjectStore.h:135`). There are six:
 
-**1. Asynchrony: three completion events, not a return value.** The
-call queues and returns; results arrive via `Context` callbacks
-embedded in the transactions (`Transaction.h:31`):
-`on_applied_sync`/`on_applied` — the mutations are visible to
-subsequent reads — and `on_commit` — "durably committed to stable
-storage (i.e., are now software/hardware crashproof)"
-(`Transaction.h:48`). RADOS maps `on_commit` to the ondisk client
-reply, which is why client-visible latency ends at the commit
-callbacks `_txc_committed_kv` queues (§3.1.6).
+```
+ OSD (holds the PG lock)                            BlueStore
+ ───────────────────────                            ─────────
+ queue_transactions(ch, [t1, t2 …]) ────────────►   returns at once                (1) async
+                                                    each t: all or nothing         (2) atomic
+                                                    same ch: applied in order      (3) ordered
+ does not read what a pending t changes ◄──────     takes no read-side lock        (4) isolation is the caller's job
+ sends only valid t (space, quota)      ◄──────     an error is ignored, or fatal  (5) no failure path
+ keeps the data buffers until on_commit ◄──────     points at them, no copy        (6) stable buffers
 
-**2. Per-transaction atomicity.** A `Transaction` applies
-all-or-nothing; after a crash the store must present it fully or not
-at all. This is the clause §4.3.9 leans on: the object write and the
-PG-log `P` records ride one transaction, so peering can trust that a
-logged write exists and an unlogged one doesn't. BlueStore satisfies
-it by funneling everything into a single RocksDB write batch per txc
-(`txc->t`, §4.3.6).
+                                        ◄── on_applied   t is readable
+                                        ◄── on_commit    t is durable ─► client reply
+```
 
-**3. Ordering per collection, parallelism across.**
-`ObjectStore.h:135`: "Any transactions queued under a given
-collection will be applied in sequence. Transactions queued under
-different collections may run in parallel." RADOS maps PG shard →
-collection, preserving client op order per PG while PGs scale across
-CPUs — this is what the per-collection `OpSequencer` implements. Note
-the doc's care: transactions are *applied* in sequence; on durability
-order the interface promises only an on-demand barrier,
-`flush_commit` (`ObjectStore.h:151` — the callback fires "once all
-transactions queued on this collection prior to the call have been
-applied and committed"). The *prefix property* the PG log needs — if
-transaction N is durable, so is everything before it on that PG — is
-a BlueStore implementation property, not an interface clause: the
-`OpSequencer` feeds `_kv_sync_thread`, which commits each swapped
-batch in submission order (§4.3.7).
+| # | Rule | Where written | How BlueStore keeps it |
+|---|---|---|---|
+| 1 | The call only queues. Results come back as `Context` callbacks: `on_applied(_sync)` = readable; `on_commit` = "durably committed to stable storage" | `Transaction.h:31`, `:48` | `_txc_committed_kv` queues the commit callbacks to the PG's op shard; a `tp_osd_tp` worker runs them and sends the ondisk reply (§3.1.6) |
+| 2 | A transaction is applied all or nothing, also after a crash | — | one RocksDB write batch per txc, `txc->t` (§4.3.6) |
+| 3 | "Any transactions queued under a given collection will be applied in sequence." Different collections may run in parallel | `ObjectStore.h:135` | one `OpSequencer` per collection (§4.2.2) |
+| 4 | The caller "promises not to attempt to read" what a pending transaction changes (until `on_applied_sync`). Violations need not be detected | `Transaction.h:77`, `:83` | no reader-vs-writer lock at all. Data is readable when the call returns ("we're immediately readable", `BlueStore.cc:16062`) |
+| 5 | No error report. The `int` return is not used: the client write path does not even keep it | `PrimaryLogPG.h:386` | in `_txc_add_transaction`, -ENOENT/-ENODATA on most object ops are ignored (`BlueStore.cc:16436`); anything else is "not handled on operation" → `ceph_abort_msg` (`:16470`) |
+| 6 | Data buffers "must remain stable until the on_commit callback completes" | `Transaction.h:56` | `bufferlist` reference counts (§4.2.5) |
 
-**4. Isolation is the caller's job, not the store's.** The
-`TRANSACTION ISOLATION` block (`Transaction.h:77`) is the surprising
-clause: the caller "promises not to attempt to read"
-(`Transaction.h:83`) any
-element a pending transaction mutates (until `on_applied_sync`),
-violations need not be detected, and enumerations may see arbitrary
-combinations of a pending transaction's creates/deletes. RADOS
-supplies the promise via the PG lock — ops on one PG are serial, so
-no read races its own write. In exchange BlueStore is "immediately
-readable" when `queue_transactions` returns (the comment at
-[`BlueStore.cc:16062`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L16062))
-with no read-side locking against in-flight txcs — the write path
-needs no reader-vs-writer lock at all, because the isolation the
-store would otherwise need was purchased upstream, once, by the PG
-lock.
+Two points need a closer look:
 
-**5. No failure path.** The `int` return is vestigial — the OSD
-asserts success or ignores the return outright (the client write
-path, `PrimaryLogPG.h:386`, doesn't even capture it); there is no
-per-op error report and no rollback protocol. Inside
-`_txc_add_transaction`, -ENOENT/-ENODATA on most object ops are
-silently swallowed (`BlueStore.cc:16436`); anything else prints "not
-handled on operation" and dies via `ceph_abort_msg("unexpected
-error")` (`BlueStore.cc:16470`) — an error is either ignored or
-fatal, never reported. The interface effectively requires the caller
-to submit only pre-validated transactions (quota, ENOSPC and
-permission checks happen upstream in the OSD), and the source says it
-outright for ENOSPC: "if we hit *any* ENOSPC, crash, before we do any
-damage by partially applying transactions" (`BlueStore.cc:16460`).
-Deliberate: RADOS has no way to un-replicate a half-applied op.
+- **Rule 3 is about *apply* order, not *durable* order.** For
+  durability the interface offers only a barrier on request:
+  [`flush_commit`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/ObjectStore.h#L161)
+  calls back once everything queued before it is applied and
+  committed. The PG log needs more — a *prefix property*: if write N
+  is durable, every earlier write on the PG is durable too. BlueStore
+  gives this, but as an implementation property: `_kv_sync_thread`
+  commits each batch in queue order (§4.3.7).
+- **Rule 5 is on purpose.** The caller must send only transactions
+  that are already checked (space, quota, permission — all in the
+  OSD). For ENOSPC the source says it plainly: "if we hit *any*
+  ENOSPC, crash, before we do any damage by partially applying
+  transactions" (`BlueStore.cc:16460`). §4.1.2 explains why.
 
-**6. Buffer stability until commit.** The serialized transaction
-references the caller's buffers zero-copy, so they "must remain
-stable until the on_commit callback completes" (`Transaction.h:56`);
-in practice `bufferlist` refcounting handles it, but it is part of
-the contract.
-
-Notice what the contract does **not** require: fsync-per-transaction.
-Durability is *signaled* per transaction but may be *achieved* in
-batches — the freedom `_kv_sync_thread` (§4.3.7) exploits, amortizing
-one `submit_transaction_sync` (barrier #2) over many txcs'
-`on_commit`s. The contract pins ordering and atomicity and leaves
-*when* to the implementation; that gap is where all of BlueStore's
-throughput engineering lives.
+What the contract does **not** ask for: one fsync per transaction.
+Commit is *reported* per transaction but may be *done* in batches.
+`_kv_sync_thread` (§4.3.7) uses this: one `submit_transaction_sync`
+(barrier #2) serves the `on_commit` of many txcs. The contract fixes
+order and atomicity, and leaves *when* to the store. All of BlueStore's
+throughput work lives in that gap.
 
 ### 4.1.2 Why this contract — the promises made upstairs
 
-None of the six clauses is a storage-engine preference. Each is the
-compiled form of a promise some layer above has already made: RBD,
-RGW and CephFS promise their users things like "fsync returned, your
-data survives power loss"; RADOS promises the services "acked means
-durable on the quorum, per-object order holds". The OSD can keep
-those promises only if its local store signs exactly this contract.
+No rule is a storage-engine taste. Each one is a promise made higher
+up, passed down: RBD, RGW and CephFS promise their users things like
+"fsync returned, the data survives power loss", and RADOS promises the
+services "acked means durable on all replicas, and order per object
+holds". The OSD can keep those promises only if its store signs this
+exact contract:
 
-**Durability as an event (clause 1).** A guest VM's ext4/XFS journal
-is correct only if the virtual disk's FLUSH really means
-durable-on-media — librbd maps a guest flush to "wait for the
-outstanding acks", so the RADOS ack must be a durability event, which
-in turn means the store must *tell* the OSD when commit happened
-(`on_commit`), not merely return. The same shape arrives via POSIX
-`fsync` through CephFS (and through the MDS's own journal, which is
-itself RADOS objects), and via S3 semantics through RGW: a 200 means
-the object survives failures, so the reply may only follow the commit
-event. The applied/commit *split* exists for the other direction —
-read-your-writes must not wait the milliseconds durability costs, so
-visibility is signaled separately (and BlueStore makes it immediate).
-The *async* form exists because a PG shard thread pipelines many ops;
-a store call that blocked on media would serialize a whole PG on
-device latency.
+```
+ promise upstairs                        what RADOS needs                   rule
+ ────────────────                        ────────────────                   ────
+ guest FLUSH, fsync, S3 "200"       ─►   ack = the data is durable     ─►   (1) on_commit
+ read your own write, quickly       ─►   readable before durable       ─►   (1) on_applied is separate
+ a PG thread runs many ops at once  ─►   never block on the device     ─►   (1) async
+ one op = data + xattr + omap       ─►   no half-applied op            ─►   (2) atomic
+ PG log entry rides with the write  ─►   log and data inseparable      ─►   (2) atomic
+ all replicas hold the same bytes   ─►   same ops, same order, per PG  ─►   (3) ordered per collection
+ throughput from many PGs           ─►   PGs independent               ─►   (3) parallel across collections
+ the PG lock already serializes     ─►   do not lock a second time     ─►   (4) caller's isolation
+ the repop is already sent          ─►   no way to roll back           ─►   (5) succeed or crash
+ NIC-to-disk without a copy         ─►   pin buffers, do not copy      ─►   (6) stable buffers
+```
 
-**Atomicity (clause 2): compound ops, and the log.** A RADOS op is
-compound — one op can carry a data write plus xattr plus omap
-mutations (RBD pairs data with object-map updates, RGW writes the
-head object plus its manifest, one MDS journal entry batches a whole
-directory update), and a half-applied compound op after a crash would
-be an inconsistency no client can even detect, let alone repair. But
-the most demanding customer is RADOS itself: the OSD piggybacks the
-PG-log entry on the same transaction (§4.3.9), and peering decides
-which replica has which write by comparing logs — that works only if
-a write and the log entry describing it are inseparable.
+The reasons, row by row:
 
-**Ordering, scoped (clause 3): replicas converge by construction.**
-Replication is a state machine: every replica applies the same ops in
-the same order, therefore holds the same bytes. The PG log *is* that
-order, and recovery's `last_update`/`last_complete` arithmetic
-assumes the sequence has no holes — hence apply-in-sequence per
-collection. The scoping is the equally deliberate half: an OSD hosts
-hundreds of PGs, and RBD stripes one image across thousands of
-objects precisely so they land in different PGs — cross-collection
-parallelism is where every service's throughput comes from. The
-contract pins the minimum order correctness needs and frees
-everything else.
+- **(1) Durability is an event.** A guest's ext4/XFS journal is
+  correct only if a virtual-disk FLUSH means "on media". librbd maps a
+  guest flush to "wait for the outstanding acks", so the RADOS ack
+  must mean durable, and the store must *report* when commit happened.
+  The same holds for POSIX `fsync` through CephFS (the MDS journal is
+  RADOS objects too) and for RGW, where a 200 means the object
+  survives a failure. Readability is reported separately, because
+  read-your-writes must not wait the milliseconds that durability
+  costs. The call is async because a PG shard thread runs many ops
+  back to back; a call that blocked on the device would stall the PG.
+- **(2) An op is compound, and so is the log.** One RADOS op can carry
+  a data write, xattrs and omap — RGW, for example, writes a head
+  object's data and its manifest xattr in one op. A half-applied op
+  after a crash is an inconsistency no client can detect, let alone repair. The most demanding user is
+  RADOS itself: the OSD puts the PG-log entry into the same
+  transaction (§4.3.9), and peering decides who has which write by
+  comparing logs. That works only if a write and its log entry cannot
+  be separated.
+- **(3) Replicas agree because they apply the same ops in the same
+  order.** The PG log *is* that order, and recovery's
+  `last_update`/`last_complete` logic assumes it has no holes. The
+  limit to one collection matters as much: an OSD hosts hundreds of
+  PGs, and RBD stripes an image over many objects so they land in
+  different PGs. The contract fixes the order correctness needs and
+  frees the rest.
+- **(4) Isolation is already paid for.** The OSD holds a stronger
+  lock — the PG lock — because of rule 3. A store-level reader/writer
+  lock would pay again, on every access, for what its only caller
+  already has.
+- **(5) A replicated op cannot be rolled back.** When the local store
+  applies the transaction, the replicas already have it: inside
+  `ReplicatedBackend::submit_transaction`,
+  [`issue_op`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L1210)
+  is called (`ReplicatedBackend.cc:642`) before the local
+  `queue_transactions` (`:675`). There is no "un-replicate" protocol,
+  so a local `EIO` cannot be undone on peers that may have committed.
+  The store may only succeed or stop. A store that cannot apply means
+  a dead OSD, and peering copies its PGs from the healthy replicas.
+  For RBD, RGW and CephFS a storage error shows up as a short
+  *unavailability*, never as wrong data. ENOSPC is the edge case: the
+  full-ratio checks upstream prevent it, and hitting it anyway is a
+  crash by design.
+- **(6) No copy from NIC to NVMe.** The bufferlist that brought the
+  client's bytes off the wire is the one `aio_write` hands to the
+  device. A copy would double the memory traffic on every replica;
+  pinning costs the caller one reference count.
 
-**Isolation by the caller (clause 4): don't pay twice.** The OSD
-already holds a stronger serialization — the PG lock — *because of*
-the ordering requirement above. A store-level reader/writer lock
-would purchase, on every access, a guarantee its only caller already
-owns. The interface has exactly one, sophisticated, client; the
-contract is shaped to that reality.
-
-**No failure path (clause 5): you cannot roll back a replicated op.**
-By the time the local store applies the transaction, the primary has
-already sent the repop to the replicas — inside
-`ReplicatedBackend::submit_transaction`, `issue_op`
-([`ReplicatedBackend.cc:642`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L642))
-runs before the local `queue_transactions` (`:675`). There is no
-un-replicate protocol — a polite local `EIO` would require
-distributed rollback of peers that may have already committed,
-exactly the complexity RADOS exists to avoid. So the store may only
-succeed or fail-stop: a store that cannot apply is a dead OSD, and
-peering re-replicates its PGs from the healthy copies. The effect for
-RBD/RGW/CephFS is that storage errors surface as temporary
-*unavailability*, never as wrong data — a blocked op is recoverable,
-a corrupted one is not. (ENOSPC is the limit case: it cannot be
-handled transactionally at apply time, so full-ratio checks upstream
-prevent it, and hitting one anyway is a crash by design.)
-
-**Buffer stability (clause 6): zero-copy from NIC to NVMe.** The
-bufferlist that carried the client's bytes off the wire is the same
-one `aio_write` hands to the device. Copying instead of pinning would
-double memory traffic on every replica at full OSD throughput;
-pinning costs the caller a refcount.
-
-Summed up: every clause traces either to a client-visible promise
-(fsync, FLUSH, S3's 200, POSIX) or to the replicated-state-machine's
-internal needs (log atomicity, prefix order, fail-stop). Nothing in
-the contract mentions storage media — which is why the same OSD ran
-on ext4-plus-journal under FileStore yesterday and runs on RocksDB
-plus raw NVMe under BlueStore today.
+Every rule comes either from a promise the user sees (fsync, FLUSH,
+S3's 200) or from the needs of the replicated state machine (log
+atomicity, prefix order, fail-stop). None mentions the storage medium.
+That is why the same OSD code ran on a filesystem plus journal under
+FileStore, and runs on RocksDB plus a raw device under BlueStore.
 
 ## 4.2 Data structures
 
+Five objects carry one write. Four are nested, the fifth — the bytes —
+passes through all of them:
+
+```
+ OSD                                      BlueStore
+ ───                                      ─────────
+ OpContext   one client op   (4.2.3)
+  └► RepGather   waits for replica acks
+      └► Transaction ──queue_transactions──► TransContext   one txc      (4.2.1)
+                                               │ is a node in
+                                               ▼
+                                             OpSequencer    one per PG   (4.2.2)
+                                               │ hangs off
+                                               ▼
+                                             BlueStore      one per OSD  (4.2.4)
+
+ bufferlist (4.2.5): the payload, from the socket to io_submit, shared by all of them
+```
+
 ### 4.2.1 TransContext — one write's whole journey, in one object
 
-[`BlueStore.h:1906`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1906)
-
-**Purpose.** One instance per `queue_transactions` call — the txc that
-every §3.1 trace line orbits. It is the single carrier for everything the
-write accumulates on its way to durability:
+[`struct TransContext`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1906)
+— one per `queue_transactions` call. It is the *txc* of every §3.1
+trace line, and it carries everything the write collects on its way
+to disk:
 
 ```
 struct TransContext final : AioContext           BlueStore.h:1906
   state         the §4.3.5 state machine (STATE_PREPARE .. STATE_DONE)
-  osr           the sequencer ordering it against its collection
+  osr           the sequencer that orders it within its collection
   t             the in-memory kv transaction (the P/O records of §3.1.3)
   ioc           IOContext holding the queued data aios; built with
-                priv = this — how the completion callback finds the
-                txc again (§3.1.4)
+                priv = this — how the completion finds the txc
+                again (§3.1.4)
   onodes, shared_blobs    what _txc_write_nodes must encode (§4.3.4)
   deferred_txn  the deferred payload, if any
   oncommits     contexts run at commit → the client reply
   allocated / released    space accounting for the freelist update
 ```
 
-The pointer itself is the correlation key of the whole post: it is
-`arg1` of every `_txc_*` probe in §2's scripts and the txc id printed
-in the traces.
+The txc pointer is the key that ties the whole post together: it is
+`arg1` of every `_txc_*` probe in §2 and the txc id in every trace.
 
-**Which threads use it.** All four lanes of §3.1.2's map — strictly one
-at a time:
+**Threads.** All four lanes of §3.1.2's map use it — one at a time:
 
-| Thread | States it drives | Role for the instance |
+| Thread | States it drives | What it does with the txc |
 |---|---|---|
-| `tp_osd_tp` | PREPARE → AIO_WAIT | creates it, fills plan, `t`, `ioc`; submits aios |
-| `bstore_aio` | AIO_WAIT → IO_DONE | marks data IO done, queues it to kv |
+| `tp_osd_tp` | PREPARE → AIO_WAIT | creates it; fills the plan, `t`, `ioc`; submits the aios |
+| `bstore_aio` | AIO_WAIT → IO_DONE | marks the data IO done; queues it to kv |
 | `bstore_kv_sync` | KV_QUEUED → KV_SUBMITTED | applies `t`, commits the batch |
-| `bstore_kv_final` | KV_SUBMITTED → DONE | runs callbacks, retires, deletes |
+| `bstore_kv_final` | KV_SUBMITTED → DONE | queues the commit callbacks, retires it, deletes it |
 
-The txc has **no lock of its own** and needs none: exactly one thread
-owns it at any moment, and each queue handoff (`kv_queue`,
-`kv_committing_to_finalize`) publishes it to the next thread under that
-queue's lock, which provides the memory barrier. The sequencer's
-`qlock` guards the osr's *list* of txcs, never the txc's fields.
+**No lock of its own.** Only one thread owns a txc at a time. Each
+handoff goes through a queue (`kv_queue`, `kv_committing_to_finalize`)
+under that queue's lock, and the lock is the memory barrier. The
+sequencer's `qlock` guards the *list* of txcs, never a txc's fields.
 
 **Lifetime.**
 
@@ -3102,7 +3084,7 @@ queue's lock, which provides the memory barrier. The sequencer's
 _txc_create  (from queue_transactions :15998)     BlueStore.cc:14558
    │
 PREPARE → AIO_WAIT → IO_DONE → KV_QUEUED → KV_SUBMITTED
-                                               │ reply fires here (#16)
+                                               │ callbacks queued (#16)
                                                ▼
                                             KV_DONE
                              direct ───────────┤
@@ -3115,29 +3097,30 @@ PREPARE → AIO_WAIT → IO_DONE → KV_QUEUED → KV_SUBMITTED
                                                   BlueStore.cc:15051
 ```
 
-Two consequences already visible in §3.1: the client reply
-(`oncommits`) fires at `_txc_committed_kv`, well before the txc dies —
-which is why trace lines #16 and #17 are distinct events; and a
-deferred txc outlives its reply by a whole replay round-trip, which is
-why §2.4's wlat.bt records at `_txc_committed_kv`, not `_txc_finish`.
-(`_txc_create` has one other caller: `_deferred_replay` at mount,
-rebuilding txcs for L records that survived a crash.)
+- The commit callbacks (`oncommits`) are handed to the OSD at
+  `_txc_committed_kv`, well before the txc dies. That is why trace
+  lines #16 and #17 are two events. The reply itself leaves a little
+  later, from `tp_osd_tp` (§3.1.6).
+- A deferred txc lives a whole replay round-trip past its reply. That
+  is why §2.4's wlat.bt measures at `_txc_committed_kv`, not at
+  `_txc_finish`.
+- `_txc_create` has one more caller: `_deferred_replay` at mount,
+  which rebuilds txcs from the L records that survived a crash.
 
 ### 4.2.2 OpSequencer — per-collection ordering, and the txc's queue
 
-[`BlueStore.h:2231`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2231)
-
-**Purpose.** One per collection (`Collection::osr`) — the object that
-keeps a PG's txcs *ordered* while four threads process them in
-parallel, and the rendezvous point for anyone who must wait for them:
+[`class OpSequencer`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2231)
+— one per collection (`Collection::osr`). Four threads work on a PG's
+txcs at once; the sequencer keeps them in order, and anyone who must
+wait for them waits here:
 
 ```
 class OpSequencer : RefCountedObject             BlueStore.h:2231
-  qlock, qcond      guard/wake for everything below
+  qlock, qcond      lock and wakeup for everything below
   q                 the in-flight txcs, IN SUBMISSION ORDER — an
-                    intrusive list threaded through the txc's own
+                    intrusive list through the txc's own
                     sequencer_item hook: the txc IS the list node,
-                    queueing allocates nothing
+                    so queueing allocates nothing
   deferred_pending, deferred_running, deferred_lock
                     this collection's deferred replay batches
   txc_with_unstable_io, kv_committing_serially    ordering counters
@@ -3146,32 +3129,38 @@ class OpSequencer : RefCountedObject             BlueStore.h:2231
                                       all txcs reach KV_SUBMITTED
 ```
 
-Its ordering job is easiest to see in `_txc_finish_io` (`:14753`): data
-aios complete in device order, not submission order, so the completion
-walks `q` under `qlock` and only advances txcs from the front — a txc
-whose predecessor is still writing waits in IO_DONE. That is how
-commits within a PG never reorder even though the device may.
+**How it keeps order.** The device completes aios in any order.
+`_txc_finish_io` (`:14753`) walks `q` under `qlock` and moves txcs on
+only from the front:
 
-**Which threads use it.** Everyone, which is why it has real locks
-where the txc has none:
+```
+ q, in submission order:    txc1      txc2      txc3
+ aio done:                  …         ✓         ✓
+ _txc_finish_io(txc2):      txc1 is not IO_DONE yet → txc2 waits in IO_DONE
+ _txc_finish_io(txc3):      same → txc3 waits
+ _txc_finish_io(txc1):      txc1 ✓ → advance txc1, then txc2, txc3 in order
+```
 
-| Thread | Touch |
+So commits within a PG never change order, even when the device does.
+
+**Threads.** Everyone uses it, so — unlike the txc — it has real locks:
+
+| Thread | What it touches |
 |---|---|
-| `tp_osd_tp` | `queue_new` at txc create; `flush()`/`drain()` in collection ops; `deferred_lock` when queueing deferred payloads |
-| `bstore_aio` | `_txc_finish_io` walks `q` under `qlock` to advance in order |
-| `bstore_kv_sync` | reads/decrements the ordering counters per batch |
-| `bstore_kv_final` | pops `q`, `qcond.notify_all` for flush/drain waiters, reaps zombies |
+| `tp_osd_tp` | `queue_new` when a txc is created; `flush()`/`drain()` in collection ops |
+| `bstore_aio` | `_txc_finish_io` walks `q` under `qlock` (above) |
+| `bstore_kv_sync` | reads and decrements the ordering counters per batch |
+| `bstore_kv_final` | pops `q`; `qcond.notify_all` for flush/drain waiters; reaps zombies; `deferred_lock` when `_deferred_queue` (`:15645`) queues a deferred payload |
 | deferred kickers (mempool trim, drains, throttled submitters — whoever calls `deferred_try_submit`, §4.3.8) | `deferred_lock`, `deferred_pending`/`running` |
 
-**Lifetime.** Refcounted, and deliberately able to outlive its
-collection:
+**Lifetime.** Reference counted, and it can outlive its collection:
 
 ```
 collection opened / created
   _osr_attach                          :15094   new OpSequencer — or the
-   │                                            zombie for the same cid,
-   │                                            so ordering survives a
-   │                                            remove+recreate
+   │                                            zombie of the same cid,
+   │                                            so order survives a
+   │                                            remove + recreate
   lives as c->osr; every txc passes through q
    │
 collection removed
@@ -3183,25 +3172,23 @@ last txc's _txc_finish                 :15062   erased from zombie_osr_set
 refcount → 0 → freed        (_osr_drain_all :15197 sweeps zombies too)
 ```
 
-The zombie mechanism is the subtle part: a PG can be deleted while its
-last writes are still in the kv pipeline, and a *new* collection with
-the same cid must not start ordering from scratch ahead of them —
-reattaching the zombie (`:15105-15112`) closes that window.
+Why zombies: a PG can be deleted while its last writes are still in
+the kv pipeline. A *new* collection with the same cid must not start a
+fresh order ahead of them. Re-attaching the zombie (`:15105-15112`)
+closes that window.
 
 ### 4.2.3 OpContext — the op above the txc
 
-[`PrimaryLogPG.h:680`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.h#L680)
-— one layer up from BlueStore: where §4.2.1's txc carries one
-*transaction*, `PrimaryLogPG::OpContext` carries one *client op* — the
-`writefull` of §1.4 — from decode to reply. The layering is:
+[`struct OpContext`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.h#L680)
+— one layer up, in the OSD. A txc carries one *transaction*; a
+`PrimaryLogPG::OpContext` carries one *client op* (the `writefull` of
+§1.4) from decode to reply:
 
 ```
-OpContext        client-op semantics: ops → transaction + reply
-  └► RepGather   replication tracking (local commit + replica acks)
+OpContext        client-op meaning: ops → transaction + reply
+  └► RepGather   replication: local commit + replica acks
        └► ObjectStore::Transaction ──► TransContext (§4.2.1)
 ```
-
-**Purpose.** Everything the op accumulates while being interpreted:
 
 ```
 struct OpContext                            PrimaryLogPG.h:680
@@ -3217,26 +3204,40 @@ struct OpContext                            PrimaryLogPG.h:680
   bytes_written / bytes_read, delta_stats   accounting
 ```
 
-The three callback lists are the whole design: `execute_ctx` does not
-*send* a reply for a write — it **registers** the reply as an
-`on_committed` lambda (`PrimaryLogPG.cc:4473`: add `ONDISK`, send,
-`mark_commit_sent`) and the cleanup as `on_finish` (`:4497`,
-`delete ctx`), then submits. The op's future is data, stored in the op
-itself.
+**The callback lists are the design.** For a write, `execute_ctx`
+does not *send* the reply. It *registers* it:
 
-**Which threads use it.**
+```
+execute_ctx                                                  PrimaryLogPG.cc
+  ├─ on_committed += { flags ACK|ONDISK; send reply;          :4473
+  │                    mark_commit_sent }
+  ├─ on_success   += { do_osd_op_effects }  (watch/notify)    :4488
+  ├─ on_finish    += { delete ctx }                           :4495
+  └─ issue_repop ──► … later, whoever ends the op runs the lists
+```
 
-| Thread | Touch |
+The op's future is stored as data in the op itself. On an early exit
+(for example, waiting for the rw locks, `:2522`) `close_op_ctx` runs the
+same teardown early — whoever ends
+the op, the same callbacks run.
+
+**Threads.**
+
+| Thread | What it does |
 |---|---|
-| `tp_osd_tp` | creates it in `do_op` (`:2500`), runs `do_osd_ops`, submits; a *read* completes here inline (`complete_read_ctx`) and the ctx dies without ever leaving the thread |
-| `bstore_kv_final` | at txc commit (§3.1 line #16), `BlessedContext` re-takes the PG lock and `eval_repop` runs `on_committed` — the reply leaves from this thread |
-| messenger workers | with replicas, the last `MOSDRepOpReply` ack can be what drives `eval_repop` — completion then runs on a msgr thread instead |
+| `tp_osd_tp`, at submit | creates it in `do_op` (`:2500`), runs `do_osd_ops`, submits. A *read* completes right here (`complete_read_ctx`), and the ctx dies without leaving the thread |
+| `tp_osd_tp`, at commit | `bstore_kv_final` only *queues* the commit callbacks to the PG's op shard (§3.1.6, #16). A worker of that shard runs them: `BlessedContext` takes the PG lock again, `eval_repop` runs `on_committed`, and the reply leaves |
+| `tp_osd_tp`, replica ack | with replicas, the last `MOSDRepOpReply` may be what completes the repop. It too is handled in the PG's op shard (`ReplicatedBackend.cc:235`) |
 
-Like the txc, the OpContext has no lock of its own — but for the
-opposite reason: every touch happens under the **PG lock** (held by
-`do_op`, re-taken by `BlessedContext`), not via exclusive handoff. What
-it does hold is the object's rw locks (`obc`, via `get_rw_locks`,
-`:954`), which is what serializes ops *per object* on top of the PG.
+So for a client write, every access to an OpContext happens on
+`tp_osd_tp`. (Copy-from and proxy-write ops also finish on the
+Objecter's finisher thread — still under the PG lock.)
+
+**Locks.** No lock of its own, like the txc — but for a different
+reason: every access is under the **PG lock** (held by `do_op`, taken
+again by `BlessedContext`), not by a one-owner handoff. It does hold
+the object's rw locks (`obc`, via `get_rw_locks`, `:1692`); they
+serialize ops *per object*, on top of the PG.
 
 **Lifetime.**
 
@@ -3257,19 +3258,14 @@ do_op: new OpContext                        PrimaryLogPG.cc:2500
                    → rw locks released, on_finish → delete ctx
 ```
 
-The gap between "reply sent" (`on_committed`) and "ctx deleted"
-(`on_finish`, at `remove_repop`) mirrors the txc's #16/#17 split one
-layer up — and on error paths the same teardown runs early via
-`close_op_ctx` (`:2522`), which is why the completion program lives in
-lists on the ctx rather than in code after the submit: whoever ends the
-op, the same callbacks run.
+"Reply sent" (`on_committed`) and "ctx deleted" (`on_finish`) are
+two steps — the same split as the txc's #16/#17, one layer up.
 
 ### 4.2.4 BlueStore — the top-level object's state
 
-[`BlueStore.h:2414`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2414)
-— one instance per OSD; everything the previous entries attach to
-hangs off it. The members group into a handful of machines
-(references in this entry are `BlueStore.h` lines):
+[`class BlueStore`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L261)
+— one per OSD. Everything above hangs off it. Its members form a few
+groups (line numbers are `BlueStore.h`):
 
 ```
 the engines                                        :2414-2425
@@ -3278,7 +3274,8 @@ the engines                                        :2414-2425
    db            the KeyValueDB (rocksdb)                 (§4.3.6)
    bdev          THE data device: the "block" symlink
                  (not db/wal -- see below)
-   fm            durable freelist (null under NCB)        (§4.3.9)
+   fm            durable freelist (null under NCB on a     (§4.3.9)
+                 non-rotational DB device)
    alloc         in-RAM allocator
 
 the namespace                                      :2439-2444
@@ -3288,9 +3285,9 @@ the namespace                                      :2439-2444
                  sharded to spread lock traffic across CPUs
 
 id allocation                                      :2451-2454
-   nid/blobid {last,max} atomics — lock-free draw against
-                 preallocated ceilings; the kv committer bumps
-                 the durable max ahead of use (§4.3.7)
+   nid/blobid {last,max} atomics — lock-free draw below
+                 preallocated ceilings; the kv committer makes
+                 the max durable before use (§4.3.7)
 
 the deferred machinery                             :2456-2462
    deferred_lock, deferred_seq, deferred_queue_size,
@@ -3302,106 +3299,104 @@ the kv pipeline                                    :2467-2484
    kv_finalize_lock + the handoff deques  (switch #3)
 
 admission control                                  :2193
-   throttle — costs charged at queue_transactions, released
+   throttle — cost charged in queue_transactions, released
                  mid-cycle by the committer (§4.3.7)
 ```
 
-What `bdev` is exactly — and what it is not: it is the **data
-device**, the `block` symlink in the OSD directory
-(`BlueStore.cc:6250`), holding object data. The db/wal/slow names
-live one layer down, and three naming schemes overlap:
+**Tunables without locks.** Almost every setting the write path reads
+per op (`prefer_deferred_size` `:2527`, `deferred_batch_ops` `:2524`,
+`csum_type` `:2496`) is a `std::atomic`, refreshed by the config
+observer. So `ceph config set` works on a live OSD with no lock on the
+hot path.
 
-- **Deployment symlinks**: `block` (data, always), `block.db` and
-  `block.wal` (optional faster devices).
-- **BlueFS device slots** ([`BlueFS.h:268`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.h#L268)):
-  `BDEV_WAL=0`, `BDEV_DB=1`, `BDEV_SLOW=2` (plus `NEWWAL`/`NEWDB`
-  used only during live device migration). BlueFS holds its *own*
-  `BlockDevice*` per slot — separate `KernelDevice` instances with
-  separate fds, even when they open the same disk.
-- **RocksDB directory names inside BlueFS**: `db/` → `BDEV_DB`,
-  `db.wal/` → `BDEV_WAL`, `db.slow/` → `BDEV_SLOW` — so `db.slow`
-  is not a device at all but the BlueFS directory whose files land
-  on the slow (data) disk when rocksdb spills.
+#### bdev, and the three names for a device
 
-On a single-device OSD (this post's lab) there is no `block.db` or
-`block.wal`: BlueFS's `BDEV_DB` slot is a second `KernelDevice`
-opened on the *same* disk as `BlueStore::bdev` — which is exactly
-the two `bdev=0x...` pointers and two fd families in every §2/§3.1
-trace (fd 32 = `BlueStore::bdev`, fd 44 = BlueFS's `BDEV_DB`). The
-split also assigns the barriers: §3.1.5's barrier #1
-(`bdev->flush()` in the kv committer) is *this* member; barrier #2's
-WAL fsync travels `db → BlueFS → its own bdev`, never touching
-`BlueStore::bdev`.
+`bdev` is the **data device** — the `block` symlink in the OSD
+directory (opened in `_open_bdev`, `BlueStore.cc:7257`), holding
+object data. The db/wal names
+live one layer down, in BlueFS, and three naming schemes overlap:
 
-One idiom worth noticing: nearly every tunable that the write path
-reads per-op (`prefer_deferred_size` `:2527`, `deferred_batch_ops`
-`:2524`, `csum_type` `:2496`) is a `std::atomic` refreshed by the
-config observer — that is what makes `ceph config set` take effect on
-a live OSD without any lock appearing on the hot path.
+| Layer | Names | Meaning |
+|---|---|---|
+| deployment symlinks | `block`, `block.db`, `block.wal` | data (always); optional faster devices |
+| BlueFS device slots ([`BDEV_WAL`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.h#L269)) | `BDEV_WAL=0`, `BDEV_DB=1`, `BDEV_SLOW=2` (+ `NEWWAL`/`NEWDB` for live migration) | BlueFS opens its *own* `BlockDevice*` per slot — separate `KernelDevice`s, separate fds, even on the same disk |
+| RocksDB directories inside BlueFS | `db/`, `db.wal/`, `db.slow/` | map to `BDEV_DB`, `BDEV_WAL`, `BDEV_SLOW`. `db.slow` is not a device: it is the directory whose files land on the slow (data) disk when rocksdb spills over |
+
+On this post's single-device OSD there is no `block.db` or
+`block.wal`. The same disk is opened twice — BlueFS adds `block` again
+as its `BDEV_DB` (`BlueStore.cc:7812`, `:7823`):
+
+```
+ one disk ──┬── BlueStore::bdev   (KernelDevice, fd 32)   object data     ← barrier #1: bdev->flush()
+            └── BlueFS BDEV_DB    (KernelDevice, fd 44)   rocksdb files   ← barrier #2: WAL fsync, db → BlueFS → its bdev
+```
+
+That is why every §2/§3.1 trace shows two `bdev=0x...` pointers and
+two fd families.
 
 #### kv_lock — what it protects, and why it is a mutex
 
-The producer→committer handoff state, i.e. everything a foreign
-thread can touch while the kv thread might be looking:
+`kv_lock` guards the handoff from producers to the committer —
+everything another thread may touch while the kv thread looks:
 
-| structure | producers | committer use |
+| Structure | Producer | Committer |
 |---|---|---|
-| `kv_queue` (`:2474`) | `_txc_state_proc` IO_DONE, any thread (`BlueStore.cc:14705`) | swapped out per cycle (`:15340`) |
-| `kv_queue_unsubmitted` (`:2475`) | same site | swapped out |
+| `kv_queue` (`:2474`) | `_txc_state_proc` at IO_DONE, any thread (`BlueStore.cc:14705`) | swapped out per cycle (`:15340`) |
+| `kv_queue_unsubmitted` (`:2475`) | same place | swapped out |
 | `deferred_done_queue` (`:2477`) | `_deferred_aio_finish` (`BlueStore.cc:15791`) | swapped out |
-| `kv_ios` + throttle counters (`:2544`) | incremented at the push site (`:14715`) | read-and-zeroed per cycle |
-| `kv_sync_in_progress`, `kv_stop` | start/stop control | the condvar predicate |
+| `kv_ios` + throttle counters (`:2544`) | added to at the push (`:14715`) | read and zeroed per cycle |
+| `kv_sync_in_progress`, `kv_stop` | start/stop control | the wait condition |
 
-Plus `kv_cond` itself — the lock *is* the condition variable's mutex.
-Not under it: `deferred_aggressive` (atomic, `:2462`), the batch
-deques after the swap (thread-private), and the finalize handoff
-(its own `kv_finalize_lock`, so producers pushing new work never
-contend with the batch handoff).
+Plus `kv_cond` itself: `kv_lock` is the condition variable's mutex.
+*Not* under it: `deferred_aggressive` (atomic, `:2462`), the batch
+after the swap (private to the kv thread), and the finalize handoff
+(its own `kv_finalize_lock`, so new producers never wait on the batch
+handoff).
 
-Why a mutex and not a spinlock, in increasing depth:
+Why a mutex and not a spinlock:
 
-1. **The API forces it** — `kv_cond.wait(l)` needs a mutex: the
-   atomic release-and-sleep that keeps a `notify` from slipping into
-   the gap is futex+mutex machinery, and the kv thread sleeps
-   indefinitely here when idle. A spinlock has no "sleep until
-   notified".
-2. **Userspace spinlocks are a trap even for nanosecond sections.**
-   Userspace cannot disable preemption: the moment a spinlock holder
-   is descheduled, every waiter burns its full timeslice against a
-   holder that is not running. Kernel spinlocks work because
-   `spin_lock` implies `preempt_disable`; userspace has no
-   equivalent.
-3. **The mutex already is a spinlock in the case that matters.** An
-   uncontended `std::mutex` acquire is one CAS — no syscall. The
-   futex path engages only under contention, exactly when sleeping
-   beats spinning. Every operation under `kv_lock` is O(1) (push,
-   swap, counter bump); the expensive work — fsync, RocksDB apply —
-   happens strictly outside. When hold time is nanoseconds, the
-   primitive stops mattering; making a lock cheap is about what you
-   do under it.
+1. **The API needs it.** `kv_cond.wait(l)` needs a mutex: releasing
+   the lock and sleeping must be one atomic step, or a `notify` is
+   lost in between. The kv thread sleeps here, for as long as it is
+   idle. A spinlock cannot "sleep until notified".
+2. **User-space spinlocks are a trap, even for tiny sections.** User
+   space cannot turn off preemption. If the holder is scheduled out,
+   every waiter spins a full time slice for a holder that is not
+   running. Kernel spinlocks work because `spin_lock` also disables
+   preemption.
+3. **An uncontended mutex costs the same as a spinlock.**
+   `std::mutex` without contention is one CAS, no syscall. The futex
+   path runs only under contention — exactly when sleeping beats
+   spinning. Every step under `kv_lock` is O(1) (push, swap, add); the
+   costly work (fsync, RocksDB apply) is outside it. With a hold time
+   of nanoseconds, the kind of lock stops mattering; what is done
+   under it is what matters.
 
-Ceph adds one layer: `ceph::mutex` compiles to a bare `std::mutex`
-in release builds but to `mutex_debug_impl` in Debug builds —
-ownership tracking, an `nlock` counter, and asserts that turn silent
-double-locks into crashes. Debug-build lock costs are therefore far
-above the one-CAS figure; remember that when reading absolute
-latencies from a Debug lab.
+One Ceph detail: `ceph::mutex` is a plain `std::mutex` in release
+builds, but `mutex_debug_impl` in Debug builds — owner tracking, an
+`nlock` counter, asserts that turn a silent double lock into a crash.
+A Debug build's locks cost far more than one CAS; keep that in mind
+when you read absolute latencies from a Debug lab.
 
 ### 4.2.5 bufferlist — the container every hop hands over
 
-[`buffer.h:417`](https://github.com/ceph/ceph/blob/v21.3.0/src/include/buffer.h#L417)
-(`list`), [`:167`](https://github.com/ceph/ceph/blob/v21.3.0/src/include/buffer.h#L167)
-(`ptr`), [`:362`](https://github.com/ceph/ceph/blob/v21.3.0/src/include/buffer.h#L362)
-(`ptr_node`), [`buffer_raw.h:30`](https://github.com/ceph/ceph/blob/v21.3.0/src/include/buffer_raw.h#L30)
-(`raw`)
+[`buffer::list`](https://github.com/ceph/ceph/blob/v21.3.0/src/include/buffer.h#L417),
+[`buffer::ptr`](https://github.com/ceph/ceph/blob/v21.3.0/src/include/buffer.h#L167),
+[`ptr_node`](https://github.com/ceph/ceph/blob/v21.3.0/src/include/buffer.h#L362),
+[`buffer::raw`](https://github.com/ceph/ceph/blob/v21.3.0/src/include/buffer_raw.h#L30)
 
-**Purpose.** `ceph::buffer::list` — `bufferlist` everywhere in the
-tree — is the one type the write's payload travels in from the socket
-to `io_submit`: the messenger receives into it, `MOSDOp` and
-`ObjectStore::Transaction` encode into and decode out of it, BlueStore
-plans blobs as views of it, `aio_t` pins it until the device is done.
-Every probe in §2 that prints a length reads its `_len`; every `src_off`
-in §3.3 reads a node's offset. It is three objects, not one:
+`ceph::buffer::list` — `bufferlist` in the tree — is the one type the
+write's payload travels in, from the socket to `io_submit`:
+
+```
+ socket ─► messenger ─► MOSDOp ─► ObjectStore::Transaction ─► BlueStore blobs ─► aio_t ─► io_submit
+          receives into   decode        encode / decode          views of it      pins it
+```
+
+Every §2 probe that prints a length reads its `_len`; every `src_off`
+in §3.3 reads a node's offset.
+
+#### Three objects, not one
 
 ```
  list                                     buffer.h:417   32 bytes, held by value
@@ -3426,101 +3421,97 @@ in §3.3 reads a node's offset. It is three objects, not one:
    last_crc_*     one cached crc32c (range → value), under a spinlock
 ```
 
-Those offsets — `bl+24` for the length, `node+16` for the offset into
-the raw, `raw+32` for the data — are exactly what §2's `set()` probes,
-§3.3's `src_off`, and §7's census read; they come from
-`gdb -batch -ex "ptype /o ceph::buffer::v15_2_0::list"` on the binary,
-not from the header (the header hides `raw` behind `class raw;`).
+The offsets (`bl+24` length, `node+16` offset into the raw, `raw+32`
+data) are what §2's `set()` probes, §3.3's `src_off` and §7's census
+read. They come from `gdb -batch -ex "ptype /o
+ceph::buffer::v15_2_0::list"` on the binary, not from the header (the
+header hides `raw` behind `class raw;`).
 
-A `ptr` is a *(raw, offset, length)* **view**; a `ptr_node` is a `ptr`
-with a list hook; a `list` is a chain of nodes plus a running total.
-Two lists can hold nodes onto the same `raw`, at different offsets, and
-neither knows about the other — the `raw` only knows how many views it
-has. That single fact decides everything that follows.
+- a `ptr` is a **view**: (raw, offset, length);
+- a `ptr_node` is a `ptr` with a list hook;
+- a `list` is a chain of nodes plus a running total.
 
-**Sharing versus copying.** §7.1's table is the operational summary:
-`append(list)`, `append(ptr,off,len)`, `substr_of`, `claim_append`,
-`share()`, and — despite its name — `iterator::copy(len, list&)` create
-nodes and bump `nref`
-([`buffer.cc:1442`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/buffer.cc#L1442),
-[`:1577`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/buffer.cc#L1577),
-[`:805`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/buffer.cc#L805));
-`rebuild()`, `rebuild_aligned_size_and_memory()`, `c_str()` on a
-multi-node list, and `iterator::copy(len, char*)` allocate and memcpy
-([`:1172`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/buffer.cc#L1172),
-[`:1213`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/buffer.cc#L1213),
-[`:1549`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/buffer.cc#L1549),
-[`:751`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/buffer.cc#L751)).
-The `ptr` copy-constructor is `nref++`
-([`:385`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/buffer.cc#L385));
-`ptr::release`
-([`:459`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/buffer.cc#L459))
-is `--nref`, with a fast path that skips the atomic entirely when the
-count is already 1 — the common case of a buffer nobody else ever
-looked at. `raw` is deleted by the last view to go. The corollary that
-bites: a 4 KiB view onto a 4 MiB receive buffer keeps all 4 MiB alive.
+Two lists can hold nodes on the same `raw`, at different offsets, and
+neither knows the other. The `raw` knows only how many views it has.
+Everything below follows from that.
 
-`rebuild_aligned_size_and_memory(align_size, align_memory, max)` is the
-one worth knowing by heart, because `KernelDevice::aio_write` calls it
-on every O_DIRECT write. It walks the nodes once: a node whose *address*
-is a multiple of `align_memory` and whose *length* is a multiple of
-`align_size` is kept; any run of nodes that fails either test is
-unlinked, gathered into a scratch list, `rebuild()`-copied into one
-fresh `create_aligned` raw, and relinked in place. Alignment is judged
-per node — which is why the primary's payload (one 16 KiB node at raw
-offset 0) passes and the replica's (one 16 KiB node at raw offset 329)
-is copied whole, §3.3.4. `max_buffers` (`IOV_MAX` from `aio_write`)
-additionally forces consolidation when the list has more nodes than
-one `io_submit` can carry.
+#### Share or copy
 
-**Allocation.** `buffer::create(len)` builds a `raw_combined`
-([`buffer.cc:94`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/buffer.cc#L94)):
-header and bytes in one `posix_memalign` block, the header *after* the
-data so the data can start on the alignment boundary.
-`create_aligned(len, align)`
-([`:348`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/buffer.cc#L348))
-and `create_small_page_aligned`
-([`:357`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/buffer.cc#L357))
-give page-aligned data — the former is what the msgr2 receiver uses for
-each data segment (§7.3), the latter what BlueStore's read path
-allocates into (§7.6). Small appends (`append(char*, len)`,
-[`:1356`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/buffer.cc#L1356))
-go through `_carriage`: the last node is grown in place while its raw
-has room, and a new raw of roughly double size is added when it runs
-out — the encode-side pattern that builds a `MOSDOp` header or a
-transaction's op list from hundreds of tiny `encode()` calls without
-one allocation per call.
+| Operation | Effect |
+|---|---|
+| [`append(list)`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/buffer.cc#L1442), [`substr_of`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/buffer.cc#L1577), `append(ptr, off, len)`, `claim_append`, `share()` | **share**: new nodes, `nref++` |
+| [`iterator::copy(len, list&)`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/buffer.cc#L805) — despite the name | **share** |
+| [`rebuild`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/buffer.cc#L1172), [`rebuild_aligned_size_and_memory`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/buffer.cc#L1213), [`c_str`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/buffer.cc#L1549) on a multi-node list | **copy**: allocate + memcpy |
+| [`iterator::copy(len, char*)`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/buffer.cc#L751) | **copy** |
+| [`ptr(const ptr&)`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/buffer.cc#L385), the copy constructor | `nref++` |
+| [`ptr::release`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/buffer.cc#L459) | `--nref`; the last view deletes the `raw`. If `nref` is already 1, no atomic op at all — the common case of a buffer nobody else saw |
 
-**Which threads use it.** A `list` is not thread-safe and never needs
-to be: like the txc (§4.2.1), each list has exactly one owner at a
-time. Only the `raw` is shared across threads, and it is *read-only*
-once handed off — `nref` is atomic precisely so that views can be
-created and dropped from any thread. For one client write's payload
-raw:
+§7.1 is the operational summary. The side effect that bites: a 4 KiB
+view on a 4 MiB receive buffer keeps all 4 MiB alive.
 
-| Thread | Does | Nodes onto the payload raw |
+#### rebuild_aligned_size_and_memory — the copy before every O_DIRECT write
+
+`KernelDevice::aio_write` calls it on every write, with
+`align_size = align_memory = block_size` and `max_buffers = IOV_MAX`.
+It walks the nodes once:
+
+```
+ for each node:
+   address % align_memory == 0  AND  length % align_size == 0 ?
+     yes ─► keep it as is                                       (zero-copy)
+     no  ─► unlink it and the following bad nodes into a scratch list;
+            if that run is not already one aligned piece:
+              rebuild() it into one new create_aligned raw      (COPY)
+            link the result back in place
+```
+
+Alignment is judged **per node**. The primary's payload (one 16 KiB
+node at raw offset 0) passes. The replica's (one 16 KiB node at raw
+offset 329) is copied whole — §3.3.4. If the list has more than
+`max_buffers` nodes, `align_size` is first raised, so that small nodes
+fail the size test and get merged: one `io_submit` cannot carry more
+than `IOV_MAX` iovecs.
+
+#### Allocation
+
+| Call | Gives | Used by |
+|---|---|---|
+| `buffer::create(len)` → [`raw_combined`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/buffer.cc#L94) | header and data in one `posix_memalign` block; the header sits *after* the data, so the data starts on the alignment boundary | general use |
+| [`create_aligned(len, align)`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/buffer.cc#L348) | aligned data | the msgr2 receiver, per data segment (§7.3) |
+| [`create_small_page_aligned`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/buffer.cc#L357) | page-aligned data | BlueStore's read path (§7.6) |
+| [`append(char*, len)`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/buffer.cc#L1356) | grows the last node (`_carriage`) in place while its raw has room; else adds a new raw of about double size | encoding: a `MOSDOp` header or a transaction's op list is built from hundreds of tiny `encode()` calls without one allocation per call |
+
+#### Threads
+
+A `list` is not thread-safe and does not need to be: like the txc
+(§4.2.1), each list has one owner at a time. Only the `raw` is shared
+between threads, and it is *read-only* after the handoff. `nref` is
+atomic so that any thread can add or drop a view. For one client
+write's payload raw:
+
+| Thread | Does | Its nodes on the payload raw |
 |---|---|---|
 | `msgr-worker` (rx) | `create_aligned` for the frame's data segment; reads the socket into it; crc32c | `Message::data` |
 | `tp_osd_tp` | decodes `MOSDOp` (`indata` = `substr_of`), builds `op_t`, encodes the `MOSDRepOp`, plans blobs (`_do_write_big` cuts views), computes checksums, queues aios | `indata`, `op_t.data_*_bl`, wctx blobs, `aio_t::bl` |
-| `msgr-worker` (tx) | `prepare_iov` over the `MOSDRepOp`'s lists → `sendmsg` | none new — iovecs point into the raw |
+| `msgr-worker` (tx) | `prepare_iov` over the `MOSDRepOp`'s lists → `sendmsg` | none new — the iovecs point into the raw |
 | `bstore_aio` / `bstore_kv_sync` | reap the completion; `aio_t` dies | drops `aio_t::bl` |
-| `tp_osd_tp` (reply) | `OpRequest` dtor → `Message::put` | drops `Message::data` → `nref` 0 → free |
+| `tp_osd_tp` (reply) | `OpRequest` destructor → `Message::put` | drops `Message::data` → `nref` 0 → free |
 
-The crc cache is the one piece of mutable state on a `raw`, and it is
-there for this table's shape: the receiving messenger computes a
-crc32c over the data segment and stores (range → value) on the raw
-([`buffer_raw.h:96`](https://github.com/ceph/ceph/blob/v21.3.0/src/include/buffer_raw.h#L96));
-when the same bytes are later sent on — the primary's `MOSDRepOp`
-carries views onto the very raw the `MOSDOp` arrived in — a tx crc over
-an identical range is a lookup
-([`buffer.cc:2096`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/buffer.cc#L2096)),
+**The crc cache.** It is the only mutable state on a `raw`, and it
+exists for this table. The receiving messenger computes a crc32c over
+the data segment and stores (range → value) on the raw
+([`raw::set_crc`](https://github.com/ceph/ceph/blob/v21.3.0/src/include/buffer_raw.h#L106)).
+The primary's `MOSDRepOp` carries views on the very raw the `MOSDOp`
+arrived in. So the tx crc over the same range is a lookup
+([`get_crc`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/buffer.cc#L2096) in [`list::crc32c`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/buffer.cc#L2085)),
 not a pass over 16 KiB.
 
-**Lifetime of the payload raw**, from §3.3's trace: born at the
-replica's or primary's `read_frame_segment`, dead when the op's
-`Message` is dropped — after the client reply for the primary, after
-`repop_commit` for the replica. Every hop in between adds a view and
-removes none:
+#### Lifetime of the payload raw
+
+Born in `read_frame_segment` on the receiving OSD. Every hop adds a
+view and removes none. Dead when the op's `Message` is dropped — after
+the client reply on the primary, after `repop_commit` on a replica
+(§3.3):
 
 ```
  msgr-worker   create_aligned(16 KiB)  ──►  raw  nref=1   (Message::data)
@@ -3535,19 +3526,19 @@ removes none:
  tp_osd_tp     OpRequest destroyed → MOSDOp put           nref=0  → raw freed
 ```
 
-The raw's lifetime is therefore the **union** of every consumer's, and
-the last one is not the device — it is the op tracker releasing the
-request after the reply. §7.7 measures this; the design consequence is
-that a receive buffer's memory is charged to the connection's
+The raw lives as long as its longest user. That is not the device: it
+is the op tracker, which lets go of the request after the reply (§7.7
+measures it). So a receive buffer stays charged to the connection's
 throttler (`Message::byte_throttler`, returned in `~Message`,
-[`Message.h:355`](https://github.com/ceph/ceph/blob/v21.3.0/src/msg/Message.h#L355))
+[`~Message`](https://github.com/ceph/ceph/blob/v21.3.0/src/msg/Message.h#L355))
 until the *op* completes, not until the bytes are on disk.
 
-**Typical usage on the sender: `Transaction::write()` and `encode()`.**
-The primary's `op_t` is the clearest example of the whole type in
-action, because it is built, encoded onto the wire, *and* queued to
-the local store — from the same nodes. `write()`
-([`Transaction.h:900`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/Transaction.h#L900))
+#### Worked example: Transaction::write() and encode()
+
+The primary's `op_t` shows the whole type at work: it is built,
+encoded onto the wire, *and* queued to the local store — all from the
+same nodes.
+[`Transaction::write`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/Transaction.h#L900)
 records the op in `op_bl` and files the payload into one of two data
 lists:
 
@@ -3569,16 +3560,23 @@ void write(cid, oid, off, len, const bufferlist& write_data, flags) {
 }
 ```
 
-Nothing here copies bytes. `encode(bufferlist)` writes a 4-byte length
-and then `append()`s — new nodes onto the caller's raw;
-`encode_nohead` is the `append` alone; `substr_of` cuts views at the
-page boundaries of the *destination offset* (`alignstart` is how many
-bytes precede the first page boundary of `off`, so a write at `off=0`
-has `alignstart=0` and is entirely aligned). What the branch decides
-is only *which list* the views land in, and therefore where the bytes
-will sit in the wire frame. `encode(p, d, features)`
-([`Transaction.h:1345`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/Transaction.h#L1345))
-then lays the two lists out:
+Nothing here copies bytes:
+
+- `encode(bufferlist)` writes a 4-byte length, then `append()`s — new
+  nodes on the caller's raw. `encode_nohead` is the `append` alone.
+- `substr_of` cuts views at the page boundaries of the *destination
+  offset*. `alignstart` is the number of bytes before the first page
+  boundary at or after `off`; a write at `off=0` has `alignstart=0`
+  and is aligned from its first byte.
+- The branch decides only *which list* a view lands in — and so where
+  the bytes sit in the wire frame.
+
+[`Transaction::encode`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/Transaction.h#L1345)
+then lays the two lists out. This is the layout when the peer has
+`SERVER_TENTACLE` (encoding version 10; with version 9,
+`data_misaligned_bl` goes into `p_bl`, `d_bl` stays empty, and
+`issue_op` sends `p_bl` as the data segment —
+`Transaction.h:1362-1370`, `ReplicatedBackend.cc:1181-1187`):
 
 ```
  p_bl (→ MOSDRepOp middle)          d_bl (→ MOSDRepOp data segment)
@@ -3593,49 +3591,80 @@ then lays the two lists out:
  └──────────────────────────┘
 ```
 
-`d_bl` is still just nodes onto the original raw: `generate_subop` hands
-it to `MOSDRepOp::set_data`, the messenger's `write_message` builds
-iovecs from its nodes (`prepare_iov`,
-[`buffer.h:1213`](https://github.com/ceph/ceph/blob/v21.3.0/src/include/buffer.h#L1213))
-and `sendmsg`s them — so from the primary's receive buffer to the
-replica's socket, the 16 KiB is never copied in user space (§7.3). On
-the replica, `decode_bl`
-([`Transaction.h:717`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/Transaction.h#L717))
-reverses the split with `decode_nohead` — `iterator::copy(len, list&)`,
-a share — so the reassembled write is, again, views onto the received
-data segment; whether those views start on a page boundary is decided
-entirely by which branch `write()` took on the primary. With
-`data_features = 0` the legacy branch puts the payload behind the attr
-values and a length word (§3.3.3's 329 bytes), and
-`rebuild_aligned_size_and_memory` on the replica copies it once more;
-with the features set, the aligned list goes first and the copy
-disappears (§3.3.8, §7.4). The bufferlist did its job either way —
-the difference is entirely in how `Transaction::write()` arranged the
-views.
+The rest of the trip, still without a user-space copy:
+
+```
+ primary   d_bl ─► MOSDRepOp::set_data ─► write_message ─► prepare_iov ─► sendmsg     (§7.3)
+                                                           (buffer.h:1213)
+ replica   data segment ─► decode_bl: decode_nohead = iterator::copy(len, list&) = share
+                           (Transaction.h:717)
+           ─► the write is again views on the received segment
+```
+
+Whether those views start on a page boundary was decided by the
+branch `write()` took on the primary:
+
+| `data_features` | Wire layout | On the replica |
+|---|---|---|
+| `0` (legacy branch) | payload after the attr values and a length word (§3.3.3's 329 bytes) | `rebuild_aligned_size_and_memory` copies it once more |
+| set | aligned list first, at offset 0 | no copy (§3.3.8, §7.4) |
+
+The bufferlist does the same job either way. The difference is only
+in how `Transaction::write()` arranged the views.
 
 ## 4.3 Function reference
 
-The functions doing the heavy lifting above, in the order a write
-meets them: plan (`_do_write_big` / `_do_write_small`) → execute
-(`_do_alloc_write`) → encode (`_txc_write_nodes`) → drive
-(`_txc_state_proc`) → commit (`submit_transaction_sync`) → and the two
-thread loops that own the tail, `_kv_sync_thread` and
-`_kv_finalize_thread`. §4.3.9 then backtracks to the front door,
-`queue_transactions` — where the transaction, its PG-log `P` records
-already inside, first meets BlueStore — and §4.3.10–4.3.11 cover the
-write-v2 planning lane (§3.1.8) that replaces the first three entries
-when `bluestore_write_v2` is on. Bare `:NNNN`
-line numbers are
-[`BlueStore.cc` at the v21.3.0 tag](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc)
-(§4.3.6 is `RocksDBStore.cc`); each heading links its definition.
+The functions of the write path. Bare `:NNNN` is
+[`BlueStore.cc` at v21.3.0](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc)
+unless the subsection says otherwise. Where they sit on the path:
+
+```
+ tp_osd_tp                                     bstore_aio      bstore_kv_sync        bstore_kv_final
+ ─────────                                     ──────────      ──────────────        ───────────────
+ 4.3.9  queue_transactions  (front door)
+   └► _do_write ─┬─ classic: plan
+                 │    4.3.1 _do_write_big
+                 │    4.3.2 _do_write_small
+                 │  execute
+                 │    4.3.3 _do_alloc_write
+                 └─ v2 (bluestore_write_v2):
+                      4.3.10 _do_write_v2
+                      4.3.11 Writer::do_write
+      4.3.4 _txc_write_nodes  (encode)
+      ────────── 4.3.5 _txc_state_proc: called by every lane, drives the txc ──────────
+                                                               4.3.7 _kv_sync_thread
+                                                                 └► 4.3.6 submit_
+                                                                    transaction_sync
+                                                                                     4.3.8 _kv_finalize_thread
+```
+
+What each one costs:
+
+| § | Function | Device IO it does | Locks it takes |
+|---|---|---|---|
+| 4.3.1 | `_do_write_big` | none on the common path; head/tail *reads* on one deferred branch | none of its own |
+| 4.3.2 | `_do_write_small` | head/tail *reads* for read-modify-write; may queue a direct `aio_write` | none of its own |
+| 4.3.3 | `_do_alloc_write` | queues the data aios (not submitted yet) | allocator mutex, a buffer-cache shard lock — none held across the function |
+| 4.3.4 | `_txc_write_nodes` | none — memory only | none |
+| 4.3.5 | `_txc_state_proc` | none itself; *starts* the data `io_submit` and the deferred replay | `kv_lock`, `qlock` (asserted), `deferred_lock` |
+| 4.3.6 | `submit_transaction_sync` | 4 KiB WAL append + flush, via BlueFS (barrier #2) | RocksDB's writer mutex |
+| 4.3.7 | `_kv_sync_thread` | both barriers: data-device flush, WAL append + fsync | `kv_lock`, dropped before the barriers |
+| 4.3.8 | `_kv_finalize_thread` | none; may *start* the deferred replay | `kv_finalize_lock`; `qlock` inside the txc steps |
+| 4.3.9 | `queue_transactions` | none directly (its callees may read) | the caller's PG lock; `qlock` in `queue_new`; may kick deferred |
+| 4.3.10 | `_do_write_v2` | none of its own (its callees may read) | as `_do_write` |
+| 4.3.11 | `Writer::do_write` | head/tail *reads* for unaligned edges; stages the aios or the deferred payload | none of its own |
+
+"None of its own" means: the OSD's PG lock and the per-collection
+sequencer already serialize all writers of this onode.
 
 ### 4.3.1 _do_write_big — plan the aligned part
 
-[`BlueStore.cc:17077`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L17077)
-— takes the txc, collection `c`, onode `o`, the logical
-`offset~length`, the payload iterator `blp`, and the `WriteContext
-*wctx` it appends its plan to. Called by `_do_write_data` (`:17648`)
-for the whole-min_alloc-units span of the write.
+[`BlueStore::_do_write_big`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L17077)
+— input: the txc, collection `c`, onode `o`, the range
+`offset~length`, the payload iterator `blp`, and the
+`WriteContext *wctx` that receives the plan. `_do_write_data`
+(`:17648`) calls it for the part of the write made of whole
+min_alloc units.
 
 ```
 loop over the span in ≤ target_blob_size (64 KiB) chunks
@@ -3652,22 +3681,18 @@ loop over the span in ≤ target_blob_size (64 KiB) chunks
         └► wctx->write(chunk) — plan recorded, nothing done :17268
 ```
 
-**IOs:** none on the common path — the plan lands in `wctx`, deferred
-payloads in the kv transaction. The exception is the deferred branch's
-head/tail fill: when the existing blob's checksum chunk is wider than
-the write's alignment, `_do_write_big_apply_deferred` *reads* the
-missing bytes from the device (`_do_read`, `:17026`, `:17043`).
-Allocation and the data writes happen later, in §4.3.3.
-
-**Locks:** none of its own; the OSD's PG lock and the per-collection
-sequencer already serialize writers on this onode.
+- The plan goes into `wctx`, deferred payloads into the kv
+  transaction. Allocation and the data writes come later (§4.3.3).
+- The one read: on the deferred branch, if the existing blob's
+  checksum chunk is wider than the write's alignment,
+  `_do_write_big_apply_deferred` reads the missing bytes from the
+  device.
 
 ### 4.3.2 _do_write_small — plan the unaligned part
 
-[`BlueStore.cc:16566`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L16566)
-— same parameters; handles the sub-min_alloc span
-(`length < min_alloc_size` is asserted). This is where
-read-modify-write lives — three exits:
+[`BlueStore::_do_write_small`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L16566)
+— same input; handles the part smaller than min_alloc_size (asserted:
+`length < min_alloc_size`). Read-modify-write lives here. Three exits:
 
 ```
 sub-4-KiB write
@@ -3685,19 +3710,17 @@ sub-4-KiB write
         └► wctx->write                                          :16943
 ```
 
-**IOs:** the head/tail `_do_read`s, and possibly a direct `aio_write`
-queued right here (`:16699`) — the small path both reads and writes,
-so "plan" is only mostly true for it. The RMW rewrite never becomes a
-direct aio: it always rides the kv transaction as a deferred op, even
-on the SSD defaults of §1.1 where deferred writes are otherwise off.
-
-**Locks:** none of its own (same serialization as §4.3.1).
+- "Plan" is only mostly true here: this function may read *and* queue
+  a direct write.
+- The RMW rewrite never becomes a direct aio. It always rides the kv
+  transaction as a deferred op — even with the SSD defaults of §1.1,
+  where deferred writes are otherwise off.
 
 ### 4.3.3 _do_alloc_write — allocate, checksum, start the IO
 
-[`BlueStore.cc:17290`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L17290)
-— takes the txc, collection, onode and the filled `wctx`; executes the
-plan.
+[`BlueStore::_do_alloc_write`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L17290)
+— input: the txc, collection, onode and the filled `wctx`. It carries
+out the plan:
 
 ```
 wctx->writes (the plan)
@@ -3715,24 +3738,22 @@ wctx->writes (the plan)
                         extent of the blob (map_bl)         :17571
 ```
 
-The two fine points the diagram flags: the defer decision compares the
-*plan's total* against `prefer_deferred_size` — two 32 KiB blobs with
-a 64 KiB threshold go direct, not deferred — and a direct blob emits
-one aio per physical extent, so a fragmented allocation queues several
-aios for one blob.
+Two details:
 
-**IOs:** queues the data writes on the txc's IOContext; nothing is
-submitted yet (`_txc_aio_submit` does that, §3.1.3 line #8). No reads.
+- The defer test compares the *whole plan's* size with
+  `prefer_deferred_size`. Two 32 KiB blobs against a 64 KiB threshold
+  go direct, not deferred.
+- A direct blob gets one aio per physical extent. A fragmented
+  allocation queues several aios for one blob.
 
-**Locks:** the allocator's internal mutex (inside `allocate`) and a
-buffer-cache shard lock (inside `_buffer_cache_write`); nothing held
-across the function.
+The aios wait on the txc's IOContext; `_txc_aio_submit` submits them
+(§3.1.3 line #8).
 
 ### 4.3.4 _txc_write_nodes — metadata into the transaction
 
-[`BlueStore.cc:14789`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L14789)
-— takes the txc and the kv transaction `t`; runs at the end of
-`queue_transactions`, after every op is planned.
+[`BlueStore::_txc_write_nodes`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L14789)
+— input: the txc and the kv transaction `t`. Runs at the end of
+`queue_transactions`, after every op is planned:
 
 ```
 for each dirty onode
@@ -3744,44 +3765,40 @@ for each shared blob (clone bookkeeping)
    └► t->set / rmkey(PREFIX_SHARED_BLOB)                    :14822
 ```
 
-**IOs:** none — memory into the in-memory transaction; the bytes reach
-disk in §4.3.6.
-
-**Locks:** none.
+Memory into the in-memory transaction only; the bytes reach the disk
+in §4.3.6.
 
 ### 4.3.5 _txc_state_proc — drive the txc through its states
 
-[`BlueStore.cc:14634`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L14634)
-— takes only the txc. Every thread that touches a txc calls this one
-function; the switch decides what happens next, falling through where
-no wait is needed. The thread running each state is §3.1.2's map:
+[`BlueStore::_txc_state_proc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L14634)
+— input: the txc only. Every thread that touches a txc calls this one
+function. A `switch` on the state decides what is next, and falls
+through where nothing must be waited for:
 
 ```
 STATE_PREPARE      :14641  pending aios? → _txc_aio_submit    tp_osd_tp
 STATE_AIO_WAIT     :14656  → _txc_finish_io                   bstore_aio
 STATE_IO_DONE      :14671  → KV_QUEUED: push kv_queue,
                            wake kv thread (switch #2)         bstore_aio
-STATE_KV_SUBMITTED :14720  → _txc_committed_kv → reply        bstore_kv_final
+STATE_KV_SUBMITTED :14720  → _txc_committed_kv → callbacks    bstore_kv_final
+                           queued (reply on tp_osd_tp)
 STATE_KV_DONE      :14724  deferred txn? → _deferred_queue    bstore_kv_final
 STATE_FINISHING    :14739  → _txc_finish, txc retired         bstore_kv_final
 ```
 
-**IOs:** starts them all, does none itself: the data `io_submit`
-(PREPARE) and the deferred replay (KV_DONE).
+Locks: `kv_lock` while queueing and waking the kv thread (`:14704`).
+IO_DONE needs the sequencer's `qlock` — asserted at `:14672`, taken by
+the caller `_txc_finish_io` (`:14763`). `_deferred_queue` takes the
+sequencer's `deferred_lock` (`:15650`).
 
-**Locks:** `kv_lock` while queueing and waking the kv thread
-(`:14704`); IO_DONE requires the sequencer's `qlock` (asserted
-`:14672`; taken by its caller `_txc_finish_io`, `:14763`);
-`_deferred_queue` takes the sequencer's `deferred_lock` (`:15650`).
-
-**Captured callers** — a perf uprobe on this function (§2.5's
-recipe), DWARF-unwound over a 182-write run: **728 samples, exactly
-four distinct stacks, exactly 182 hits each**. The state machine is
-entered precisely four times per direct-write txc, once per driver:
+**Who calls it — measured.** A perf uprobe on this function (§2.5's
+recipe), DWARF-unwound, over a 182-write run: **728 samples, exactly
+four distinct stacks, exactly 182 each**. The state machine is entered
+exactly four times per direct-write txc, once per driver:
 
 ```
-25%  tp_osd_tp        PREPARE — the initial kick, closing the whole
-                      submission chain in one unwind:
+25%  tp_osd_tp        PREPARE — the first kick; one unwind shows the
+                      whole submission chain:
      _txc_state_proc
        ← queue_transactions
        ← ReplicatedBackend::submit_transaction
@@ -3798,7 +3815,7 @@ entered precisely four times per direct-write txc, once per driver:
        ← aio_cb
        ← KernelDevice::_aio_thread
 
-25%  bstore_aio       IO_DONE — the recursion, photographed:
+25%  bstore_aio       IO_DONE — the function calls itself:
      _txc_state_proc
        ← _txc_finish_io
        ← _txc_state_proc
@@ -3811,47 +3828,51 @@ entered precisely four times per direct-write txc, once per driver:
        ← _kv_finalize_thread
 ```
 
-The third stack shows `_txc_state_proc` twice in one call chain —
-the AIO_WAIT case invoking `_txc_finish_io` (`:14735`), which
-re-enters the state machine for IO_DONE processing: the function's
-self-recursive structure, visible in the frames. And the perfect
-182 × 4 equality is an invariant the logs never stated this tightly:
-four entries per direct-write transaction, no more, no fewer. A
-deferred txc breaks the tie — it loses both `bstore_aio` entries
-(no data aio) and gains the deferred-path drivers instead.
+- The third stack has `_txc_state_proc` twice: the AIO_WAIT case
+  calls `_txc_finish_io` (`:14668`), which re-enters the state machine
+  for IO_DONE.
+- 182 × 4 is an invariant the logs never showed so clearly: four
+  entries per direct-write txc, no more, no fewer. A deferred txc
+  breaks it. It has no data aio, so PREPARE falls through to AIO_WAIT
+  in the same call (`:14654`): the separate AIO_WAIT entry is gone, and
+  the IO_DONE re-entry moves to `tp_osd_tp`. Later the deferred path
+  adds its own entries (DEFERRED_CLEANUP on `bstore_kv_final`).
 
 ### 4.3.6 submit_transaction_sync — make the transaction durable
 
-[`RocksDBStore.cc:1668`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/RocksDBStore.cc#L1668)
-— takes a `KeyValueDB::Transaction` (a wrapped `rocksdb::WriteBatch`)
-and commits it with `sync = true`. The surprise is *which* transaction:
-in the kv cycle the client records do **not** travel in this call.
+[`RocksDBStore::submit_transaction_sync`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/RocksDBStore.cc#L1668)
+— input: a `KeyValueDB::Transaction`; commits it with `sync = true`.
+The surprise: in the kv cycle, the client's records do **not** travel
+in this call.
 
-First, what the handle actually is. `KeyValueDB::Transaction` is a
-typedef — `std::shared_ptr<TransactionImpl>`
-([`KeyValueDB.h:144`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/KeyValueDB.h#L144))
-— and `RocksDBStore::get_transaction()`
-([`RocksDBStore.h:349`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/RocksDBStore.h#L349))
-returns a `RocksDBTransactionImpl` whose entire substance is one
-member: `rocksdb::WriteBatch bat` (`:300`). So
-`KeyValueDB::Transaction synct = db->get_transaction()`
-(`BlueStore.cc:15399`) means only "give me a new, empty batch of KV
-mutations": every `t->set()` / `rm_single_key()` appends an encoded
-record to an in-memory buffer, touching nothing in rocksdb. Despite
-the name there is no BEGIN/COMMIT, no reads, no isolation, no
-conflict detection — a `WriteBatch` is blind writes, and its only
-transactional property is **atomicity at apply time**: handed to
-`rocksdb::DB::Write`, all its mutations enter the WAL and memtable as
-one unit, all-or-none after a crash. That is exactly the §4.1
-clause-2 contract and all BlueStore needs — it never reads through
-the KV layer inside a transaction, because the OSD's serialization
-already guarantees no conflicting writer exists. Every txc got its
-own batch the same way at creation (`txc->t`, `_txc_create`); `synct`
-is the committer's extra, per-cycle batch — the **sync**-carrying
-**t**ransaction. The `shared_ptr` answers lifetime: the batch (which
-for deferred cycles includes the 4 KiB payloads inside the `L`
-values, like §3.1.8's 4135 B record) lives exactly as long as someone
-holds the handle, and dies when the cycle ends.
+**What a "transaction" is here.** Much less than the name says:
+
+```
+KeyValueDB::Transaction                      KeyValueDB.h:144
+  = std::shared_ptr<TransactionImpl>
+      └► RocksDBTransactionImpl              (RocksDBStore::get_transaction, RocksDBStore.h:349)
+           └► rocksdb::WriteBatch bat        :300    ← the whole substance
+
+t->set() / rm_single_key()   append an encoded record to bat, in memory; rocksdb is not touched
+db->Write(bat)               all records enter the WAL + memtable as ONE unit
+```
+
+- No BEGIN/COMMIT, no reads, no isolation, no conflict check — a
+  `WriteBatch` is blind writes. Its one transactional property is
+  **atomicity at apply time**: all or nothing after a crash. That is
+  rule 2 of §4.1, and all BlueStore needs: it never reads through the
+  KV layer inside a transaction, because the OSD already guarantees no
+  conflicting writer.
+- Each txc gets its own batch at creation (`txc->t`, `_txc_create`).
+  `synct` (`BlueStore.cc:15399`) is the committer's extra batch, one
+  per cycle — the **sync**-carrying **t**ransaction.
+- The `shared_ptr` handles lifetime: a batch lives while someone
+  holds the handle. For a deferred write, the txc's own batch
+  (`txc->t`) also holds the 4 KiB payload inside the `L` value
+  (`:16016`), like §3.1.8's 4135 B record. `synct` gets only the `L`
+  *deletions* (and, rarely, the id-ceiling bumps).
+
+**One kv cycle, two kinds of submit:**
 
 ```
 one kv cycle (bstore_kv_sync, §3.1.5)
@@ -3860,145 +3881,166 @@ one kv cycle (bstore_kv_sync, §3.1.5)
    │    the two P + one O records: appended to the WAL       (via :14919)
    │    buffer + memtable, NO fsync
    └─ once:   db->submit_transaction_sync(synct)           BlueStore.cc:15463
-        synct = nid/blobid-max bumps                       :15406,:15415
-                + deferred-cleanup rmkeys                  :15448-15456
+        synct = deferred-cleanup rmkeys                    :15448-15456
+                (+ the nid/blobid-max bumps, if no txc
+                   in the batch can carry them)            :15406,:15415
         woptions.sync = !disableWAL                        RocksDBStore.cc:1673
         └► submit_common → db->Write                       :1607,:1624
              sync=true → fsync the WAL file  → #12/#14, barrier #2
 ```
 
-The sync call's own batch (`synct`) is nearly empty — its job is the
-*blocking WAL fsync*, which makes everything appended before it durable
-at once, including the async batches carrying this write's `P`/`O`
-records. That is why the single 4 KiB WAL block flushed at #13 contains
-the client records even though the async twin (`:1654`) submitted them:
-the WAL is one sequential file, and one fsync covers all of it. §2.2's
-wstats sample shows the pairing directly — 10 puts produced
-`@d_kv_commit_sync: 10` *and* `@d_kv_commit_async: 10`, one of each per
-cycle. (wtrace probes only the sync call; the async submits sit
+`synct` itself is almost empty. Its job is the *blocking WAL fsync*:
+the WAL is one sequential file, so one fsync makes everything appended
+before it durable — including the async batches with this write's
+`P`/`O` records. That is why the single 4 KiB WAL block flushed at #13
+holds the client records, although the async twin (`:1654`) submitted
+them. §2.2's wstats shows the pairing: 10 puts gave
+`@d_kv_commit_sync: 10` *and* `@d_kv_commit_async: 10`, one of each
+per cycle. (wtrace probes only the sync call; the async submits sit
 unprobed between trace lines #10 and #11.)
 
-**Why the append underneath is still `aio_write` — and how many aios
-one commit costs.** The call is fully synchronous (the committer
-blocks inside until the fsync returns), yet the WAL bytes travel
-through `KernelDevice::aio_write`. For *this* caller aio buys
-nothing — a single small append immediately followed by `fdatasync`
-from the same thread has nothing to overlap — and the code contains
-the admission: `bluefs_sync_write=true` (`BlueFS.cc:4169`) switches
-exactly this into a blocking `pwritev`. It stays aio by default
-because BlueFS has **one write path for every writer**, and the
-other writers need it: a multi-extent flush queues one aio per
-extent (`:4163`) and fires them with a single `aio_submit` (`:4190`)
-— in flight in parallel, where sync writes would serialize; and
-during a big SST write, `append_try_flush` flushes every
-`bluefs_min_flush_size` while rocksdb keeps appending, waiting for
-the *previous* aio only at the next flush (`:4120`) — the device
-chews flush N while the CPU builds flush N+1. The WAL append is the
-odd one out: the only serialized-then-immediately-fsynced writer in
-the system. Nobody optimizes it because the ceremony is ~µs
-(io_submit + reaper wakeup + condvar) under a ~5 ms barrier — our
-traces show `aio_write → blkdev_write_iter` within ~30 µs of each
-other, then the fdatasync at ~5000 µs. On PLP flash, where the
-barrier costs ~10 µs instead, that ratio inverts and
-`bluefs_sync_write` stops being cosmetic. (Probe caveat if you flip
-it: wtrace's `aio_write` probe goes dark on that path — the
-kernel-side `blkdev_write_iter` probe still sees the writes.)
+**Why the WAL append is still `aio_write`.** The call is fully
+synchronous — the committer blocks until the fsync returns — yet the
+WAL bytes go through `KernelDevice::aio_write`:
 
-The aio count per commit, verified against the captures: **one** —
-every §2/§3.1 trace shows exactly one `aio_write` on the BlueFS bdev
-per `submit_transaction_sync`. It grows only when the flush range
-crosses an extent boundary (one aio per extent), or in *plain* WAL
-mode, where the fsync must also update the file's fnode through the
-BlueFS journal — a second append plus a **second fdatasync** for the
-journal sync. Envelope mode (§6.6 of the internals post) exists
-precisely to delete that second pair; its "~50% fewer fdatasync"
-claim is this arithmetic.
+```
+ writer                          needs aio?
+ ──────                          ──────────
+ multi-extent flush              yes: one aio per extent (BlueFS.cc:4163), one aio_submit (:4190),
+                                      all in flight at once
+ big SST write                   yes: append_try_flush flushes every bluefs_min_flush_size and waits for
+                                      the PREVIOUS aio only at the next flush (:4120) — device and CPU overlap
+ WAL append + fdatasync          no:  one small write, then an fsync from the same thread; nothing to overlap
+```
 
-**IOs:** the 4 KiB WAL append and the flush behind it (§3.1.5), via
-BlueFS — the flushed bytes include the async-appended batches. SST
-files are written later by compaction, off the write path.
+BlueFS has one write path for all writers, and the first two need
+aio. There is a switch, `bluefs_sync_write=true` (`BlueFS.cc:4169`),
+but it turns *every* BlueFS write — WAL, SST, compaction output —
+into a blocking `pwritev`, and so also kills the overlap of the SST
+row.
+Nobody bothers because the aio overhead (io_submit + reaper wakeup +
+condvar) is µs under a ~5 ms barrier: our traces show `aio_write` and
+`blkdev_write_iter` within ~30 µs, then the fdatasync at ~5000 µs. On
+PLP flash the barrier is ~10 µs, and the aio overhead of the WAL
+append is no longer small next to it. (If you turn it on, wtrace's
+`aio_write` probe goes dark; the kernel-side `blkdev_write_iter` probe
+still sees the writes.)
 
-**Locks:** RocksDB's internal writer mutex — concurrent committers form
-a write group whose leader writes the WAL once; nothing on the Ceph
-side.
+**How many aios per commit.** One — every §2/§3.1 trace shows exactly
+one `aio_write` on the BlueFS bdev per `submit_transaction_sync`. More
+only when:
+
+- the flush range crosses an extent boundary: one aio per extent;
+- the WAL is in *plain* mode: the fsync must also update the file's
+  fnode through the BlueFS journal — a second append plus a **second
+  fdatasync**. Envelope mode (§6.6 of the internals post) exists to
+  delete that second pair; its "~50% fewer fdatasync" claim is this
+  arithmetic.
+
+SST files are written later by compaction, off the write path. Locks:
+concurrent committers form a RocksDB write group whose leader writes
+the WAL once; nothing on the Ceph side.
 
 ### 4.3.7 _kv_sync_thread — the kv committer (thread bstore_kv_sync)
 
-[`BlueStore.cc:15290`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15290)
-— the thread body behind the `bstore_kv_sync` lane of §3.1.2; no
-parameters, runs for the OSD's lifetime. Everything §3.1.5 traced is one
-iteration of this loop:
+[`BlueStore::_kv_sync_thread`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15290)
+— the body of the `bstore_kv_sync` lane (§3.1.2). It runs for the
+OSD's lifetime. Everything §3.1.5 traced is one pass of this loop:
 
 ```
-while (true)                                        :15290
+while (true)                                        :15303
   kv_queue empty → kv_cond.wait()                   :15326  ← switch #2
   swap the whole queue → kv_committing              :15340
   drop kv_lock                                      :15350
-  batch has completed data aios?
+  flush needed? (below)
     └► bdev->flush()             barrier #1         :15359-15385
-  per txc: db->submit_transaction(txc->t)  ASYNC    :15429  (§4.3.6)
-  build synct: id bumps + deferred cleanup          :15399,:15448
+       deferred_done → deferred_stable              :15387-15394
+  synct = db->get_transaction()                     :15399
+  id ceilings → first unsubmitted txc's t (or synct) :15405-15423
+  per txc: _txc_apply_kv → submit_transaction ASYNC :15429  (§4.3.6)
+  release the throttle                              :15445
+  deferred_stable's L keys → rm_single_key in synct :15448-15456
   db->submit_transaction_sync(synct)  barrier #2    :15463
   hand the batch to the finalize thread,
   kv_finalize_cond.notify_one()                     :15497-15517
+  retake kv_lock: deferred_done → deferred_stable_queue
+    (stable by this cycle's WAL fsync; cleaned next cycle) :15554-15557
 ```
 
-The loop is one idea applied twice — *decouple submission from
-durability, then batch the durability* — and most of its cleverness
-hides in the ordering:
+One idea, used twice: *separate submission from durability, then
+batch the durability.* The details are in the order:
 
-- **The batching is self-clocking.** There is no timer and no target
-  size: the swap takes whatever accumulated while the *previous* cycle
-  was blocked in fsync. Slow device → longer cycle → bigger next batch
-  → better amortization — natural congestion control, and why per-write
-  cost at high QD approaches 1/N of an fsync while QD1 pays the full
-  two-barrier price (§5.2). The mode-8-16 batch histogram from §2.2's
-  `_txc_apply_kv` counting is this mechanism at QD16.
-- **Barrier #1 is conditional** (`force_flush`, `:15359-15377`): taken
-  when the cycle saw direct-write aios or has deferred completions to
-  stabilize; on a single shared device the BlueFS commit fsyncs the
-  same fd anyway, so it can sometimes be skipped. A deferred-only
-  cycle is the single-barrier commit §3.1.8's deferred trace shows.
-  Barrier #2 is unconditional.
-- **The flush promotes `deferred_done` → `deferred_stable`**
-  (`:15389-15396`), and only then do the deferred `L` records get
-  `rm_single_key`'d into `synct` (`:15448-15456`). The ordering is the
-  crash-safety proof: crash before this commit and replay re-executes
-  deferred writes onto already-correct data — idempotent. Deleting `L`
-  records before the data flush would be the fatal order.
-- **`synct` piggybacks the id ceilings** — `nid_max`/`blobid_max`
-  prealloc bumps ride the *earliest* txn in flight (`:15405`) so a new
-  ceiling is durable before any object uses it; the in-memory values
-  advance only after the sync commit returns (`:15521`).
-- **The throttle releases *before* the commit** (`:15442`) — the
-  comment says it all: "this allows new ops to be prepared and enter
-  pipeline while we are waiting on the kv commit sync/flush." Without
-  it every cycle would drain the pipeline, sleep, and stutter awake
-  one transaction at a time.
+**Batching clocks itself.** No timer, no target size. The swap takes
+whatever piled up while the *previous* cycle was blocked in fsync:
 
-**IOs:** both barriers of §3.1.5 — the data-device fdatasync and the WAL
-append + fsync behind the sync commit. This is the only thread that
-pays them.
+```
+ slow device ─► longer cycle ─► more txcs pile up ─► bigger next batch ─► fsync cost shared by more writes
+```
 
-**Locks:** `kv_lock` around sleeping and grabbing the queue (`:15294`),
-*dropped* before the barriers (`:15350`) so submitters never wait on a
-flush — after the swap the batch is private to this thread.
+At high queue depth the cost per write goes toward 1/N of an fsync; at
+QD1 each write pays both barriers in full (§5.2). The batch-size
+histogram of §2.2's `_txc_apply_kv` count (mode 8–16 at QD16) is this
+mechanism.
+
+**Barrier #1 is conditional** (`force_flush`, `:15359-15377`):
+
+```
+ BlueFS on the same single device as data?
+   yes ─► flush if: this cycle has data aios
+                    OR nothing else to commit (no txcs, no deferred_stable)
+                    OR deferred_aggressive
+          (deferred completions alone: the BlueFS commit fsyncs the same
+           device anyway, so the flush is skipped)
+   no  ─► flush if: data aios OR deferred_done not empty
+```
+
+Barrier #2 is always taken. A cycle with deferred work only is the
+single-barrier commit of §3.1.8's deferred trace.
+
+**Deferred cleanup comes after the data is stable.** Deferred writes
+become stable in one of two ways: by this cycle's flush
+(`deferred_done` → `deferred_stable`, `:15387-15394`), or — when the
+flush is skipped on a shared device — by this cycle's WAL fsync
+(`:15557`), and then they are cleaned one cycle later. Only then are
+the deferred `L` records deleted (`rm_single_key` into `synct`,
+`:15448-15456`). This order is the crash-safety proof: a crash before
+the commit replays the deferred writes onto data that is already
+correct — harmless, the replay is idempotent. Deleting `L` records
+before the data flush would lose data.
+
+**The id ceilings ride the earliest transaction.** When a ceiling is
+near (`nid_last + prealloc/2 > nid_max`, `:15406`), the new
+`nid_max`/`blobid_max` goes into the first not-yet-submitted txc of
+the batch (`kv_submitting.front()`), or into `synct` if all were
+already submitted (`:15405-15423`). So a new ceiling is
+durable before any object uses it. The in-memory values
+move only after the sync commit returns (`:15521`).
+
+**The throttle is released *before* the commit** (`:15445`). The
+comment: "this allows new ops to be prepared and enter pipeline while
+we are waiting on the kv commit sync/flush." Without it, every cycle
+would drain the pipeline, sleep, and restart one transaction at a
+time.
+
+Locks: `kv_lock` around the sleep and the swap (`:15294`), and again
+briefly at the end of the cycle (`:15554`). It is dropped before the
+barriers (`:15350`), so submitters never wait for a
+flush. After the swap, the batch is private to this thread.
 
 ### 4.3.8 _kv_finalize_thread — the finisher (thread bstore_kv_final)
 
-[`BlueStore.cc:15564`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15564)
-— the thread body behind `bstore_kv_final` (the thread is named after
-the role; the function is `_kv_finalize_thread`). No parameters. It
-exists so completion callbacks never run on — and never delay — the
-committing thread:
+[`BlueStore::_kv_finalize_thread`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15564)
+— the body of `bstore_kv_final` (the thread is named after the role,
+the function after the step). It exists so that the commit steps
+never run on — and never delay — the committing thread:
 
 ```
 while (true)                                        :15564
   nothing to do → kv_finalize_cond.wait()           :15582  ← switch #3
   swap in committed txcs + stable deferred batches  :15585,:15586
   per committed txc: _txc_state_proc                :15596
-    KV_SUBMITTED → _txc_committed_kv → callbacks,
-                   osd_op_reply(ondisk) leaves        (#16)
+    KV_SUBMITTED → _txc_committed_kv → oncommits queued to the
+                   PG's op shard; tp_osd_tp sends the reply  (#16, §3.1.6)
     KV_DONE      → deferred txn? _deferred_queue
     FINISHING    → _txc_finish, txc retired           (#17)
   per stable deferred batch: _txc_state_proc
@@ -4006,22 +4048,18 @@ while (true)                                        :15564
   maybe kick the replay: deferred_try_submit()      :15614
 ```
 
-**IOs:** none of its own; it can *start* the deferred replay
-(`deferred_try_submit`, `:15614`), whose aios then belong to the data
-device path.
-
-**Locks:** `kv_finalize_lock` around the sleep and the swaps; the txc
-steps take the sequencer's `qlock` inside `_txc_committed_kv`
+The replay it may start (`:15614`) issues its aios on the data-device
+path. Locks: `kv_finalize_lock` around the sleep and the swaps; the
+txc steps take the sequencer's `qlock` inside `_txc_committed_kv`
 (`:14957`) and `_txc_finish` (`:15006`).
 
 ### 4.3.9 queue_transactions — the entry point, and where the P records come from
 
-[`BlueStore.cc:15980`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15980)
-— the `ObjectStore` interface: a vector of `Transaction`s arrives from
-the OSD on the tp_osd_tp thread. The point easy to miss is that by
-this line **every KV mutation of the commit is already decided** —
-BlueStore will plan, allocate and encode, but it adds no intent of its
-own:
+[`BlueStore::queue_transactions`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15980)
+— the `ObjectStore` interface of §4.1.1. A vector of `Transaction`s
+arrives from the OSD on `tp_osd_tp`. The point easy to miss: at this
+line **every KV change of the commit is already decided**. BlueStore
+plans, allocates and encodes, but adds no intent of its own:
 
 ```
 queue_transactions(ch, tls)                                 :15980
@@ -4038,8 +4076,8 @@ queue_transactions(ch, tls)                                 :15980
    └─ _txc_state_proc — the §4.3.5 state machine starts     :16060
 ```
 
-**The three KV sets.** wtrace.bt (§2.3) shows the same trio for every
-small write — two `P` sets and one `O` set:
+**The three KV sets.** wtrace.bt (§2.3) shows the same three for every
+small write — two `P`, one `O`:
 
 ```
 139  tp_osd_tp  RocksDBTransactionImpl::set  P keylen=40 val=188B
@@ -4047,80 +4085,76 @@ small write — two `P` sets and one `O` set:
 172  tp_osd_tp  RocksDBTransactionImpl::set  O keylen=37 val=385B
 ```
 
-The `O` set is the object's onode, re-encoded wholesale by
+The `O` set is the object's onode, encoded again in full by
 `_txc_write_nodes` (§4.3.4). The two `P` sets are **not about the
-object at all** — they are the PG's replication bookkeeping, generated
-in the OSD *before* `queue_transactions` was called, while the backend
-was assembling the transaction:
+object at all**. They are the PG's replication bookkeeping, made in
+the OSD *before* `queue_transactions`, while the backend built the
+transaction:
 
-- `ReplicatedBackend::submit_transaction`
-  ([`ReplicatedBackend.cc:659`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L659))
-  calls `log_operation`
-  ([`PrimaryLogPG.h:516`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.h#L516)),
-  which calls `PeeringState::append_log`
-  ([`PeeringState.cc:4772`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.cc#L4772));
-  via `write_if_dirty` (`:554`) that lands in `PG::prepare_write`
-  ([`PG.cc:908`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PG.cc#L908)),
-  which builds one key map and publishes it with
-  `t.omap_setkeys(coll, pgmeta_oid, km)` (`:941`) — plain omap on the
-  PG's hidden *pgmeta* object, riding the same transaction as the
-  write.
-- **`P` #1, `keylen=40 val=188B`** — one `pg_log_entry_t` appended to
-  the PG log: `(*km)[entry.get_key_name()] = bl`
-  ([`PGLog.cc:847`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PGLog.cc#L847));
-  the key is the eversion rendered `"%010u.%020llu"`
-  ([`osd_types.h:921`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.h#L921)),
-  31 chars.
-- **`P` #2, `keylen=18 val=194B`** — the `_fastinfo` record
-  ([`osd_types.h:7103`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.h#L7103)):
-  the condensed `pg_info_t` delta (last_update, stats), re-encoded
-  every op by `prepare_info_keymap`
-  ([`osd_types.cc:7617`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.cc#L7617));
-  the full `_info`/`_biginfo` only when rarer state changes.
+```
+ReplicatedBackend::submit_transaction        ReplicatedBackend.cc:659
+ └► log_operation                            PrimaryLogPG.h:516
+     └► PeeringState::append_log             PeeringState.cc:4772
+         └► write_if_dirty                   :554
+             └► PG::prepare_write            PG.cc:908
+                 builds one key map km:
+                   P #1  km[p->get_key_name()] = pg_log_entry_t          PGLog.cc:951
+                   P #2  km["_fastinfo"]          = pg_info_t delta       osd_types.cc:7617
+                 t.omap_setkeys(coll, pgmeta_oid, km)                     PG.cc:941
+                   plain omap on the PG's hidden pgmeta object,
+                   in the same transaction as the write
+```
 
-BlueStore's only contribution is the column: `_omap_setkeys`
-(`:18521`) asks the target onode for its omap prefix, and
-`calc_omap_prefix` (`:4845`) returns `PREFIX_PGMETA_OMAP` = `"P"`
-(`:139`) because the pgmeta onode carries the `pgmeta_omap` flag
-(regular objects get `"m"`). Each final key is `nid + '.' + user_key`,
-hence the observed lengths: 8+1+31 = 40 and 8+1+9 = 18
-(`"_fastinfo"`). The PG log thus inherits BlueStore's transaction
-atomicity for free — if the txc commits, the write and the log entry
-describing it are durable together — and pgmeta traffic compacts in
-its own RocksDB column family, isolated from user omap.
+| Set | keylen | What | Key |
+|---|---|---|---|
+| `P` #1 | 40 = 8 + 1 + 31 | one `pg_log_entry_t` appended to the PG log | the eversion as `"%010u.%020llu"` ([`get_key_name`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.h#L921)), 31 chars |
+| `P` #2 | 18 = 8 + 1 + 9 | the `_fastinfo` record ([`fastinfo_key`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.h#L7103)): the small `pg_info_t` delta (last_update, stats), written on almost every write by `prepare_info_keymap`. The full `_info`/`_biginfo` only on rarer state changes | `"_fastinfo"`, 9 chars |
+| `O` | 37 | the onode | the object key |
 
-The set you might *expect* for a write — a freelist record for the
-allocated extents — is absent by design: `bluestore_allocation_from_file`
-defaults to true
-([`global.yaml.in:5461`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L5461)),
-which forces `freelist_type = "null"` (`:7379`); allocation state is
-written to a file at clean shutdown and rebuilt from the onodes'
-extent maps after a crash, so per-txc allocator KV traffic is zero.
-Net: for a small write, two of the three sets — and roughly half the
-KV bytes — are replication machinery, not object state.
+BlueStore adds only the column. `_omap_setkeys` (`:18521`) asks the
+target onode for its omap prefix; `calc_omap_prefix` (`:4845`) returns
+`PREFIX_PGMETA_OMAP` = `"P"` (`:139`), because the pgmeta onode has
+the `pgmeta_omap` flag (normal objects get `"m"`). Each final key is
+`nid + '.' + user_key` — hence the 8 + 1 + … lengths above. Two
+results:
 
-**IOs:** none directly; the data aios are queued during planning and
-submitted by the state machine this function kicks at `:16060`.
+- The PG log gets BlueStore's atomicity for free: if the txc commits,
+  the write and its log entry are durable together.
+- pgmeta traffic compacts in its own RocksDB column family, apart
+  from user omap.
 
-**Locks:** runs under the caller's PG lock (ops on one PG are already
-serial); the `OpSequencer` orders txcs per collection, and the
-deferred throttle path may briefly raise `deferred_aggressive` and
-drive `deferred_try_submit` (`:16039`).
+**The missing set.** You might expect a freelist record for the
+allocated extents. On this lab's OSD there is none, by design:
+[`bluestore_allocation_from_file`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L5457)
+defaults to true. On a non-rotational DB device that forces
+`freelist_type = "null"` (`:7372-7379`): allocation state is written
+to a file at clean shutdown and rebuilt from the onodes' extent maps
+after a crash, so per-txc allocator KV traffic is zero. With a
+rotational DB device the bitmap freelist stays, and allocator records
+do appear.
+
+Net: for a small write, two of the three sets — about half the KV
+bytes — are replication machinery, not object state.
+
+The data aios were queued during planning; the state machine this
+function starts (`:16060`) submits them. The deferred throttle path
+may briefly raise `deferred_aggressive` and drive
+`deferred_try_submit` (`:16039`).
 
 ### 4.3.10 _do_write_v2 — the v2 dispatcher
 
-[`BlueStore.cc:17946`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L17946)
-— same parameters as `_do_write`; which one runs is decided per write
-in `_write` (`:18101`) from a flag read once at startup (`:9566`,
-`bluestore_write_v2`, so switching requires an OSD restart but no
-format change — both paths produce the same onode/blob metadata).
+[`BlueStore::_do_write_v2`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L17946)
+— same input as `_do_write`. Which one runs is decided per write in
+`_write` (`:18101`), from `bluestore_write_v2`, read once at startup
+(`:9566`). Switching needs an OSD restart but no format change: both
+paths write the same onode/blob metadata.
 
 ```
 _do_write_v2(txc, c, o, offset, length, bl)                 :17946
    │
    ├─ _choose_write_options — same wctx knobs as classic
    ├─ compression on?
-   │    ├─ onode has segment_size: carve the write along segment
+   │    ├─ onode has segment_size: cut the write at segment
    │    │    boundaries, one _do_write_v2_compressed per segment
    │    └─ else: single call with a ±128 KiB lookaround      :17998
    │         (re-pack neighbouring compressed blobs — the
@@ -4129,25 +4163,22 @@ _do_write_v2(txc, c, o, offset, length, bl)                 :17946
         └► wr.do_write(offset, bl)              (§4.3.11)
 ```
 
-**IOs:** none of its own — the Writer (or the compressed helper)
-stages them.
-
-**Locks:** as `_do_write` — the PG lock and the per-collection
-sequencer serialize writers on this onode; `fault_range_ex` loads the
-affected extent-map shards before the Writer runs.
+`fault_range_ex` loads the affected extent-map shards before the
+Writer runs.
 
 ### 4.3.11 Writer::do_write — punch, decide once, place
 
-[`Writer.cc:1415`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/Writer.cc#L1415)
-— the uncompressed v2 write as one object: split the data into
-blob-sized chunks, empty the target range in a single pass, make one
-deferred-vs-direct decision, place the chunks. References in this
-entry are `Writer.cc` lines.
+[`Writer::do_write`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/Writer.cc#L1415)
+— the uncompressed v2 write as one object: cut the data into
+blob-sized chunks, empty the target range in one pass, decide
+deferred-or-direct once, place the chunks. Line numbers here are
+`Writer.cc`.
 
 ```
 do_write(location, data)                                    :1415
    │
    ├─ _split_data / _align_to_disk_block
+   │    unaligned edge? _read_self head/tail   :1381,:1404  ← device READs
    ├─ _punch_hole_2 — ONE extent-map walk                   :44
    │    splits boundary extents, drops refs, accumulates:
    │    released AUs, pruned blobs, shared-blob changes,
@@ -4165,18 +4196,15 @@ do_write(location, data)                                    :1415
         csum per blob, stage the aio or the deferred payload
 ```
 
-The deferred/direct choice is per write, not per chunk — the comment
-at `:1308` states the principle: "having parts of write executed as
-deferred and other parts as direct is suboptimal in any case".
-
-**IOs:** stages the data aio(s) for direct writes (submitted later by
-`_txc_aio_submit`, §3.1.3 line #8) or folds the payload into the txc's
-deferred `L` record — the role classic split between
-`_do_alloc_write` and the small-path deferred staging.
-
-**Locks:** none of its own; same upstream serialization as the
-classic planners. The Writer respects shard bounds
-(`left/right_shard_bound`) set from the faulted range by its caller.
+- The choice is per write, not per chunk. The comment at `:1308`:
+  "having parts of write executed as deferred and other parts as
+  direct is suboptimal in any case".
+- Output: the data aio(s) for a direct write (submitted later by
+  `_txc_aio_submit`, §3.1.3 line #8), or the payload folded into the
+  txc's deferred `L` record. In the classic path this work was split
+  between `_do_alloc_write` and the small-path deferred staging.
+- The Writer respects shard bounds (`left/right_shard_bound`), set by
+  its caller from the faulted range.
 
 # 5. Performance analysis
 
