@@ -521,6 +521,97 @@ high QD   can lose, for two reasons:
 Jens says low QD is the normal case for these opcodes, and he has ideas for
 the high-QD case.
 
+**Where the saving comes from: count per request.**
+
+*Author's analysis from the code (v7.3-rc2 + series), not measured.*
+
+- Setup: the app submits one request R and waits for its CQE
+  (`io_uring_enter(fd, 1, 1, IORING_ENTER_GETEVENTS)`, QD 1). An idle
+  worker W sleeps on another CPU.
+- IPI: waking a task on another idle CPU sends an IPI, unless that CPU
+  polls in idle (then setting NEED_RESCHED is enough). The table counts the
+  worst case.
+- Case B assumes the common timing: W runs after T commits the handoff, and
+  the I/O takes longer than the handoff. See the note below the table.
+
+Case A: R does **not** block (fsync on tmpfs, statx cache hit):
+
+```
+TODAY (punt)                                     HANDOFF
+  CPU 0: T                   CPU 1: W              CPU 0: T
+  ────────────────────       ────────────────      ──────────────────────────────
+  io_wq_enqueue()                                  io_handoff_possible():
+   wake_up_process(W) ─①──→ switch in      [s1]     atomic_read(nr_iosleep) > 0
+  io_cqring_wait():          run R                 issue R inline, done
+   schedule()    [s2]        post CQE:             post CQE, return
+                             ├ normal ring:
+                             │ fill CQE,
+                             │ io_cqring_wake()
+                             └ DEFER_TASKRUN:
+                               local task_work
+          ←──────────── ②──  wake T
+  switch in      [s3]        worker loop:
+  (DEFER: run task_work,      schedule()    [s4]
+   post CQE)
+  return
+```
+
+Case B: R blocks once (waits for its I/O):
+
+```
+TODAY (punt)                                  HANDOFF
+  T                        W                    T                         W
+  ─────────────────        ────────────────     ──────────────────────    ───────────────────────
+  wake W ─────①──────────→ in          [s1]     issue R inline, R sleeps:
+  wait CQE: out  [s2]      run R, sleep          sched_submit_work()
+                           on I/O: out   [s3]   → io_uring_task_sleeping()
+                                                  claim + commit W ─①───→ in              [s1]
+                   IRQ ─②→ in          [s4]      T out           [s2]    io_handoff_resume():
+                           post CQE                                        identity move
+            ←────────③──── wake T (DEFER: tw)                              wait CQE: out   [s3]
+  in             [s5]      out         [s6]     IRQ ─②→ T in    [s4]
+  return                                        R done → io_handoff_complete():
+                                                task_work → W ──────③──→ in              [s5]
+                                                worker loop: out [s6]    run tw, post CQE
+                                                                         (+ maybe fork a spare)
+                                                                         return as tid 100
+```
+
+| | wakeups | context switches | task_work | IPIs (worst case) | other |
+|---|---|---|---|---|---|
+| A, today, normal ring | 2 | 4 | 0 | 2 | io-wq enqueue/dequeue, R's data moves between CPU caches |
+| A, today, `DEFER_TASKRUN` | 2 | 4 | 1 | 2 | same |
+| **A, handoff** | **0** | **0** | **0** | **0** | `io_handoff_possible()` checks (`atomic_read()`), signal mask save/restore |
+| B, today, normal ring | 3 | 6 | 0 | 3 | io-wq enqueue/dequeue |
+| B, today, `DEFER_TASKRUN` | 3 | 6 | 1 | 3 | same |
+| **B, handoff** | **3** | **6** | **1** | **3** | identity move (`thread_handoff_prepare()` + `finish()`), app thread moves to W's CPU, maybe a spare `fork()` |
+
+Case B can cost more if the timing is different:
+
+- W wakes when it is claimed. If it goes back to sleep before T commits,
+  the commit wakes it again: +1 wakeup, +2 switches.
+- If the I/O finishes before W sets FINISHED, T sleeps once more in
+  `io_wq_handoff_worker()` and needs another wakeup.
+
+What the counts show:
+
+- Case A: the handoff removes the whole round trip: two wakeups, four
+  switches, and a task_work on `DEFER_TASKRUN` rings. This is the QD 1
+  gain.
+- Case B: the wakeups and switches are the same as today. Wakeup ① of W
+  replaces today's first wakeup of W, and ③ (task_work to W) replaces
+  today's CQE wakeup of T. The extras are: the identity move, one
+  task_work even on a normal ring (`io_handoff_complete()` always uses
+  task_work), maybe a new spare worker, and the app thread now continuing
+  on W's CPU with cold caches. These extras are the likely source of the
+  fsync-on-ext4 loss (not measured). An ext4 fsync also blocks more than
+  once (writeback, then the jbd2 commit).
+- The I/O completion wakeup (②) is the same in both designs. It is local
+  if blk-mq completes on the submitting CPU.
+- In a VM, waking an idle vCPU usually costs VM exits (IPI send, HLT
+  wakeup). So Case A's two cross-CPU wakeups cost more in the cover
+  letter's VM. On bare metal the gap is probably smaller.
+
 **Not changed:**
 
 | request | why |
