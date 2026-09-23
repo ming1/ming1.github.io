@@ -924,199 +924,247 @@ pad). A read checks them first, then decompresses.
 
 # 6. Object Metadata (`O` value)
 
-An `O` value is three concatenated sections.
 Code path: writer `BlueStore::_record_onode()`, reader
 `BlueStore::Onode::decode_raw()` ([`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc)).
 
+An `O` value has three parts. The extent map is either inline (part 3) or
+split into shards, each shard in its own key:
+
 ```
-+-------------------------------+------------------------+---------------------------------+
-| bluestore_onode_t             | spanning-blob section  | inline extent map               |
-| DENC v2/v3, 6 B header (§6.1) | (§6.2)                 | only if extent_map_shards       |
-|                               |                        | empty: le32 len + §6.3 payload  |
-+-------------------------------+------------------------+---------------------------------+
+ O value (key §4.4)
+ +-----------------------+----------------------+-----------------------------+
+ | bluestore_onode_t     | spanning blobs       | inline extent map           |
+ | (§6.1)                | (§6.2)               | le32 len + payload (§6.3)   |
+ |                       |                      | only if there are no shards |
+ +-----------------------+----------------------+-----------------------------+
+      |
+      | onode field extent_map_shards not empty: part 3 is absent
+      v
+ shard values (key §4.5):  [ shard 0 ] [ shard 1 ] ...   each = one §6.3 payload
 ```
 
-When `extent_map_shards` is non-empty the third section is absent and the
-extent map lives in separate shard values under the §4.5 keys, one §6.3
-payload per shard.
+| Term | Meaning |
+|---|---|
+| extent | a logical range of the object, mapped to part of a blob |
+| extent map | all extents of the object, sorted by logical offset |
+| shard | one piece of the extent map, covering one logical range; loaded only when an I/O touches it |
+| cut | a shard boundary: the logical offset where one shard ends and the next starts |
+| spanning blob / promote | a blob moved out of the shards into the onode (§6.2); "promotion" is that move |
 
 ## 6.1 `bluestore_onode_t`
 
 Source: [`src/os/bluestore/bluestore_types.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h) (`bluestore_onode_t`,
 `_denc_friend`). Frame: `DENC_START`, struct_v 2 or 3, compat 1.
 
-| Field | Type | Since | Description |
+| Field | Type | Since | Meaning |
 |---|---|---|---|
-| `nid` | varint | 1 | numeric id; sole link to omap keys |
+| `nid` | varint | 1 | numeric id; the only link to omap keys |
 | `size` | varint | 1 | logical object size |
-| `attrs` | le32 count + { string, bufferptr } | 1 | xattrs: `_` = object_info_t, `snapset` = SnapSet (both opaque OSD payloads), user xattrs as `_<name>` |
-| `flags` | u8 | 1 | masks: 0x01 OMAP, 0x02 PGMETA_OMAP, 0x04 PERPOOL_OMAP, 0x08 PERPG_OMAP |
-| `extent_map_shards` | le32 count + shard_info | 1 | empty → inline extent map |
+| `attrs` | le32 count + { string, bufferptr } | 1 | xattrs: `_` = object_info_t, `snapset` = SnapSet (both opaque OSD data), user xattrs as `_<name>` |
+| `flags` | u8 | 1 | 0x01 OMAP, 0x02 PGMETA_OMAP, 0x04 PERPOOL_OMAP, 0x08 PERPG_OMAP |
+| `extent_map_shards` | le32 count + shard_info | 1 | empty = inline extent map |
 | `expected_object_size` | varint | 1 | allocation hints |
 | `expected_write_size` | varint | 1 | |
 | `alloc_hint_flags` | varint | 1 | |
-| `zone_offset_refs` | le32 count + { le32, le64 } | 2 | HM-SMR only, otherwise empty |
-| `segment_size` | le32 | 3 | shard boundaries the extent map may not cross; 0 = segmentation off |
+| `zone_offset_refs` | le32 count + { le32, le64 } | 2 | HM-SMR only; else empty |
+| `segment_size` | le32 | 3 | segment length for reshard cuts, big writes and compressed write v2; 0 = off |
 
 `shard_info` = { varint `offset` (logical start), varint `bytes` (encoded
-shard length) } — the demand-paging index for `ExtentMap::fault_range()`.
+size of the shard) }. `ExtentMap::fault_range()` uses it to find which
+shards to load.
 
-The struct ends with the `DENC_FINISH` of its own frame, and nothing
-above is a blob: the spanning-blob section (§6.2) and the inline extent
-map (§6.3) are separate structures concatenated after it in the same `O`
-value, decoded by separate calls in `Onode::decode_raw()`. That is why
-`ceph-dencoder type bluestore_onode_t` stops at the frame boundary and
-reports the rest as stray data (§7.1).
+The struct holds no blob. Its `DENC_FINISH` ends the frame; the spanning
+section and the inline map follow as separate encodings. So
+`ceph-dencoder type bluestore_onode_t` stops at the frame end and reports
+the rest as stray data (§7.1).
 
-Version policy (paraphrasing the header comment): objects are written v3
-with `segment_size` initialized from `bluestore_onode_segment_size` when
-segmentation is enabled; objects created by older code decode with
-`segment_size = 0` and keep operating in legacy (spanning-blob) mode; older
-code reading a v3 onode skips the field via the compat frame and rewrites
-it as v2. With the default `bluestore_onode_segment_size = 0` the encoder
-emits struct_v 2 (`_record_onode()` passes `FLAG_DEBUG_FORCE_V2`), which
-the captured OSD confirms. The field's consumer is the v2 write path
-(`bluestore_write_v2`, off by default): `_do_write_v2` carves writes
-along segment boundaries so compressed blobs can be re-packed per
-segment — the recompression hook. Write v2 itself changes **no other
-on-disk structure**: both write paths emit the same onode, blob,
-extent-map and deferred (`L`) encodings; `segment_size` is the only
-format element introduced for it.
+Version: set by the store-wide `bluestore_onode_segment_size` option
+(read at mount, updated live), not by the onode's own field:
+
+```
+option value     struct_v written    segment_size in the onode
+0 (default)      2                   absent; decodes as 0
+> 0              3                   le32; a new onode gets
+                                     max(option, pool comp_max_blob_size)
+```
+
+* Option 0: `_record_onode()` and `decode_raw()` both pass
+  `FLAG_DEBUG_FORCE_V2`, so encode writes v2 and decode forces
+  `segment_size = 0`. The captured OSD writes v2.
+* Old code reads a v3 onode, skips `segment_size` (compat frame), and
+  writes it back as v2.
+* Users of `segment_size`:
+  * reshard (§6.2): where shards may be cut;
+  * legacy write, `_do_write_data()`: the aligned middle of a write goes
+    to `_do_write_big()` once per segment. Head and tail (small writes)
+    are not cut;
+  * write v2 (`_do_write_v2`; `bluestore_write_v2` is off by default):
+    only the compressed path cuts at segment lines.
+* Nothing else in the on-disk format changes: onode, blob, extent map
+  and `L` records are the same with or without segments, and for both
+  write paths.
 
 ## 6.2 Spanning-blob section
 
 Code path: `BlueStore::ExtentMap::encode_spanning_blobs()` /
-`ExtentDecoder::decode_spanning_blobs()`, promotion in
-`ExtentMap::encode_some()` / `reshard()`
+`ExtentDecoder::decode_spanning_blobs()`; reshard request in
+`ExtentMap::encode_some()`, promotion in `reshard()` / `reshard_action()`
 ([`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc)).
 
-Sharding the extent map (§4.5, §6.3) imposes an independence rule: every
-shard value must be decodable on its own. Blob definitions are therefore
-encoded inline in the shard that references them — which is impossible for
-a blob whose extents cross a shard boundary, since two shards would
-reference one definition. Such a blob is promoted to a spanning blob: its
-definition moves out of the shards and into the onode value, as section 2
-of the §6 layout:
+Rule: each shard value must decode alone. So a blob is defined inline in
+the shard that uses it. A blob that crosses a shard cut breaks the rule:
+
+```
+ logical offset  0                         cut                        end
+                 |        shard 0           |         shard 1         |
+ blob B                        [============|=========]
+                               used by shard 0 and shard 1
+
+ fix 1: split B at the cut   -> B1 inline in shard 0, B2 inline in shard 1
+ fix 2: make B spanning      -> B defined once in the onode; both shards
+        ("promote B")           refer to it by id
+```
+
+Encoding (part 2 of the `O` value):
 
 ```
 u8 struct_v = 2
 varint count
 count x {
-  varint blob_id       per-onode id, stable across reloads
-  blob wrapper (§5.3)  with the use tracker present — this is the
-                       include_ref_map case
+  varint blob_id          per-onode id
+  blob wrapper (§5.3)     with use tracker (include_ref_map = true)
 }
 ```
 
-Because the onode value is read before anything else about the object,
-`Onode::decode_raw()` decodes this section eagerly into the spanning-blob
-table before any shard is loaded; shard references then resolve by id
-(§6.3, `BLOBID_FLAG_SPANNING`, id in bits 4+) regardless of which shards
-are faulted in. An unsharded onode has no shard boundaries and always
-encodes `count = 0` — the `02 00` pair in the §7.1 specimen. A
-populated spanning section, and the split-versus-promote rule that
-governs it, is captured in §7.3.
+* `Onode::decode_raw()` decodes this section before any shard. Shards
+  then find a spanning blob by id (§6.3, `BLOBID_FLAG_SPANNING`, id in
+  bits 4+), whichever shards are loaded.
+* An unsharded onode has no cuts, so count is always 0: bytes `02 00`
+  in §7.1.
+* Only this section stores the use tracker (§5.4). A shard-local blob's
+  tracker is rebuilt from its own shard. A spanning blob's users may sit
+  in shards that are not loaded, so its tracker must be stored.
 
-The reference tracker is persisted only in this section. A shard-local
-blob's reference accounting is rebuilt at decode time from the extents of
-its own shard, which are all present by definition; a spanning blob's
-referencing extents may lie in unloaded shards, so releasing space on
-partial deallocation would otherwise require faulting in every shard.
+Split or spanning — decided in `reshard()`:
 
-Lifecycle:
+```
+encode_some(), per extent:
+    normal blob:   blob reaches outside the shard?       -> request_reshard()
+    spanning blob: extent passes the shard end?          -> request_reshard()
 
-* promotion — `encode_some()` detects a blob escaping the range being
-  encoded (`blob_escapes_range()`) and calls `request_reshard()`; the
-  reshard pass re-cuts shard boundaries and then, for each blob that still
-  crosses one, either splits it or promotes it (below);
-* demotion — when overwrites confine a blob to one shard, it is dropped
-  from the spanning table (`id = -1`) and re-encoded inline at the next
-  reshard;
-* prevention — v3 onode segmentation (§6.1, `segment_size` > 0) forbids
-  blobs from crossing segment boundaries, which by construction keeps
-  every blob within one shard; with the default `segment_size = 0` the
-  spanning machinery above is in effect.
+reshard_action(): re-cut shards; for each blob that still crosses a cut:
 
-Crossing a shard boundary is necessary but not sufficient for promotion.
-During reshard a crossing blob is **split** when `Blob::can_split()` and
-`Blob::can_split_at(blob_offset)` both hold, and promoted to spanning
-(`_make_spanning()`) only when either test fails
-([`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc)).
-Each test has two halves
-([`src/os/bluestore/BlueStore.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h)):
+    can_split()?
+      no  -> _make_spanning(): whole blob becomes spanning
+      yes -> walk the cuts left to right:
+               can_split_at(cut)?
+                 yes -> split; the right piece is checked at the next cut
+                 no  -> the piece that holds this cut (from the last
+                        split, or the whole blob) becomes spanning; stop
+```
 
-| Test | blob half | use-tracker half |
+Extents of a spanning blob are still cut at shard boundaries: each shard
+keeps its own extents, all pointing at the one spanning id.
+
+| Test | blob part | use-tracker part |
 |---|---|---|
 | `can_split()` | not `FLAG_SHARED`, `FLAG_COMPRESSED` or `FLAG_HAS_UNUSED` (§5.2) | tracker is per-AU (`num_au > 0`, §5.4) |
-| `can_split_at()` | no checksums, or offset is csum-chunk aligned | offset is AU-aligned and within the tracker |
+| `can_split_at(off)` | no checksums, or `off` is csum-chunk aligned | `off % au_size == 0` and `off < num_au * au_size` |
 
-The three excluded flags are not an arbitrary list: each marks blob-wide
-state that cannot be divided at an arbitrary offset. A shared blob's
-refcounts live in one `X` record under one sbid, which other objects also
-reference (§5.5); a compressed blob's payload is a single compressed
-unit; the `unused` field is one bitmap over the whole blob. The alignment
-test is the same idea applied to the side tables that can be divided —
-a cut is only legal where the checksum array and the use tracker can be
-cut too. **A blob is splittable exactly when all of its side tables are,
-and promotion is what happens when they are not.**
+Why these tests: a blob can split only if all its per-blob data can split.
 
-An ordinary mutable blob therefore splits and never appears here; §7.3
-captures both outcomes at one boundary.
+* SHARED: one `X` record under one sbid, also used by other objects (§5.5).
+* COMPRESSED: the data is one compressed unit.
+* HAS_UNUSED: one bitmap for the whole blob; the code says splitting it
+  is "complex", so it is not done.
+* checksums and use tracker: can split, but only at their chunk / AU
+  boundaries.
 
-Promotion inverts the property sharding was introduced to buy. A shard is
-loaded only when a request touches its range, but the spanning section
-rides in the onode value, so a spanning blob is decoded on every onode
-load and re-encoded on every onode update whether or not the I/O touches
-its extents. It also costs a persisted use tracker, and an id namespace
-that no other blob needs. BlueStore treats a growing population as a
-pathology rather than a cost: `l_bluestore_spanning_blobs` counts them,
-and `bluestore_debug_too_many_blobs_threshold` (24576) dumps the offending
-onode for diagnosis
-([`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc),
-`_make_spanning`).
+A plain blob (none of the three flags, more than one AU) splits when the
+cut is aligned to both the csum chunk and the AU. §7.3 shows both
+outcomes at one cut.
 
-Hence the v21 direction recorded under prevention above: rather than make
-spanning blobs cheaper, segmentation removes the case. Declaring
-boundaries that blobs may not cross means reshard cuts only on those
-lines, so no blob can straddle a cut and this machinery never engages.
-The specimens in §7 run with the default `segment_size = 0`, which is
-why they still exercise it.
+Life of a spanning blob:
+
+```
+ from       event                                         to
+ inline     crosses a cut and cannot split there          spanning
+ spanning   a reshard covers it and it crosses no cut     id = -1, inline
+                                                          in the same commit
+ spanning   onode drops to 0 shards                       inline
+ spanning   merged into another blob at clone             id = -1
+            (reblob_extents)
+ spanning   no longer used and empty (_wctx_finish)       removed
+```
+
+A reshard runs inside `_record_onode()`, which then writes the shards
+again, so a blob made inline is stored inline in the same commit.
+
+Cost: shards load on demand, but the spanning section is in the onode.
+So every spanning blob is decoded on each onode load and re-encoded on
+each onode update, even when the I/O does not touch it. It also needs a
+stored use tracker and an id.
+
+* `l_bluestore_spanning_blobs` counts them.
+* When a new spanning blob brings the onode to
+  `bluestore_debug_too_many_blobs_threshold` (24576) or more, reshard
+  dumps the onode for debugging (at most once per 5 minutes per onode).
+* v21 answer: segmentation (§6.1). With `segment_size > 0`, reshard cuts
+  only at an extent whose blob starts at or after the next segment line.
+  Writes that cut at segment lines keep their blobs inside one segment.
+  This reduces spanning blobs; it does not forbid them:
+  * small writes and uncompressed write v2 do not cut at segment lines;
+  * onodes with `segment_size = 0` (old objects, or option 0) do not use
+    segments at all;
+  * a blob that still crosses a cut takes the split-or-spanning path above.
+
+  The §7 specimens use option 0, so they show spanning blobs.
 
 ## 6.3 Extent-map encoding
 
 Code path: `BlueStore::ExtentMap::encode_some()` /
 `ExtentDecoder::decode_some()` ([`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc),
-`BLOBID_FLAG_*`). One shard value — or the inline map — is:
+`BLOBID_FLAG_*`). One shard value, or the inline map:
 
 ```
 u8 struct_v = 2
-varint n              extent count
+varint n                        extent count
 n x extent record:
-  varint blobid_field
-  [ varint_lowz gap ]          if !CONTIGUOUS: logical gap since prev end
-  [ varint_lowz blob_offset ]  if !ZEROOFFSET
-  [ varint_lowz length ]       if !SAMELENGTH
-  [ inline blob (§5.3) ]       if blobid_field >> 4 == 0 and !SPANNING
+  varint blobid_field           flags + id, below
+  [ varint_lowz gap ]           if !CONTIGUOUS: logical gap since prev end
+  [ varint_lowz blob_offset ]   if !ZEROOFFSET
+  [ varint_lowz length ]        if !SAMELENGTH
+  [ inline blob (§5.3) ]        if id == 0 and !SPANNING
 ```
 
-`blobid_field` bit assignments:
+`blobid_field`:
 
 ```
-bit 0  BLOBID_FLAG_CONTIGUOUS   extent starts at prev extent's logical end
-bit 1  BLOBID_FLAG_ZEROOFFSET   blob_offset == 0
-bit 2  BLOBID_FLAG_SAMELENGTH   length == previous extent's length
-bit 3  BLOBID_FLAG_SPANNING     bits 4+ hold a spanning-blob id (§6.2)
-bits 4+                         0 = inline blob definition follows;
-                                k > 0 = back-reference: k = 1 + index of the
-                                EXTENT at which the blob was first inlined
+bit 0    CONTIGUOUS    extent starts at prev extent's logical end
+bit 1    ZEROOFFSET    blob_offset == 0
+bit 2    SAMELENGTH    length == prev extent's length
+bit 3    SPANNING      id = spanning-blob id (§6.2)
+bits 4+  id            not SPANNING:
+                         0     = blob defined inline right here
+                         k > 0 = the blob defined inline at extent k-1
+                                 of this shard
 ```
 
-Back-references are extent-ordinal, not blob-ordinal: the encoder stores
-`last_encoded_id = n + 1` where `n` is the index of the extent that carried
-the inline definition, and the decoder resolves `k - 1` against a table
-indexed by extent position (`consume_blobid()`). Example: extents 0,1,2
-using blobs A,A,B → blob B is inlined at extent 2 with `blobid_field`
-bits 4+ = 0; a later extent reusing B encodes `k = 3`.
+Each shard starts from prev end = 0 and prev length = 0, not from the
+shard's start offset. So the first extent of a shard stores its absolute
+logical offset as the gap (unless it starts at 0).
+
+`k` counts **extents**, not blobs. When extent `n` defines a blob inline,
+the encoder sets that blob's `last_encoded_id = n + 1`. The decoder looks
+up `k - 1` in a table indexed by extent position (`consume_blobid()`):
+
+```
+extent   blob   id in blobid_field
+0        A      0   define A inline     A.last_encoded_id = 1
+1        A      1   -> extent 0
+2        B      0   define B inline     B.last_encoded_id = 3
+3        B      3   -> extent 2
+```
 
 # 7. Captured Specimens
 
@@ -1333,7 +1381,8 @@ extents.
 
 This specimen captures a populated spanning section: **one blob promoted
 because it is referenced from two shards and cannot be split.** Promotion
-requires an unsplittable blob (§6.2), so the object is cloned — a clone
+requires a blob that cannot be split at the cut (§6.2), so the object is
+cloned — a clone
 marks blobs `FLAG_SHARED`, the cheapest way to produce one.
 
 A 256 KiB object is written and a pool snapshot taken. The first of the
