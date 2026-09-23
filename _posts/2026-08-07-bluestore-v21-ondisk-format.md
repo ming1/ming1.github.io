@@ -808,17 +808,43 @@ Code path: `Collection::make_blob_shared()`, `_assign_blobid()`,
 
 After a clone, two objects use the same disk extents. Each onode keeps its
 own copy of the blob. Only the refcounts are shared, in one `X` record
-keyed by sbid (BE u64 in the key, §4.2):
+keyed by sbid (BE u64 in the key, §4.2).
+
+The **ref_map** is those refcounts: a sorted list of *disk* ranges.
 
 ```
- head onode                  clone onode
- blob: SHARED, sbid 61442    blob: SHARED, sbid 61442
-            \                   /
-             v                 v
-     X key 00 00 00 00 00 00 f0 02
-     ref_map:  0x4df000  4 KiB  refs 1      clone only
-               0x4e0000  4 KiB  refs 2      head + clone
-               ...
+key                     value
+disk offset (u64)  -->  length (u32), refs (u32)
+```
+
+* `refs` = how many onodes (head, clones) still use that disk range.
+* Ranges never overlap. A get or put on part of a range splits it.
+  Neighbours with the same `refs` are merged.
+* `refs` reaches 0: the record is removed and the range is freed.
+
+The §7.3 blob (sbid 61442) shows why it counts disk ranges, not blobs:
+the head and the clone free different parts.
+
+```
+disk offset   0x4df000  0x4e0000  0x4e1000  0x4e2000       0x4ee000
+              +---------+---------+---------+---------+   +---------+
+clone blob    |  data   |  data   |  data   |  data   |...|  data   |
+head blob     |  hole   |  data   |  hole   |  data   |...|  data   |
+              +---------+---------+---------+---------+   +---------+
+ref_map       refs 1    refs 2    refs 1    refs 2    ... refs 2
+              clone     both      clone     both          both
+```
+
+How it got there (final state captured in §7.3):
+
+```
+step                          ref_map records (offset, length, refs)
+clone: make_blob_shared()     0x4df000  64 KiB  1      blob's own refs
+clone: clone takes refs       0x4df000  64 KiB  2      one record, merged
+head overwrites every         0x4df000   4 KiB  1      each put splits the
+second 4 KiB block            0x4e0000   4 KiB  2      range; neighbours
+                              0x4e1000   4 KiB  1      differ, so no merge
+                              ...                      -> 16 records
 ```
 
 Value encoding:
