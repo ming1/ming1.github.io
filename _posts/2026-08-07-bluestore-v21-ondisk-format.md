@@ -1534,6 +1534,7 @@ Only the block-21 cut falls inside a 64 KiB window:
 | 1 | 16–31 | 61442 | shards 0 **and** 1 | **spanning** |
 | 2 | 32–47 | 61443 | shard 1 | inline, local |
 | 3 | 48–63 | 61444 | shard 2 | inline, local |
+{: .table .table-bordered .table-condensed}
 
 **Why the cut is at 0x15000.** `ExtentMap::reshard()` walks the extents
 in order and adds `extent_avg` (encoded bytes ÷ extent count) per extent.
