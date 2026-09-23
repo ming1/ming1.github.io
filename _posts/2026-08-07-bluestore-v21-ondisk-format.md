@@ -1698,14 +1698,22 @@ later uses are back-references; window 1's shared blob is always a
 spanning ref:
 
 ```
-shard 0  blocks 0-20   head 0, 61441    2 inline + 14 back-refs
-                       h1a              1 inline +  2 back-refs
-                       61442 (spanning)              2 spanning   blocks 17, 19
-shard 1  blocks 21-47  h1b              1 inline +  4 back-refs
-                       61442 (spanning)              6 spanning   blocks 21-31 odd
-                       head 2, 61443    2 inline + 14 back-refs
-shard 2  blocks 48-63  head 3, 61444    2 inline + 14 back-refs
+shard    blob               inline at        back-refs                spanning refs
+shard 0  head 0             [ 0] block  0    7  (blocks 2-14 even)
+         61441              [ 1] block  1    7  (blocks 3-15 odd)
+         h1a                [16] block 16    2  (blocks 18, 20)
+         61442 (spanning)   -                -                        2  (blocks 17, 19)
+shard 1  61442 (spanning)   -                -                        6  (blocks 21-31 odd)
+         h1b                [ 1] block 22    4  (blocks 24-30 even)
+         head 2             [11] block 32    7  (blocks 34-46 even)
+         61443              [12] block 33    7  (blocks 35-47 odd)
+shard 2  head 3             [ 0] block 48    7  (blocks 50-62 even)
+         61444              [ 1] block 49    7  (blocks 51-63 odd)
 ```
+
+`[n]` = record index inside the shard (as in the listing below). Shard
+1's first record `[0]` (block 21) is a spanning ref, so its first inline
+blob is at `[1]`.
 
 * 8 spanning refs = window 1's 8 shared blocks (2 in shard 0, 6 in
   shard 1).
