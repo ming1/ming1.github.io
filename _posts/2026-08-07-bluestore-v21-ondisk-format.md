@@ -1715,6 +1715,21 @@ shard 2  head 3             [ 0] block 48    7  (blocks 50-62 even)
 1's first record `[0]` (block 21) is a spanning ref, so its first inline
 blob is at `[1]`.
 
+How to spot an inline blob: dump a shard value
+(`ceph-kvstore-tool ... get O '<onode key><BE u32 offset>x' out <file>`,
+§11.3) and read the flag varint `v` at the start of each record (§6.3):
+
+```
+SPANNING (0x08) set          -> spanning ref           e.g. 0d 07, 08 57 17 07
+0x08 clear, v >> 4 == 0      -> inline: a blob follows e.g. 03 07 0f e6 ...
+0x08 clear, v >> 4 == k      -> back-ref to [k-1]      e.g. 15 0b (k=1), 95 02 0b (k=17)
+```
+
+An inline record is long: a whole blob (pextents, checksums, and the sbid
+if shared) follows its first bytes. Back-refs and spanning refs are 2–4
+bytes. Blob flags `0x14` (SHARED) plus the sbid name the shared blobs;
+the others are head blobs.
+
 * 8 spanning refs = window 1's 8 shared blocks (2 in shard 0, 6 in
   shard 1).
 * 8 inline blobs + 1 spanning blob = the object's nine blobs.
