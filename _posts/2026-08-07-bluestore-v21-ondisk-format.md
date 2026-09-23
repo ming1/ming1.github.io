@@ -1689,6 +1689,7 @@ A shard names a blob in three ways:
 | 0 | 3 | 16 | 2 |
 | 1 | 3 | 18 | 6 |
 | 2 | 2 | 14 | 0 |
+{: .table .table-bordered .table-condensed}
 
 The three shards, record by record. A shared blob inside one shard is
 inline plus 2-byte back-references; window 1's shared blob is reached by
