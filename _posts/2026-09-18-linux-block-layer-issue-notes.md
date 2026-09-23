@@ -407,6 +407,23 @@ the kernel stack. So the kernel moves the *identity* instead: an idle worker
 becomes the submitter and returns to userspace, and the blocked thread
 becomes the worker.
 
+**"Return to userspace" here means the `io_uring_enter()` syscall
+returns.** Request results do not change: they still arrive as CQEs.
+
+```
+(1) syscall return   io_uring_enter() → rax = number of SQEs taken (or -errno)
+                     lands on the calling thread: its stack, registers, signal state
+                     → only that thread (or one with its identity) can do it
+(2) request result   CQE {user_data, res} in the CQ ring (shared memory)
+                     → any task can post it, at any time
+```
+
+If a request blocks inline, (1) cannot happen: the request is still on the
+thread's kernel stack, and the app thread would be stuck in the syscall. The
+handoff lets W do (1) quickly as the same tid — submit the rest, handle
+`GETEVENTS`, `syscall_set_return_value()` — while T finishes the request and
+posts its CQE later, as io-wq does today.
+
 ```
 TODAY — fsync on tmpfs, does not really block
 
