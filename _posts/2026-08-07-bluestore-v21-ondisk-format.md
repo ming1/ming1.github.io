@@ -1761,8 +1761,9 @@ What the walk shows:
 A write finds its extents the same way, then:
 
 * **Target blob decides the update.**
-  * Mutable (not shared, not compressed): write in place (§8.2) —
-    direct into unused chunks, deferred over written data.
+  * Mutable (not shared, not compressed): in place when possible
+    (§8.2) — unused chunks direct or deferred by size, small overwrites
+    deferred, large overwrites to new space.
   * Shared or compressed: allocate new space and point the extent map at
     it. Freed ranges go to the transaction's `released` set (§8.2). For
     a shared blob, a refcount put comes first (§5.5); only ranges that
@@ -1786,36 +1787,68 @@ A write finds its extents the same way, then:
 
 # 8. Transactions and Deferred Writes
 
-## 8.1 Commit protocol
-
-Code path: `BlueStore::queue_transactions()`,
-`BlueStore::TransContext::state_t` ([`src/os/bluestore/BlueStore.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h)).
-
-One `queue_transactions()` call folds its entire batch of ObjectStore
-transactions into a single `TransContext`, which becomes a single RocksDB
-`WriteBatch` containing all onode/shard/omap/alloc/statfs mutations plus,
-when needed, one `L` record. The batch commit (RocksDB WAL append + fsync
-through BlueFS) is the single atomicity and durability point — BlueStore
-has no other commit record.
-
-Durability therefore nests three logs: the BlueFS journal (§3.3) makes the
-RocksDB WAL file findable, the RocksDB WAL makes the WriteBatch durable,
-and the `L` records inside the batch defer raw block writes (§8.2).
-
-`state_t` values: `prepare`, `aio_wait`, `io_done`, `kv_queued`,
-`kv_submitted`, `kv_done`, `deferred_queued`, `deferred_cleanup`,
-`deferred_done`, `finishing`, `done`.
+After a crash, a transaction survives through three nested logs:
 
 ```
- prepare -> aio_wait -> io_done -> kv_queued -> kv_submitted (*) -> kv_done
-                                                    |                  |
-                                                    v                  v
-                                       deferred_queued -> ... ->   finishing -> done
-                                       deferred_cleanup (**)
-                                       deferred_done
+ BlueFS journal (§3.3)  --finds-->  RocksDB WAL file
+ RocksDB WAL            --holds-->  one WriteBatch per transaction (§8.1)
+ WriteBatch             --holds-->  optional L record: block writes not yet
+                                    done on the device (§8.2)
+```
 
- (*)  WriteBatch durable: the transaction logically exists
- (**) a later WriteBatch deletes the L key
+## 8.1 Commit protocol
+
+Code path: `BlueStore::queue_transactions()`, `_txc_state_proc()`,
+`_kv_sync_thread()` ([`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc)),
+`BlueStore::TransContext::state_t` ([`src/os/bluestore/BlueStore.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h)).
+
+```
+ queue_transactions(batch of ObjectStore transactions)
+   -> one TransContext (txc)
+   -> one KV transaction (RocksDB WriteBatch):
+        onode, shards, omap, X, C, [one L record],
+        statfs T + freelist (§9.1 bitmap mode only)
+        (the KV thread may also add S nid_max / blobid_max, §4.3)
+```
+
+* **Atomic per txc:** the whole WriteBatch applies, or none of it.
+* **Submitted async:** `_kv_sync_thread()` submits each txc's batch
+  without sync (`kv_submitted`: not durable yet). With
+  `bluestore_sync_submit_transaction` (default false) the queuing thread
+  does it instead.
+* **Durable in batches:** then one small `synct` is committed with
+  `submit_transaction_sync()`. The RocksDB WAL is one ordered log, so
+  this sync makes every earlier batch durable too. `synct` also carries
+  the `L` key deletions.
+* **Data first:** direct data writes (aio) finish before the txc goes to
+  the KV queue. KV commits keep order per OpSequencer (per collection),
+  even if aio finishes out of order.
+* **Flush first:** before the sync, `block` may need a flush:
+  * separate DB device: flush if there were data writes or finished
+    deferred writes;
+  * single shared device: flush only for data writes (or when nothing
+    else is pending); the BlueFS WAL sync flushes the same device. So
+    finished deferred writes become stable one cycle later, and their
+    `L` keys are deleted one `synct` later.
+
+States (`state_t`, in order; `deferred_done` exists but is never set):
+
+```
+ prepare -> aio_wait -> io_done -> kv_queued -> kv_submitted -> kv_done
+            (only if data aio)
+                                                                   |
+          +-------------------- deferred ops? ---------------------+
+          | no                                                 yes |
+          |                                                        v
+          |                                                 deferred_queued     block writes from the L record
+          |                                                 deferred_cleanup    IO done; a later synct deletes L
+          v                                                        |
+      finishing  <-------------------------------------------------+
+          |
+          v
+         done
+
+ kv_done: WriteBatch durable, the transaction exists
 ```
 
 ## 8.2 Deferred records — `L`
@@ -1824,30 +1857,77 @@ Source: [`src/os/bluestore/bluestore_types.h`](https://github.com/ceph/ceph/blob
 (`bluestore_deferred_transaction_t`, `bluestore_deferred_op_t`); key
 builder `get_deferred_key()` ([`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc)).
 
-Small overwrites of allocated space (≤ `bluestore_prefer_deferred_size`)
-cannot be written in place before commit (torn-write risk). The data
-travels inside the KV batch and is replayed onto the block device after
-commit. Key: BE u64 `deferred_txn_seq`. Value:
+A deferred write puts its data inside the KV batch. The block write
+happens after commit. Two reasons to defer:
+
+* **Overwrite of written data** in a mutable blob. Writing it in place
+  before commit would destroy the only copy that the committed metadata
+  and checksums describe; a crash could also tear the block. The `L`
+  record is a redo log: the write happens after commit and can be
+  replayed.
+  * Small overwrites (`_do_write_small`, below `min_alloc_size`) are
+    deferred when the chunk-aligned range is already allocated.
+  * Larger overwrites are deferred only below `prefer_deferred_size`;
+    above it they go to new space.
+* **Small write to fresh or unused space** (below
+  `prefer_deferred_size`): one KV commit is cheaper than a separate device
+  write plus flush, mainly on HDD. Above it, the write is direct.
+
+These rules are for the default (classic) write path. Write v2
+(`bluestore_write_v2`, off by default) has its own in `Writer.cc`.
+
+```
+option                                default   meaning
+bluestore_prefer_deferred_size_hdd    64 KiB    defer writes below this
+bluestore_prefer_deferred_size_ssd    0         never defer by size on SSD
+bluestore_prefer_deferred_size        0         0 = use the hdd/ssd value
+bluestore_deferred_batch_ops_hdd      64        when to submit a batch,
+bluestore_deferred_batch_ops_ssd      16        not whether to defer
+bluestore_deferred_batch_ops          0         0 = use the hdd/ssd value
+```
+
+Key: BE u64 `seq`. `seq = ++deferred_seq`, an in-memory counter, not
+stored: it starts at 1 when the OSD process starts. One `L` record per
+txc. Value:
 
 ```
 bluestore_deferred_transaction_t   DENC_START(1,1)
   le64 seq
   le32 op count, each op:          bluestore_deferred_op_t, DENC_START(1,1)
-    u8 op                          1 = OP_WRITE (sole opcode)
+    u8 op                          1 = OP_WRITE (only opcode)
     PExtentVector extents          destination disk runs (§5.1)
     bufferlist data                le32 len + payload; len = sum of extents
   interval_set released            le32 count + { le64 offset, le64 length };
-                                   extents freed only after the deferred
-                                   write completes
+                                   always empty (asserted: "only kraken did this")
 ```
 
-Recovery: `BlueStore::_deferred_replay()` iterates all `L` records at
-mount. Each decoded transaction first passes
-`_eliminate_outdated_deferred()`, which drops any op whose destination
-overlaps extents now owned by BlueFS — replaying a stale deferred write
-into space BlueFS has since claimed would corrupt the DB. Surviving ops are
-re-executed; re-execution is idempotent because the payload bytes are
-unchanged.
+**Released space** travels in the txc, not in the `L` record. A txc
+collects freed extents in its in-memory `released` set (from §5.5 puts
+and dropped blobs). With the bitmap freelist (§9.1) they are written in
+the same WriteBatch. The allocator gets them only when the txc is done
+and all earlier txcs of the same OpSequencer have finished their deferred
+writes (and after discard, if enabled). So no deferred write can land in
+space that is already reused.
+
+Replay at mount (`_mount()`: open DB, freelist and allocator → start KV
+threads → `_deferred_replay()`):
+
+```
+ for each L record:
+   _eliminate_outdated_deferred(): cut out the parts of each op that now
+       belong to BlueFS (and the matching data bytes); drop an op when
+       nothing is left
+   something left: rebuild a txc in state kv_done -> normal deferred
+       path (§8.1); its L key is deleted after the write
+   nothing left:   skip it; its L key stays in the DB
+ _osr_drain_all(): wait until all replayed writes are done
+```
+
+* Why cut BlueFS space: BlueFS may have taken that space since the
+  record was written. Replaying old data there would corrupt the DB.
+* Replay is idempotent: the same bytes go to the same disk extents.
+* A skipped `L` key is harmless: the next mount trims it again, and a new
+  txc that gets the same `seq` overwrites it and then deletes it.
 
 # 9. Free Space Persistence
 
