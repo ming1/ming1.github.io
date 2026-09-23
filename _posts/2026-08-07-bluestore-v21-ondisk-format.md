@@ -1254,8 +1254,14 @@ Sharding options
 `ExtentMap::update()` checks the limits; `reshard()` does the cutting.
 
 One record is 16 B here, so 75 writes is the smallest count that crosses
-1200 B (2 + 75 × 16 = 1202). Result: one onode record and three shard
-records (`ceph-kvstore-tool ... list O`, shared key prefix cut short):
+1200 B (2 + 75 × 16 = 1202).
+
+The object is 4.6 MiB. That is fine: a RADOS object may be up to
+`osd_max_object_size` (128 MiB). 4 MiB is only the default object size of
+RBD, CephFS and RGW. At a 64 KiB stride, 4 MiB holds 64 writes
+(2 + 64 × 16 = 1026 B), too few to shard.
+
+The 75 writes give one onode record and three shard records (`ceph-kvstore-tool ... list O`, shared key prefix cut short):
 
 ```
 O  <ghobject key>'o'                          onode, 368 B
