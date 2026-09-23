@@ -1483,19 +1483,43 @@ shard 2   212 = 2 + 18 + 12 x 16      13 extents
 
 ## 7.3 Spanning blobs: 256 KiB cloned object, 8 KiB-stride overwrites
 
-Goal: capture a spanning blob. That needs a blob that crosses a cut and
-cannot be split there (§6.2). A clone makes blobs `FLAG_SHARED`, which
-fails `can_split()`, so the recipe clones the object.
+### 7.3.1 The story in one view
 
-* A 256 KiB object is written (four 64 KiB blobs), then a pool snapshot
-  is taken.
-* The first overwrite clones the whole object: all four blobs become
-  `FLAG_SHARED` (`_do_clone_range()` → `dup_esb()` →
-  `make_blob_shared()`). `dup_esb` is used because the OSD was created
-  with `bluestore_elastic_shared_blobs` = true (default). The mode is
-  stored in meta at mkfs; an older OSD without it uses legacy `dup()`.
-* 32 overwrites of 4 KiB, one every 8 KiB, fragment the map past the
-  sharding limit.
+A shared blob that crosses a shard cut cannot be split. So BlueStore moves
+it into the onode, and both shards point to it by id.
+
+Picture A — window 1 at the cut:
+
+```
+ block         16  17  18  19  20 | 21  22  23  24  25  26  27  28  29  30  31
+ owner          H   S   H   S   H |  S   H   S   H   S   H   S   H   S   H   S
+ shard        ----- shard 0 ------|----------------- shard 1 ------------------
+                                  ^ cut 0x15000 (block 21)
+
+ head blob    [------ h1a -------]|[---------------- h1b ----------------]
+                                    split at the cut (4 KiB aligned: passes the csum-chunk
+                                    and AU tests); each shard defines its own half
+ shared 61442 [-------------------|-------------------------------------------]
+                                    SHARED -> cannot split -> spanning:
+                                    defined once in the onode (id 0), both shards point to it
+```
+
+1. A 256 KiB object is written: four 64 KiB blobs, one per 64 KiB
+   **window** (windows 0–3).
+2. A pool snapshot is taken. The first overwrite clones the object: all
+   four blobs become `FLAG_SHARED`.
+3. 32 overwrites of 4 KiB, one every 8 KiB: the head gets new blobs for
+   the even blocks (H); the shared blobs keep the odd blocks (S). The map
+   passes 1200 B and is sharded: cuts at blocks 21 and 48.
+4. The block-21 cut falls inside window 1. The head's blob there splits
+   into h1a and h1b. The shared blob 61442 fails `can_split()` (§6.2), so
+   it becomes **spanning**.
+5. Cost: its 233 B definition now sits in the onode, decoded on every
+   onode load (§6.2).
+
+7.3.2 shows the layout, 7.3.3 the bytes, 7.3.4 the details.
+
+### 7.3.2 Recipe and layout
 
 ```
 $ rados -p p1 put sp256 /root/obj_256               # 256 KiB -> 64 KiB blobs
@@ -1505,9 +1529,12 @@ $ for w in 0 1 2 3; do for j in $(seq 0 7); do
   done; done
 ```
 
-The head now owns every even 4 KiB block; the shared blobs keep every
-odd one. The cuts are at 0x15000 (block 21) and 0x30000 (block 48).
-Only the block-21 cut falls inside a 64 KiB window:
+* The clone path is `_do_clone_range()` → `dup_esb()` →
+  `make_blob_shared()`. `dup_esb` is used because the OSD was created
+  with `bluestore_elastic_shared_blobs` = true (default); the mode is
+  stored in meta at mkfs, and an older OSD without it uses legacy
+  `dup()`.
+* Cuts: 0x15000 (block 21) and 0x30000 (block 48, a window edge).
 
 ```
           0       8       16      24      32      40      48      56     63
@@ -1523,59 +1550,32 @@ Only the block-21 cut falls inside a 64 KiB window:
                           shard 0 | 1                shard 1 | 2
 
  H = 4 KiB overwritten by the head; a window's eight H blocks share one
-     head blob (head 0, head 2, head 3 — and h1a/h1b, see below)
+     head blob (head 0, head 2, head 3 — and h1a/h1b, see 7.3.1)
  S = 4 KiB still referenced from that window's clone-shared blob, named
      here by its sbid
 ```
 
-| Window | Blocks | sbid | Shards holding its 8 S blocks | Result |
-|---|---|---|---|---|
-| 0 | 0–15 | 61441 | shard 0 | inline, local |
-| 1 | 16–31 | 61442 | shards 0 **and** 1 | **spanning** |
-| 2 | 32–47 | 61443 | shard 1 | inline, local |
-| 3 | 48–63 | 61444 | shard 2 | inline, local |
-{: .table .table-bordered .table-condensed}
-
-**Why the cut is at 0x15000.** `ExtentMap::reshard()` walks the extents
-in order and adds `extent_avg` (encoded bytes ÷ extent count) per extent.
-It cuts before an extent when:
+Every block is one extent record. Picture B — how each record names its blob:
 
 ```
-estimate + extent_avg > 500          no blob crosses here   (target)
-estimate + extent_avg > 500 + 100    a blob crosses here    (+ slop, 20% of target)
+ block    0       8       16      24      32      40      48      56
+          |       |       |       |       |       |       |       |
+ shard    [-------- 0 --------][----------- 1 -----------][----- 2 ------]
+ record   IIbbbbbbbbbbbbbbIsbsbsIsbsbsbsbsIIbbbbbbbbbbbbbbIIbbbbbbbbbbbbbb
+
+ I = inline: the blob is defined in this record
+ b = back-ref to an earlier I in the same shard
+ s = spanning ref: id 0, defined in the onode
 ```
 
-The capture fits one whole-object reshard with `extent_avg` = 28. It ran
-when the inline map first passed 1200 B: after the write to block 40,
-with 43 extents (43 × 28 ≈ 1204–1246 B). Window 2 was half written then,
-so 21 extents lay between blocks 21 and 48:
+* The first use of a blob in a shard is inline (I at blocks 0, 1 =
+  head 0, 61441; 16 = h1a; 22 = h1b; 32, 33 = head 2, 61443; 48, 49 =
+  head 3, 61444). Later uses are back-refs.
+* The 8 `s` records are window 1's 8 shared blocks: 2 in shard 0, 6 in
+  shard 1. Shard 1's first record (block 21) is one of them.
+* 8 inline blobs + 1 spanning blob = the object's nine blobs.
 
-```
-extent at   blob crosses?     estimate + 28        limit   result
-block 16    no                16 x 28 + 28 = 476   500     no cut
-block 20    yes               20 x 28 + 28 = 588   600     no cut
-block 21    yes               21 x 28 + 28 = 616   600     cut 0x15000
-block 32    no                11 x 28 + 28 = 336   500     no cut
-block 48    no                21 x 28 + 28 = 616   500     cut 0x30000
-```
-
-The window edge at block 16 is 24 B short of the target, so the cut moves
-into window 1. This is inferred from the code and the capture, not traced:
-only `extent_avg` = 28 gives both cuts (27 → blocks 22, 48; 29 → 20, 40).
-
-Both §6.2 outcomes meet at the block-21 cut:
-
-```
- window 1 at cut 0x15000
-   shared blob 61442   SHARED -> can_split() fails  -> spanning (id 0)
-   head blob           passes both split tests      -> split:
-                         h1a: shard 0 record [16], 5 pextents (3 real: blocks 16, 18, 20)
-                         h1b: shard 1 record [1], 10 pextents (5 real: blocks 22-30)
- cut 0x30000           on a window edge             -> nothing to split or promote;
-                                                       shard 2's first record still
-                                                       writes the absolute gap and
-                                                       the length (as in §7.2)
-```
+### 7.3.3 The bytes
 
 The head object (`snap` = `CEPH_NOSNAP`; the clone sorts first, lower
 snap id, §4.4) has eight records: four under `O`, one `X` per shared blob:
@@ -1588,7 +1588,7 @@ snap id, §4.4) has eight records: four under `O`, one `X` per shared blob:
 | shard 2 | `<ghobject>'o' 00 03 00 00 'x'` | 423 B |
 | shared blobs | `X` + BE u64 `00 00 00 00 00 00 f0 01` … `f0 04` | 56 B each |
 
-Onode value, 1166 B = 6 B frame + 925 B onode + 235 B spanning section; no
+**Onode**, 1166 B = 6 B frame + 925 B onode + 235 B spanning section; no
 part 3 (the map is sharded):
 
 ```
@@ -1606,16 +1606,8 @@ part 3 (the map is sharded):
 00 00 00 00         zone_offset_refs: 0
 ```
 
-```
-925 B onode payload
-  867   xattr values (264 + 603)
-   28   xattr framing: le32 count + per attr (le32 name len, name, le32 value len)
-   30   BlueStore fields: nid 2, size 3, flags 1, extent_map_shards 17,
-        3 hint varints 3, zone_offset_refs count 4
-```
-
-**Spanning section (the shared blob)**, all 235 bytes = 2 B header +
-233 B entry:
+**Spanning section (the shared blob 61442)**, 235 B = 2 B header + 233 B
+entry:
 
 ```
 02 01                            section header: struct_v 2, count = 1
@@ -1652,78 +1644,16 @@ c7 9f bd 81 6b bb a6 5c ce e8 fc 5b 5c 52 4b 47 crc32c, chunks 12-15
 00 80 20 00 80 20                AU 12-15 referenced: 0, 4096, 0, 4096
 ```
 
-```
-233 B entry = 1 id + 1 count + 128 pextents + 1 flags + 67 csum + 8 sbid + 27 tracker
-              pextents + checksums = 84%  -> why a spanning blob is costly (§6.2)
-```
-
-What the full listing shows:
-
-* **Holes cost more than data.** `INVALID_OFFSET` has no low zero bits
-  for `denc_lba` (§1) to strip: 10 B lba + 1 B length = 11 B, against
-  4 + 1 = 5 B for a real extent. The eight holes take 88 of the 128
-  pextent bytes.
-* **The first real extent uses a different lba class.** 0x4e0000 has 17
-  low zero bits → 16-bit class (`39 01 00 00`, low bits `1`).
-  0x4e2000–0x4ee000 have 13–15 → 12-bit class (low bits `0` or `4`).
-  Same width. The class is picked by whole nibbles of low zero bits:
-  fewer than 12 → byte class; 12–15, 16–19, 20 or more → 12-, 16-,
-  20-bit class.
-* **Checksums cover the holes too.** All 16 chunks keep a checksum, though
-  the head uses only eight. The csum array follows the blob's logical
-  length. Only a trailing hole can shrink it (`prune_tail()`), never in a
-  shared blob, and here the last pextent is real.
+* **Holes cost more than data**: a hole pextent is 11 B, a real one 5 B.
+  The eight holes take 88 of the 128 pextent bytes.
+* **Checksums cover the holes too**: all 16 chunks keep a checksum,
+  though the head uses only eight (why: 7.3.4).
 * The pattern is the history: 64 KiB allocated in one piece, then every
   other block released by the overwrites. The use tracker shows the same
   pattern per AU.
 
-A shard names a blob in three ways:
-
-```
- inline         blob defined in this record              k = 0
- back-reference same blob as the inline record k-1       k > 0   (this shard only)
- spanning       blob id in the onode spanning section    SPANNING flag
-```
-
-| Shard | inline blobs | back-references | spanning refs |
-|---|---|---|---|
-| 0 | 3 | 16 | 2 |
-| 1 | 3 | 18 | 6 |
-| 2 | 2 | 14 | 0 |
-{: .table .table-bordered .table-condensed}
-
-One record = one 4 KiB block, so the rows add up to each shard's record
-count (21 + 27 + 16 = 64). The first use of a blob in a shard is inline;
-later uses are back-references; window 1's shared blob is always a
-spanning ref:
-
-```
-shard    blob               inline at        back-refs                spanning refs
-shard 0  head 0             [ 0] block  0    7  (blocks 2-14 even)
-         61441              [ 1] block  1    7  (blocks 3-15 odd)
-         h1a                [16] block 16    2  (blocks 18, 20)
-         61442 (spanning)   -                -                        2  (blocks 17, 19)
-shard 1  61442 (spanning)   -                -                        6  (blocks 21-31 odd)
-         h1b                [ 1] block 22    4  (blocks 24-30 even)
-         head 2             [11] block 32    7  (blocks 34-46 even)
-         61443              [12] block 33    7  (blocks 35-47 odd)
-shard 2  head 3             [ 0] block 48    7  (blocks 50-62 even)
-         61444              [ 1] block 49    7  (blocks 51-63 odd)
-```
-
-`[n]` = record index inside the shard (as in the listing below). Shard
-1's first record `[0]` (block 21) is a spanning ref, so its first inline
-blob is at `[1]`.
-
-* 8 spanning refs = window 1's 8 shared blocks (2 in shard 0, 6 in
-  shard 1).
-* 8 inline blobs + 1 spanning blob = the object's nine blobs.
-* h1a and h1b are the two halves of window 1's head blob, split at the
-  block-21 cut.
-
-The three shards, record by record. A shared blob inside one shard is
-inline plus 2-byte back-references; window 1's shared blob is reached by
-spanning references from both shards:
+**Shards**, record by record: picture B (7.3.2) with its bytes. `[n]` is
+the record index inside its shard.
 
 ```
 shard 0, 494 B, 21 records, blocks 0-20
@@ -1764,11 +1694,87 @@ shard 2, 423 B, 16 records, blocks 48-63
   ...  blocks 52-63 alternate the same way, no spanning record anywhere
 ```
 
-Shard 2 is the control case: one window, no cut inside, no spanning
-record. Its first record carries the absolute gap `c3 01` = 0x30000.
+* Shard 2 is the control case: one window, no cut inside, no spanning
+  record.
+* Each shard's first record carries its absolute logical offset as the
+  gap (§6.3, as in §7.2): `57` = 0x15000 (shard 1), `c3 01` = 0x30000
+  (shard 2).
 
-Selected records unpacked (`k` = `varint >> 4`; C/Z/L =
-CONTIGUOUS/ZEROOFFSET/SAMELENGTH):
+**`X` record for sbid 61442**, key `BE u64` 0x000000000000f002:
+
+```
+01 01 32 00 00 00   DENC_START(1,1), payload 50 B
+10                  ref_map: 16 entries
+ff 26  07  01       offset 0x4df000 (absolute varint_lowz), length 4096, refs 1
+07  07  02          offset delta 4096, length 4096, refs 2
+07  07  01          delta 4096, length 4096, refs 1
+...                 refs alternate 1, 2 through all 16 entries
+```
+
+`ceph-dencoder type bluestore_shared_blob_t` decodes offsets 5107712,
+5111808, … with `refs` 1, 2, 1 …, and prints `"sbid": 0`: the id is in the
+key, not the value. §5.5 draws what the 1/2 pattern means.
+
+### 7.3.4 Details
+
+**Why the cut is at 0x15000.** `ExtentMap::reshard()` walks the extents
+in order and adds `extent_avg` (encoded bytes ÷ extent count) per extent.
+It cuts before an extent when:
+
+```
+estimate + extent_avg > 500          no blob crosses here   (target)
+estimate + extent_avg > 500 + 100    a blob crosses here    (+ slop, 20% of target)
+```
+
+The capture fits one whole-object reshard with `extent_avg` = 28. It ran
+when the inline map first passed 1200 B: after the write to block 40,
+with 43 extents (43 × 28 ≈ 1204–1246 B). Window 2 was half written then,
+so 21 extents lay between blocks 21 and 48:
+
+```
+extent at   blob crosses?     estimate + 28        limit   result
+block 16    no                16 x 28 + 28 = 476   500     no cut
+block 20    yes               20 x 28 + 28 = 588   600     no cut
+block 21    yes               21 x 28 + 28 = 616   600     cut 0x15000
+block 32    no                11 x 28 + 28 = 336   500     no cut
+block 48    no                21 x 28 + 28 = 616   500     cut 0x30000
+```
+
+The window edge at block 16 is 24 B short of the target, so the cut moves
+into window 1. This is inferred from the code and the capture, not traced:
+only `extent_avg` = 28 gives both cuts (27 → blocks 22, 48; 29 → 20, 40).
+
+**Byte accounting.**
+
+```
+925 B onode payload
+  867   xattr values (264 + 603)
+   28   xattr framing: le32 count + per attr (le32 name len, name, le32 value len)
+   30   BlueStore fields: nid 2, size 3, flags 1, extent_map_shards 17,
+        3 hint varints 3, zone_offset_refs count 4
+```
+
+```
+233 B entry = 1 id + 1 count + 128 pextents + 1 flags + 67 csum + 8 sbid + 27 tracker
+              pextents + checksums = 84%  -> why a spanning blob is costly (§6.2)
+```
+
+**Spanning entry, pextents and checksums.**
+
+* A hole is `INVALID_OFFSET`: no low zero bits for `denc_lba` (§1) to
+  strip, so 10 B lba + 1 B length.
+* pextent[1], the first real one, uses a different lba class: 0x4e0000
+  has 17 low zero bits → 16-bit class (`39 01 00 00`, low bits
+  `1`). 0x4e2000–0x4ee000 have 13–15 → 12-bit class (low bits `0` or
+  `4`). Same width. The class is picked by whole nibbles of low zero
+  bits: fewer than 12 → byte class; 12–15, 16–19, 20 or more → 12-, 16-,
+  20-bit class.
+* The csum array follows the blob's logical length. Only a trailing hole
+  can shrink it (`prune_tail()`), never in a shared blob, and here the
+  last pextent is real.
+
+**Reading record bytes.** Selected records unpacked (`k` = `varint >> 4`;
+C/Z/L = CONTIGUOUS/ZEROOFFSET/SAMELENGTH):
 
 | Record | Bytes | varint | k | flags | blob_offset | Resolves to |
 |---|---|---|---|---|---|---|
@@ -1780,8 +1786,6 @@ CONTIGUOUS/ZEROOFFSET/SAMELENGTH):
 | s1 `[ 0]` | `08 57 17 07` | 8 | — | SPANNING | 0x5000 | spanning id 0, gap 0x15000 |
 | s1 `[13]` | `c5 01 0b` | 197 | 12 | C, L | 0x2000 | `blobs[11]`, record `[11]` |
 
-How to read the bytes:
-
 * `95 02` = `(0x95 & 0x7f) | (0x02 << 7)` = 277 → k = 17, flags = 5.
 * `blob_offset` is `varint_lowz` (§1): `0b` → `0x0b >> 2` = 2, `2 << 12`
   = 0x2000. That is block 18 inside h1a (which starts at block 16).
@@ -1792,15 +1796,13 @@ How to read the bytes:
   ([`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc)).
 * Spanning records: `0x0d` = C | L | SPANNING, id `0x0d >> 4` = 0, then
   one `blob_offset` byte: 2 bytes in all. Shard 1's first record is
-  `0x08` (SPANNING only), so it writes gap, offset and length; the gap
-  is absolute (§6.3).
+  `0x08` (SPANNING only), so it writes gap, offset and length.
 * Block n is logical offset n × 4096: `[17]` at block 17 = 0x11000.
 
-Record size:
+**Record size.**
 
 * Only four records start at a blob start (s0 `[0]`, `[16]`; s1 `[11]`;
-  s2 `[0]`), so almost every record
-  pays one `blob_offset` byte.
+  s2 `[0]`), so almost every record pays one `blob_offset` byte.
 * C and L drop gap and length everywhere except each shard's first
   record.
 * The blobid varint is 1 byte while `k << 4 < 128` (k ≤ 7, a definition
@@ -1818,50 +1820,20 @@ c5 01 0b   3 B   -> [11]    k = 12
   byte. Shard 1 has 14 references to records after `[7]`: 14 extra bytes
   of 583.
 
-Only one of the object's nine blobs has an id. `Blob::is_spanning()` is
-`id >= 0` ([`src/os/bluestore/BlueStore.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h)),
+**Blob names.** Only one of the nine blobs has an id. `Blob::is_spanning()`
+is `id >= 0` ([`src/os/bluestore/BlueStore.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h)),
 and in normal operation only `_make_spanning()` gives a blob a new id
-(decode restores it).
-The others keep id −1 and are named by record position:
-
-| Blob | Defined in | Referenced as |
-|---|---|---|
-| window 1 shared, sbid 61442 | onode spanning section (§6.2) | **spanning id 0** |
-| window 0 head | shard 0, record `[0]` | back-reference to `[0]` |
-| window 0 shared, sbid 61441 | shard 0, record `[1]` | back-reference to `[1]` |
-| window 1 head, left half | shard 0, record `[16]` | back-reference to `[16]` |
-| window 1 head, right half | shard 1, record `[1]` | back-reference to `[1]` |
-| window 2 head | shard 1, record `[11]` | back-reference to `[11]` |
-| window 2 shared, sbid 61443 | shard 1, record `[12]` | back-reference to `[12]` |
-| window 3 head | shard 2, record `[0]` | back-reference to `[0]` |
-| window 3 shared, sbid 61444 | shard 2, record `[1]` | back-reference to `[1]` |
-
-Record positions are **per shard**: shard 0's `[1]` and shard 1's `[1]`
-are different blobs. So a blob used from two shards cannot be named by
-position. That is what the spanning id is for.
-
-Window 1's shared blob carries three names:
+(decode restores it). The others keep id −1 and are named by record
+position, which is **per shard**: shard 0's `[1]` and shard 1's `[1]` are
+different blobs. So a blob used from two shards cannot be named by
+position; that is what the spanning id is for. Window 1's shared blob
+carries three names:
 
 ```
  sbid 61442       per OSD     key of its X record (§5.5); allocated below blobid_max (§4.3)
  spanning id 0    per onode   used by shard records (0d ..)
  record index     none        not defined in any shard
 ```
-
-The `X` record for sbid 61442, key `BE u64` 0x000000000000f002:
-
-```
-01 01 32 00 00 00   DENC_START(1,1), payload 50 B
-10                  ref_map: 16 entries
-ff 26  07  01       offset 0x4df000 (absolute varint_lowz), length 4096, refs 1
-07  07  02          offset delta 4096, length 4096, refs 2
-07  07  01          delta 4096, length 4096, refs 1
-...                 refs alternate 1, 2 through all 16 entries
-```
-
-`ceph-dencoder type bluestore_shared_blob_t` decodes offsets 5107712,
-5111808, … with `refs` 1, 2, 1 …, and prints `"sbid": 0`: the id is in the
-key, not the value. §5.5 draws what the 1/2 pattern means.
 
 ## 7.4 Walking the mapping for an I/O
 
