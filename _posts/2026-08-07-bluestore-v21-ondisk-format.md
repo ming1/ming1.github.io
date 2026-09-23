@@ -660,48 +660,84 @@ read-modify-write the counters.
 
 # 5. Blob Structures
 
-A blob is the unit that binds logical object data to physical device
-extents: it carries the pextents, the checksums covering them, and the
-flags that decide how it may be shared, compressed or split. Blobs are
-not addressable on their own — every one is embedded in, or referenced
-from, an object's extent map (§6.3), and the shared-blob refcount map
-(§5.5) is the only piece with a key of its own. They are specified first
-because every extent-map record in §6 contains or points at one, and the
-captured byte streams there cannot be decoded without this section.
+A **blob** maps object data to disk space. It holds the disk extents, one
+checksum per chunk, and some flags. A blob has no RocksDB key. It is stored
+inside an object's extent map (§6). Only the refcounts of a cloned blob get
+their own key (`X`, §5.5). §6 cannot be decoded without this section.
+
+```
+ O value or shard value (§6)                    X value, key = sbid (§5.5)
+ +--------------------------------------+      +---------------------------+
+ | extent-map record                    |      | ref_map                   |
+ |   Blob wrapper              (§5.3)   |      |   offset, length, refs    |
+ |   +- bluestore_blob_t       (§5.2)   |      |   ...                     |
+ |   |    extents  -------------------------+  +---------------------------+
+ |   |    flags, checksums              |   |                ^
+ |   +- sbid     if FLAG_SHARED  -----------|----------------+
+ |   +- use tracker  if spanning (§5.4) |   |
+ +--------------------------------------+   |
+                                            v
+ device:  [ hole ] [ lba, len ] [ hole ] [ lba, len ] ...   pextents (§5.1)
+          if compressed: header (§5.6) + compressed bytes + zero pad
+```
+
+| Term | Meaning |
+|---|---|
+| pextent | one run of disk space: `(offset, length)` |
+| AU | use-tracker unit, normally `min_alloc_size` (4 KiB in §7) |
+| spanning blob | a blob used by more than one extent-map shard; stored once in the onode (§6.2) |
+| shared blob | a blob that a clone also uses; has `FLAG_SHARED` and an sbid |
+| sbid | shared-blob id; the key of the blob's `X` record |
 
 ## 5.1 `bluestore_pextent_t`
 
 Source: [`src/os/bluestore/bluestore_types.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h) (`bluestore_pextent_t`), bare
 denc.
 
-`lba offset` + `varint_lowz length (u32)`. `offset == ~0ull`
-(`INVALID_OFFSET`) marks an unallocated (punched) run inside a blob.
-`PExtentVector` uses a varint element count (custom
-`denc_traits<PExtentVector>`), unlike default containers.
+```
+bluestore_pextent_t   lba offset | varint_lowz length (u32)
+PExtentVector         varint count | pextent x count
+```
+
+* `offset == ~0ull` (`INVALID_OFFSET`) is a hole: a part of the blob with
+  no disk space.
+* The count is a varint (custom `denc_traits<PExtentVector>`). Default
+  containers use a le32 count.
 
 ## 5.2 `bluestore_blob_t`
 
 Source: [`src/os/bluestore/bluestore_types.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h) (`bluestore_blob_t`), bare
-denc; struct_v (2) inherited from the containing §6.2/§6.3 section.
+denc; struct_v (2) comes from the §6.2/§6.3 section that contains it.
 
-| Field | Type | Present when |
+```
+extents               PExtentVector (§5.1)
+flags                 varint
+if COMPRESSED:
+  logical_length      varint_lowz          uncompressed size
+  compressed_length   varint_lowz          header + compressed bytes
+                      (no COMPRESSED flag: logical length = sum of extents)
+if CSUM:
+  csum_type           u8                   table below
+  csum_chunk_order    u8                   chunk = 1 << order bytes
+  csum_data           varint len + bytes   one checksum per chunk
+if HAS_UNUSED:
+  unused              le16                 bit i = 1/16 of blob never written
+```
+
+| Flag | Name | Meaning |
 |---|---|---|
-| `extents` | PExtentVector | always |
-| `flags` | varint | always |
-| `logical_length` | varint_lowz | FLAG_COMPRESSED (else = sum of extents) |
-| `compressed_length` | varint_lowz | FLAG_COMPRESSED |
-| `csum_type` | u8 | FLAG_CSUM |
-| `csum_chunk_order` | u8 | FLAG_CSUM; chunk = `1 << order` bytes |
-| `csum_data` | varint len + raw | FLAG_CSUM; array of per-chunk checksums |
-| `unused` | le16 bitmap | FLAG_HAS_UNUSED; 1 bit per 1/16 blob: never written |
+| `0x01` | `LEGACY_FLAG_MUTABLE` | legacy |
+| `0x02` | `FLAG_COMPRESSED` | data is compressed (§5.6) |
+| `0x04` | `FLAG_CSUM` | checksums present |
+| `0x08` | `FLAG_HAS_UNUSED` | `unused` bitmap present |
+| `0x10` | `FLAG_SHARED` | a clone uses the blob; sbid follows (§5.3) |
 
-Flags: `0x01` LEGACY_MUTABLE, `0x02` COMPRESSED, `0x04` CSUM,
-`0x08` HAS_UNUSED, `0x10` SHARED.
+Below, flags are written without the `FLAG_` prefix.
 
-Checksum types ([`src/common/Checksummer.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/Checksummer.h), `Checksummer::CSumType`; note
-NONE = 1, not 0):
+Checksum types ([`src/common/Checksummer.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/Checksummer.h), `Checksummer::CSumType`).
+NONE is 1, not 0: 0 means "not set" in pool options.
 
-| Value | Type | Element width (B) |
+| Value | Type | Bytes per chunk |
 |---|---|---|
 | 1 | none | 0 |
 | 2 | xxhash32 | 4 |
@@ -710,94 +746,132 @@ NONE = 1, not 0):
 | 5 | crc32c_16 | 2 |
 | 6 | crc32c_8 | 1 |
 
+Example from §7.3: flags `14` = SHARED | CSUM; then `04 0c 40` = crc32c,
+order 12 (4 KiB chunks), 64 bytes = 16 chunks x 4 B.
+
 ## 5.3 Blob wrapper
 
 Source: [`src/os/bluestore/BlueStore.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h) (`BlueStore::Blob::encode/decode`).
 
 ```
-bluestore_blob_t                 (§5.2)
-[ le64 sbid ]                    if FLAG_SHARED: key into X prefix (§5.5)
-[ use tracker (§5.4) ]           spanning blobs only (include_ref_map)
+bluestore_blob_t        (§5.2)
+[ le64 sbid ]           only if FLAG_SHARED -> key of the X record (§5.5)
+[ use tracker ]         only for spanning blobs: include_ref_map = true (§5.4)
 ```
 
-This wrapper, not `bluestore_blob_t` alone, is what an extent-map shard
-inlines (§6.3) and what the spanning section carries (§6.2). The `sbid`
-is the pointer from an object's own metadata to state it shares with
-another object: once a clone exists, whether an extent may be freed can
-no longer be answered from one object's blob, and the sbid is the key
-of the `X` record holding the answer. It cannot be derived — sharing is
-assigned from a counter at clone time (§5.5) — so it is stored, but only
-under `FLAG_SHARED`, since most blobs are never cloned. It is stored once
-per definition, never on a reference: the eight records referring to
-§7.3's spanning blob carry two bytes each and no sbid between them.
-Note it is a fixed le64 rather than a varint, so it costs 8 bytes where
-3 would do.
+An extent-map shard (§6.3) and the spanning section (§6.2) store this
+wrapper, not the bare `bluestore_blob_t`.
+
+The sbid:
+
+* comes from a counter at clone time (§5.5). It cannot be computed, so it
+  is stored;
+* exists only on SHARED blobs. Most blobs are never cloned;
+* is stored once, where the blob is defined. Records that point at the
+  blob do not repeat it: in §7.3, eight records point at one spanning
+  blob, and none carries the sbid (seven are 2 bytes each);
+* is a fixed le64, not a varint: 8 bytes where 3 would do
+  (61442 = `02 f0 00 00 00 00 00 00`).
 
 ## 5.4 Use tracker — `bluestore_blob_use_tracker_t`
 
 Source: [`src/os/bluestore/bluestore_types.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h)
 (`bluestore_blob_use_tracker_t`).
 
-Per-allocation-unit referenced-byte counts for spanning blobs; decides when
-a partially overwritten blob's space can be released.
+Bytes still in use per AU. When an AU drops to 0, its space can be freed
+even though the rest of the blob is still in use.
 
 ```
-varint au_size                   0 = tracker empty, nothing follows
-if au_size != 0:
-  varint num_au
-  if num_au == 0:  varint total_bytes        single-region blob
-  else:            num_au x varint bytes     referenced bytes per AU
+varint au_size                   0 = empty, nothing follows
+varint num_au
+num_au == 0:  varint total_bytes         whole blob is one region
+num_au  > 0:  varint bytes x num_au      bytes in use per AU
 ```
+
+Only spanning blobs store it. For other blobs, the extent-map decoder
+rebuilds it from the records that use the blob. A spanning blob is used
+from several shards, and shards load one at a time, so it must be stored.
+
+The AU here is `get_release_size()`: `min_alloc_size`, or the checksum
+chunk if that is larger; for a compressed blob, the whole blob.
+
+Example from §7.3: `80 20 10` = au_size 4096, 16 AUs; then
+`0, 4096, 0, 4096, ...` — every second AU has 0 bytes in use.
 
 ## 5.5 Shared blobs — `X` value, `bluestore_shared_blob_t`
 
 Source: [`src/os/bluestore/bluestore_types.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h) (`bluestore_shared_blob_t`,
 `bluestore_extent_ref_map_t`).
 Code path: `Collection::make_blob_shared()`, `_assign_blobid()`,
-`_txc_write_nodes()`, `open_shared_blob()`
+`_txc_write_nodes()`, `open_shared_blob()`, `load_shared_blob()`
 ([`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc)).
 
-Created when a blob is cloned; refcounts on physical ranges. The blob
-itself stays in the onode — only the ref_map is shared, keyed by sbid
-(BE u64 in the key, §4.2). Value: `DENC_START(1,1)` + ref_map:
+After a clone, two objects use the same disk extents. Each onode keeps its
+own copy of the blob. Only the refcounts are shared, in one `X` record
+keyed by sbid (BE u64 in the key, §4.2):
 
 ```
+ head onode                  clone onode
+ blob: SHARED, sbid 61442    blob: SHARED, sbid 61442
+            \                   /
+             v                 v
+     X key 00 00 00 00 00 00 f0 02
+     ref_map:  0x4df000  4 KiB  refs 1      clone only
+               0x4e0000  4 KiB  refs 2      head + clone
+               ...
+```
+
+Value encoding:
+
+```
+DENC_START(1,1)
 varint count
-first record:      varint_lowz offset (absolute)
-subsequent:        varint_lowz offset-delta from previous
-each record body:  varint_lowz length, varint refs
+record 0:           varint_lowz offset               absolute
+record 1..count-1:  varint_lowz offset - prev offset   delta
+each record:        + varint_lowz length + varint refs
 ```
 
-When a put drops the last reference of a range, the released extents land
-in the owning transaction's `released` set (§8.2). Captured example:
-§7.3.
+The sbid itself is not in the value; it is only in the key. Captured
+example: §7.3.
 
-The sbid is a per-OSD counter, not a per-object one. `_assign_blobid()` is
-`++blobid_last` with no disk access; durability comes from the `blobid_max`
-super key (§4.3), which the commit path pushes forward by
-`bluestore_blobid_prealloc` (10K) once half a batch is consumed, so the
-reservation is persisted long before the ids are handed out. At mount
-`blobid_last` resumes from `blobid_max`, so ids below the stored ceiling
-are spent whether or not they were ever issued, and no sbid is reused.
+Life of an `X` record:
 
-Records are written by `_txc_write_nodes()`, in the same `WriteBatch` as
-the onode and shard changes that caused them, so refcounts cannot diverge
-from the extent maps referencing them:
+```
+clone          make_blob_shared(): set SHARED, clear HAS_UNUSED,
+               take a ref on every non-hole pextent  -> record created
+ref change     whole ref_map re-encoded and set again
+               (no merge operator, unlike b §9.1 and T §4.8)
+range refs->0  that range goes to the transaction's released set (§8.2)
+ref_map empty  rmkey
+unshare        clone removed, head is the only user -> rmkey
+```
 
-| Event | Effect on the `X` record |
-|---|---|
-| clone | `make_blob_shared()` sets `FLAG_SHARED`, clears `FLAG_HAS_UNUSED`, takes a ref on every valid pextent; the record is created |
-| refcount change | the whole ref_map is re-encoded and `set` again — this prefix has no merge operator, unlike `b` (§9.1) and `T` (§4.8) |
-| last ref dropped | `persistent->empty()`, so the record is `rmkey`'d |
+* `_txc_write_nodes()` writes the record in the same `WriteBatch` as the
+  onode and shard changes. Refcounts and extent maps cannot disagree.
+* Full rewrite has a cost: the §7.3 record is 56 bytes for 16 entries.
+  Changing one refcount rewrites all 56.
+* The record is read on demand, not at mount:
+  * `open_shared_blob()` finds or makes an unloaded in-memory entry from
+    the sbid in the blob (§5.3). It does not read the DB.
+  * `load_shared_blob()` reads `X` when the refcounts are first needed.
+* Two paths scan the whole prefix:
+  * fsck: looks for records no onode uses, and for sbids with no record;
+  * NCB allocation recovery after a crash (§9.2).
 
-Rewriting in full is what makes a fragmented shared blob expensive: the
-§7.3 record is 56 bytes for 16 entries, and changing one block's
-refcount rewrites all 56. The record is read on demand rather than at
-mount — `open_shared_blob()` fetches it when a `FLAG_SHARED` blob is first
-touched, using the sbid decoded from the blob itself (§5.3), so the id
-travels in the metadata while the refcounts stay out of line. Only fsck
-scans the whole prefix, looking for stray records that no onode references
-and for referenced sbids that have none.
+sbid allocation (one counter per OSD):
+
+```
+ 0 ............. blobid_last ............. blobid_max
+                 last id given, RAM only    stored ceiling, S key (§4.3)
+
+ _assign_blobid()    ++blobid_last, no disk I/O
+ _kv_sync_thread()   if blobid_last + prealloc/2 > blobid_max:
+                        blobid_max = blobid_last + prealloc
+                     prealloc = bluestore_blobid_prealloc, default 10240
+ mount               blobid_last = blobid_max
+                     ids between the old blobid_last and blobid_max are
+                     never used; no sbid is reused
+```
 
 ## 5.6 Compression header
 
@@ -805,12 +879,22 @@ Source: [`src/os/bluestore/bluestore_types.h`](https://github.com/ceph/ceph/blob
 (`bluestore_compression_header_t`); algorithm ids
 [`src/compressor/Compressor.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/compressor/Compressor.h) (`Compressor::COMP_ALG_*`).
 
-Compressed blob payload = header + compressed bytes. Header:
-`DENC_START(2,1)`, u8 algorithm (0 none, 1 snappy, 2 zlib, 3 zstd, 4 lz4,
-5 brotli), le32 `length` (uncompressed), and since v2 an optional le32
-`compressor_message` encoded as u8 presence flag + le32 when present
-(zstd/lz4 window hints). Checksums in the blob cover the compressed bytes,
-so scrub verifies without decompressing.
+A compressed blob's data on disk = header + compressed bytes + zero pad
+to `min_alloc_size`.
+
+```
+DENC_START(2,1)
+u8     type                 0 none, 1 snappy, 2 zlib, 3 zstd,
+                            4 lz4 (if built), 5 brotli (if built)
+le32   length               compressed bytes that follow the header
+                            (uncompressed size = logical_length, §5.2)
+v2:    compressor_message   u8 present flag, then le32 if present
+                            (zlib window bits; others leave it unset)
+compressed bytes ...
+```
+
+Blob checksums cover the on-disk bytes (header + compressed data + zero
+pad). A read checks them first, then decompresses.
 
 # 6. Object Metadata (`O` value)
 
