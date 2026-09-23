@@ -1691,6 +1691,27 @@ A shard names a blob in three ways:
 | 2 | 2 | 14 | 0 |
 {: .table .table-bordered .table-condensed}
 
+One record = one 4 KiB block, so the rows add up to each shard's record
+count (21 + 27 + 16 = 64). The first use of a blob in a shard is inline;
+later uses are back-references; window 1's shared blob is always a
+spanning ref:
+
+```
+shard 0  blocks 0-20   head 0, 61441    2 inline + 14 back-refs
+                       h1a              1 inline +  2 back-refs
+                       61442 (spanning)              2 spanning   blocks 17, 19
+shard 1  blocks 21-47  h1b              1 inline +  4 back-refs
+                       61442 (spanning)              6 spanning   blocks 21-31 odd
+                       head 2, 61443    2 inline + 14 back-refs
+shard 2  blocks 48-63  head 3, 61444    2 inline + 14 back-refs
+```
+
+* 8 spanning refs = window 1's 8 shared blocks (2 in shard 0, 6 in
+  shard 1).
+* 8 inline blobs + 1 spanning blob = the object's nine blobs.
+* h1a and h1b are the two halves of window 1's head blob, split at the
+  block-21 cut.
+
 The three shards, record by record. A shared blob inside one shard is
 inline plus 2-byte back-references; window 1's shared blob is reached by
 spanning references from both shards:
