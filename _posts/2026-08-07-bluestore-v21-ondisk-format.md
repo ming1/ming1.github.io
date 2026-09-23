@@ -85,18 +85,25 @@ Structures marked "bare denc" below omit this 6-byte header.
 
 ## 2.1 Device roles
 
-An OSD data directory contains up to three block devices
+An OSD has one to three block devices
 ([`src/os/bluestore/BlueFS.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.h), device slots):
 
-| Symlink | BlueFS slot | Constant | Role |
-|---|---|---|---|
-| `block.wal` | 0 | `BDEV_WAL` | BlueFS/RocksDB write-ahead log (fastest) |
-| `block.db` | 1 | `BDEV_DB` | RocksDB SSTs + BlueFS superblock/journal |
-| `block` | 2 | `BDEV_SLOW` | Object data; BlueFS spillover |
+```
+ symlink      BlueFS slot     holds                               presence
+ block.wal    0  BDEV_WAL     RocksDB WAL, BlueFS journal         optional, fastest
+ block.db     1  BDEV_DB      RocksDB SSTs, BlueFS superblock     optional
+                              (+ journal if no block.wal)
+ block        2  BDEV_SLOW    object data; BlueFS spillover       always
+```
 
-When `block.db` is absent, the main device is registered in the `BDEV_DB`
-slot and serves both roles; `bluefs_layout_t::shared_bdev` records this
-([`src/os/bluestore/bluefs_types.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluefs_types.h), `BlueStore::_open_bluefs()`).
+* No `block.db`: the main device also takes the `BDEV_DB` slot and holds
+  the DB.
+* `bluefs_layout_t` records the layout: `shared_bdev` = the slot of the
+  main device (`BDEV_DB` without `block.db`, else `BDEV_SLOW`), plus
+  `dedicated_db` / `dedicated_wal`
+  ([`src/os/bluestore/bluefs_types.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluefs_types.h), `BlueStore::_minimal_open_bluefs()`).
+* Slots 3 `BDEV_NEWWAL` and 4 `BDEV_NEWDB` are used only while adding or
+  migrating devices.
 
 ## 2.2 Byte-range map
 
@@ -121,19 +128,36 @@ block.db:  label @ 0, BlueFS superblock @ 0x1000 (SUPER_RESERVED applies)
 block.wal: label @ 0 only
 ```
 
-The BlueFS superblock always lives at offset 0x1000 of whichever device
-occupies the `BDEV_DB` slot (§2.1). The first 8 KiB (`SUPER_RESERVED`) of
-that device — and the first 4 KiB of every other device — are excluded from
-allocation (`BlueFS::_get_minimal_reserved()`, [`src/os/bluestore/BlueFS.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.cc)).
+* The BlueFS superblock is always at 0x1000 of the device in the
+  `BDEV_DB` slot (§2.1).
+* Not allocatable:
+  * BlueFS (`BlueFS::_get_minimal_reserved()`, [`src/os/bluestore/BlueFS.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.cc)):
+    first 8 KiB (`SUPER_RESERVED`) of the `BDEV_DB` device, 4 KiB of the
+    WAL device, nothing on `BDEV_SLOW`;
+  * BlueStore (`_get_ondisk_reserved()`): the first
+    `roundup(8 KiB, min_alloc_size)` of the main device, always.
 
 Constants ([`src/os/bluestore/bluestore_common.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_common.h)):
-`BDEV_LABEL_BLOCK_SIZE = 4096`, `BLUEFS_SUPER_POSITION = 4096`,
-`BLUEFS_SUPER_BLOCK_SIZE = 4096`, `SUPER_RESERVED = 8192`.
-Replica positions: `bdev_label_positions` ([`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc)) =
-{0, 1 GiB, 10 GiB, 100 GiB, 1000 GiB}; a replica is written only where
-`position + 4096 <= device size`. Multi-position labels apply to the main
-device when label meta `multi=yes` is present; `epoch` is bumped on every
-label rewrite so stale replicas are detectable.
+
+```
+BDEV_LABEL_BLOCK_SIZE    4096     BLUEFS_SUPER_POSITION    4096
+BLUEFS_SUPER_BLOCK_SIZE  4096     SUPER_RESERVED           8192
+```
+
+Label replicas (`bdev_label_positions`, [`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc)):
+
+* positions {0, 1 GiB, 10 GiB, 100 GiB, 1000 GiB}, where
+  `position + 4096 <= device size`;
+* mkfs writes every position that fits, and the allocator keeps those
+  slots. A missing replica is added later by fsck repair (unless BlueFS
+  data is there) or by device expand;
+* only on the main device, and only when label meta `multi=yes`
+  (`bluestore_bdev_label_multi`, default true);
+* `epoch` goes up when label meta changes (`write_meta()`);
+* read (`_read_multi_bdev_label()`): if the copy at 0 has no
+  `multi=yes`, it is used alone. Otherwise, among copies with `multi=yes`
+  and the same `osd_uuid`, the highest `epoch` wins; older copies are
+  reported as outdated.
 
 ## 2.3 Device label — `bluestore_bdev_label_t`
 
@@ -151,7 +175,7 @@ Code path: `BlueStore::_write_bdev_label()` / `_read_bdev_label()`
 |   uuid_d   osd_uuid          (16 B)           |
 |   le64     size              device size      |
 |   utime_t  btime             birth time       |
-|   string   description       "main"/"bluefs db"/"bluefs wal" |
+|   string   description       e.g. "main"      |
 |   map<string,string> meta    (struct_v >= 2)  |
 +-----------------------------------------------+
 | le32 crc32c (seed -1, over all bytes above,   |
@@ -161,9 +185,9 @@ Code path: `BlueStore::_write_bdev_label()` / `_read_bdev_label()`
 +-----------------------------------------------+
 ```
 
-The `meta` map on the main device carries what older releases kept as small
-files in the OSD data directory, plus the authoritative freelist geometry
-(§9.1).
+`description` is `"main"`, `"bluefs db"` or `"bluefs wal"`. The `meta`
+map on the main device holds what older releases kept as small
+files in the OSD data directory, and the freelist geometry (§9.1).
 
 Captured (`ceph-bluestore-tool show-label`):
 
@@ -180,14 +204,24 @@ Captured (`ceph-bluestore-tool show-label`):
 }
 ```
 
-`magic` is a meta entry, not a binary magic number; label integrity is
-established by the trailing crc32c and the osd_uuid match.
+`magic` is a meta entry, not a binary magic number. The label is trusted
+because of the trailing crc32c and the `osd_uuid` match.
 
 # 3. BlueFS: Bootstrap Filesystem
 
-BlueFS is a journal-only filesystem that hosts RocksDB's files. The
-directories RocksDB sees (`db/`, `db.wal/`, `db.slow/`) form a flat
-two-level namespace replayed from a single journal file at every mount.
+BlueFS is a small filesystem that holds RocksDB's files. It has no inode
+table: all its metadata lives in one journal, replayed at every mount.
+
+```
+ superblock @ 0x1000 (§3.1)
+     |  log_fnode = inode 1 = the journal
+     v
+ journal (§3.3), replayed (§3.4)
+     |  builds in memory: dirs db/, db.wal/, db.slow/ -> files -> fnodes (extents)
+     v
+ RocksDB files (SST, WAL, MANIFEST) read through their fnode extents
+```
+
 Types: [`src/os/bluestore/bluefs_types.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluefs_types.h); implementation:
 [`src/os/bluestore/BlueFS.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.cc); RocksDB glue:
 [`src/os/bluestore/BlueRocksEnv.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueRocksEnv.cc) (`BlueRocksEnv`).
@@ -197,24 +231,31 @@ Types: [`src/os/bluestore/bluefs_types.h`](https://github.com/ceph/ceph/blob/v21
 Source: [`src/os/bluestore/bluefs_types.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluefs_types.h) (`bluefs_super_t`), encode in
 [`src/os/bluestore/bluefs_types.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluefs_types.cc).
 Code path: `BlueFS::_write_super()` / `_open_super()`.
-Location: offset 0x1000, `BDEV_DB`-slot device (§2.2).
-Frame: `ENCODE_START(_version, compat)`; `_version` 2 = baseline, 3 =
-envelope mode enabled; compat is 1 at version 2 but raised to 3 at version 3,
-so pre-envelope code rejects an envelope-mode filesystem outright instead of
-skipping fields it cannot honor.
+Location: offset 0x1000 of the `BDEV_DB`-slot device (§2.2).
 
-| Field | Type | Description |
+Frame `ENCODE_START(_version, compat)`:
+
+```
+_version   compat   meaning
+2          1        baseline
+3          3        envelope mode (§3.5); pre-envelope code refuses to mount
+```
+
+| Field | Type | Meaning |
 |---|---|---|
-| `uuid` | uuid_d | this BlueFS instance; every journal txn must match |
+| `uuid` | uuid_d | this BlueFS; every journal txn must carry it |
 | `osd_uuid` | uuid_d | owning OSD |
 | `seq` | le64 | superblock write generation |
-| `block_size` | le32 | journal granularity (4096) |
-| `log_fnode` | `bluefs_fnode_t` | inode 1 = the journal itself (bootstrap root) |
-| `memorized_layout` | optional `bluefs_layout_t` | device topology for migration sanity checks |
+| `block_size` | le32 | journal unit (4096) |
+| `log_fnode` | `bluefs_fnode_t` | inode 1 = the journal itself |
+| `memorized_layout` | optional `bluefs_layout_t` | device layout, for migration checks |
 | crc | le32 | crc32c (seed -1) over the encoded super |
 
-The superblock is rewritten only when the journal is compacted or its fnode
-changes at that level; steady-state journal growth does not touch it.
+* Written at mkfs, at the end of each journal compaction, on device
+  add/migrate (`bluefs-bdev-new-db`, `-new-wal`, `-migrate`: this is where
+  `memorized_layout` changes), and on `revert-wal-to-plain` (§3.5).
+  Normal journal growth does not touch it.
+* `seq` goes up on every write.
 
 ## 3.2 File metadata — `bluefs_extent_t`, `bluefs_fnode_t`, `bluefs_fnode_delta_t`
 
@@ -229,35 +270,34 @@ DENC_START(1,1) frame (6 B), then:
   u8           bdev        device slot 0/1/2
 ```
 
-`bluefs_fnode_t` — a whole inode. Frame: `DENC_START`; struct_v/compat =
-(1,1), or (2,2) when `encoding` is `ENVELOPE`/`ENVELOPE_FIN` — the compat
-bump locks out pre-envelope decoders:
+`bluefs_fnode_t` — a whole inode. Frame `DENC_START` (1,1); (2,2) when
+`encoding` is `ENVELOPE`/`ENVELOPE_FIN`, so old decoders refuse it:
 
-| Field | Type | Since | Description |
+| Field | Type | Since | Meaning |
 |---|---|---|---|
 | `ino` | varint | 1 | inode number; 1 = journal |
-| `size` | varint | 1 | logical file size (see §3.5 for envelope files) |
+| `size` | varint | 1 | logical file size (envelope files: §3.5) |
 | `mtime` | utime_t | 1 | |
 | `__unused__` | u8 | 1 | was `prefer_bdev` |
 | `extents` | le32 count + `bluefs_extent_t`[] | 1 | full physical map |
 | `encoding` | varint | 2 | `bluefs_node_encoding`: 0 PLAIN, 1 ENVELOPE, 2 ENVELOPE_FIN |
 | `content_size` | varint | 2 | payload bytes inside envelopes |
 
-`bluefs_fnode_delta_t` — the incremental form. Same frame versioning, but
-the field list differs: there is no `__unused__` byte; in its position sits
-`offset` (le64) — the allocation offset at which the delta's extents append
-(the `allocated_commited` baseline; `bluefs_fnode_t::make_delta()` /
-`reset_delta()`), used for consistency checking on replay:
+`bluefs_fnode_delta_t` — an incremental update. Same frame rule. It has
+`offset` where the fnode has `__unused__`, and only the new extents:
 
-| Field | Type | Since | Description |
+| Field | Type | Since | Meaning |
 |---|---|---|---|
 | `ino` | varint | 1 | |
 | `size` | varint | 1 | new logical size |
 | `mtime` | utime_t | 1 | |
-| `offset` | le64 | 1 | allocated bytes covered by previously journaled extents |
-| `extents` | le32 count + `bluefs_extent_t`[] | 1 | newly added extents only |
+| `offset` | le64 | 1 | allocated bytes already journaled; new extents append here (checked on replay) |
+| `extents` | le32 count + `bluefs_extent_t`[] | 1 | new extents only |
 | `encoding` | varint | 2 | as fnode |
 | `content_size` | varint | 2 | as fnode |
+
+`offset` = `allocated_commited` (`bluefs_fnode_t::make_delta()` /
+`reset_delta()`).
 
 ## 3.3 Journal format — `bluefs_transaction_t`
 
@@ -265,7 +305,7 @@ Source: [`src/os/bluestore/bluefs_types.h`](https://github.com/ceph/ceph/blob/v2
 in [`src/os/bluestore/bluefs_types.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluefs_types.cc).
 
 The journal is the content of inode 1, written in `block_size` (4 KiB)
-units. Each transaction is an `ENCODE_START(1,1)`-framed record:
+units. One transaction:
 
 ```
 +----+----+----------+------------------+----------+-------------+----------+----------+
@@ -277,27 +317,27 @@ transaction longer than one block occupies contiguous blocks; the next
 transaction begins at the next block boundary.
 ```
 
-The replay code peeks the first 34 bytes (6-byte frame + uuid + seq + 4-byte
-`op_len`) of each block to decide whether more blocks belong to the current
-transaction (`len + 6 > bl.length()` in `BlueFS::_replay()` — the `+ 6` is
-this frame header).
+* The crc is inside the frame.
+* Replay reads one block and decodes its first 30 bytes: 6 B frame,
+  uuid, seq. If frame `len` + 6 > bytes read (`BlueFS::_replay()`; 6 is
+  the frame header), the transaction continues into more blocks.
+* `op_bl` = a list of ops: `u8` opcode + payload (classic encoding:
+  `string` = le32 len + bytes, integers fixed LE).
 
-`op_bl` is a concatenation of ops, each a `u8` opcode followed by its
-payload (classic encoding: `string` = le32 len + bytes, ints fixed LE):
-
-| # | Opcode | Payload | Semantics |
+| # | Opcode | Payload | Meaning |
 |---|---|---|---|
-| 1 | `OP_INIT` | — | first op of a fresh filesystem |
+| 0 | `OP_NONE` | — | never written; replay rejects it (`-EIO`) |
+| 1 | `OP_INIT` | — | first op of a new filesystem |
 | 2 | `OP_ALLOC_ADD` | obsolete | pre-Pacific global freelist |
 | 3 | `OP_ALLOC_RM` | obsolete | |
-| 4 | `OP_DIR_LINK` | string dir, string file, le64 ino | (re)bind name → ino |
+| 4 | `OP_DIR_LINK` | string dir, string file, le64 ino | bind name → ino |
 | 5 | `OP_DIR_UNLINK` | string dir, string file | remove name |
 | 6 | `OP_DIR_CREATE` | string dir | |
 | 7 | `OP_DIR_REMOVE` | string dir | |
-| 8 | `OP_FILE_UPDATE` | `bluefs_fnode_t` | full inode replace |
+| 8 | `OP_FILE_UPDATE` | `bluefs_fnode_t` | replace whole inode |
 | 9 | `OP_FILE_REMOVE` | le64 ino | drop inode |
-| 10 | `OP_JUMP` | le64 next_seq, le64 offset | compaction anchor: skip ahead |
-| 11 | `OP_JUMP_SEQ` | le64 next_seq | bump seq only |
+| 10 | `OP_JUMP` | le64 next_seq, le64 offset | after compaction: skip ahead |
+| 11 | `OP_JUMP_SEQ` | le64 next_seq | set seq only |
 | 12 | `OP_FILE_UPDATE_INC` | `bluefs_fnode_delta_t` | incremental inode update |
 
 ## 3.4 Replay state machine
@@ -310,61 +350,73 @@ Code path: `BlueFS::_replay()` ([`src/os/bluestore/BlueFS.cc`](https://github.co
     v
   read block_size at pos  ------------------------------+
     |                                                   |
-  peek frame(6), uuid, seq, op_len                      |
+  peek frame(6), uuid, seq                              |
     |                                                   |
   uuid != super.uuid ?  ----> STOP (end of valid log)   |
   seq != last_seq + 1 ? ----> STOP                      |
     |                                                   |
-  op_len + 6 spills past block ? read more blocks       |
+  frame len + 6 spills past block ? read more blocks    |
     |                                                   |
   decode fails / crc32c mismatch ?                      |
-    |   mid multi-block txn -> STOP (torn tail)         |
-    |   single-block txn    -> -EIO, mount FAILS        |
+    |   multi-block txn, after a good one -> STOP       |
+    |   otherwise                         -> -EIO       |
     |                                                   |
-  apply ops to in-memory dir map + inode table          |
+  apply ops to in-memory dir map + file map             |
     |                                                   |
-  OP_JUMP: pos = max(pos, jump_offset); seq = next-1    |
+  OP_JUMP: read forward to offset; seq = next - 1       |
     |                                                   |
   pos = next block boundary  ---------------------------+
 ```
 
-There is no commit record: the uuid/seq/crc triple is the validity test.
-The uuid and seq mismatches always terminate replay cleanly (they mark the
-end of the log); a crc/decode failure is treated as a clean end only when it
-occurs in the continuation blocks of a multi-block transaction — a corrupt
-single-block transaction fails the mount with `-EIO`. All fnode state
-(including RocksDB file extents) exists only in this journal; BlueFS has no
-inode table region.
+* No commit record: uuid + seq + crc decide if a transaction is valid.
+* A continuation read past the journal end aborts, unless
+  `bluefs_replay_recovery` is set.
+* All fnodes, including RocksDB file extents, exist only in this journal.
 
-Journal compaction (`BlueFS::_compact_log_async_LD_LNF_D()`) writes a fresh
-prefix of `OP_FILE_UPDATE`/`OP_DIR_LINK` ops describing the current
-namespace, terminated by `OP_JUMP` to the live tail, then swings
-`super.log_fnode` to the new extents.
+Compaction (`BlueFS::_compact_log_async_LD_LNF_D()`):
+
+```
+ first:     the old journal gets new extents + op_jump; writers go on
+            there (= the live tail)
+ new journal =
+   starter          op_init + op_file_update_inc (new log fnode)
+                    + op_jump -> compacted meta
+   compacted meta   op_dir_create / op_file_update / op_dir_link for every
+                    live dir and file + op_jump -> live tail
+ last step: write the superblock; super.log_fnode -> starter
+```
+
+With `bluefs_compact_log_sync` the sync variant
+`_compact_log_sync_LNF_LD()` is used instead.
 
 ## 3.5 Envelope mode (v21 WAL fast path)
 
 Source: [`src/os/bluestore/BlueFS.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.h) (`BlueFS::File::envelope_t`).
 
-Purpose: eliminate one journal update per RocksDB WAL append. A PLAIN file
-requires an `op_file_update_inc` to persist every size change; an ENVELOPE
-file self-describes its content, so only allocation changes touch the
-journal.
+Goal: save one journal update per RocksDB WAL append. A PLAIN file needs
+an `op_file_update_inc` for every size change. An ENVELOPE file describes
+its own content, so only allocation changes go to the journal.
 
-The mode is selected by configuration, not negotiated from disk: when
-`bluefs_wal_envelope_mode` (default true,
-[`src/common/options/global.yaml.in`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in)) is set, `BlueFS::open_for_write()`
-assigns `encoding = ENVELOPE` to files whose name ends in `.log`.
-`_write_super()` then records `_version = 3` with compat 3 (§3.1), which
-locks pre-envelope code out; nothing is read back from the superblock to
-decide the mode.
+How it is turned on:
+
+* by config, not read from disk: `bluefs_wal_envelope_mode` (default
+  true, [`src/common/options/global.yaml.in`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in));
+* `BlueFS::open_for_write()` sets `encoding = ENVELOPE` for files whose
+  name ends in `.log`;
+* the journal is marked as using envelope mode; mount also marks it if
+  any file already has envelope encoding. `_write_super()` then writes
+  `_version = 3`, compat 3 (§3.1), which locks out pre-envelope code;
+* going back needs `ceph-bluestore-tool revert-wal-to-plain --path <osd>`
+  (the option help text still says `downgrade-wal-to-v1`, which does not
+  exist).
 
 | State | `fnode.size` means | journal writes per append | on open |
 |---|---|---|---|
 | `PLAIN` (0) | exact EOF | one `op_file_update_inc` per size change | read to size |
-| `ENVELOPE` (1) | last journaled envelope boundary | none (allocation changes only) | walk envelopes from size through allocated space |
-| `ENVELOPE_FIN` (2) | exact EOF (orderly close) | one final update | read to size |
+| `ENVELOPE` (1) | last journaled envelope boundary | none (allocation changes only) | walk envelopes from 0 through allocated space |
+| `ENVELOPE_FIN` (2) | exact EOF (clean close) | one final update | walk envelopes from 0 to size |
 
-On-disk framing of an ENVELOPE file's content (verbatim source comment):
+Framing of an ENVELOPE file's content (verbatim source comment):
 
 ```
 flush 0 l==24                                     flush 1 l==4             flush 2 l==12
@@ -374,10 +426,14 @@ llll llll dddd dddd dddd dddd dddd dddd ssss ssss llll llll dddd ssss ssss llll 
 l = le64 content length, d = payload, s = 8-byte stamp
 ```
 
-The stamp is a per-file fingerprint: `uuid[0..7] ^ uuid[8..15] ^
-xorshift(ino)` (`envelope_t::generate_stamp()`). During the open-time walk,
-a bad length or stamp terminates the file. `fnode.content_size` tracks
-payload bytes.
+* Stamp = per-file fingerprint: `uuid[0..7] ^ uuid[8..15] ^ xorshift(ino)`
+  (`envelope_t::generate_stamp()`).
+* The walk (`_envmode_index_file()`) runs at mount, at the end of
+  `_replay()`, for every envelope file. `open_for_read()` walks only a
+  file that is not indexed yet.
+* Envelopes below `fnode.size` are trusted. Past it, the walk stops at the
+  first bad length or stamp: that is the end of the file. It then sets
+  `fnode.size` and `fnode.content_size` (payload bytes).
 
 Captured (`ceph-bluestore-tool bluefs-log-dump`):
 
@@ -397,32 +453,36 @@ Captured (`ceph-bluestore-tool bluefs-log-dump`):
 
 # 4. RocksDB Schema
 
-BlueStore opens RocksDB through `BlueRocksEnv` on the BlueFS namespace:
-`db/CURRENT` → `db/MANIFEST-*` → `db.wal/*.log` replay, unmodified RocksDB
-recovery on top of §3.
+BlueStore opens RocksDB through `BlueRocksEnv` on the BlueFS namespace.
+Recovery is plain RocksDB on top of §3:
+
+```
+ db/CURRENT -> db/MANIFEST-* -> replay db.wal/*.log
+```
 
 ## 4.1 Column families
 
-A RocksDB column family (CF) is an independent keyspace inside one
-database. Each CF owns a private LSM tree — its own memtables, SST files,
-and options (block cache, write-buffer sizes, compaction style, merge
-operators) — while all CFs share the write-ahead log, MANIFEST, and
-background thread pools. The shared WAL is what preserves the §8.1 commit
-contract: one `WriteBatch` spanning several CFs commits atomically. A WAL
-segment becomes deletable only after every CF holding data in it has
-flushed, so per-CF flush tuning also bounds WAL retention.
+A column family (CF) is a separate keyspace inside one RocksDB:
+
+```
+                 own per CF                          shared by all CFs
+ CF "O-0" ...    memtables, SST files, options       WAL, MANIFEST, threads
+```
+
+* The shared WAL keeps the §8.1 contract: one `WriteBatch` across several
+  CFs commits atomically.
+* A WAL file can be deleted only after every CF with data in it has
+  flushed. So per-CF flush settings also decide how long WAL files stay.
 
 At mkfs, `bluestore_rocksdb_cfs`
 ([`src/common/options/global.yaml.in`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in))
-assigns prefixes to CFs; default:
+maps prefixes to CFs. Default:
 
 ```
 m(3) p(3,0-12) O(3,0-13)=block_cache={type=binned_lru}
 L=min_write_buffer_number_to_merge=32
 P=min_write_buffer_number_to_merge=32
 ```
-
-Resulting layout:
 
 | Column family | Prefix | Shards | Shard hash over key bytes | Options |
 |---|---|---|---|---|
@@ -433,40 +493,38 @@ Resulting layout:
 | `P` | `P` | 1 | — | merge buffers |
 | default | all others | 1 | — | |
 
-The definition serves three purposes:
+Why:
 
-* isolation — high-churn prefixes compact without rewriting unrelated
-  data; unlisted prefixes share the default CF;
-* per-CF tuning — `L` and `P` accumulate up to 32 memtables before
-  flushing (`min_write_buffer_number_to_merge`), so a deferred record
-  (§8.2) written by one commit and deleted shortly after by another
-  normally annihilates in memory and never reaches an SST; PG-log
-  append-and-trim in `P` behaves the same way; `O` reads go through a
-  `binned_lru` block cache;
-* sharding — `O`, `m`, `p` are each split across 3 CFs by a hash of the
-  leading key bytes, yielding smaller LSM trees that flush and compact in
-  parallel.
+* **Isolation:** a busy prefix compacts without rewriting other data.
+* **Tuning:** `L` and `P` wait for 32 memtables before flushing
+  (`min_write_buffer_number_to_merge`). A deferred record (§8.2) written
+  by one commit and deleted soon after then cancels out in memory and
+  never reaches an SST. PG-log append-and-trim in `P` works the same way.
+  `O` reads use a `binned_lru` block cache.
+* **Sharding:** `O`, `m`, `p` are each split over 3 CFs by a hash of the
+  leading key bytes. Smaller LSM trees flush and compact in parallel.
+* **Hash ranges keep neighbours together:** all keys of one object (`O`,
+  13 B = shard byte + pool + hash, §4.4) or one PG (`p`, 12 B = pool +
+  hash, §4.6) land in the same CF. Object listing and PG removal never
+  cross CFs.
 
-The hash ranges are chosen so all keys of one object (`O`, 13 = shard byte
-+ pool + hash, §4.4) or one PG (`p`, 12 = pool + hash, §4.6) land in the
-same shard; range scans such as object listing or PG removal never
-straddle CFs.
+Where the definition lives:
 
-The active definition is persisted at mkfs as the BlueFS file
-`sharding/def` and parsed at every open by
-`RocksDBStore::parse_sharding_def()`
-([`src/kv/RocksDBStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/RocksDBStore.cc));
-changing `bluestore_rocksdb_cfs` has no effect on an existing OSD. Shard
-CFs are named `O-0`, `O-1`, ...; CF membership of each SST file in `db/`
-is recorded in the RocksDB MANIFEST. Per-prefix merge operators (§4.8,
-§9.1) are registered against the CF holding the prefix. The layout is
-inspected and converted offline with `ceph-bluestore-tool show-sharding`
-and `reshard`
-([`src/os/bluestore/bluestore_tool.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_tool.cc));
-`reshard` physically moves keys between CFs.
+* written at mkfs as the BlueFS file `sharding/def` (plus
+  `sharding/recreate_columns` during resharding), parsed at every open
+  by `RocksDBStore::parse_sharding_def()`
+  ([`src/kv/RocksDBStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/RocksDBStore.cc)).
+  Changing `bluestore_rocksdb_cfs` later has no effect on an existing OSD;
+* shard CFs are named `O-0`, `O-1`, …; the RocksDB MANIFEST records which
+  CF each SST belongs to;
+* merge operators (§4.8, §9.1) are registered on the CF that holds the
+  prefix;
+* offline tools: `ceph-bluestore-tool show-sharding` and `reshard`
+  ([`src/os/bluestore/bluestore_tool.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_tool.cc));
+  `reshard` moves keys between CFs.
 
-Column families are physical placement only; key formats (§4.2–§4.8) are
-unaffected.
+CFs change only where keys are stored. Key formats (§4.2–§4.8) are the
+same.
 
 ## 4.2 Prefix table
 
@@ -496,16 +554,19 @@ Code path: `BlueStore::_open_super_meta()` and mkfs
 
 | Key | Value encoding | Captured bytes | Meaning |
 |---|---|---|---|
-| `nid_max` | le64 | `03 08 00 ..` (0x803) | allocated-onode-id high-water mark |
-| `blobid_max` | le64 | `00 50 00 ..` (0x5000) | shared-blob/blob id high-water mark |
-| `min_alloc_size` | le64 | `00 10 00 ..` (4096) | immutable after mkfs; decoding b-bitmaps and blob geometry depends on it |
+| `nid_max` | le64 | `03 08 00 ..` (0x803) | onode-id high-water mark |
+| `blobid_max` | le64 | `00 50 00 ..` (0x5000) | shared-blob id high-water mark |
+| `min_alloc_size` | le64 | `00 10 00 ..` (4096) | fixed at mkfs; b-bitmaps and blob geometry depend on it |
 | `ondisk_format` | le32 | `04 00 00 00` | current format epoch (4) |
 | `min_compat_ondisk_format` | le32 | `03 00 00 00` | oldest code allowed to mount |
 | `freelist_type` | ASCII | `bitmap` | `bitmap` or `null` (NCB, §9.2) |
 | `per_pool_omap` | ASCII | `2` | omap key generation: absent = legacy, `1` = per-pool, `2` = per-PG |
 
-`nid_max`/`blobid_max` are batched reservations: ids below the stored max
-may remain unused; on mount, allocation continues from the stored max.
+* `nid_max` and `blobid_max` are batched reservations: some ids below the
+  stored max stay unused, and after mount allocation continues from
+  the stored max.
+* Format numbers in code: latest 4, min compat 3, min readable 1.
+* A legacy key `min_min_alloc_size` is read and removed on upgrade.
 
 ## 4.4 `O` — object key construction
 
@@ -514,27 +575,39 @@ Source: [`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.
 `ONODE_KEY_SUFFIX 'o'`, `EXTENT_SHARD_KEY_SUFFIX 'x'`).
 
 ```
-+------+----------------+------------+- - - - - -+- - - - - - +----------+----------+---+
-| u8   | BE u64         | BE u32     | nspace    | key/name    | BE u64   | BE u64   |'o'|
-| shard| pool + 2^63    | rev. hash  | esc + '!' | (below)     | snap     | generation|  |
-+------+----------------+------------+- - - - - -+- - - - - - +----------+----------+---+
++-------+-------------+-----------+- - - - - -+- - - - - +--------+------------+-----+
+| u8    | BE u64      | BE u32    | nspace    | key/name | BE u64 | BE u64     | 'o' |
+| shard | pool + 2^63 | rev. hash | esc + '!' | (below)  | snap   | generation |     |
++-------+-------------+-----------+- - - - - -+- - - - - +--------+------------+-----+
 ```
 
-* shard byte = `shard_id + 0x80` (`NO_SHARD` = -1 → `0x7f`).
-* pool is biased by 2^63 so negative pools (temp/meta) sort first.
-* hash = `hobject_t::_reverse_bits(hash)`: bit-reversal makes key order
-  equal PG enumeration order.
-* String escaping (`append_escaped()`): bytes ≤ `#` → `#xx`, bytes ≥ `~` →
-  `~xx` (2 hex digits); terminator `!`. Order-preserving for 7-bit-clean
-  names only: the source notes a signed-char comparison bug for bytes above
-  0x7f, kept for key compatibility ("we do additional sorting where it is
-  needed", [`BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc) comment above `append_escaped()`).
-* Name section — three cases:
-  * no locator key: `escaped(name)` `!` `=`
-  * key == name: `escaped(key)` `!` `=` (name not repeated)
-  * key != name: `escaped(key)` `!` (`<` or `>` = sign of key-vs-name
-    comparison) `escaped(name)` `!`
-* snap: `CEPH_NOSNAP` = 0xff..fe (head), `SNAPDIR` = 0xff..ff.
+| Part | Encoding | Why |
+|---|---|---|
+| shard | `shard_id + 0x80` (`NO_SHARD` = -1 → `0x7f`) | |
+| pool | BE u64, pool + 2^63 | negative pools (temp/meta) sort first |
+| hash | BE u32 `hobject_t::_reverse_bits(hash)` | key order = PG order |
+| nspace, key, name | escaped strings, `!`-terminated | order-preserving |
+| snap | BE u64: `CEPH_NOSNAP` = 0xff..fe (head), `SNAPDIR` = 0xff..ff | |
+| generation | BE u64 (`NO_GEN` = 0xff..ff) | |
+| suffix | `'o'` (onode) or `'x'` (shard, §4.5) | |
+
+String escaping (`append_escaped()`):
+
+* bytes ≤ `#` → `#xx`, bytes ≥ `~` → `~xx` (2 hex digits); terminator
+  `!`.
+* Order is kept only for 7-bit names. `char` is signed (Ceph builds with `-fsigned-char`), so bytes ≥ 0x80
+  compare as negative and also become `#xx`. The source calls this a bug,
+  kept so existing keys stay valid ("we do additional sorting where it is
+  needed", comment above `append_escaped()`).
+
+Name part, three cases:
+
+```
+no locator key    escaped(name) '!' '='
+key == name       escaped(key)  '!' '='                   (name not repeated)
+key != name       escaped(key)  '!' ('<' or '>') escaped(name) '!'
+                                     sign of key vs name
+```
 
 Captured key of object `specimen` (pool 1, hash 0x5810483c):
 
@@ -555,10 +628,13 @@ ff ff ff ff ff ff ff ff     generation = NO_GEN
 Source: [`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc) (`get_extent_shard_key()`,
 `is_extent_shard_key()`).
 
-Full onode key (including the `'o'`) + `BE u32 shard_logical_offset` +
-`'x'`. The trailing byte discriminates onode vs shard keys without decoding;
-shards of an object sort immediately after its onode. Captured example:
-§7.2.
+```
+ onode key (ends in 'o')  +  BE u32 shard logical offset  +  'x'
+```
+
+* The last byte tells onode (`'o'`) from shard (`'x'`) without decoding.
+* An object's shards sort right after its onode.
+* Captured example: §7.2.
 
 ## 4.6 `M`/`P`/`m`/`p` — omap keys
 
@@ -566,8 +642,7 @@ Source: [`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.
 (`BlueStore::Onode::calc_omap_key()`, `calc_omap_header()`,
 `calc_omap_tail()`).
 
-The prefix an object uses is fixed by `bluestore_onode_t::flags` (§6.1) at
-first omap write:
+The onode flags (§6.1), set at the first omap write, pick the prefix:
 
 | Onode flags | Prefix | Key layout |
 |---|---|---|
@@ -576,19 +651,25 @@ first omap write:
 | `FLAG_PERPOOL_OMAP` only | `m` | BE u64 pool + BE u64 nid + sep + name |
 | legacy (none) | `M` | BE u64 nid + sep + name |
 
-Separator bytes, chosen for sort order `'-' < '.' < '~'`:
-`-` omap header (whole-object header blob), `.` user keys, `~` tail
-sentinel (range-scan upper bound). Unlike `O` keys, the pool here is raw
-BE s64 (no 2^63 bias). Captured (`ceph-kvstore-tool`, prefix `p`):
+Separator (sorts `'-' < '.' < '~'`):
+
+```
+'-'   omap header (one per object)
+'.'   user keys
+'~'   tail marker: upper bound for range scans
+```
+
+Unlike `O` keys, the pool here is raw BE s64 (no 2^63 bias). Captured
+(`ceph-kvstore-tool`, prefix `p`):
 
 ```
 00 00 00 00 00 00 00 01 | 3c 12 08 1a | 00 00 00 00 00 00 04 84 | 2e | omap_key_1
 pool=1                    rev-hash      nid=1156                  '.'   name
 ```
 
-The per-PG layout embeds the same reversed hash as the `O` key, so an
-object's omap sorts within its PG; PG deletion/export is therefore a
-contiguous range scan.
+The per-PG layout uses the same reversed hash as the `O` key. So an
+object's omap sorts inside its PG, and PG removal or export is one range
+scan.
 
 ## 4.7 `C` — collections
 
@@ -597,54 +678,59 @@ Code path: `get_coll_range()`, `_open_collections()`,
 `_split_collection()`, `_merge_collection()`
 ([`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc)).
 
-A collection is ObjectStore's grouping unit: one PG, plus the per-OSD
-`meta` collection holding bookkeeping objects (OSD superblock, PG
-metadata). Key: the ASCII rendering of the `spg_t` plus the literal
-`_head` (EC shards include the shard id: `1.4s2_head`); the meta
-collection's key is `meta`.
+A collection groups objects: one per PG, plus the per-OSD `meta`
+collection (OSD superblock, PG metadata).
 
-Value — the collection's entire persistent state:
+* Key: ASCII `spg_t` + `_head`, e.g. `1.4_head`; EC shards add the shard
+  id: `1.4s2_head`. The meta collection's key is `meta`.
+* Value, the whole persistent state:
 
 ```
 01 01 04 00 00 00   DENC_START(1,1), payload len 4
 03 00 00 00         le32 bits = significant low PG-hash bits
 ```
 
-Membership is computed, not stored; no per-collection object list exists.
-An object belongs to PG collection `<pool>.<ps>` iff
-`hash & ((1 << bits) - 1) == ps`. Because `O` keys embed
-`_reverse_bits(hash)` (§4.4), this predicate is equivalent to a contiguous
-key range, derived by `get_coll_range()`:
+No object list is stored. Membership is computed:
+
+```
+ object in PG <pool>.<ps>   iff   hash & ((1 << bits) - 1) == ps
+                                  (and same pool and shard: pg_t::contains)
+```
+
+`O` keys hold `_reverse_bits(hash)` (§4.4), so this is one key range
+(`get_coll_range()`):
 
 ```
 start = shard | pool | _reverse_bits(ps)
 end   = shard | pool | _reverse_bits(ps) + (1 << (32 - bits))
 ```
 
-Collection listing, scrub/backfill enumeration, and PG deletion are range
-scans over [start, end). Each PG collection additionally owns a temp
-region for in-flight recovery objects: the same range math with
-pool = `-2 - pool`, a separate negative-pool key region cleared by range
-at PG activation.
+* Listing, scrub/backfill and PG removal are range scans over
+  [start, end).
+* Each PG also has a temp range for in-flight recovery objects: same
+  math with pool = `-2 - pool` (a negative pool, so a separate key
+  region), cleared at PG activation.
+* `bits` is stored, not derived from the pool: `pg_num` need not be a
+  power of two. At `pg_num` = 12, some PGs use 3 hash bits and others 4.
 
-`bits` is stored per collection rather than derived from the pool because
-`pg_num` need not be a power of two: at `pg_num` = 12, some PGs are
-defined by 3 hash bits and others by 4.
+Split and merge move no objects:
 
-Split and merge move no objects. `_split_collection()` writes the child's
-`C` record and sets both records to `bits + 1`; the parent's key range
-bisects, and the upper half now belongs to the child.
-`_merge_collection()` is the inverse (`bits - 1`). fsck validates the
-predicate in reverse: every onode's hash must fall inside its collection's
-declared range.
+```
+ split  1.4 (bits 3)  ->  1.4 (bits 4) + child 1.c (bits 4)
+        child's C record: created before, by _create_collection()
+        _split_collection(): rewrites the parent's C record with bits + 1;
+        the parent's key range halves, the upper half is the child's
+ merge  _merge_collection(): writes the target's C record with the new
+        bits, removes the source's C record
+```
 
-Captured (`ceph-kvstore-tool`): the reference OSD's 10 `C` keys are
-`1.0_head`–`1.7_head` (pool 1, `pg_num` 8, bits 3), `2.0_head` (the
-`.mgr` pool), and `meta`.
+fsck does the reverse check: an onode outside every collection's
+range is reported as a stray object.
 
-Collections are loaded before any onode access at mount
-(`_open_collections()`, §10): key interpretation and membership checks
-require the cnode.
+* Captured (`ceph-kvstore-tool`): 10 `C` keys: `1.0_head`–`1.7_head`
+  (pool 1, `pg_num` 8, bits 3), `2.0_head` (the `.mgr` pool), and `meta`.
+* Collections load before any onode at mount (`_open_collections()`,
+  §10): key ranges and membership checks need the cnode.
 
 ## 4.8 `T` — statfs
 
@@ -652,11 +738,17 @@ Source: [`src/os/bluestore/BlueStore.h`](https://github.com/ceph/ceph/blob/v21.3
 merge operator `Int64ArrayMergeOperator`
 ([`src/os/bluestore/bluestore_common.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_common.h)).
 
-Key: BE u64 pool id (`0xffffffffffffffff` = meta pool -1), or the single
-legacy key `bluestore_statfs`. Value: 5 signed le64 counters:
-`allocated, stored, compressed_original, compressed, compressed_allocated`.
-Updates are RocksDB merges (element-wise add), so commits never
-read-modify-write the counters.
+```
+key     BE u64 pool id (0xffffffffffffffff = meta pool -1)
+        or the single legacy key "bluestore_statfs"
+value   5 x signed le64: allocated, stored, compressed_original,
+                         compressed, compressed_allocated
+```
+
+* Bitmap freelist (§9.1): each commit adds its change as a RocksDB merge
+  (element-wise add), so it never reads the counters first.
+* NCB (§9.2; default with a flash DB): no per-commit updates; the counters are rewritten
+  in full at clean shutdown (`_close_db()`).
 
 # 5. Blob Structures
 
@@ -2103,9 +2195,9 @@ onode's blob extents plus BlueFS's own extents
 [2] read BlueFS super @0x1000             crc32c; get log_fnode       (§3.1)
         |
 [3] replay BlueFS journal (ino 1)         uuid/seq/crc chain          (§3.4)
-        |
+        |                                 then envelope walk          (§3.5)
 [4] open RocksDB via BlueRocksEnv         MANIFEST + db.wal/*.log
-        |                                 replay; envelope walk       (§3.5)
+        |                                 replay
 [5] _open_super_meta                      S: ondisk_format gate,
         |                                 nid_max, blobid_max,
         |                                 min_alloc_size,
