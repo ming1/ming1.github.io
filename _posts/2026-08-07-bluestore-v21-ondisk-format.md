@@ -1902,32 +1902,7 @@ What the walk shows:
   is in the onode, decoded in step 2. A back-reference would work only
   inside shard 1.
 
-A write finds its extents the same way, then:
-
-* **Target blob decides the update.**
-  * Mutable (not shared, not compressed): in place when possible
-    (§8.2) — unused chunks direct or deferred by size, small overwrites
-    deferred, large overwrites to new space.
-  * Shared or compressed: allocate new space and point the extent map at
-    it. Freed ranges go to the transaction's `released` set (§8.2). For
-    a shared blob, a refcount put comes first (§5.5); only ranges that
-    reach 0 refs are freed.
-* **Only dirty shards** are re-encoded and written (`ExtentMap::update()`).
-  A 4 KiB write to this object rewrites one shard record, not the whole
-  map. An inline map is always rewritten whole.
-* **The onode is rewritten, with the whole spanning section**, even if
-  the write does not touch the spanning blob (§6.2). `_write()` calls
-  `txc->write_onode()` after `_do_write()`.
-  * Only ObjectStore omap ops can skip it: once the object has omap,
-    `_omap_setkeys()` and friends call `note_modified_object()` ("onode
-    itself isn't written"). The first omap key still writes the onode, to
-    set the omap flag.
-  * But an OSD omap write also updates `object_info_t`, a setattr. At
-    `debug_bluestore 20`, one `rados setomapval` gave `_setattrs`,
-    `_omap_setkeys` and `_record_onode` on the same object: the onode was
-    rewritten anyway.
-* **Reshard** runs if a shard crosses the §7.2 size limits. It may split
-  or promote blobs, which changes the reference form later records use.
+A write finds its extents the same way; §8.3 shows what it rewrites.
 
 # 8. Transactions and Deferred Writes
 
@@ -2072,6 +2047,49 @@ threads → `_deferred_replay()`):
 * Replay is idempotent: the same bytes go to the same disk extents.
 * A skipped `L` key is harmless: the next mount trims it again, and a new
   txc that gets the same `seq` overwrites it and then deletes it.
+
+## 8.3 What a write rewrites
+
+A write first finds its extents like the read in §7.4 (steps 1–4). Then
+it does two things.
+
+**1. Write the data.** The target blob decides where:
+
+```
+target blob                     data goes to
+mutable, unused chunk           direct write (deferred if small)
+mutable, overwrite, small       deferred: inside the L record, written after commit
+mutable, overwrite, large       new space
+shared or compressed            new space
+```
+
+* "Small" follows the §8.2 rules.
+* New space leaves the old range behind: a shared blob gets a refcount
+  put first (§5.5); ranges at 0 refs go to the released set (§8.2).
+
+**2. Update the metadata**, in the same KV batch (§8.1):
+
+```
+record          rewritten when                    note
+shard ('x')     its extents changed               only dirty shards (ExtentMap::update());
+                                                  a 4 KiB write to the §7.3 object = 1 shard
+onode ('o')     every write                       with the whole spanning section (§6.2);
+                                                  an inline map is part of it
+shards          a shard passes the §7.2 limits    reshard: may split or promote blobs
+```
+
+`_write()` calls `txc->write_onode()` after `_do_write()`, so the onode is
+written even when the spanning blob is not touched.
+
+The one exception is omap:
+
+* An ObjectStore omap op on an object that already has omap skips the
+  onode (`note_modified_object()`: "onode itself isn't written"). The
+  first omap key still writes it, to set the omap flag.
+* In practice an OSD omap write also updates `object_info_t`, a setattr,
+  so the onode is written anyway. At `debug_bluestore 20`, one
+  `rados setomapval` gave `_setattrs`, `_omap_setkeys` and
+  `_record_onode` on the same object.
 
 # 9. Free Space Persistence
 
