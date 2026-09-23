@@ -1859,6 +1859,28 @@ the §7.3 capture.
    => read 4 KiB at device offset 0x4ea000, check it against 0xcfae3298
 ```
 
+**Step 4 in detail.** A shard value is one §6.3 payload: `struct_v`,
+record count, then the records. It must be parsed from the first record:
+
+```
+field                 depends on
+gap (if !C)           prev extent's logical end   (pos)
+length (if !L)        prev extent's length        (prev_len)
+back-ref k            record k-1 of this shard    (must be decoded first)
+record size           2 B ... 200+ B              -> no fixed stride to jump by
+```
+
+This happens once per shard load, not per I/O:
+
+```
+fault_range()    shard not in memory? read it, decode ALL its records
+                 (ExtentDecoder::decode_some())
+seek_lextent()   later I/Os search the in-memory extent map; no byte parsing
+```
+
+Here one record is one 4 KiB block only because of the §7.3 stride; in
+general one record covers any length (§7.1: one record, 16 KiB).
+
 Why step 7 never hits a hole:
 
 * The eight holes are at even blob offsets. The head's own extents cover
