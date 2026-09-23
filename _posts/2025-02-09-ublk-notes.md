@@ -1,7 +1,7 @@
 ---
 title: ublk notes
 category: storage
-tags: [linux kernel, block layer, ublk, io_uring]
+tags: [linux kernel, block layer, ublk, io-uring]
 ---
 
 Title: ublk notes
