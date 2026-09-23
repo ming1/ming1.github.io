@@ -658,8 +658,8 @@ sched_submit_work():
 T issues request R: flags = PF_IO_HANDOFF
 
 sleep 1  io_uring_task_sleeping(): hand off to W
-           io_wq_handoff_commit() sets PF_IO_WORKER on T
            T->io_uring = NULL (tctx moved to W)
+           io_wq_handoff_commit() sets PF_IO_WORKER on T
            io_wq_worker_sleeping(T), called by hand
 wake 1   sched_update_worker(): PF_IO_WORKER → io_wq_worker_running(T)     balanced
 sleep 2  flags = PF_IO_HANDOFF | PF_IO_WORKER
@@ -674,12 +674,123 @@ Points to note:
 
 | point | detail |
 |---|---|
-| one-shot only by order | After the handoff T still has `PF_IO_HANDOFF`, but `T->io_uring == NULL`. If the hook ran again, its first lines (`tctx = tsk->io_uring; ho = &tctx->handoff; req = ho->req`) would dereference NULL. Only the `else if` order stops that. T must keep `PF_IO_HANDOFF` (`io_issue_handed_off()` and `io_wq_task_work_add()` use it), so a comment or an early `if (!tsk->io_uring) return;` in the hook would make it safe. |
+| one-shot only by order | See the note below the table. |
 | refused → retried | If the hook refuses (lock held, no idle worker, `prepare` fails), the next sleep tries again. `thread_handoff_prepare()` is safe to repeat: x86 skips the FPU save once `TIF_NEED_FPU_LOAD` is set; the arm64 helpers are idempotent. |
-| trigger is "about to sleep" | A request with a few short sleeps hands off on the first short one. A task woken between `sched_submit_work()` and `__schedule()` never really sleeps, but its identity has already moved. Not a bug, but it costs a handoff — one more reason why always-blocking requests lose. |
-| sleeps that are not seen | Preemption (task still running): no hook, correct. rt-mutex sleeps: seen, via `rt_mutex_pre_schedule()`. Futex PI (`rt_mutex_futex_pre_schedule()`) skips it, but only runs in the futex syscall, not in an io_uring issue. |
+| trigger is "about to sleep" | A request with a few short sleeps hands off on the first short one. A task woken between `sched_submit_work()` and `__schedule()` never really sleeps, but the handoff is already committed: T is a worker and W will finish the syscall. `rt_mutex_slowlock()` even runs the hook before it knows it must wait. Not a bug, but a request that sleeps only briefly still pays for a full handoff. |
+| sleeps that are not seen | Preemption (task still running): no hook, correct. rt-mutex sleeps: seen, via `rt_mutex_pre_schedule()`. Futex PI (`rt_mutex_futex_pre_schedule()`) skips the hook, but runs only in the futex syscall. PREEMPT_RT spinlock waits (`schedule_rtlock()`) must not run the hook at all: `sched_submit_work()` warns on `TASK_RTLOCK_WAIT`. |
 
-### 2.3.6 Questions Jens asks reviewers
+**Why it is one-shot only by order.** After the handoff T still has
+`PF_IO_HANDOFF`, but `T->io_uring == NULL`. If the hook ran again, its first
+lines (`tctx = tsk->io_uring; ho = &tctx->handoff; req = ho->req`) would
+dereference NULL. Only the `else if` order stops that. T must keep
+`PF_IO_HANDOFF`, because `io_issue_handed_off()` uses it to know that
+`uring_lock` is no longer held. An early `if (!tsk->io_uring) return;` in the
+hook would make this safe; a comment would at least document it.
+
+### 2.3.6 Per-task state
+
+*Author's analysis (from reading the code, not tested).*
+
+A handoff splits one thread into two halves. What happens to each part of
+the `task_struct`?
+
+```
+                                 identity moves T → W          task_struct stays T
+                                 (what userspace sees)         (the unfinished kernel work)
+───────────────────────────────  ────────────────────────────  ──────────────────────────────
+1. state of the running syscall                                 plug, journal_info, nameidata,
+                                                                memalloc scope flags, held locks
+                                                                → correct: T keeps doing the work
+2. user-visible per-thread state  moved / must match / refused  anything not in those lists
+3. pointers to the task_struct                                  kept by other code
+   held by others                                               → now point at the worker T
+```
+
+**1. State of the running syscall.** This is the reason to move the identity
+and not the work: T keeps its stack and everything that belongs to the
+unfinished request.
+
+The block plug needed a fix (patches 9 and 11), because it used to be in
+the ring's shared state:
+
+```
+T  io_submit_sqes(): struct blk_plug plug on T's stack, current->plug = &plug
+   issue R → blocks → schedule()
+     sched_submit_work():
+       1. io_uring_task_sleeping()   handoff; io_submit_sqes_abandon() sets the ring's
+                                     plug_started = false, so W never touches T's plug
+       2. blk_flush_plug(T->plug)    send T's queued bios, from T
+   wakes up, R may add more bios to T's plug
+   io_submit_sqes() sees -EIOCBQUEUED:
+     if (current->plug == &plug) blk_finish_plug(&plug)       ← T ends its own plug
+
+W  io_handoff_resume() → io_submit_sqes(): a new plug on W's stack
+```
+
+Filesystem per-task state:
+
+| state | what happens | ok? |
+|---|---|---|
+| `journal_info` (jbd2 handle, XFS transaction) | stays with T; W starts with NULL | ✓ same as two io-wq workers today |
+| `nameidata` (path walk) | T keeps its walk; W has its own | ✓ |
+| `PF_MEMALLOC_NOFS/NOIO` scopes set by fs code | stay on T; only `PF_MCE_*` flags move | ✓ they belong to T's work |
+| locks held by T (inode rwsem, `sb_writers`, …) | T owns them and releases them | ✓ only `uring_lock` is dropped for W; `submit_lock_depth` says when that is allowed |
+| `fs_struct` (cwd, root, umask), `files_struct` | must be equal, or no handoff | ✓ |
+| cgroup, ioprio value | move to W. W drops the `io_context` it shared with T (`CLONE_IO`); T keeps it, so T's remaining bios are charged as before | ✓ |
+| I/O accounting | a snapshot moves to W; I/O done by T later counts to T | minor, same as io-wq |
+| **`PR_SET_IO_FLUSHER`** | **not moved, not checked** | **✗, see below** |
+
+**2. User-visible per-thread state.** The series handles it in four ways:
+
+| handling | fields |
+|---|---|
+| moved | tid, leader, signals (incl. `sigaltstack`, `restart_block`), robust list, rseq, creds, sched attributes, … (full table in 2.3.1) |
+| checked, else no handoff (`thread_handoff_compatible()`) | same thread group, W not traced, `mm`, `files`, `fs`, `nsproxy`, seccomp, SysV `undo_list`, `user_ns`, some x86 TIF flags; W must not have `no_new_privs` unless T has it |
+| refused (`thread_handoff_allowed()`) | see 2.3.1 |
+| known gaps (RFC) | LSM task blobs, `PR_SET_IO_FLUSHER` |
+
+Problems these lists do not solve:
+
+| state | problem |
+|---|---|
+| `PR_SET_IO_FLUSHER` | a known gap, but not a harmless one: see below |
+| x86 resctrl `closid` / `rmid` | Set per tid by writing it to a resctrl `tasks` file. Not moved or checked: tid 100 now runs in W's cache / bandwidth group. |
+| BPF task local storage, sched_ext task state | Keyed by `task_struct`: data for tid 100 stays on T. |
+| task_work queued on T before it blocked | Only io_uring's own work moves (`io_handoff_tw_moved()`). Other work runs on T, now a worker — e.g. `kill_me_maybe` after a machine check in `copy_from_user()` during the issue: SIGBUS goes to the wrong task. |
+| NUMA balancing stats, `nr_dirtied` | not moved; only performance |
+
+**`PR_SET_IO_FLUSHER` is not a harmless gap.** It sets `PF_MEMALLOC_NOIO`
+and `PF_LOCAL_THROTTLE` (`kernel/sys.c:2407`). Userspace block servers
+(FUSE, NBD, ublk, …) can use it so that their memory reclaim never waits for I/O to
+their own device. The RFC says a gap "can only ever restrict". This is not
+true for this flag:
+
+```
+server thread tid 100 has IO_FLUSHER, worker W does not
+  → after the handoff, tid 100 runs WITHOUT NOIO
+  → reclaim in tid 100 can wait for writeback to its own device → deadlock risk
+```
+
+W usually has the flag, because a worker copies the flags of the thread
+that forks it, normally the submitting thread. But not if W was forked
+before the prctl, e.g. a spare created when the thread first used the ring.
+Fix: check it in `thread_handoff_compatible()`, like seccomp.
+
+**3. Pointers to the `task_struct` held by other code.**
+
+```
+kept as struct pid (tid)          → follows the identity: pidfd, F_SETOWN_EX tid, /proc/<tid>
+kept as task_struct *  (current)  → stays on T, now a kernel worker:
+                                      ublk io->task (§1): dispatch aborted, COMMIT -EINVAL
+                                      any driver that saves current to mean "this thread"
+```
+
+`exchange_tids()` swaps the `struct pid`s, so tid-based references follow the
+identity. Raw `task_struct` pointers do not. io_uring fixes its own
+(`submitter_task`, `tctx->task`) but cannot know about others. This is
+Jens's third question below.
+
+### 2.3.7 Questions Jens asks reviewers
 
 - Is the list of refused task states complete? Is moving thread group
   leadership this way OK (the leader must stay first on `->thread_head`, as
