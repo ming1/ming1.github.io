@@ -543,7 +543,7 @@ object).
 | `m` | PREFIX_PERPOOL_OMAP | BE u64 pool + nid + sep + name (§4.6) | omap value | 0 |
 | `p` | PREFIX_PERPG_OMAP | BE u64 pool + BE u32 hash + nid + sep + name (§4.6) | omap value | 5 |
 | `L` | PREFIX_DEFERRED | BE u64 seq | `bluestore_deferred_transaction_t` (§8.2) | 0 |
-| `B` | PREFIX_ALLOC | ASCII `size`, `blocks`, `bytes_per_block`, `blocks_per_key` | le64 (§9.1, legacy geometry copy) | 4 |
+| `B` | PREFIX_ALLOC | ASCII `size`, `blocks`, `bytes_per_block`, `blocks_per_key` | le64 (§9.1, geometry copy) | 4 |
 | `b` | PREFIX_ALLOC_BITMAP | BE u64 region offset | region bitmap (§9.1) | 802 |
 | `X` | PREFIX_SHARED_BLOB | BE u64 sbid | `bluestore_shared_blob_t` (§5.5) | 0 |
 
@@ -2093,19 +2093,42 @@ The one exception is omap:
 
 # 9. Free Space Persistence
 
+BlueStore keeps free space in one of two ways. `S freelist_type` (§4.3)
+says which:
+
+```
+                      bitmap (§9.1)                    NCB, "null" (§9.2)
+where it lives        b keys in RocksDB                memory; a BlueFS file at
+                                                       clean shutdown
+cost per commit       b merges in every WriteBatch     none
+                      that allocates or frees
+after a crash         read the b keys                  rebuild from all onodes
+used when             DB on HDD, or the option         flash DB and
+                      was off (never switched)         bluestore_allocation_from_file
+                                                       (default true)
+```
+
+An NCB OSD does not switch back to bitmap by itself. The captured OSD runs
+bitmap mode: its file-backed test devices count as rotational.
+
 ## 9.1 Bitmap freelist — `B` / `b`
 
 Source: [`src/os/bluestore/BitmapFreelistManager.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BitmapFreelistManager.h) / [`.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BitmapFreelistManager.cc)
 (`BitmapFreelistManager`, `XorMergeOperator`).
 
-Geometry parameters: `size` (device bytes), `blocks`, `bytes_per_block`
-(= min_alloc_size), `blocks_per_key` (default 128). On v21 the
-authoritative copy lives in the main-device label meta under `bfm_*` names
-(§2.3, written by `_write_out_fm_meta()`); the unprefixed `B`-prefix RocksDB
-keys are a legacy copy read only when the label meta is absent
-(`BitmapFreelistManager::init()` falls back to `_load_from_db()`).
+Geometry: `size` (device bytes), `blocks`, `bytes_per_block`
+(= `min_alloc_size`), `blocks_per_key` (`bluestore_freelist_blocks_per_key`,
+default 128). Two copies:
 
-Bitmap under `b`: one key per region of `blocks_per_key` blocks.
+* label meta `bfm_*` (§2.3, `_write_out_fm_meta()`): read first by
+  `init()`;
+* `B` keys `size`, `blocks`, `bytes_per_block`, `blocks_per_key`: all
+  written at mkfs; `blocks` and `size` rewritten on expand; the fallback
+  when the label has no `bfm_*` (`_load_from_db()`). If the DB `size` is
+  larger (an expand by an older release that updated only `B`), the DB
+  copy wins.
+
+Bitmap under `b`, one key per region of `blocks_per_key` blocks:
 
 ```
 bytes_per_key = bytes_per_block * blocks_per_key      (512 KiB with defaults)
@@ -2122,113 +2145,145 @@ value byte 0                          value byte 15
 +----------------+                    +----------------+
 ```
 
-All updates are RocksDB merges through `XorMergeOperator`: allocate and
-release both XOR the same bits. Consequences:
+Updates are RocksDB merges (`XorMergeOperator`): allocate and release
+both flip the same bits.
 
-* no read-modify-write in the commit path;
-* allocate and free are the same operator, so a double-free is detectable
-  by fsck as a parity error;
-* a key whose bits have all returned to zero may persist after churn.
+* No read-modify-write in the commit path.
+* Keys whose bits all return to 0 stay in the DB.
+* fsck compares the bitmap with the blocks the onodes use: a double free
+  shows up as a `leaked extent`, a double allocate as a free extent that
+  `intersects allocated blocks`.
 
-Captured: `b` key `00..00` (region at byte 0) has value `03 00 .. 00` —
-blocks 0–1 allocated = the 8 KiB `SUPER_RESERVED` area, matching mkfs
-(`fm->allocate(BDEV_FIRST_LABEL_POSITION, reserved, t)` in
-`BlueStore::_open_fm()`).
+Captured: `b` key `00..00` (region at byte 0) = `03 00 .. 00`: blocks 0–1
+allocated, the 8 KiB reserved at the device start (§2.2). mkfs marks it
+with `fm->allocate(BDEV_FIRST_LABEL_POSITION, reserved, t)` in
+`BlueStore::_open_fm()`.
 
 ## 9.2 NCB mode — allocation file (`freelist_type = "null"`)
 
 Source: [`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc) (NCB section:
 `allocator_image_header`, `allocator_image_trailer`, `ALLOCATOR_NCB_DIR`,
-`ALLOCATOR_NCB_FILE`); mode selection in `BlueStore::_open_fm()`.
-Introduced by commit `272160ab5e4` ("Remove Allocations from RocksDB");
-first released in v17 (Quincy), default-on since introduction.
+`ALLOCATOR_NCB_FILE`).
+Introduced by commit `272160ab5e4` ("Remove Allocations from RocksDB"),
+first released in v17.1.0 (Quincy), default on from the start.
 
-Rationale. In bitmap mode, every commit that allocates or frees space
-carries `b`-key XOR operands in its WriteBatch: allocation bookkeeping is
-persisted on the client-write critical path, then paid again through
-WAL, flush, and compaction. The free list, however, is derived state —
-fully reconstructible from the union of every onode's blob extents
-(§6–§5) and BlueFS's own extents (§3). NCB (the introducing commit's
-phrasing: allocation information committed "into RocksDB
-(column-family B)" — hence the name) stops persisting it at runtime
-altogether: the allocator lives in memory, is destaged once at clean
-shutdown to the BlueFS file `ALLOCATOR_NCB_DIR/ALLOCATOR_NCB_FILE`, and
-is rebuilt from onodes after a crash. The commit reports a 25% IOPS
-increase with reduced latency for small random writes.
+**Why.** In bitmap mode every commit that allocates or frees space
+carries `b` merges: allocation bookkeeping sits on the client write
+path, then is paid again by WAL, flush and compaction. But free space
+can be rebuilt from the onodes. NCB ("no column-family B": the code calls the bitmap "CF-B") stops
+storing it at runtime. The commit reports 25% more IOPS and lower latency
+for small random writes.
 
-Cost shift per event:
+The price moves from every commit to shutdown and mount:
 
 | Event | bitmap mode | NCB mode |
 |---|---|---|
-| every allocating/freeing commit | `b` merge operands in the WriteBatch | nothing persisted |
-| clean shutdown | nothing | one sequential destage of the image |
-| mount after clean shutdown | scan `b` prefix | sequential read of the image |
-| mount after crash | scan `b` prefix | rebuild from all onodes + BlueFS extents |
+| clean shutdown | nothing | write the free-space file |
+| mount after clean shutdown | read the `b` keys | read the file |
 
-When `S.freelist_type` = `null`, the bitmap is not maintained. Mode
-selection requires all four of:
+**When.** `freelist_type = "null"` is a `BitmapFreelistManager` with its
+null flag set. mkfs picks it in `_open_fm()` when:
 
 ```
 !is_db_rotational()  &&  !read_only  &&  db_avail  &&
 cct->_conf->bluestore_allocation_from_file      (default: true)
 ```
 
-The rotational term bounds the crash-recovery cost: the rebuild reads
-every onode on the OSD, acceptable on flash but a long OSD-down window on
-HDDs, which therefore stay in bitmap mode — as do file-backed test
-devices, the captured OSD among them. The `!read_only` term means offline
-tools never switch a store to NCB. Since the option defaults to true, a
-production OSD with a non-rotational DB device runs NCB without any
-configuration; commit `bfd4e18eaad` ("Multithreaded allocation
-recovery", in the v21 line) parallelizes the crash rebuild.
+* So mkfs on a flash DB creates the OSD in NCB mode directly.
+* A bitmap-mode OSD switches at mount (`_open_db_and_around()` →
+  `commit_to_null_manager()`) when `!is_db_rotational() && !read_only &&
+  !to_repair` and the option is on.
+* Read-only opens and the `to_repair` open (`ceph-bluestore-tool
+  reshard`, `ceph-kvstore-tool destructive-repair`) only stop a switch:
+  an NCB OSD opened that way stays NCB. `fsck --repair` is a normal open.
+* HDD DBs stay in bitmap mode: a crash rebuild reads every onode, which
+  is a long OSD-down window on HDD.
+* If the option is turned off on an NCB OSD, mount fails with
+  `-ENOTSUP` (`_init_alloc()`). The man page names
+  `ceph-bluestore-tool restore_cfb` as the way back to bitmap; in
+  v21.3.0 its code needs the option off and then hits the same
+  `-ENOTSUP` (read from the code, not tested).
+* Commit `bfd4e18eaad` ("Multithreaded allocation recovery", first in
+  v21.0.1) can run the rebuild in parallel
+  (`bluestore_allocation_recovery_threads` > 1); default 0 = the old
+  single-thread path.
 
-Placement. The image is a standalone BlueFS file rather than RocksDB
-content, a reserved raw region, or journal payload:
+**Life of the file** (`ALLOCATOR_NCB_DIR/ALLOCATOR_NCB_FILE` in BlueFS):
 
-| Alternative | Rejected because |
+```
+ mount      file valid? ---- yes --> load free extents into the allocator
+            |
+            no (crash: the file was truncated at the last mount)
+            |
+            v
+            rebuild (read_allocation_from_drive_on_startup()):
+              scan shared blobs (X) and every onode's extents -> used space;
+              the reserved start of the device -> used;
+              statfs is rebuilt from the same scan
+            then, either way (not in read-only):
+              truncate the file to 0
+ running    allocator in memory only; nothing written
+ umount     _close_db(): write T (statfs), then the file = all free extents
+```
+
+* The file lists **free** extents of the main device. BlueFS extents
+  (and extra label copies) are written as free too: the file does not
+  track them. At mount, BlueFS takes its extents back out of the
+  allocator (`init_rm_free`) and `_main_bdev_label_try_reserve()` takes
+  the label copies; so the rebuild does not scan them either.
+* The file is written only at clean umount. After a crash rebuild, it is
+  written at the next clean umount.
+
+**Why a BlueFS file:**
+
+| Option | Rejected because |
 |---|---|
-| RocksDB value(s) | the image needs no transactional, lookup, or merge property, yet would pay WAL double-write and later compaction of a large blob; it would also re-insert allocation state into the pipeline NCB exists to evacuate |
-| reserved raw region | image size is unbounded — 16 B per free extent, fragmentation-dependent — and cannot be sized at mkfs |
-| BlueFS journal / superblock | the journal is replayed at every mount and rewritten at every compaction (§3.4); the superblock is a single 4 KiB block (§3.1) |
-| standalone BlueFS file | growable extents plus atomic, journaled create/invalidate — the same pattern as `sharding/def` (§4.1) |
+| RocksDB value(s) | would pay WAL double-write and compaction for a large blob, and put allocation state back into the path NCB removes |
+| reserved raw region | size is not known at mkfs: 16 B per free extent, grows with fragmentation |
+| BlueFS journal / superblock | the journal is replayed at every mount and rewritten at every compaction (§3.4); the superblock is one 4 KiB block (§3.1) |
+| **standalone BlueFS file** | growable, with atomic, journaled create and truncate — same pattern as `sharding/def` (§4.1) |
 
-BlueFS guarantees the file's extents, not its contents; self-validation
-(signature, serial, pad checks, per-buffer and header/trailer crc32c) is
-supplied by the image format below.
-
-File format:
+BlueFS guarantees the file's extents, not its content, so the file checks
+itself:
 
 ```
-+--------------------------------+  header, 48 B + le32 crc32c
-| le32 format_version (1)        |
-| le32 valid_signature 0x1face0ff|
-| le32 tv_sec, le32 tv_nsec      |
-| le32 serial                    |
-| le32 pad[7] (must be 0)        |
-| le32 crc32c over header        |
-+--------------------------------+
-| extent records:                |  free-space runs,
-|   { le64 offset, le64 length } |  one le32 crc32c appended per
-|   ... 16 B each ...            |  4096-extent (64 KiB) buffer
-+--------------------------------+
-| trailer, 56 B + le32 crc32c    |
-|   16 B null extent (0,0)       |  terminator marker
-|   le32 format_version          |
-|   le32 valid_signature         |
-|   le32 tv_sec, le32 tv_nsec    |
-|   le32 serial                  |
-|   le32 pad (must be 0)         |
-|   le64 entries_count           |
-|   le64 allocation_size         |
-|   le32 crc32c over trailer     |
-+--------------------------------+
++----------------------------------+  header: 48 B (DENC) + le32 crc32c
+| le32 format_version (1)          |
+| le32 valid_signature 0x1face0ff  |
+| le32 tv_sec, le32 tv_nsec        |
+| le32 serial                      |
+| le32 pad[7] (must be 0)          |
++----------------------------------+
+| free extents, raw:               |  { le64 offset, le64 length }, 16 B each;
+|   { le64 offset, le64 length }   |  one le32 crc32c after each full 4096-extent
+|   ...                            |  (64 KiB) buffer and after the final partial
+|                                  |  one; each crc starts from the previous
+|                                  |  buffer's crc (first seed -1)
++----------------------------------+
+| trailer: 56 B (DENC) + le32 crc  |
+|   null extent (0, 0)             |  end marker
+|   le32 format_version            |
+|   le32 valid_signature           |
+|   le32 tv_sec, le32 tv_nsec      |
+|   le32 serial                    |
+|   le32 pad (must be 0)           |
+|   le64 entries_count             |
+|   le64 allocation_size           |  sum of free lengths
++----------------------------------+
 ```
 
-On mount the file is accepted only if signatures, serial, pad bytes, crcs
-and entry counts all validate; after a crash (the file is invalidated when
-opened for write) the allocation map is reconstructed by scanning every
-onode's blob extents plus BlueFS's own extents
-(`read_allocation_from_drive_on_startup()`), then destaged again.
+On mount the file is used only if all checks pass:
+
+* header: signature, pad bytes all 0, crc;
+* each extent: length not 0; each buffer crc;
+* trailer: null extent, signature; `serial`, `format_version` and
+  timestamp equal to the header's; `entries_count`, `allocation_size`
+  (sum of free lengths), pad, crc.
+
+Otherwise the rebuild runs. Offline tools: `ceph-bluestore-tool allocmap`
+rebuilds the allocation from the onodes and compares it with the
+allocator loaded at mount (file or bitmap); fsck skips the bitmap check
+in NCB mode.
 
 # 10. Recovery-Relevant State: Mount Sequence
 
