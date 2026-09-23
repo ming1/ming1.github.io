@@ -638,7 +638,48 @@ W2   creds only, issue C → done
      thread_handoff_finish(from T) → return to user as T's tid     ← one full move
 ```
 
-### 2.3.5 Questions Jens asks reviewers
+### 2.3.5 A request that sleeps many times
+
+*Author's analysis (from reading the code, not tested).*
+
+The hook runs on every voluntary sleep. A blocked request may sleep many
+times before it is done. Does it hand off again on every sleep? No:
+
+```c
+schedule():  if (!task_is_running(tsk)) sched_submit_work(tsk);   // every voluntary sleep
+
+sched_submit_work():
+	if (task_flags & PF_WQ_WORKER)        wq_worker_sleeping(tsk);
+	else if (task_flags & PF_IO_WORKER)   io_wq_worker_sleeping(tsk);
+	else if (task_flags & PF_IO_HANDOFF)  io_uring_task_sleeping(tsk);   // checked last
+```
+
+```
+T issues request R: flags = PF_IO_HANDOFF
+
+sleep 1  io_uring_task_sleeping(): hand off to W
+           io_wq_handoff_commit() sets PF_IO_WORKER on T
+           T->io_uring = NULL (tctx moved to W)
+           io_wq_worker_sleeping(T), called by hand
+wake 1   sched_update_worker(): PF_IO_WORKER → io_wq_worker_running(T)     balanced
+sleep 2  flags = PF_IO_HANDOFF | PF_IO_WORKER
+           PF_IO_WORKER is checked first → io_wq_worker_sleeping(T)         normal worker
+sleep 3  same as sleep 2
+R done   io_handoff_end(): clear PF_IO_HANDOFF, see PF_IO_WORKER → io_handoff_complete()
+```
+
+So after the first handoff, T is a normal io-wq worker until R ends.
+
+Points to note:
+
+| point | detail |
+|---|---|
+| one-shot only by order | After the handoff T still has `PF_IO_HANDOFF`, but `T->io_uring == NULL`. If the hook ran again, its first lines (`tctx = tsk->io_uring; ho = &tctx->handoff; req = ho->req`) would dereference NULL. Only the `else if` order stops that. T must keep `PF_IO_HANDOFF` (`io_issue_handed_off()` and `io_wq_task_work_add()` use it), so a comment or an early `if (!tsk->io_uring) return;` in the hook would make it safe. |
+| refused → retried | If the hook refuses (lock held, no idle worker, `prepare` fails), the next sleep tries again. `thread_handoff_prepare()` is safe to repeat: x86 skips the FPU save once `TIF_NEED_FPU_LOAD` is set; the arm64 helpers are idempotent. |
+| trigger is "about to sleep" | A request with a few short sleeps hands off on the first short one. A task woken between `sched_submit_work()` and `__schedule()` never really sleeps, but its identity has already moved. Not a bug, but it costs a handoff — one more reason why always-blocking requests lose. |
+| sleeps that are not seen | Preemption (task still running): no hook, correct. rt-mutex sleeps: seen, via `rt_mutex_pre_schedule()`. Futex PI (`rt_mutex_futex_pre_schedule()`) skips it, but only runs in the futex syscall, not in an io_uring issue. |
+
+### 2.3.6 Questions Jens asks reviewers
 
 - Is the list of refused task states complete? Is moving thread group
   leadership this way OK (the leader must stay first on `->thread_head`, as
