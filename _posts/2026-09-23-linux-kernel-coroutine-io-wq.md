@@ -205,7 +205,7 @@ coroutine B: wants the same i_rwsem → owner == current → ?
 ## 4. What testing and review found
 
 The first version passed my own tests. The liburing test suite and review
-then found six bugs (three more in §15). Bug 2 was the prototype's own mistake; the other five
+then found six bugs (three more in Part II §9). Bug 2 was the prototype's own mistake; the other five
 are places where kernel code assumes **one task = one sleeping context**:
 
 | # | symptom | cause | fix |
@@ -251,11 +251,11 @@ Correctness, on a **debug kernel** (lockdep, mutex/rwsem/spinlock debugging):
 
 | test | normal | coroutine |
 |---|---|---|
-| own tests T1–T9 (fs ops, pipe wakeups, lock contention, cancel, exit, userfaultfd with i_rwsem held, 200 blocked FIFO opens; T8 cancels again after `-EALREADY`, see §15) | pass | pass |
+| own tests T1–T9 (fs ops, pipe wakeups, lock contention, cancel, exit, userfaultfd with i_rwsem held, 200 blocked FIFO opens; T8 cancels again after `-EALREADY`, see Part II §9) | pass | pass |
 | liburing suite (257 tests) | fails bind-listen, sqe_group, iowait | fails bind-listen, sqe_group, connect (connect: 0/10 fails on rerun in both modes) |
 | lockdep / WARN / hung task | none | none |
 
-Performance, on a **non-debug kernel** (commit 1a59ecf4726c, before the bug 7–9 fixes of §15; lock
+Performance, on a **non-debug kernel** (commit 1a59ecf4726c, before the bug 7–9 fixes of Part II §9; lock
 debugging off), median of 3 runs per value:
 
 Requests that really sleep (async FIFO opens, released after 1 s):
@@ -290,7 +290,7 @@ Other workloads (10 s runs):
   request.
 - pipe: every short sleep costs a coroutine switch, plus the worker loop and
   `uring_lock` contention. Resume-all is at most a small part of this gap
-  (§14).
+  (Part II §8).
 - `RWF_DSYNC` writes are left out: the results vary too much between runs.
   At QD 32, coroutine mode gave 146, 1912 and 1960 ops/s (normal: 122, 303,
   148); at QD 1 it gave 151, 61 and 53 (normal: 149, 129, 151). The emulated
@@ -308,13 +308,13 @@ does 13% fewer ops/s, and statx QD 32 is 8% faster.
 - rt_mutex sleeps (PI futex, some drivers, and all sleeping locks on
   PREEMPT_RT) skip `schedule()` and block the whole worker: safe, but slow.
 - Not handled: proxy execution, per-task stats (PSI) while a coroutine sleeps.
-- Resume-all costs O(sleeping coroutines) per wakeup (§14 fixes it for wait
+- Resume-all costs O(sleeping coroutines) per wakeup (Part II §8 fixes it for wait
   queues). Pipe QD 32 is 13% slower, mostly not because of resume-all.
 - Numbers come from a VM; real hardware not tested.
 
 # Part II: sharing the stack, and waking the right one
 
-## 7. Two costs left from Part I
+## 1. Two costs left from Part I
 
 Two costs remain from Part I:
 
@@ -328,7 +328,7 @@ Two costs remain from Part I:
 The goal for a first upstream version: **simple, efficient, reliable**, and
 easy to extend later.
 
-## 8. The story in one view
+## 2. The story in one view
 
 ```
  Q1: can coroutines share one stack?
@@ -357,17 +357,17 @@ easy to extend later.
 4. A request that sleeps deep inside fs code needs its stack. But a sleeping
    stack is shallow (at most 2352 bytes measured), so one private page is enough.
 5. The waker already holds an address on the sleeper's stack. The stack base
-   tells which coroutine it is. (#4 and #5 were built in separate trees; §16
+   tells which coroutine it is. (#4 and #5 were built in separate trees; §10
    says what combining them needs.)
 
-§9–§10 are #1–#2, §11 is why syscall scope does not help, §12 is #3, §13 is #4,
-§14 is #5, §16 is the v1 choice.
+§3–§4 are #1–#2, §5 is why syscall scope does not help, §6 is #3, §7 is #4,
+§8 is #5, §10 is the v1 choice.
 
 Prototype modes (`kernel.io_uring_wq_coro`): 1 = Part I (own 16 KB stack),
 2 = lazy stack copy, 3 = copy + poison, 4 = stack only from the first sleep,
 5 = shared lower pages.
 
-## 9. Why one stack cannot be shared
+## 3. Why one stack cannot be shared
 
 The first idea: all coroutines of a worker run on **one** stack. On a switch,
 copy the used part out; before running again, copy it back to the same
@@ -427,7 +427,7 @@ The pipe tests passed, but only because a pipe read in io-wq never sleeps
 (io_uring arms poll instead). Copying is cheap, at most 2352 bytes per switch.
 It is wrong, not slow.
 
-## 10. Pre-allocated wait slots: fixes some, not all
+## 4. Pre-allocated wait slots: fixes some, not all
 
 Next idea: allocate the wait objects **per coroutine**, in advance, instead of
 on the stack. The prototype gives each coroutine 12 slots of 192 bytes and
@@ -466,7 +466,7 @@ finds its outer struct with `container_of()`. Sharing the stack this way would
 need every published on-stack object in fs, block, mm and RCU moved off the
 stack. That is a tree-wide change.
 
-## 11. "Only a syscall runs as a coroutine" does not help
+## 5. "Only a syscall runs as a coroutine" does not help
 
 Limiting coroutines to whole syscalls (one io_uring request each) makes the
 entry and the exit clean. It does not decide **where** the op sleeps. The
@@ -489,7 +489,7 @@ State and stack are needed at such a point. Only a suspension point **at the
 top of the op**, with no locks and no stack, avoids both. That is the
 stackless design.
 
-## 12. Stackless: the request is the coroutine
+## 6. Stackless: the request is the coroutine
 
 io_uring is already stackless where the kernel allows it: it issues with
 `IO_URING_F_NONBLOCK`, and on `-EAGAIN` it arms poll and keeps the state in
@@ -570,7 +570,7 @@ Where it fits, and where it does not:
 For the second group, stackless means an async VFS. Those ops stay in io-wq,
 or use stackful coroutines.
 
-## 13. If a stack is needed, make it small
+## 7. If a stack is needed, make it small
 
 How deep is a coroutine's stack **when it sleeps**? A trace at every sleep in
 the stackful prototype:
@@ -630,7 +630,7 @@ plain call, and gets a stack only at its first sleep. Requests that never
 sleep cost no stack. It works and passes the tests, but moving the loop
 between stacks is the most complex part of all the prototypes.
 
-## 14. Waking the right coroutine
+## 8. Waking the right coroutine
 
 The waker does not know about coroutines; it wakes the worker **task**. But
 it usually holds an **address**: the wait entry, the lock waiter, the timer.
@@ -659,7 +659,7 @@ record": the record is at the stack base, and the waker finds it by alignment.
 v1 hooks one function, `default_wake_function()`. It covers all wait queues:
 `wait_event*`, `wait_woken`, wait_bit, wait_var, pipe, FIFO, poll. It is
 +161/−22, about 35 lines of it outside io_uring, and it needs the fix for bug 9
-(§15) underneath. Extensions are independent, with resume-all as the
+(§9) underneath. Extensions are independent, with resume-all as the
 fallback:
 
 ```
@@ -683,13 +683,13 @@ Each row is one boot with an A/B switch; compare within a row only.
 
 v1 alone gets most of the gain, because the costly sleepers are on wait
 queues. Plain statx and pipe showed no difference within the ±20% noise, even
-with E1+E2. So resume-all is at most a small part of their cost in Part I (§5). The
+with E1+E2. So resume-all is at most a small part of their cost in Part I §5. The
 likely costs, not measured one by one, are the coroutine start (two switches),
 the worker loop and `uring_lock` contention.
 
-## 15. Bugs found on the way
+## 9. Bugs found on the way
 
-Numbering continues from §4:
+Bug numbers continue from Part I §4:
 
 | # | symptom | cause | fix |
 |---|---|---|---|
@@ -712,21 +712,21 @@ all modes. Exact wakeup hit it more often (11/40), because a coroutine
 blocked on `uring_lock` is no longer resumed by unrelated wakeups. That makes
 the window wider, but it is not a lost wakeup.
 
-## 16. What to propose first
+## 10. What to propose first
 
 Rule: **simple, efficient, reliable, and extensible.**
 
 ```
                          touches                          per sleeper   covers
- stackless (§12)         io_uring + 2 mm helpers          88–224 B      ops with one top wait
+ stackless (§6)          io_uring + 2 mm helpers          88–224 B      ops with one top wait
  stackful + mode 5       schedule(), ttwu, mutex, fork,   4 KB          every op
-   + exact wakeup (§14)  per-task state switch
+   + exact wakeup (§8)   per-task state switch
  io-wq today             –                                thread        every op
 ```
 
 - **v1: stackless SYNC_FILE_RANGE.** No scheduler, lock or arch code. Exact
   wakeup and clean cancel for free, and it falls back to io-wq for any step it
-  cannot do async. The bugs in §15 and in §4 all came from the stackful
+  cannot do async. The bugs in §9 and in Part I §4 all came from the stackful
   hooks. None of them can happen here.
 - **Extend by op, with the same API:** bdev fsync (done as the second commit),
   then FIFO open and regular-file fdatasync. Add a new await primitive only
@@ -741,7 +741,7 @@ Rule: **simple, efficient, reliable, and extensible.**
 - **Dead ends:** copying the stack, and pre-allocated waiter slots for a
   shared stack.
 
-## 17. Limits
+## 11. Limits
 
 - The host was shared by several VMs, so plain
   statx/pipe throughput differences below ±20% are noise.
@@ -777,6 +777,6 @@ Code: the Part I prototype is 14 files, +798/−58, on v7.3-rc4, not published y
 Tests [`iowq_coro_test.c`]({{ site.baseurl }}/code/io-wq-coro/iowq_coro_test.c),
 [`iowq_coro_bench.c`]({{ site.baseurl }}/code/io-wq-coro/iowq_coro_bench.c).
 Run `iowq_coro_test <dir-on-ext4>` once with `kernel.io_uring_wq_coro=0` and
-once with `=1`. T8 cancels again after `-EALREADY` (§15). The Part II
+once with `=1`. T8 cancels again after `-EALREADY` (Part II §9). The Part II
 prototypes (stackless, shared-page stacks, exact wakeup) and their benchmarks
 are on the same base, not published yet.
