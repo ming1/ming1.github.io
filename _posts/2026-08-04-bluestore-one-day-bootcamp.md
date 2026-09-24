@@ -10,10 +10,8 @@ tags: [ceph, bluestore, storage, learning, testing, debugging]
 > A live log of a one-day intensive on the BlueStore codebase (Ceph v21.3.0):
 > six subsystem stations, each a loop of *orient → grill → trace on real
 > hardware → gap-fill*, plus two self-written patches built and verified along
-> the way. Companion posts:
-> [BlueStore Internals]({{ site.baseurl }}/storage/bluestore-v21-internals) and
-> the [Code Quiz]({{ site.baseurl }}/storage/ceph-bluestore-code-quiz), which
-> serves as the closed-book final exam.
+> the way. Companion post:
+> [BlueStore Internals]({{ site.baseurl }}/storage/bluestore-v21-internals).
 
 ## Method
 
