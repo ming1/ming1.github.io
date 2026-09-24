@@ -52,11 +52,13 @@ Two running posts share one shape — a new issue is a new section in the matchi
 
 One `# N.` section per issue (in the Ceph post: `## N.` under a `# Part …` component group — BlueStore/BlueFS, OSD, Messenger, RGW; section numbers run continuously across parts, and a new issue goes into its part and renumbers the ones after it, with the part table at the top updated): a status line (how found · affects · component · fix · Status), then Report → Analysis → Proposed solution → Takeaways. When adding or reworking a section:
 
-- **Open with the story.** Unless the issue is a few paragraphs long, make `N.1` a "story in one view" (model: Ceph post §8.1) so the reader has the whole idea before any evidence:
+- **Every section needs `N.1 The story in one view`** — required, not optional; readers find it the most useful part. Model: Ceph post **§6.1** (Tracker #72848). It gives the whole idea before any evidence:
   1. a one- or two-sentence thesis;
-  2. one lane/flow diagram with `#N` gutter markers;
-  3. a numbered cause→effect chain keyed to the same `#N` — how the path normally works → where it goes wrong → what that costs → what was supposed to prevent it → the gap → the fix (and any twist the fix exposes);
+  2. one lane/flow diagram with `#N` gutter markers (e.g. write path | clone path), ending with the fix as the last `#N`;
+  3. a short numbered cause→effect chain keyed to the same `#N` — normal path → where it breaks → cost → the gap → the fix. §6.1 does it in 4 steps of 1–3 lines: the diagram carries the detail, the chain only names each step;
   4. a 2–3 line map of which subsection proves which step.
+
+  Below it, draw each thing once: one picture per mechanism (§6 keeps one "three views" picture of the blob, not three), no prose that restates a diagram.
 - The N.1 chain runs top-down (cause→effect) in plain words; the Analysis `why?` tree runs bottom-up (symptom→cause) with `file:line`. Keep both, and don't restate the mechanism in prose between them.
 - **One bug, one linear story.** If an issue grows a second bug (a review finding, a sibling gap), give it its own `N.x` block — observation → root cause → fix → why safe → validation — instead of interleaving it through Report/Analysis/Solution. One merged Takeaways at the end.
 - When renumbering, fix the in-section `N.x.y` cross-refs; other posts link only to a section as a whole.
