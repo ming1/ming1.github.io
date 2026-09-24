@@ -500,18 +500,27 @@ static int t7_samelock(void)
 	return 0;
 }
 
+/*
+ * A cancel that finds its read running in io-wq returns -EALREADY: the read
+ * goes on, and may then arm poll and wait for data that never comes. Like a
+ * real application, cancel it again then: it is found in the poll table.
+ */
 static int t8_cancelrace(void)
 {
-	int p[16][2], res[32], round, i, bad = 0;
+	int p[16][2], res[32], round, i, bad = 0, retries = 0;
 	char in[16][8];
 	struct io_uring ring;
 	struct io_uring_sqe *sqe;
+	struct io_uring_cqe *cqe;
 
 	io_uring_queue_init(64, &ring, 0);
 	for (i = 0; i < 16; i++)
 		if (pipe(p[i]))
 			FAIL("T8 pipe");
 	for (round = 0; round < 100; round++) {
+		int reads = 0, cancels = 0;
+		double end;
+
 		for (i = 0; i < 16; i++) {
 			sqe = io_uring_get_sqe(&ring);
 			io_uring_prep_read(sqe, p[i][0], in[i], sizeof(in[i]), 0);
@@ -528,10 +537,42 @@ static int t8_cancelrace(void)
 			io_uring_prep_cancel64(sqe, i + 1, 0);
 			sqe->user_data = 16 + i + 1;
 			io_uring_submit(&ring);
+			cancels++;
 		}
 		memset(res, 0x7f, sizeof(res));
-		if (wait_cqes(&ring, 16 + 8, res, 32, 10))
-			FAIL("T8 round %d timeout", round);
+		end = now() + 10;
+		while (reads < 16 || cancels) {
+			struct __kernel_timespec ts = { .tv_nsec = 100000000 };
+			int ret = io_uring_wait_cqe_timeout(&ring, &cqe, &ts);
+			unsigned ud;
+
+			if (ret == -ETIME || ret == -EINTR) {
+				if (now() > end)
+					FAIL("T8 round %d timeout: %d reads, %d cancels left",
+					     round, 16 - reads, cancels);
+				continue;
+			}
+			if (ret)
+				FAIL("T8 wait %d", ret);
+			ud = cqe->user_data;
+			res[ud] = cqe->res;
+			io_uring_cqe_seen(&ring, cqe);
+			if (ud < 16) {
+				reads++;
+				continue;
+			}
+			cancels--;
+			/* still running: cancel again unless it finished */
+			if (res[ud] == -EALREADY && res[ud - 16] == 0x7f7f7f7f) {
+				usleep(1000);
+				sqe = io_uring_get_sqe(&ring);
+				io_uring_prep_cancel64(sqe, ud - 16, 0);
+				sqe->user_data = ud;
+				io_uring_submit(&ring);
+				cancels++;
+				retries++;
+			}
+		}
 		for (i = 0; i < 16; i += 2)
 			if (res[i] != 1) {
 				printf("  T8 round %d: woken read %d got %d\n",
@@ -549,6 +590,8 @@ static int t8_cancelrace(void)
 		close(p[i][1]);
 	}
 	io_uring_queue_exit(&ring);
+	if (retries)
+		printf("# T8 canceled again after -EALREADY: %d\n", retries);
 	if (bad)
 		FAIL("T8 %d innocent reads failed", bad);
 	return 0;
