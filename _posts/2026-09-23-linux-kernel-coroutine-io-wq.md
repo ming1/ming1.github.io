@@ -205,8 +205,9 @@ coroutine B: wants the same i_rwsem → owner == current → ?
 ## 4. What testing and review found
 
 The first version passed my own tests. The liburing test suite and review
-then found six bugs (three more in Part II §9). Bug 2 was the prototype's own mistake; the other five
-are places where kernel code assumes **one task = one sleeping context**:
+then found six bugs (three more in Part II §5). Bug 2 was the prototype's own
+mistake; the other five are places where kernel code assumes **one task = one
+sleeping context**:
 
 | # | symptom | cause | fix |
 |---|---|---|---|
@@ -251,12 +252,12 @@ Correctness, on a **debug kernel** (lockdep, mutex/rwsem/spinlock debugging):
 
 | test | normal | coroutine |
 |---|---|---|
-| own tests T1–T9 (fs ops, pipe wakeups, lock contention, cancel, exit, userfaultfd with i_rwsem held, 200 blocked FIFO opens; T8 cancels again after `-EALREADY`, see Part II §9) | pass | pass |
+| own tests T1–T9 (fs ops, pipe wakeups, lock contention, cancel, exit, userfaultfd with i_rwsem held, 200 blocked FIFO opens; T8 cancels again after `-EALREADY`, see Part II §5) | pass | pass |
 | liburing suite (257 tests) | fails bind-listen, sqe_group, iowait | fails bind-listen, sqe_group, connect (connect: 0/10 fails on rerun in both modes) |
 | lockdep / WARN / hung task | none | none |
 
-Performance, on a **non-debug kernel** (commit 1a59ecf4726c, before the bug 7–9 fixes of Part II §9; lock
-debugging off), median of 3 runs per value:
+Performance, on a **non-debug kernel** (commit 1a59ecf4726c, before the bug
+7–9 fixes of Part II §5; lock debugging off), median of 3 runs per value:
 
 Requests that really sleep (async FIFO opens, released after 1 s):
 
@@ -290,7 +291,7 @@ Other workloads (10 s runs):
   request.
 - pipe: every short sleep costs a coroutine switch, plus the worker loop and
   `uring_lock` contention. Resume-all is at most a small part of this gap
-  (Part II §8).
+  (Part II §6.3).
 - `RWF_DSYNC` writes are left out: the results vary too much between runs.
   At QD 32, coroutine mode gave 146, 1912 and 1960 ops/s (normal: 122, 303,
   148); at QD 1 it gave 151, 61 and 53 (normal: 149, 129, 151). The emulated
@@ -308,13 +309,13 @@ does 13% fewer ops/s, and statx QD 32 is 8% faster.
 - rt_mutex sleeps (PI futex, some drivers, and all sleeping locks on
   PREEMPT_RT) skip `schedule()` and block the whole worker: safe, but slow.
 - Not handled: proxy execution, per-task stats (PSI) while a coroutine sleeps.
-- Resume-all costs O(sleeping coroutines) per wakeup (Part II §8 fixes it for wait
-  queues). Pipe QD 32 is 13% slower, mostly not because of resume-all.
+- Resume-all costs O(sleeping coroutines) per wakeup (Part II §4.3 fixes it
+  for wait queues). Pipe QD 32 is 13% slower, mostly not because of resume-all.
 - Numbers come from a VM; real hardware not tested.
 
 # Part II: sharing the stack, and waking the right one
 
-## 1. Two costs left from Part I
+## 1. The problem
 
 Two costs remain from Part I:
 
@@ -328,7 +329,7 @@ Two costs remain from Part I:
 The goal for a first upstream version: **simple, efficient, reliable**, and
 easy to extend later.
 
-## 2. The story in one view
+## 2. The idea
 
 ```
  Q1: can coroutines share one stack?
@@ -357,17 +358,24 @@ easy to extend later.
 4. A request that sleeps deep inside fs code needs its stack. But a sleeping
    stack is shallow (at most 2352 bytes measured), so one private page is enough.
 5. The waker already holds an address on the sleeper's stack. The stack base
-   tells which coroutine it is. (#4 and #5 were built in separate trees; §10
+   tells which coroutine it is. (#4 and #5 were built in separate trees; §7
    says what combining them needs.)
 
-§3–§4 are #1–#2, §5 is why syscall scope does not help, §6 is #3, §7 is #4,
-§8 is #5, §10 is the v1 choice.
+| step | question | section |
+|---|---|---|
+| #1, #2 | why can't coroutines share one stack? | §3 |
+| #3 | how does a request suspend without a stack? | §4.1 |
+| #4 | how small can a stack be? | §4.2 |
+| #5 | how does a wakeup find its coroutine? | §4.3 |
+| – | what to propose first? | §7 |
 
 Prototype modes (`kernel.io_uring_wq_coro`): 1 = Part I (own 16 KB stack),
 2 = lazy stack copy, 3 = copy + poison, 4 = stack only from the first sleep,
 5 = shared lower pages.
 
-## 3. Why one stack cannot be shared
+## 3. Why a shared stack does not work
+
+### 3.1 Copying the stack in and out
 
 The first idea: all coroutines of a worker run on **one** stack. On a switch,
 copy the used part out; before running again, copy it back to the same
@@ -427,7 +435,7 @@ The pipe tests passed, but only because a pipe read in io-wq never sleeps
 (io_uring arms poll instead). Copying is cheap, at most 2352 bytes per switch.
 It is wrong, not slow.
 
-## 4. Pre-allocated wait slots: fixes some, not all
+### 3.2 Pre-allocated wait slots
 
 Next idea: allocate the wait objects **per coroutine**, in advance, instead of
 on the stack. The prototype gives each coroutine 12 slots of 192 bytes and
@@ -466,7 +474,7 @@ finds its outer struct with `container_of()`. Sharing the stack this way would
 need every published on-stack object in fs, block, mm and RCU moved off the
 stack. That is a tree-wide change.
 
-## 5. "Only a syscall runs as a coroutine" does not help
+### 3.3 Running only syscalls as coroutines
 
 Limiting coroutines to whole syscalls (one io_uring request each) makes the
 entry and the exit clean. It does not decide **where** the op sleeps. The
@@ -489,7 +497,9 @@ State and stack are needed at such a point. Only a suspension point **at the
 top of the op**, with no locks and no stack, avoids both. That is the
 stackless design.
 
-## 6. Stackless: the request is the coroutine
+## 4. How it works
+
+### 4.1 Stackless: the request is the coroutine
 
 io_uring is already stackless where the kernel allows it: it issues with
 `IO_URING_F_NONBLOCK`, and on `-EAGAIN` it arms poll and keeps the state in
@@ -530,32 +540,16 @@ Wakeup and resume:
               └─ ->issue(req) again, at aw->state, on the submitter's own stack
 ```
 
-- **Exact wakeup by construction**: 1024 waits → 1024 wakes, 1024 resumes,
-  2048 `->issue()` calls (the first issue plus one resume each).
-- **No io-wq thread while waiting**: 1024 suspended requests, 0 workers.
+- **Exact wakeup by construction**: the wait entry is inside one request, so
+  the wakeup resumes exactly that request.
+- **No io-wq thread while waiting**: a suspended request holds no stack and
+  no thread (counts and throughput in §6.1).
 - **Cancel and exit** go through a list in the ring. The canceller tries to
   dequeue the entry under the wait queue lock; if the wakeup wins, the resume
   sees `canceled`. Either way the request completes `-ECANCELED` exactly once.
 - **No sched, lock or arch change.** v1 (SYNC_FILE_RANGE) is +413/−8, mostly
   in io_uring, plus two mm helpers (`folio_wait_writeback_async()` and its
   cancel).
-
-Numbers (non-debug, write + linked sync, median of 3 × 5 s, ops/s):
-
-| workload | stackless | io-wq today | stackful (Part I design, same run) |
-|---|---|---|---|
-| NVMe bdev fdatasync QD 32 | 2479 (4 workers) | 427 (33 workers) | 1124 |
-| NVMe bdev fdatasync QD 1024 | 39911 | 629 | 11959 |
-| SFR on ext4/NVMe QD 1024 | 13153 | 9553 (64 workers) | 10948 |
-| SFR on null_blk QD 1024 | 210933 | **293424** | 151759 |
-
-- The spread is wide on this shared host: NVMe QD 32 stackless ranged
-  92–2642, QD 1024 2104–41592. Measured before the code was split into commits; the op code is the same.
-- On the (emulated) NVMe disk, where flushes dominate, all flush bios are in
-  flight at once and merge.
-- No gain at QD 1 (120 / 122 / 153). On null_blk, stackful is fastest for
-  fdatasync QD 32, and io-wq wins SFR QD 1024: all resumes run on the one
-  submitter task, while io-wq spreads the work over threads.
 
 Where it fits, and where it does not:
 
@@ -570,7 +564,7 @@ Where it fits, and where it does not:
 For the second group, stackless means an async VFS. Those ops stay in io-wq,
 or use stackful coroutines.
 
-## 7. If a stack is needed, make it small
+### 4.2 When a stack is needed: keep only the top page private
 
 How deep is a coroutine's stack **when it sleeps**? A trace at every sleep in
 the stackful prototype:
@@ -614,23 +608,14 @@ Why it is correct:
   the coroutine does **not** switch away. It sleeps for real and blocks the
   worker, like io-wq today. That happened 0 times in all runs.
 
-Memory at peak:
-
-| workload | 16 KB per coroutine | mode 5 |
-|---|---|---|
-| 400 FIFO opens asleep | 6.4 MB | 1.7 MB |
-| dsync QD 32 | 1.3 MB | 0.4 MB |
-
-For comparison, io-wq today uses a whole thread per sleeping request: a 16 KB
-stack plus a ~10 KB `task_struct`, capped at 64 threads here. In the 400-open
-test, 336 opens had not even started.
-
 A lazy variant (mode 4) goes further: a request runs on the loop's stack as a
 plain call, and gets a stack only at its first sleep. Requests that never
 sleep cost no stack. It works and passes the tests, but moving the loop
 between stacks is the most complex part of all the prototypes.
 
-## 8. Waking the right coroutine
+Memory numbers are in §6.2.
+
+### 4.3 Waking the right coroutine
 
 The waker does not know about coroutines; it wakes the worker **task**. But
 it usually holds an **address**: the wait entry, the lock waiter, the timer.
@@ -659,7 +644,7 @@ record": the record is at the stack base, and the waker finds it by alignment.
 v1 hooks one function, `default_wake_function()`. It covers all wait queues:
 `wait_event*`, `wait_woken`, wait_bit, wait_var, pipe, FIFO, poll. It is
 +161/−22, about 35 lines of it outside io_uring, and it needs the fix for bug 9
-(§9) underneath. Extensions are independent, with resume-all as the
+(§5, below) underneath. Extensions are independent, with resume-all as the
 fallback:
 
 ```
@@ -669,25 +654,9 @@ fallback:
  left task-only wakeups (blk_wake_io_task, wake_up_process), signals → resume all
 ```
 
-Mixed load: FIFO opens asleep in io-wq while `statx` QD 1 runs
-(median of 5, same boot, non-debug):
+Numbers are in §6.3.
 
-| sleepers | kernel | resume-all | exact | gain |
-|---|---|---|---|---|
-| 16 | v1 | 84.8k | 104.9k | 1.24× |
-| 16 | v1+E1+E2 | 98.0k | 124.1k | 1.27× |
-| 60 | v1 | 70.9k | 93.8k | 1.32× |
-| 60 | v1+E1+E2 | 73.8k | 108.9k | 1.48× |
-
-Each row is one boot with an A/B switch; compare within a row only.
-
-v1 alone gets most of the gain, because the costly sleepers are on wait
-queues. Plain statx and pipe showed no difference within the ±20% noise, even
-with E1+E2. So resume-all is at most a small part of their cost in Part I §5. The
-likely costs, not measured one by one, are the coroutine start (two switches),
-the worker loop and `uring_lock` contention.
-
-## 9. Bugs found on the way
+## 5. What testing and review found
 
 Bug numbers continue from Part I §4:
 
@@ -712,21 +681,80 @@ all modes. Exact wakeup hit it more often (11/40), because a coroutine
 blocked on `uring_lock` is no longer resumed by unrelated wakeups. That makes
 the window wider, but it is not a lost wakeup.
 
-## 10. What to propose first
+## 6. Results
+
+### 6.1 Stackless
+
+Counting with ftrace: 1024 waits gave 1024 wakes, 1024 resumes and 2048
+`->issue()` calls (the first issue plus one resume each). 1024 suspended
+requests used 0 io-wq workers.
+
+Throughput (non-debug, write + linked sync, median of 3 × 5 s, ops/s):
+
+| workload | stackless | io-wq today | stackful (Part I design, same run) |
+|---|---|---|---|
+| NVMe bdev fdatasync QD 32 | 2479 (4 workers) | 427 (33 workers) | 1124 |
+| NVMe bdev fdatasync QD 1024 | 39911 | 629 | 11959 |
+| SFR on ext4/NVMe QD 1024 | 13153 | 9553 (64 workers) | 10948 |
+| SFR on null_blk QD 1024 | 210933 | **293424** | 151759 |
+
+- The spread is wide on this shared host: NVMe QD 32 stackless ranged
+  92–2642, QD 1024 2104–41592. Measured before the code was split into
+  commits; the op code is the same.
+- On the (emulated) NVMe disk, where flushes dominate, all flush bios are in
+  flight at once and merge.
+- No gain at QD 1 (120 / 122 / 153). On null_blk, stackful is fastest for
+  fdatasync QD 32, and io-wq wins SFR QD 1024: all resumes run on the one
+  submitter task, while io-wq spreads the work over threads.
+
+### 6.2 Memory with a private top page
+
+Peak coroutine stack memory:
+
+| workload | 16 KB per coroutine (mode 1) | private top page (mode 5) |
+|---|---|---|
+| 400 FIFO opens asleep | 6.4 MB | 1.7 MB |
+| dsync QD 32 | 1.3 MB | 0.4 MB |
+
+For comparison, io-wq today uses a whole thread per sleeping request: a 16 KB
+stack plus a ~10 KB `task_struct`, capped at 64 threads here. In the 400-open
+test, 336 opens had not even started.
+
+### 6.3 Exact wakeup
+
+Mixed load: FIFO opens asleep in io-wq while `statx` QD 1 runs
+(median of 5, same boot, non-debug):
+
+| sleepers | kernel | resume-all | exact | gain |
+|---|---|---|---|---|
+| 16 | v1 | 84.8k | 104.9k | 1.24× |
+| 16 | v1+E1+E2 | 98.0k | 124.1k | 1.27× |
+| 60 | v1 | 70.9k | 93.8k | 1.32× |
+| 60 | v1+E1+E2 | 73.8k | 108.9k | 1.48× |
+
+Each row is one boot with an A/B switch; compare within a row only.
+
+v1 alone gets most of the gain, because the costly sleepers are on wait
+queues. Plain statx and pipe showed no difference within the ±20% noise, even
+with E1+E2. So resume-all is at most a small part of their cost in Part I
+§5. The likely costs, not measured one by one, are the coroutine start (two
+switches), the worker loop and `uring_lock` contention.
+
+## 7. What to propose first
 
 Rule: **simple, efficient, reliable, and extensible.**
 
 ```
                          touches                          per sleeper   covers
- stackless (§6)          io_uring + 2 mm helpers          88–224 B      ops with one top wait
+ stackless (§4.1)        io_uring + 2 mm helpers          88–224 B      ops with one top wait
  stackful + mode 5       schedule(), ttwu, mutex, fork,   4 KB          every op
-   + exact wakeup (§8)   per-task state switch
+   + exact wakeup (§4.3) per-task state switch
  io-wq today             –                                thread        every op
 ```
 
 - **v1: stackless SYNC_FILE_RANGE.** No scheduler, lock or arch code. Exact
   wakeup and clean cancel for free, and it falls back to io-wq for any step it
-  cannot do async. The bugs in §9 and in Part I §4 all came from the stackful
+  cannot do async. The bugs in §5 and in Part I §4 all came from the stackful
   hooks. None of them can happen here.
 - **Extend by op, with the same API:** bdev fsync (done as the second commit),
   then FIFO open and regular-file fdatasync. Add a new await primitive only
@@ -741,10 +769,10 @@ Rule: **simple, efficient, reliable, and extensible.**
 - **Dead ends:** copying the stack, and pre-allocated waiter slots for a
   shared stack.
 
-## 11. Limits
+## 8. Limits
 
-- The host was shared by several VMs, so plain
-  statx/pipe throughput differences below ±20% are noise.
+- The host was shared by several VMs, so plain statx/pipe throughput
+  differences below ±20% are noise.
 - Mode 5 is untested with KASAN and on other architectures. It maps the same
   pages into many vmap areas: legal, but new for mm.
 - Stackless changes the parallelism: all resumes run on the submitter task,
@@ -754,8 +782,9 @@ Rule: **simple, efficient, reliable, and extensible.**
 
 # Takeaways
 
-- **A request that sleeps deep in the kernel needs a stack, not a thread.** The kernel has always
-  used one per sleeper because `task_struct` and stack came together.
+- **A request that sleeps deep in the kernel needs a stack, not a thread.**
+  The kernel has always used one per sleeper because `task_struct` and stack
+  came together.
 - **Stackful coroutines need two scheduler hooks:** `schedule()` to park,
   `try_to_wake_up()` to notice a wakeup.
 - **The hard part is code that assumes one task = one sleeper:** per-task
@@ -777,6 +806,6 @@ Code: the Part I prototype is 14 files, +798/−58, on v7.3-rc4, not published y
 Tests [`iowq_coro_test.c`]({{ site.baseurl }}/code/io-wq-coro/iowq_coro_test.c),
 [`iowq_coro_bench.c`]({{ site.baseurl }}/code/io-wq-coro/iowq_coro_bench.c).
 Run `iowq_coro_test <dir-on-ext4>` once with `kernel.io_uring_wq_coro=0` and
-once with `=1`. T8 cancels again after `-EALREADY` (Part II §9). The Part II
+once with `=1`. T8 cancels again after `-EALREADY` (Part II §5). The Part II
 prototypes (stackless, shared-page stacks, exact wakeup) and their benchmarks
 are on the same base, not published yet.
