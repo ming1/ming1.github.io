@@ -242,11 +242,10 @@ It shows the one rule the design depends on: **every wakeup must go through
 # 5. Results
 
 Setup: virtme-ng VM, 16 vCPUs, `PREEMPT(full)`, ext4 on an emulated NVMe
-disk, debug kernel (lockdep on), `CONFIG_IO_WQ_CORO=y`,
-`kernel.io_uring_wq_coro` = 0 or 1 (it applies to workers created after it is
-set).
+disk, `CONFIG_IO_WQ_CORO=y`, `kernel.io_uring_wq_coro` = 0 or 1 (it applies
+to workers created after it is set).
 
-Correctness:
+Correctness, on a **debug kernel** (lockdep, mutex/rwsem/spinlock debugging):
 
 | test | normal | coroutine |
 |---|---|---|
@@ -254,39 +253,52 @@ Correctness:
 | liburing suite (257 tests) | fails bind-listen, sqe_group, iowait | fails bind-listen, sqe_group, connect (connect: 0/10 fails on rerun in both modes) |
 | lockdep / WARN / hung task | none | none |
 
+Performance, on a **non-debug kernel** (commit 1a59ecf4726c, lock
+debugging off), median of 3 runs per value:
+
 Requests that really sleep (async FIFO opens, released after 1 s):
 
 ```
 blocked opens    io-wq threads          time from release to all done
-                 normal   coroutine     normal     coroutine
-     64            64         1          9.4 ms      6.0 ms
-    256            64         4         31.6 ms      9.3 ms
-   1024            64        16         44.8 ms     13.9 ms
-   4096            64        64        104.6 ms     58.6 ms
+                 normal   coroutine     normal     coroutine   speedup
+     64            64         1          5.7 ms      5.1 ms     1.1×
+    256            64         4         15.2 ms      8.9 ms     1.7×
+   1024            64        16         32.9 ms      9.2 ms     3.6×
+   4096            64        64         73.3 ms     18.5 ms     4.0×
 ```
 
-Normal io-wq stops at 64 threads; the rest wait in the queue, unstarted.
-Coroutine mode runs all of them, with few threads up to 1024 (at 4096 it
-needs 64 × 64).
+Normal io-wq stops at 64 threads; the rest wait in the queue, unstarted, so
+its time grows with the number of requests. Coroutine mode starts all of
+them, with few threads up to 1024. At 4096 it needs 64 threads × 64
+coroutines each: the same thread count as normal, but every request has
+started.
 
-The cost, for other workloads (one 5 s run each):
+Other workloads (10 s runs):
 
-| workload | normal | coroutine |
-|---|---|---|
-| statx, never sleeps, QD 1 | 81k ops/s | 83k ops/s |
-| statx, QD 32 | 268k ops/s | 241k ops/s |
-| pipe read + write, QD 1 | 47k ops/s | 38k ops/s |
-| pipe read + write, QD 32 | 114k ops/s, 217% CPU | 112k ops/s, 314% CPU |
-| 4K `RWF_DSYNC` write, QD 1 | 106 ops/s | 148 ops/s |
-| 4K `RWF_DSYNC` write, QD 32 | 160 ops/s | 89 ops/s |
+| workload | normal | coroutine | change |
+|---|---|---|---|
+| statx, never sleeps, QD 1 | 137.6k ops/s | 135.6k ops/s | −1.5% (noise) |
+| statx, QD 32 | 424.8k ops/s, 207% CPU | 458.7k ops/s, 226% CPU | +8% (and +9% CPU) |
+| pipe read + write, QD 1 | 68.9k ops/s | 64.3k ops/s | −7% |
+| pipe read + write, QD 32 | 266.7k ops/s, 203% CPU | 232.1k ops/s, 204% CPU | −13% |
 
-The dsync rows are only ~100 ops/s on an emulated disk, one run each: likely
-noise, but not checked.
+- statx QD 1 does not change: it never sleeps, so there is nothing to gain,
+  and the hand-off to io-wq is still there. This design does not remove the
+  hand-off cost that Jens's RFC targets; it removes the thread per sleeping
+  request.
+- pipe: every short sleep costs a coroutine switch, and "resume all on any
+  wakeup" resumes coroutines that were not woken. That is the price of the
+  simple model.
+- `RWF_DSYNC` writes are left out: the results vary too much between runs.
+  At QD 32, coroutine mode gave 146, 1912 and 1960 ops/s (normal: 122, 303,
+  148); at QD 1 it gave 151, 61 and 53 (normal: 149, 129, 151). The emulated
+  disk's flush behavior probably dominates. This needs real hardware.
 
-"Resume all on any wakeup" is simple, but wastes CPU when many coroutines
-sleep for short times. Also, the hand-off to io-wq is still there: this
-design does not remove the hand-off cost that Jens's RFC targets, it removes
-the thread per sleeping request.
+Debug vs non-debug: on the debug kernel (one 5 s run), pipe QD 32 in
+coroutine mode used 314% CPU against 217%, and statx QD 32 was 10% slower.
+Most likely the lock debugging caused that, lockdep above all: every switch
+copies the held-locks array. Without it, pipe QD 32 uses the same CPU but
+does 13% fewer ops/s, and statx QD 32 is 8% faster.
 
 # 6. Limits
 
@@ -294,8 +306,9 @@ the thread per sleeping request.
 - rt_mutex sleeps (PI futex, some drivers, and all sleeping locks on
   PREEMPT_RT) skip `schedule()` and block the whole worker: safe, but slow.
 - Not handled: proxy execution, per-task stats (PSI) while a coroutine sleeps.
-- Resume-all costs O(sleeping coroutines) per wakeup.
-- Debug-kernel numbers only.
+- Resume-all costs O(sleeping coroutines) per wakeup; with the switch cost,
+  pipe QD 32 is 13% slower.
+- Numbers come from a VM; real hardware not tested.
 
 # 7. Takeaways
 
