@@ -869,10 +869,10 @@ How several requests then run at once, e.g. 3 fsyncs on ext4:
 - The coroutine runs the same code as an io-wq worker
   (`io_wq_submit_work()`), so no op changes.
 
-The one rule: **hold nothing across a switch**, neither when a coroutine
-stops nor when the host switches into one. Locks, the lockdep list and
-`journal_info` belong to the host task, and kco does not swap them. If a
-lock crosses an await point:
+The one rule: **a coroutine must not hold anything when it stops**, no
+lock it took and no journal handle, whether it took them inside the await
+scope or before it. Locks, the lockdep list and `journal_info` belong to the
+host task, and kco does not swap them. If a lock crosses an await point:
 
 ```
  host runs co A:  mutex_lock(&M)      owner = host
@@ -898,6 +898,38 @@ before it sleeps, and a bdev flush holds nothing. For the same reason,
 io_uring runs coroutines only after dropping `uring_lock`. Parts I and II
 allowed locks to cross a switch; that is what needed the lock-owner and
 per-task hooks.
+
+The host itself may hold locks while it runs coroutines. At exec,
+`begin_new_exec()` cancels io_uring requests with `cred_guard_mutex` held,
+and that runs coroutines; io_uring waits for io-wq under the same lock
+today. A coroutine must just never take a lock the host holds.
+
+Which lock types matter, and what `CONFIG_KCO_DEBUG` catches when a
+coroutine stops:
+
+```
+ lock type                              can cross a stop?  caught by
+ ─────────────────────────────────────  ─────────────────  ─────────────────────
+ mutex, rw_semaphore, percpu rwsem      yes                lockdep
+   (i_rwsem, mmap_lock, sb_start_write)
+ rt_mutex, srcu_read_lock, lock_sock    yes                lockdep
+ fs transaction (current->journal_info: yes                journal_info check
+   ext4/jbd2, btrfs, gfs2, ...)
+ folio lock, buffer lock, other         yes                nothing: review only
+   sleeping bit locks
+ struct semaphore, state bits + wait    yes                nothing: review only
+ spinlock, rwlock, bit_spin_lock,       no (cannot sleep)  atomic / irq / RCU
+   irq/bh/preempt off, rcu_read_lock                       check
+```
+
+- The check compares the task's state when the coroutine stops with its
+  state when the host switched into it. Anything the coroutine took and
+  still holds is reported.
+- A jbd2 handle is the worst case: a coroutine that waits for a commit
+  while it holds a handle deadlocks even alone, because the commit waits
+  for that handle.
+- Bit locks and semaphores are invisible to lockdep. That is why each await
+  point is checked by hand and kept narrow.
 
 ## 3. How it works
 
@@ -1050,10 +1082,9 @@ What testing and review caught:
   high QD.
 - Benchmarks were run before the last review fixes.
 - Use 2 has tests but no in-tree user yet.
-- The rule "hold nothing across a switch" is checked only with
-  `CONFIG_KCO_DEBUG`, and only for locks taken inside the await scope. A
-  lock taken before the scope, and one held by the host when it switches in,
-  are not caught yet.
+- The rule is checked only with `CONFIG_KCO_DEBUG`, and only for lock types
+  lockdep tracks and for `journal_info`. Bit locks and semaphores depend on
+  review.
 
 # Takeaways
 
