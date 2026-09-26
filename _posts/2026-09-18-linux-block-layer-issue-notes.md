@@ -483,8 +483,20 @@ workers:
                   thread_handoff_finish(): take the identity, return to user
 ```
 
-Many blocked SQEs in one call move only the creds per step, and the full
-identity once, at the end.
+**Many blocking SQEs in one call.** Each hop moves only the creds; the full
+identity moves once, at the end. But each hop needs an idle spare worker,
+and there are only 2 (`IO_WQ_HANDOFF_SPARES`). So with 32 blocking SQEs:
+
+```
+ SQE 1       2 spares idle → inline in T, blocks → hand off to W1
+ SQE 2       1 spare idle  → inline in W1, blocks → hand off to W2
+ SQE 3..32   0 spares idle → sent to io-wq, as today
+             W2 returns to user space as tid 100
+```
+
+Each blocked request still sleeps on some thread's stack: T, W1, and 30
+io-wq workers. So 32 blocked requests still need about 32 threads. The
+handoff saves the round trip only for requests that do **not** block.
 
 ## 2.5 What moves
 
