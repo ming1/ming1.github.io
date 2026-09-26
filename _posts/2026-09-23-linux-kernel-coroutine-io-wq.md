@@ -831,6 +831,44 @@ Only the **stack** is switched. All of it fits in `kernel/kco/`.
 Outside a coroutine the mark does nothing, so the same code works in both
 places.
 
+What the mark does, and what a plain sleep is:
+
+- `scoped_guard(kco_await)` only counts "inside an await scope". The two
+  wait helpers, `kco_wait_event()` and `bio_await()`, check it: inside the
+  scope they suspend the coroutine, otherwise they wait as usual.
+- A coroutine is **not** a new task. It is the host task on another stack.
+  So a plain sleep (a mutex, a page fault, a `wait_event()` outside the
+  scope) is an ordinary sleep of the host: the scheduler sees one task
+  sleep, and a wakeup resumes it right there, on the coroutine's stack.
+
+How several requests then run at once, e.g. 3 fsyncs on ext4:
+
+```
+ host thread                             co1          co2          co3
+ ──────────────────────────────────────  ───────────  ───────────  ───────────
+ submit: start co1, co2, co3
+ run co1  ─────────────────────────────→ ->issue()
+                                         wait commit
+          ←──────────────────────────── suspend
+ run co2  ───────────────────────────────────────────→ same, suspend
+ run co3  ────────────────────────────────────────────────────────→ same
+ nothing ready: the thread sleeps
+
+          jbd2: ONE commit for all 3 → wakes co1, co2, co3
+
+ run co1, co2, co3                       flush bio    flush bio    flush bio
+                                         suspend      suspend      suspend
+          flush done → wakes them
+ run co1, co2, co3                       CQE          CQE          CQE
+```
+
+- Only one `->issue()` uses the CPU at a time, but the **waits overlap**:
+  all 3 wait for the commit and the flush together, as with 3 io-wq threads.
+- Each coroutine keeps its call chain on its own stack. Resuming it is a
+  stack switch back into the wait, which checks its condition again.
+- The coroutine runs the same code as an io-wq worker
+  (`io_wq_submit_work()`), so no op changes.
+
 ## 3. How it works
 
 ```
