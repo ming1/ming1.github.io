@@ -494,6 +494,14 @@ and there are only 2 (`IO_WQ_HANDOFF_SPARES`). So with 32 blocking SQEs:
              W2 returns to user space as tid 100
 ```
 
+Why do SQEs 3..32 go to io-wq, and not inline? Inline is safe only if the
+thread can hand off when the request blocks. Without an idle spare, a
+blocking request would leave the app thread stuck in `io_uring_enter()`.
+The op has no nonblocking path to try, so io-wq is the only safe choice.
+No new spare comes during the call: the handoff runs just before the task
+sleeps, where it can't create a thread. New spares are made only when the
+call ends.
+
 Each blocked request still sleeps on some thread's stack: T, W1, and 30
 io-wq workers. So 32 blocked requests still need about 32 threads. The
 handoff saves the round trip only for requests that do **not** block.
