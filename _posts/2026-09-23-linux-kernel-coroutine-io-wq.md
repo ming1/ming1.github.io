@@ -883,6 +883,29 @@ host task, and kco does not swap them. If a lock crosses an await point:
                                       → deadlock
 ```
 
+Why B does not just suspend, and why nothing wakes the host:
+
+- B's `mutex_lock()` is a plain sleep. Only `kco_wait_event()` and
+  `bio_await()` call `kco_suspend()`; the mutex code goes straight to
+  `schedule()`, and kco does not hook `schedule()`. So the host **task**
+  sleeps, with B's frames on top of its stack.
+- Only `mutex_unlock(&M)` wakes it, and only A calls that. A runs only when
+  the host switches to A's stack, but the host sleeps in B:
+
+```
+ host (in B) waits for M ──→ only A unlocks M ──→ A runs only when the
+     ▲                                            host switches to it
+     └────────────── the host is asleep in B ◄────────────┘
+```
+
+- A's own wakeup does not help: it puts A on the ready list and wakes the
+  host with `TASK_INTERRUPTIBLE`, but the host sleeps `UNINTERRUPTIBLE` in
+  the mutex. Even when woken, the mutex loop only checks M, not the ready
+  list.
+
+It is `mutex_lock(&M)` twice in one task. With lockdep, you see "possible
+recursive locking"; without it, a hung task after 120 s.
+
 - **Deadlock:** as above. Folio and buffer locks do the same, and lockdep
   does not see them.
 - **Held in user space:** the io_uring host returns to user space while A
@@ -895,9 +918,32 @@ host task, and kco does not swap them. If a lock crosses an await point:
 That is why every await point is checked by hand: ext4 marks fsync only
 where no journal handle is open, the jbd2 commit wait drops `j_state_lock`
 before it sleeps, and a bdev flush holds nothing. For the same reason,
-io_uring runs coroutines only after dropping `uring_lock`. Parts I and II
-allowed locks to cross a switch; that is what needed the lock-owner and
-per-task hooks.
+io_uring runs coroutines only after dropping `uring_lock`.
+
+**Could a `schedule()` hook let a lock cross a stop?** That is Part I: every
+sleep switches to another coroutine, so B's `mutex_lock()` would stop B, and
+the host could run A, which unlocks M. But the hook alone is not enough:
+
+```
+ problem when locks cross a stop          what Part I needed
+ ───────────────────────────────────────  ──────────────────────────────
+ mutex_unlock() wakes the host task,      a try_to_wake_up() hook to find
+   not B                                    which coroutine waits (or wake
+                                            all of them)
+ A and B have the same owner: B's lock    lock-owner fixes in mutex code
+   path sees "owner == current",            (Part I bug: a handoff request
+   rt_mutex sees the owner wait on itself   taken as an acquire)
+ lockdep sees one task take M twice       per-coroutine held_locks
+ journal_info, plug, ... are per task     per-coroutine task fields
+```
+
+And one problem no hook fixes: here the host is a **user** task. It returns
+to user space while A is stopped with M held, and the lock stays held for as
+long as the program runs in user space. Part I's host was an io-wq thread,
+which never returns to user space.
+
+So kco keeps the rule. A wait that needs a lock held goes to io-wq; a wait
+that holds nothing can become an await point.
 
 The host itself may hold locks while it runs coroutines. At exec,
 `begin_new_exec()` cancels io_uring requests with `cred_guard_mutex` held,
