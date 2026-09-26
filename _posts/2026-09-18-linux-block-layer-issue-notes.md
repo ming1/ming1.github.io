@@ -666,6 +666,47 @@ and cannot move:
 - Known gaps: LSM state stored in the task, and `PR_SET_IO_FLUSHER`. They do
   not move.
 
+**Why not let io-wq finish the blocked request?** It does: the thread that
+finishes it (task A) becomes an io-wq worker. But no *other* thread can
+take the request over. Once it blocks, it is not a request in a queue; it
+is a half-done call chain on A's kernel stack:
+
+```
+A's kernel stack:  io_uring_enter → io_issue_sqe → io_fsync → vfs_fsync
+                   → ext4_sync_file → jbd2_log_wait_commit → schedule()
+```
+
+- Its local variables and return addresses are in those frames. The kernel
+  cannot resume them on another stack.
+- Other code points to A itself: the wait entries wake A's `task_struct`,
+  and a mutex or journal handle it holds is owned by A.
+
+**Why not just let A sleep?** Then `io_uring_enter()` does not return, and
+the app thread is stuck in the syscall. It cannot submit or reap. Async
+becomes sync.
+
+**Why not move the stack to B instead?** The waker would still wake A, and
+the locks would still be owned by A. The sleeper's `task_struct` must stay
+the same. So the part that moves is what userspace sees, the identity, and
+B uses it to return from the syscall.
+
+When a request blocks, something has to move:
+
+```
+ what moves     who
+ ────────────   ─────────────────────────────────────────────────────────
+ the op         io-wq today: the work goes to another thread before it runs
+ the identity   this series: the user half of the task goes to another
+                task_struct
+ the stack      kernel coroutines: the op has its own stack, and one task
+                switches between stacks
+ nothing        stackless: the op is rewritten as a state machine
+```
+
+Moving an identity is core work: `kernel/thread_handoff.c`, a
+`sched_submit_work()` hook and arch code. The coroutine options are compared
+in [Linux Kernel Coroutines for io_uring io-wq]({% post_url 2026-09-23-linux-kernel-coroutine-io-wq %}).
+
 ### 2.3.2 The parts
 
 ```
