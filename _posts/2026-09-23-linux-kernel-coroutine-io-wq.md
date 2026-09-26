@@ -869,6 +869,36 @@ How several requests then run at once, e.g. 3 fsyncs on ext4:
 - The coroutine runs the same code as an io-wq worker
   (`io_wq_submit_work()`), so no op changes.
 
+The one rule: **hold nothing across a switch**, neither when a coroutine
+stops nor when the host switches into one. Locks, the lockdep list and
+`journal_info` belong to the host task, and kco does not swap them. If a
+lock crosses an await point:
+
+```
+ host runs co A:  mutex_lock(&M)      owner = host
+                  suspend             M stays held
+ host runs co B:  mutex_lock(&M)      M is taken → the host sleeps,
+                                      waiting for A to unlock M;
+                                      but only the host can resume A
+                                      → deadlock
+```
+
+- **Deadlock:** as above. Folio and buffer locks do the same, and lockdep
+  does not see them.
+- **Held in user space:** the io_uring host returns to user space while A
+  is stopped. M stays held until the task next enters the kernel, maybe
+  never, and every other task that needs M waits.
+- **Wrong owner:** while B runs, M looks like B's lock. B could unlock it
+  without a warning, lockdep sees wrong lock chains, and ext4 code in B
+  finds A's journal handle and thinks it is nested in A's transaction.
+
+That is why every await point is checked by hand: ext4 marks fsync only
+where no journal handle is open, the jbd2 commit wait drops `j_state_lock`
+before it sleeps, and a bdev flush holds nothing. For the same reason,
+io_uring runs coroutines only after dropping `uring_lock`. Parts I and II
+allowed locks to cross a switch; that is what needed the lock-owner and
+per-task hooks.
+
 ## 3. How it works
 
 ```
@@ -1020,6 +1050,10 @@ What testing and review caught:
   high QD.
 - Benchmarks were run before the last review fixes.
 - Use 2 has tests but no in-tree user yet.
+- The rule "hold nothing across a switch" is checked only with
+  `CONFIG_KCO_DEBUG`, and only for locks taken inside the await scope. A
+  lock taken before the scope, and one held by the host when it switches in,
+  are not caught yet.
 
 # Takeaways
 
