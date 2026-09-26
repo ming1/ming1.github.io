@@ -1,7 +1,7 @@
 ---
 layout: post
 title: "Linux Kernel Coroutines for io_uring io-wq"
-description: "Run many blocked io_uring requests on one io-wq thread as kernel coroutines; then try to share one stack between them and wake only the right one: what crashed, what worked, nine bugs, and what to propose first"
+description: "Run many blocked io_uring requests on one io-wq thread as kernel coroutines; then try to share one stack between them and wake only the right one: what crashed, what worked, nine bugs, and what to propose first; then kco: generic coroutines that stop only at marked await points, with no scheduler change"
 category: linux kernel
 tags: [linux kernel, io-uring, io-wq, coroutine, scheduler, locking, blk-mq, kernel stack, prototype]
 ---
@@ -780,6 +780,209 @@ Rule: **simple, efficient, reliable, and extensible.**
 - The last io-wq step of SYNC_FILE_RANGE, starting writeback of dirty
   folios, still sleeps. A nowait writeback start would remove it.
 
+# Part III: kco, coroutines that stop only where marked
+
+## 1. The problem
+
+Parts I and II change core kernel code, because there one task holds many
+sleepers:
+
+```
+ hook                 why
+ ──────────────────   ─────────────────────────────────────────────
+ schedule()           catch every sleep, switch to another coroutine
+ try_to_wake_up()     find which coroutine a wakeup is for
+ lock owners          one task = one owner, but many requests
+ per-task fields      current->plug, ->journal_info, ... are per request
+```
+
+Most bugs in Parts I and II came from these places, and such hooks are hard
+to upstream.
+
+> Can we have coroutines with **new code only**: 0 lines in the scheduler,
+> locking, fork and exit?
+
+## 2. The idea
+
+Suspend a coroutine only at sleeps **marked in the source**, the
+*await points* (like `.await` in Rust). Any other sleep just blocks the
+thread.
+
+```
+ in a coroutine:
+
+   plain sleep                  →  the thread sleeps  (correct, not concurrent)
+
+   scoped_guard(kco_await)
+       sleep                    →  the coroutine stops,
+                                   the thread runs others
+```
+
+Why this needs no core change:
+
+- **Locks, per-task fields:** an await point is checked by hand to hold no
+  lock and no per-task state. So they never mix between requests.
+- **Wakeup:** the coroutine sleeps on its **own** wait entry, which points to
+  it. No `try_to_wake_up()` hook.
+- **Sleep:** every other sleep is a plain `schedule()`. No `schedule()` hook.
+
+Only the **stack** is switched. All of it fits in `kernel/kco/`.
+
+Outside a coroutine the mark does nothing, so the same code works in both
+places.
+
+## 3. How it works
+
+```
+          host thread = executor
+        ┌──────────────────────────────────────────────┐
+        │  ready list → switch to each coroutine       │
+        │                                              │
+        │   coroutine A   running  (own 16 KB stack)   │
+        │   coroutine B   stopped at an await point    │
+        │   coroutine C   stopped at an await point    │
+        └──────────────────────────────────────────────┘
+                             ▲
+                             │ 2. C goes on the ready list, the host is woken
+                             │
+   wait queue / bio done ────┘ 1. wakes C's own wait entry
+```
+
+- Only the host runs its coroutines, so they need no locks between them.
+- A wakeup that comes before C has fully stopped is not lost: C runs again.
+- The switch (x86_64 assembly) swaps the registers and the stack fields of
+  `task_struct`: `stack`, `stack_vm_area`, the top-of-stack pointer, and the
+  kretprobe/rethook lists (return probes live on the stack). Credentials,
+  `mm` and files stay with the host.
+
+The await points today:
+
+```c
+/* block/fops.c: blkdev_fsync() */
+	scoped_guard(kco_await)
+		error = blkdev_issue_flush(bdev);	/* waits for the flush bio */
+
+/* fs/ext4/fsync.c: ext4_sync_file() */
+	scoped_guard(kco_await)
+		ret = ext4_fsync_journal(inode, datasync, &needs_barrier);
+
+/* fs/jbd2/journal.c: jbd2_log_wait_commit() */
+	kco_wait_event(journal->j_wait_done_commit, ...);
+```
+
+More ops become concurrent by marking more places, one checked place at a
+time.
+
+Two uses:
+
+```
+ 1. a syscall runs as a coroutine          io_uring (Jens's case); the host is
+                                           the submitting task
+ 2. blocking kernel calls in one kernel    one thread runs many blocking calls,
+    thread or work function                instead of one work item each
+```
+
+## 4. The first user: io_uring
+
+With `IORING_SETUP_COROUTINE`, blocking ops run on the submitting task
+instead of in io-wq. It needs `SINGLE_ISSUER | DEFER_TASKRUN`, and rejects
+SQPOLL, IOPOLL and `IOSQE_ASYNC`.
+
+Where a request goes, decided when it would be sent to io-wq:
+
+```
+ request that would go to io-wq
+        │
+        ├─ can it wait on user space?        yes → io-wq  (as today)
+        │
+        ├─ has an await point                    → coroutine
+        │  (ext4 fsync, bdev fsync)
+        │
+        ├─ quick, no await point                 → run now, on the submitter
+        │  (statx, fadvise, rename, openat, tmpfs fsync)
+        │
+        └─ may block long, no await point        → io-wq
+           (xfs fsync)
+```
+
+Why the first question matters: a coroutine that sleeps outside an await
+point blocks the submitter. If only the submitter can end that sleep, it
+never ends:
+
+```
+ submitter
+   └─ coroutine: statx("/fuse/file") → sleeps, waiting for the FUSE daemon
+                                                      │
+ FUSE daemon = the same submitter ◄───────────────────┘   deadlock
+```
+
+The same happens with a userfaultfd buffer. So a request stays on the
+submitter only if: the file system is ext4, xfs, tmpfs or a known block
+device; the path is in the dcache (`LOOKUP_CACHED`) with no lease; user
+buffers are anonymous memory; no `RESOLVE_*` flags.
+
+The check must come **before** the request is placed. The first version
+sent a request to io-wq from inside a coroutine, and that deadlocked.
+
+## 5. Results
+
+8-vCPU VM with NVMe. Throughput relative to io-wq:
+
+```
+                QD 1    QD 8    QD 32     io-wq threads
+ fsync ext4     0.98    1.61    1.80      0
+ fsync tmpfs    6.37    4.66    3.15      0
+ statx ext4     2.39    1.24    0.99      0
+ fadvise        5.19    2.70    2.27      0
+ rename         1.31    1.17    1.20      0
+```
+
+Mixed load (¾ statx, ¼ fsync), ops per second at QD 32:
+
+```
+             statx      fsync
+ io-wq       243K       53.3K
+ kco         605K       85.5K
+ handoff     2.69M       5.3K   ← fsync starved
+```
+
+kco makes both faster. The handoff in Jens's RFC is faster on statx, but
+almost stops fsync.
+
+- No extra workqueue use: the `queue_work()` count equals plain io-wq's.
+- One coroutine costs ~160 ns (create + run + finish).
+- Tests: KUnit 16/16; 18 io_uring cases under KASAN + lockdep; the liburing
+  suite with kco forced on gives the same result as without it.
+
+Code:
+
+```
+ scheduler, locking, fork, exit    0 lines
+ new files                         ~2100 lines (~560 of them tests)
+ io_uring edits in existing files  ~150 lines
+ marks in ext4, jbd2, block        +25 / −4
+```
+
+What testing and review caught:
+
+- A kretprobe on a stopped coroutine hit a rethook WARN → swap the
+  rethook lists too.
+- Sending a request to io-wq from inside a coroutine deadlocked → decide
+  before placing it (§4).
+- Ring exit could touch a freed executor → io_uring holds a ring reference.
+- Leases and `RESOLVE_*` could still wait on others → such requests go to
+  io-wq.
+
+## 6. Limits
+
+- x86_64 only; needs `VMAP_STACK` and the ORC unwinder.
+- Concurrent only at await points: today ext4 fsync (not with fast_commit)
+  and bdev fsync.
+- The check before placing costs a dcache walk, so handoff wins on statx at
+  high QD.
+- Benchmarks were run before the last review fixes.
+- Use 2 has tests but no in-tree user yet.
+
 # Takeaways
 
 - **A request that sleeps deep in the kernel needs a stack, not a thread.**
@@ -801,6 +1004,12 @@ Rule: **simple, efficient, reliable, and extensible.**
   against 4728 bytes peak while running. Share the pages below, keep the top.
 - **The waker's address already names the sleeper.** Stack alignment turns it
   into a coroutine id, with no new field anywhere.
+- **Stop only where the code says so.** With explicit await points (kco,
+  Part III), nothing in the scheduler, locking, fork or exit changes: only
+  the stack is switched, and the wait entry names the coroutine.
+- **Sleeping outside an await point is correct, just not concurrent.** The
+  one danger is waiting on the host itself, so decide before issue whether
+  an op can wait on user space.
 
 Code: the Part I prototype is 14 files, +798/−58, on v7.3-rc4, not published yet.
 Tests [`iowq_coro_test.c`]({{ site.baseurl }}/code/io-wq-coro/iowq_coro_test.c),
