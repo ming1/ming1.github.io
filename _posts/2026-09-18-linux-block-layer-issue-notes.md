@@ -395,101 +395,95 @@ must not wait for H: the writer and the disk.
 | Arch | x86-64 and arm64 only |
 | Status | RFC, in review |
 
-This section follows Jens's cover letter and patches. Function names are
-from the series applied on v7.3-rc2.
+Function names below are from the series applied on v7.3-rc2.
 
-## 2.1 The story in one view
+## 2.1 The problem
 
-Some io_uring requests have no nonblocking path, so today they always go to
-an io-wq worker thread. Most of them never block. The series runs them in
-the submitting thread. If one *does* block, the work cannot move — it is on
-the kernel stack. So the kernel moves the *identity* instead: an idle worker
-becomes the submitter and returns to userspace, and the blocked thread
-becomes the worker.
-
-**"Return to userspace" here means the `io_uring_enter()` syscall
-returns.** Request results do not change: they still arrive as CQEs.
+Some opcodes have no nonblocking path: fsync, statx, openat with
+`O_CREAT`/`O_TMPFILE`, other `*at` ops, fadvise, xattr, splice. io_uring
+always sends them to an io-wq worker, even when they would not block:
 
 ```
-(1) syscall return   io_uring_enter() → rax = number of SQEs taken (or -errno)
-                     lands on the calling thread: its stack, registers, signal state
-                     → only that thread (or one with its identity) can do it
-(2) request result   CQE {user_data, res} in the CQ ring (shared memory)
-                     → any task can post it, at any time
+ submitter T                                io-wq worker W
+ io_uring_enter()
+   prep: REQ_F_FORCE_ASYNC
+   io_queue_sqe_fallback() → io_queue_iowq() ──wake──→ run fsync on tmpfs
+                                                       (a few µs, never blocks)
+   wait for the CQE        ◄──────wake / task_work──── done
+
+ cost: 2 wakeups + 4 context switches (+1 task_work on DEFER rings)
+       for a few µs of work
 ```
 
-If a request blocks inline, (1) cannot happen: the request is still on the
-thread's kernel stack, and the app thread would be stuck in the syscall. The
-handoff lets W do (1) quickly as the same tid — submit the rest, handle
-`GETEVENTS`, `syscall_set_return_value()` — while T finishes the request and
-posts its CQE later, as io-wq does today.
-
-```
-TODAY — fsync on tmpfs, does not really block
-
-  submitter T                            io-wq worker W
-  io_uring_enter()
-   prep: no nonblocking path → REQ_F_FORCE_ASYNC
-   io_queue_sqe_fallback()
-   → io_queue_iowq()  ─────────────────→ wake up                          #1
-  return to user                          vfs_fsync()   a few µs
-  run completion   ←──── task_work ─────  done                            #2
-  cost: wakeup + context switches + task_work, for a few µs of work
-
-
-WITH HANDOFF — request does not block (the common case)
-
-  T: io_uring_enter() → io_handoff_begin() → vfs_fsync() inline → done → return   #3
-
-
-WITH HANDOFF — request blocks
-
-  T (tid 100)                                idle worker W
-  vfs_fsync() → schedule()
-   sched_submit_work(): PF_IO_HANDOFF
-   → io_uring_task_sleeping()           #4
-      io_wq_handoff_claim(): pick W
-      unlock uring_lock, move tctx to W
-      io_wq_handoff_commit() ──────────────→ wakes in io_handoff_resume()
-      T is now an io-wq worker               submit the remaining SQEs    #5
-                                             thread_handoff_finish(): W becomes tid 100
-  ...sleeps...                               return to userspace as tid 100
-  wakes up, request done
-  io_handoff_complete()                 #6
-  io_uring_handoff_worker(): worker loop
-```
-
-| # | function | what it does |
-|---|---|---|
-| 1 | `io_queue_sqe_fallback()` → `io_queue_iowq()` | fsync, statx, …: prep sets `REQ_F_FORCE_ASYNC` → sent to io-wq without trying inline |
-| 2 | io-wq worker | runs the request, sends the completion back to T by task_work |
-| 3 | `io_handoff_begin()` | request is `blockable` and a spare worker exists → issue in T, *blocking* allowed |
-| 4 | `sched_submit_work()` → `io_uring_task_sleeping()` | T is about to sleep: claim an idle worker, give it the ring |
-| 5 | `io_handoff_resume()`, `thread_handoff_finish()` | worker finishes `io_uring_enter()`, takes T's tid, signals, creds, registers… |
-| 6 | `io_handoff_complete()`, `io_uring_handoff_worker()` | old T completes the request like io-wq, then joins the worker pool |
-
-Steps #1–#2 are explained in 2.2, steps #3–#6 in 2.3.
-
-## 2.2 Motivation
-
-**Many requests are always sent to io-wq, but seldom block.** Normally
-io_uring first tries a request with `IO_URING_F_NONBLOCK`. For many
-opcodes the kernel has no nonblocking version. Their prep step marks the
-request `REQ_F_FORCE_ASYNC`, and io_uring sends it to io-wq without trying
-it inline. Examples from the RFC:
-
-| opcode | example where it does not block |
+| opcode | when it does not block |
 |---|---|
-| fsync / fdatasync | fdatasync that has nothing to wait for, e.g. on tmpfs |
-| statx | the dentry is in the dcache |
-| openat with `O_CREAT` / `O_TRUNC` / `O_TMPFILE` | `O_TMPFILE` (plain openat already tries inline) |
-| other `*at` ops, fadvise (e.g. DONTNEED), xattr, splice | also always punted; the RFC gives no specific case |
+| fsync / fdatasync | nothing to write, e.g. tmpfs |
+| statx | the dentry is cached |
+| openat `O_TMPFILE` | usually |
+| fadvise `DONTNEED` | usually |
 
-io_uring cannot know this in advance, so it must be careful and pay for the
-worker every time: a thread wakeup, context switches, and a task_work round
-trip.
+## 2.2 The idea
 
-**Result** (from the cover letter; virtme-ng, 8 vCPU; ops/s change vs. baseline = same kernel, feature turned off by sysctl):
+Run the request in T. Usually it does not block, and there is no worker at
+all. If it **does** block, move T's **identity** to an idle worker W:
+
+```
+ does not block (common):   T: issue inline → done → return to user
+
+ blocks:
+   T (tid 100)                        idle worker W
+   issue inline → about to sleep
+     give the ring to W ────────────→ wake up
+     T becomes an io-wq worker        submit the rest of the SQEs
+   ...sleeps...                       take T's identity: tid 100
+   wakes, request done                return to user as tid 100
+   post the CQE, join the pool
+```
+
+"Return to user" means only that `io_uring_enter()` returns. Results still
+arrive as CQEs, and any task can post a CQE. But the syscall return must
+happen **as the calling thread**: its tid, registers, signals, creds.
+
+**Why the identity, and not the work?** Once a request blocks, it is a
+half-done call chain on T's kernel stack:
+
+```
+ T's kernel stack:  io_uring_enter → io_issue_sqe → io_fsync → vfs_fsync
+                    → ext4_sync_file → jbd2_log_wait_commit → schedule()
+```
+
+```
+ option                         why not
+ ─────────────────────────────  ─────────────────────────────────────────────
+ give the request to io-wq      no other thread can resume these frames
+ let T sleep                    io_uring_enter() never returns: async → sync
+ move the stack to W            the waker still wakes T, locks are owned by T
+ move the identity to W         ✓ T keeps the stack, W returns to user
+```
+
+When a request blocks, something has to move:
+
+```
+ what moves     who
+ ────────────   ─────────────────────────────────────────────────────────
+ the op         io-wq today: the work goes to another thread before it runs
+ the identity   this series
+ the stack      kernel coroutines: the op has its own stack
+ nothing        stackless: the op is rewritten as a state machine
+```
+
+The coroutine options are compared in
+[Linux Kernel Coroutines for io_uring io-wq]({% post_url 2026-09-23-linux-kernel-coroutine-io-wq %}).
+
+**Not changed:** `FMODE_NOWAIT` read/write and pollable files (already
+nonblocking), `REQ_F_NOWAIT`, IOPOLL/SQPOLL/SQ_REWIND rings, `IOSQE_ASYNC`
+(except the optional patch 15), and `uring_cmd` (drivers such as ublk keep
+per-task state, §1).
+
+## 2.3 Results
+
+From the cover letter: virtme-ng, 8 vCPU, ops/s against the same kernel
+with the feature off.
 
 | request | QD 1 | QD 8 | QD 32 |
 |---|---|---|---|
@@ -504,223 +498,50 @@ trip.
 | openat O_TMPFILE, tmpfs | +222% | −11% | −18% |
 | splice to pipe, ext4 | +8% | +0% | −10% |
 
-CPU use (whole process, including io-wq workers): with handoff, most rows
-are about 100% of one CPU. Exceptions: fsync on ext4 (up to 146%) and splice at
-QD 8/32 (about 180%, same as baseline). Baseline uses up to 544% (renameat, ext4,
-QD 8).
-
 ```
-QD 1      big win: no worker round trip per request
-high QD   can lose, for two reasons:
-            1. today io-wq runs many slow requests in parallel on many CPUs;
-               with handoff most of the work stays in one thread
-            2. the request always blocks (fsync on ext4): then sending it to
-               io-wq up front is quicker
+ QD 1      big win: no worker round trip
+ high QD   can lose:
+             - io-wq runs slow requests on many CPUs in parallel;
+               with handoff most work stays in one thread
+               (about 100% of one CPU, vs up to 544% for io-wq)
+             - a request that always blocks (ext4 fsync) is cheaper to
+               send to io-wq up front
 ```
 
-Jens says low QD is the normal case for these opcodes, and he has ideas for
-the high-QD case.
+Jens says low QD is the normal case for these opcodes.
 
-**Where the saving comes from: count per request.**
+**Cost per request** (*author's count from the code, not measured*; QD 1,
+worst case with an IPI per cross-CPU wakeup):
 
-*Author's analysis from the code (v7.3-rc2 + series), not measured.*
+| | wakeups | switches | task_work | extra work |
+|---|---|---|---|---|
+| no block, today | 2 | 4 | 0 (1 on DEFER) | io-wq queue, cache misses |
+| **no block, handoff** | **0** | **0** | **0** | an atomic check, signal mask save/restore |
+| blocks, today | 3 | 6 | 0 (1 on DEFER) | io-wq queue |
+| **blocks, handoff** | **3** | **6** | **1** | identity move, app thread moves to W's CPU (cold cache), maybe a spare `fork()` |
 
-- Setup: the app submits one request R and waits for its CQE
-  (`io_uring_enter(fd, 1, 1, IORING_ENTER_GETEVENTS)`, QD 1). An idle
-  worker W sleeps on another CPU.
-- IPI: waking a task on another idle CPU sends an IPI, unless that CPU
-  polls in idle (then setting NEED_RESCHED is enough). The table counts the
-  worst case.
-- Case B assumes the common timing: W runs after T commits the handoff, and
-  the I/O takes longer than the handoff. See the note below the table.
+- No block: the whole round trip is gone. That is the QD 1 gain.
+- Blocks: same wakeups and switches as today, plus the identity move, one
+  task_work and a cold CPU. That is the likely cause of the ext4 fsync
+  loss (not measured). An ext4 fsync also blocks twice (writeback, then the
+  jbd2 commit), but only the first sleep hands off (§2.4).
+- In a VM, waking an idle vCPU costs VM exits, so the no-block gain is
+  larger there than on bare metal.
 
-Case A: R does **not** block (fsync on tmpfs, statx cache hit):
-
-```
-TODAY (punt)                                     HANDOFF
-  CPU 0: T                   CPU 1: W              CPU 0: T
-  ────────────────────       ────────────────      ──────────────────────────────
-  io_wq_enqueue()                                  io_handoff_possible():
-   wake_up_process(W) ─①──→ switch in      [s1]     atomic_read(nr_iosleep) > 0
-  io_cqring_wait():          run R                 issue R inline, done
-   schedule()    [s2]        post CQE:             post CQE, return
-                             ├ normal ring:
-                             │ fill CQE,
-                             │ io_cqring_wake()
-                             └ DEFER_TASKRUN:
-                               local task_work
-          ←──────────── ②──  wake T
-  switch in      [s3]        worker loop:
-  (DEFER: run task_work,      schedule()    [s4]
-   post CQE)
-  return
-```
-
-Case B: R blocks once (waits for its I/O):
+## 2.4 How it works
 
 ```
-TODAY (punt)                                  HANDOFF
-  T                        W                    T                         W
-  ─────────────────        ────────────────     ──────────────────────    ───────────────────────
-  wake W ─────①──────────→ in          [s1]     issue R inline, R sleeps:
-  wait CQE: out  [s2]      run R, sleep          sched_submit_work()
-                           on I/O: out   [s3]   → io_uring_task_sleeping()
-                                                  claim + commit W ─①───→ in              [s1]
-                   IRQ ─②→ in          [s4]      T out           [s2]    io_handoff_resume():
-                           post CQE                                        identity move
-            ←────────③──── wake T (DEFER: tw)                              wait CQE: out   [s3]
-  in             [s5]      out         [s6]     IRQ ─②→ T in    [s4]
-  return                                        R done → io_handoff_complete():
-                                                task_work → W ──────③──→ in              [s5]
-                                                worker loop: out [s6]    run tw, post CQE
-                                                                         (+ maybe fork a spare)
-                                                                         return as tid 100
+ layer     file                      job
+ ───────   ───────────────────────   ────────────────────────────────────
+ kernel    kernel/thread_handoff.c   allowed / prepare / finish the move
+ sched     kernel/sched/core.c       sched_submit_work(): hook on sleep
+ arch      arch/x86, arch/arm64      save user registers, load them in W
+ io-wq     io_uring/io-wq.c          keep idle spares, claim one, swap
+ io_uring  io_uring/handoff.c        begin/end the issue, sleep hook,
+                                     resume in W
 ```
 
-| | wakeups | context switches | task_work | IPIs (worst case) | other |
-|---|---|---|---|---|---|
-| A, today, normal ring | 2 | 4 | 0 | 2 | io-wq enqueue/dequeue, R's data moves between CPU caches |
-| A, today, `DEFER_TASKRUN` | 2 | 4 | 1 | 2 | same |
-| **A, handoff** | **0** | **0** | **0** | **0** | `io_handoff_possible()` checks (`atomic_read()`), signal mask save/restore |
-| B, today, normal ring | 3 | 6 | 0 | 3 | io-wq enqueue/dequeue |
-| B, today, `DEFER_TASKRUN` | 3 | 6 | 1 | 3 | same |
-| **B, handoff** | **3** | **6** | **1** | **3** | identity move (`thread_handoff_prepare()` + `finish()`), app thread moves to W's CPU, maybe a spare `fork()` |
-
-Case B can cost more if the timing is different:
-
-- W wakes when it is claimed. If it goes back to sleep before T commits,
-  the commit wakes it again: +1 wakeup, +2 switches.
-- If the I/O finishes before W sets FINISHED, T sleeps once more in
-  `io_wq_handoff_worker()` and needs another wakeup.
-
-What the counts show:
-
-- Case A: the handoff removes the whole round trip: two wakeups, four
-  switches, and a task_work on `DEFER_TASKRUN` rings. This is the QD 1
-  gain.
-- Case B: the wakeups and switches are the same as today. Wakeup ① of W
-  replaces today's first wakeup of W, and ③ (task_work to W) replaces
-  today's CQE wakeup of T. The extras are: the identity move, one
-  task_work even on a normal ring (`io_handoff_complete()` always uses
-  task_work), maybe a new spare worker, and the app thread now continuing
-  on W's CPU with cold caches. These extras are the likely source of the
-  fsync-on-ext4 loss (not measured). An ext4 fsync also blocks more than
-  once (writeback, then the jbd2 commit).
-- The I/O completion wakeup (②) is the same in both designs. It is local
-  if blk-mq completes on the submitting CPU.
-- In a VM, waking an idle vCPU usually costs VM exits (IPI send, HLT
-  wakeup). So Case A's two cross-CPU wakeups cost more in the cover
-  letter's VM. On bare metal the gap is probably smaller.
-
-**Not changed:**
-
-| request | why |
-|---|---|
-| read/write on `FMODE_NOWAIT` files, pollable files | already have a nonblocking path + poll retry |
-| `REQ_F_NOWAIT` | the user asked for `-EAGAIN` |
-| IOPOLL, SQPOLL, SQ_REWIND rings | different issue path |
-| SQEs with `IOSQE_ASYNC` | the user asked for io-wq (only the optional patch 15 changes this) |
-| `uring_cmd` | drivers such as ublk keep per-task state (see §1: `io->task`) |
-
-## 2.3 Core idea and implementation
-
-### 2.3.1 Move the identity, not the work
-
-When the request blocks, the work is deep in the kernel stack of task A. It
-cannot move. But what userspace sees of a thread can move:
-
-```
-                 before                                 after handoff
-task_struct A    tid 100, user registers, signals,      io-wq worker; its kernel stack
-                 creds, sched settings, …                still holds the blocked request
-task_struct B    idle io-wq worker                       tid 100, user registers, signals, …
-                                                         → returns from io_uring_enter()
-```
-
-Userspace sees the same tid return from the syscall. It is only on a
-different `task_struct`.
-
-`thread_handoff_finish()` moves:
-
-| group | items |
-|---|---|
-| ids | tid (`exchange_tids()`), thread group leader, children |
-| signals | pending signals, signal mask |
-| user memory links | robust futex list, `clear_child_tid`, rseq |
-| security | creds, loginuid, `no_new_privs` |
-| scheduling | nice / policy (fair class only), affinity, mempolicy, cgroup, ioprio |
-| accounting | utime, stime, faults, context switches, I/O counters |
-| other | comm, personality, pdeath_signal, timer slack, start time, user registers and FPU (arch hook) |
-
-A handoff is refused when some state belongs to the `task_struct` itself
-and cannot move:
-
-- `thread_handoff_allowed()`: ptrace (tracee or tracer), per-task perf,
-  PI futexes, RT/deadline class, core scheduling cookie, kcov, armed
-  per-thread CPU timers, audit, uretprobes, syscall user dispatch, a vfork
-  parent.
-- x86: 32-bit tasks, AMX, shadow stacks, I/O bitmaps, emulated iopl, and
-  more.
-- arm64: compat tasks, GCS, `TIF_TSC_SIGSEGV`; SME/ZA are refused when the
-  task blocks (`arch_thread_handoff_prepare()`).
-- Known gaps: LSM state stored in the task, and `PR_SET_IO_FLUSHER`. They do
-  not move.
-
-**Why not let io-wq finish the blocked request?** It does: the thread that
-finishes it (task A) becomes an io-wq worker. But no *other* thread can
-take the request over. Once it blocks, it is not a request in a queue; it
-is a half-done call chain on A's kernel stack:
-
-```
-A's kernel stack:  io_uring_enter → io_issue_sqe → io_fsync → vfs_fsync
-                   → ext4_sync_file → jbd2_log_wait_commit → schedule()
-```
-
-- Its local variables and return addresses are in those frames. The kernel
-  cannot resume them on another stack.
-- Other code points to A itself: the wait entries wake A's `task_struct`,
-  and a mutex or journal handle it holds is owned by A.
-
-**Why not just let A sleep?** Then `io_uring_enter()` does not return, and
-the app thread is stuck in the syscall. It cannot submit or reap. Async
-becomes sync.
-
-**Why not move the stack to B instead?** The waker would still wake A, and
-the locks would still be owned by A. The sleeper's `task_struct` must stay
-the same. So the part that moves is what userspace sees, the identity, and
-B uses it to return from the syscall.
-
-When a request blocks, something has to move:
-
-```
- what moves     who
- ────────────   ─────────────────────────────────────────────────────────
- the op         io-wq today: the work goes to another thread before it runs
- the identity   this series: the user half of the task goes to another
-                task_struct
- the stack      kernel coroutines: the op has its own stack, and one task
-                switches between stacks
- nothing        stackless: the op is rewritten as a state machine
-```
-
-Moving an identity is core work: `kernel/thread_handoff.c`, a
-`sched_submit_work()` hook and arch code. The coroutine options are compared
-in [Linux Kernel Coroutines for io_uring io-wq]({% post_url 2026-09-23-linux-kernel-coroutine-io-wq %}).
-
-### 2.3.2 The parts
-
-```
-layer       file                      job
-─────────   ───────────────────────   ─────────────────────────────────────────────
-kernel      kernel/thread_handoff.c   allowed / prepare / finish: move the identity
-sched       kernel/sched/core.c       sched_submit_work(): PF_IO_HANDOFF → io_uring hook
-arch        arch/x86, arch/arm64      save user registers before sleep, load them after
-io-wq       io_uring/io-wq.c          keep idle spares, claim one, swap roles
-io_uring    io_uring/handoff.c        begin/end around the issue, the sleep hook, resume
-```
-
-The scheduler hook sits next to the existing ones for workqueue and io-wq
-workers:
+The scheduler hook sits next to the ones for workqueue and io-wq workers:
 
 ```c
 	if (task_flags & PF_WQ_WORKER)
@@ -731,236 +552,149 @@ workers:
 		io_uring_task_sleeping(tsk);
 ```
 
-### 2.3.3 Step by step
+The three steps:
 
 ```
-io_uring_enter()
- ├─ io_handoff_enter()        save syscall args, so another task can finish the call
- └─ io_submit_sqes()
-     └─ io_issue_sqe()
-         ├─ io_handoff_begin()        blockable op? spare worker? no signal pending? → yes:
-         │    block all signals but KILL/STOP (like an io-wq worker)
-         │    set PF_IO_HANDOFF
-         ├─ clear IO_URING_F_NONBLOCK (only if begin succeeded)
-         ├─ __io_issue_sqe()          may sleep ──────────────┐
-         ├─ io_handoff_end()          clear PF_IO_HANDOFF     │
-         └─ handed off? → io_handoff_complete()               │
-                                                              ▼
-schedule() → sched_submit_work() → io_uring_task_sleeping()   (must not sleep here)
- ├─ ctx->submit_lock_depth != 0?   → no handoff, just sleep
- ├─ thread_handoff_prepare()       arch: save user registers (first hop only)
- ├─ io_wq_handoff_claim()          pick an idle worker W
- ├─ io_handoff_release_ring()      count used SQEs, unlock uring_lock for W
- ├─ io_handoff_move_tctx()         task->io_uring, task refs, submitter_task, task_work → W
- └─ io_wq_handoff_commit()         swap: this task becomes the io-wq worker; wake W
+ 1. T issues   io_issue_sqe()
+                 io_handoff_begin()     blockable op + idle worker + no signal?
+                                        block all signals but KILL/STOP,
+                                        set PF_IO_HANDOFF, clear NONBLOCK
+                 __io_issue_sqe()       may sleep ──→ step 2
+                 io_handoff_end()       handed off? → io_handoff_complete()
 
-W: io_handoff_resume()
- ├─ thread_handoff_adopt_creds()   enough to issue requests for the user
- ├─ io_submit_sqes(rest)           may block and hand off again
- ├─ thread_handoff_finish()        take the full identity, once
- └─ set the syscall return value, return to userspace as tid 100
+ 2. T sleeps   schedule() → sched_submit_work() → io_uring_task_sleeping()
+                 uring_lock needed here? (submit_lock_depth) → just sleep
+                 thread_handoff_prepare()   save user registers
+                 io_wq_handoff_claim()      pick idle worker W
+                 io_handoff_release_ring()  unlock uring_lock for W
+                 io_handoff_move_tctx()     io_uring task context → W
+                 io_wq_handoff_commit()     T becomes the io-wq worker, wake W
+
+ 3. W resumes  io_handoff_resume()
+                 thread_handoff_adopt_creds()   enough to issue for the user
+                 io_submit_sqes(rest)           may block and hand off again
+                 thread_handoff_finish()        take the full identity
+                 set the syscall return value, return as tid 100
 ```
 
-Why each supporting patch is needed:
+**Many blocking SQEs in one call.** A full identity move per blocked SQE
+would cost more than io-wq. So each step moves only the creds and the
+io_uring context, and the full identity moves once, at the end (patch 12):
 
-| patch | reason |
+```
+ SQEs:  [A blocks] [B blocks] [C]
+
+ T    issue A → blocks → hand off to W1         T:  worker, runs A
+ W1   creds only: issue B → blocks → W2         W1: worker, runs B
+ W2   creds only: issue C → done
+      full identity from T → return as T's tid   ← one full move
+```
+
+**A request that sleeps many times** hands off only on its first sleep.
+After it, T has `PF_IO_WORKER`, which `sched_submit_work()` checks first, so
+T is a normal io-wq worker until the request ends:
+
+```
+ sleep 1   PF_IO_HANDOFF             → io_uring_task_sleeping(): hand off
+ sleep 2+  PF_IO_HANDOFF|IO_WORKER   → io_wq_worker_sleeping(): normal worker
+ done      io_handoff_end() → io_handoff_complete()
+```
+
+Supporting patches:
+
+| patch | why |
 |---|---|
-| x86: `ret_from_fork()` puts the thread function's return value in `regs->ax` (4) | the promoted worker returns the syscall result, not 0 |
-| tctx node list (6) | walking the tctx xarray cost 12 µs, even for one entry |
-| uring_lock depth tracking (7) | the hook may unlock `uring_lock` for W only outside code that needs it held |
-| split `io_uring_enter()` (8) | another task must be able to finish the syscall |
-| block plug on the stack (9) | the plug was in the ring's shared submit state; after a handoff another task finishes the batch, but the block layer still has the blocked task's `current->plug`. On the stack it stays with the task that made it |
+| 4: x86 `ret_from_fork()` returns `regs->ax` | the promoted worker returns the syscall result, not 0 |
+| 6: tctx node list | walking the xarray cost 12 µs |
+| 7: `uring_lock` depth tracking | unlock `uring_lock` for W only where that is safe |
+| 8: split `io_uring_enter()` | another task finishes the syscall |
+| 9: block plug on the stack | the plug stays with the task that made it (§2.5) |
 
-### 2.3.4 Many blocking SQEs in one call
+## 2.5 What moves, what stays
 
-If each blocked SQE moved the full identity, N blocking SQEs would cost N
-full moves — worse than N io-wq punts. Patch 12 moves only the creds and
-the io_uring task context on each step, and the full identity once, at the
-end:
+A handoff splits one thread in two:
 
 ```
-SQEs:  [A blocks] [B blocks] [C]
-
-T    issue A → blocks → hand off to W1                  T: worker, runs A; waits until W2 finishes
-W1   creds only, issue B → blocks → hand off to W2       W1: worker again, runs B
-W2   creds only, issue C → done
-     thread_handoff_finish(from T) → return to user as T's tid     ← one full move
+ goes to W (what user space sees)       stays on T (the unfinished work)
+ ─────────────────────────────────────  ─────────────────────────────────
+ moved:  tid, leader, children,         stack, held locks, journal_info,
+         signals, robust futex list,    plug, nameidata, NOFS/NOIO scopes
+         rseq, creds, sched attrs,
+         cgroup, ioprio, accounting,
+         user registers
+ must be equal (else no handoff):
+         mm, files, fs, nsproxy,
+         seccomp, ...
 ```
 
-### 2.3.5 A request that sleeps many times
+Keeping the unfinished work on T is correct: T still runs it, like an
+io-wq worker does today.
 
-*Author's analysis (from reading the code, not tested).*
+**Refused** (`thread_handoff_allowed()`), because the state belongs to the
+`task_struct` itself: ptrace, per-task perf, PI futexes, RT/deadline, core
+scheduling, kcov, per-thread CPU timers, audit, uretprobes, syscall user
+dispatch, a vfork parent; x86 32-bit, AMX, shadow stacks, I/O bitmaps;
+arm64 compat, GCS, SME/ZA.
 
-The hook runs on every voluntary sleep. A blocked request may sleep many
-times before it is done. Does it hand off again on every sleep? No:
+**Known gaps (RFC):** LSM state stored in the task, and
+`PR_SET_IO_FLUSHER` (§2.6).
 
-```c
-schedule():  if (!task_is_running(tsk)) sched_submit_work(tsk);   // every voluntary sleep
-
-sched_submit_work():
-	if (task_flags & PF_WQ_WORKER)        wq_worker_sleeping(tsk);
-	else if (task_flags & PF_IO_WORKER)   io_wq_worker_sleeping(tsk);
-	else if (task_flags & PF_IO_HANDOFF)  io_uring_task_sleeping(tsk);   // checked last
-```
-
-```
-T issues request R: flags = PF_IO_HANDOFF
-
-sleep 1  io_uring_task_sleeping(): hand off to W
-           T->io_uring = NULL (tctx moved to W)
-           io_wq_handoff_commit() sets PF_IO_WORKER on T
-           io_wq_worker_sleeping(T), called by hand
-wake 1   sched_update_worker(): PF_IO_WORKER → io_wq_worker_running(T)     balanced
-sleep 2  flags = PF_IO_HANDOFF | PF_IO_WORKER
-           PF_IO_WORKER is checked first → io_wq_worker_sleeping(T)         normal worker
-sleep 3  same as sleep 2
-R done   io_handoff_end(): clear PF_IO_HANDOFF, see PF_IO_WORKER → io_handoff_complete()
-```
-
-So after the first handoff, T is a normal io-wq worker until R ends.
-
-Points to note:
-
-| point | detail |
-|---|---|
-| one-shot only by order | See the note below the table. |
-| refused → retried | If the hook refuses (lock held, no idle worker, `prepare` fails), the next sleep tries again. `thread_handoff_prepare()` is safe to repeat: x86 skips the FPU save once `TIF_NEED_FPU_LOAD` is set; the arm64 helpers are idempotent. |
-| trigger is "about to sleep" | A request with a few short sleeps hands off on the first short one. A task woken between `sched_submit_work()` and `__schedule()` never really sleeps, but the handoff is already committed: T is a worker and W will finish the syscall. `rt_mutex_slowlock()` even runs the hook before it knows it must wait. Not a bug, but a request that sleeps only briefly still pays for a full handoff. |
-| sleeps that are not seen | Preemption (task still running): no hook, correct. rt-mutex sleeps: seen, via `rt_mutex_pre_schedule()`. Futex PI (`rt_mutex_futex_pre_schedule()`) skips the hook, but runs only in the futex syscall. PREEMPT_RT spinlock waits (`schedule_rtlock()`) must not run the hook at all: `sched_submit_work()` warns on `TASK_RTLOCK_WAIT`. |
-
-**Why it is one-shot only by order.** After the handoff T still has
-`PF_IO_HANDOFF`, but `T->io_uring == NULL`. If the hook ran again, its first
-lines (`tctx = tsk->io_uring; ho = &tctx->handoff; req = ho->req`) would
-dereference NULL. Only the `else if` order stops that. T must keep
-`PF_IO_HANDOFF`, because `io_issue_handed_off()` uses it to know that
-`uring_lock` is no longer held. An early `if (!tsk->io_uring) return;` in the
-hook would make this safe; a comment would at least document it.
-
-### 2.3.6 Per-task state
-
-*Author's analysis (from reading the code, not tested).*
-
-A handoff splits one thread into two halves. What happens to each part of
-the `task_struct`?
+**The block plug** was in the ring's shared state. Now it lives on
+`io_submit_sqes()`'s stack:
 
 ```
-                                 identity moves T → W          task_struct stays T
-                                 (what userspace sees)         (the unfinished kernel work)
-───────────────────────────────  ────────────────────────────  ──────────────────────────────
-1. state of the running syscall                                 plug, journal_info, nameidata,
-                                                                memalloc scope flags, held locks
-                                                                → correct: T keeps doing the work
-2. user-visible per-thread state  moved / must match / refused  anything not in those lists
-3. pointers to the task_struct                                  kept by other code
-   held by others                                               → now point at the worker T
+ T  plug on T's stack, current->plug = &plug
+    issue R → blocks → hand off: the ring forgets the plug
+                                 (plug_started = false)
+    T flushes and finishes its own plug later
+ W  io_submit_sqes(): a new plug on W's stack
 ```
 
-**1. State of the running syscall.** This is the reason to move the identity
-and not the work: T keeps its stack and everything that belongs to the
-unfinished request.
+## 2.6 Problems found in review
 
-The block plug needed a fix (patches 9 and 11), because it used to be in
-the ring's shared state:
+*Author's analysis from the code, not tested.*
 
-```
-T  io_submit_sqes(): struct blk_plug plug on T's stack, current->plug = &plug
-   issue R → blocks → schedule()
-     sched_submit_work():
-       1. io_uring_task_sleeping()   handoff; io_submit_sqes_abandon() sets the ring's
-                                     plug_started = false, so W never touches T's plug
-       2. blk_flush_plug(T->plug)    send T's queued bios, from T
-   wakes up, R may add more bios to T's plug
-   io_submit_sqes() sees -EIOCBQUEUED:
-     if (current->plug == &plug) blk_finish_plug(&plug)       ← T ends its own plug
-
-W  io_handoff_resume() → io_submit_sqes(): a new plug on W's stack
-```
-
-Filesystem per-task state:
-
-| state | what happens | ok? |
+| problem | what goes wrong | fix |
 |---|---|---|
-| `journal_info` (jbd2 handle, XFS transaction) | stays with T; W starts with NULL | ✓ same as two io-wq workers today |
-| `nameidata` (path walk) | T keeps its walk; W has its own | ✓ |
-| `PF_MEMALLOC_NOFS/NOIO` scopes set by fs code | stay on T; only `PF_MCE_*` flags move | ✓ they belong to T's work |
-| locks held by T (inode rwsem, `sb_writers`, …) | T owns them and releases them | ✓ only `uring_lock` is dropped for W; `submit_lock_depth` says when that is allowed |
-| `fs_struct` (cwd, root, umask), `files_struct` | must be equal, or no handoff | ✓ |
-| cgroup, ioprio value | move to W. W drops the `io_context` it shared with T (`CLONE_IO`); T keeps it, so T's remaining bios are charged as before | ✓ |
-| I/O accounting | a snapshot moves to W; I/O done by T later counts to T | minor, same as io-wq |
-| **`PR_SET_IO_FLUSHER`** | **not moved, not checked** | **✗, see below** |
+| `PR_SET_IO_FLUSHER` not moved or checked | tid 100 may run **without** `PF_MEMALLOC_NOIO`: reclaim in a FUSE/NBD/ublk server can wait for its own device | check it in `thread_handoff_compatible()`, like seccomp |
+| raw `task_struct *` pointers to T | still point at T, now a worker (ublk, below) | follow the move, or refuse |
+| hook is one-shot only by `else if` order | after a handoff `T->io_uring == NULL`; running the hook again dereferences NULL | `if (!tsk->io_uring) return;` |
+| handoff on "about to sleep" | a short sleep still pays a full handoff | — |
+| resctrl `closid`/`rmid`, BPF task storage, sched_ext state | stay on T, keyed by the `task_struct` | — |
+| other task_work queued on T | runs on the worker, e.g. SIGBUS after a machine check goes to the wrong task | — |
 
-**2. User-visible per-thread state.** The series handles it in four ways:
+**`PR_SET_IO_FLUSHER`.** The flag sets `PF_MEMALLOC_NOIO` and
+`PF_LOCAL_THROTTLE`, so that a block server's reclaim never waits on its own
+device. The series moves only the `PF_MCE_*` flags, on purpose ("Not
+PF_MEMALLOC_NOIO, kernel code sets that too"). The RFC says a gap "can only
+ever restrict". Not here: W usually has the flag (it copies the flags of the
+thread that forks it), but not if W was forked before the prctl.
 
-| handling | fields |
-|---|---|
-| moved | tid, leader, signals (incl. `sigaltstack`, `restart_block`), robust list, rseq, creds, sched attributes, … (full table in 2.3.1) |
-| checked, else no handoff (`thread_handoff_compatible()`) | same thread group, W not traced, `mm`, `files`, `fs`, `nsproxy`, seccomp, SysV `undo_list`, `user_ns`, some x86 TIF flags; W must not have `no_new_privs` unless T has it |
-| refused (`thread_handoff_allowed()`) | see 2.3.1 |
-| known gaps (RFC) | LSM task blobs, `PR_SET_IO_FLUSHER` |
-
-Problems these lists do not solve:
-
-| state | problem |
-|---|---|
-| `PR_SET_IO_FLUSHER` | a known gap, but not a harmless one: see below |
-| x86 resctrl `closid` / `rmid` | Set per tid by writing it to a resctrl `tasks` file. Not moved or checked: tid 100 now runs in W's cache / bandwidth group. |
-| BPF task local storage, sched_ext task state | Keyed by `task_struct`: data for tid 100 stays on T. |
-| task_work queued on T before it blocked | Only io_uring's own work moves (`io_handoff_tw_moved()`). Other work runs on T, now a worker — e.g. `kill_me_maybe` after a machine check in `copy_from_user()` during the issue: SIGBUS goes to the wrong task. |
-| NUMA balancing stats, `nr_dirtied` | not moved; only performance |
-
-**`PR_SET_IO_FLUSHER` is not a harmless gap.** It sets `PF_MEMALLOC_NOIO`
-and `PF_LOCAL_THROTTLE` (`kernel/sys.c:2407`). Userspace block servers
-(FUSE, NBD, ublk, …) can use it so that their memory reclaim never waits for I/O to
-their own device. The RFC says a gap "can only ever restrict". This is not
-true for this flag:
+**Pointers to the `task_struct`.** `exchange_tids()` swaps the `struct pid`,
+so references by tid follow the identity. Raw pointers do not:
 
 ```
-server thread tid 100 has IO_FLUSHER, worker W does not
-  → after the handoff, tid 100 runs WITHOUT NOIO
-  → reclaim in tid 100 can wait for writeback to its own device → deadlock risk
+ by tid (struct pid)       pidfd, F_SETOWN_EX, /proc/<tid>   → follow to W   ✓
+ by task_struct *          ublk io->task, any "current"      → stay on T     ✗
 ```
 
-W usually has the flag, because a worker copies the flags of the thread
-that forks it, normally the submitting thread. But not if W was forked
-before the prctl, e.g. a spare created when the thread first used the ring.
-Fix: check it in `thread_handoff_compatible()`, like seccomp.
-
-**3. Pointers to the `task_struct` held by other code.**
+ublk shows it. The RFC excludes `uring_cmd`, but a ublk server can mix
+uring_cmds and an FSYNC on one ring:
 
 ```
-kept as struct pid (tid)          → follows the identity: pidfd, F_SETOWN_EX tid, /proc/<tid>
-kept as task_struct *  (current)  → stays on T, now a kernel worker:
-                                      ublk io->task (§1): dispatch aborted, COMMIT -EINVAL
-                                      any driver that saves current to mean "this thread"
+ ublk server T: uring_cmds for ublk I/O + FSYNC to the backing file, same ring
+   FSYNC blocks inline → handoff → tctx->task = W
+     dispatch task_work runs on W: current != io->task → I/O aborted
+     COMMIT from tid 100 (now W):  current != io->task → -EINVAL
 ```
 
-`exchange_tids()` swaps the `struct pid`s, so tid-based references follow the
-identity. Raw `task_struct` pointers do not. io_uring fixes its own
-(`submitter_task`, `tctx->task`) but cannot know about others. This is
-Jens's third question below.
+So ublk must follow the move, or a task that owns ublk I/O must refuse the
+handoff.
 
-### 2.3.7 Questions Jens asks reviewers
+## 2.7 Jens's questions to reviewers
 
-- Is the list of refused task states complete? Is moving thread group
-  leadership this way OK (the leader must stay first on `->thread_head`, as
-  `de_thread()` keeps it)?
+- Is the list of refused task states complete? Is moving thread-group
+  leadership this way OK?
 - Is the x86 / arm64 register handling right?
 - Does anything depend on a thread's user identity staying on one
-  `task_struct`?
-
-*Author's note (from reading the code, not tested):* the last question
-matters for ublk. Its per-io `io->task` (§1) is a `task_struct` pointer.
-In non-batch mode, ublk runs dispatch task_work and accepts COMMIT only
-when `current == io->task`. The RFC excludes `uring_cmd` for this reason. But
-that does not cover everything:
-
-```
-ublk server thread T: uring_cmds for ublk I/O + FSYNC to the backing file, same ring
-  FSYNC is blockable → issued inline → blocks → handoff to W
-    io_handoff_move_tctx(): tctx->task = W
-      ublk dispatch task_work now runs on W → ublk_dispatch_req(): current != io->task → abort
-      the tid now on W sends COMMIT             → current != io->task → -EINVAL
-```
-
-So ublk would need to follow the identity move, or tasks that own ublk I/O
-should refuse the handoff.
+  `task_struct`? (Yes: ublk, §2.6.)
