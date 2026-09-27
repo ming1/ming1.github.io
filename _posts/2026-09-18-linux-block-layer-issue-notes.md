@@ -431,6 +431,15 @@ it **does** block, T gives its **identity** to an idle worker W:
                                           return as tid 100
 ```
 
+**The identity moves only so the syscall can return.** The blocked request
+needs no identity: T finishes it like an io-wq worker. W needs it to
+return from `io_uring_enter()` as the same thread, after it submits the
+rest of the SQEs, and after it waits for `min_complete` CQEs if
+`IORING_ENTER_GETEVENTS` is set. So an app that waits for the blocked
+request's own CQE gains nothing: W waits for that CQE too. io-wq provides
+both sides: an idle worker of the same process, created in advance (the
+sleep hook can't fork), and a worker slot for T afterwards.
+
 Why move the identity, and not the work? A blocked request is a half-done
 call chain on T's kernel stack (`io_fsync → vfs_fsync → ... → schedule()`):
 
