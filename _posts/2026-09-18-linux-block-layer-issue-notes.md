@@ -592,3 +592,25 @@ taking the lock again, opening a block device with `O_EXCL`, or
 unmounting, fails until the unrelated FSYNC ends. The last
 `mntput()` has the same problem. Fix: refuse the handoff in
 `__io_handoff_begin()` when task_work is pending.
+
+**5. `/proc/<tid>` follows the identity, per-task state does not.** procfs
+keeps a `struct pid` in its inodes and looks up the task on each access,
+and `exchange_tids()` moves the `struct pid`. So `/proc/100/...`, even an
+fd opened before the handoff, shows W after it. comm, start time,
+accounting and sched attributes move too, so `stat` and `status` look
+continuous. What stays with the `task_struct` shows the problem:
+
+```
+ /proc/100/stack, wchan   show W; the blocked request is on T, listed as
+                          iou-wrk-.../308
+ /proc/100/attr/*         AppArmor's task context stays on T: an onexec
+                          profile change asked for before the handoff is
+                          lost, and the next exec() runs without it
+ Yama PR_SET_PTRACER      the exception is keyed by the group leader's
+                          task_struct; if T is the leader, the handoff
+                          moves leadership to W, and the allowed debugger
+                          can no longer attach
+```
+
+The same class as problem 1: state keyed by the `task_struct`, not the
+tid.
