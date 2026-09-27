@@ -484,27 +484,22 @@ workers:
 ```
 
 **Many blocking SQEs in one call.** Each hop moves only the creds; the full
-identity moves once, at the end. But each hop needs an idle spare worker,
-and there are only 2 (`IO_WQ_HANDOFF_SPARES`). So with 32 blocking SQEs:
+identity moves once, at the end. Each hop needs a spare: an idle io-wq
+worker. The pool is refilled toward 2 after each call. With 32 blocking
+SQEs and 2 spares:
 
 ```
- SQE 1       2 spares idle → inline in T, blocks → hand off to W1
- SQE 2       1 spare idle  → inline in W1, blocks → hand off to W2
- SQE 3..32   0 spares idle → sent to io-wq, as today
-             W2 returns to user space as tid 100
+ SQE 1       2 spares → inline in T, blocks → hand off to W1
+ SQE 2       1 spare  → inline in W1, blocks → hand off to W2
+ SQE 3..32   0 spares → io-wq, as today
 ```
 
-Why do SQEs 3..32 go to io-wq, and not inline? Inline is safe only if the
-thread can hand off when the request blocks. Without an idle spare, a
-blocking request would leave the app thread stuck in `io_uring_enter()`.
-The op has no nonblocking path to try, so io-wq is the only safe choice.
-No new spare comes during the call: the handoff runs just before the task
-sleeps, where it can't create a thread. New spares are made only when the
-call ends.
-
-Each blocked request still sleeps on some thread's stack: T, W1, and 30
-io-wq workers. So 32 blocked requests still need about 32 threads. The
-handoff saves the round trip only for requests that do **not** block.
+- No spare, no inline: a blocking request would leave the app thread stuck
+  in `io_uring_enter()`.
+- No new spare during the call: the handoff runs just before a task sleeps,
+  where it can't create a thread.
+- Each blocked request still sleeps on a thread (T, W1, 30 io-wq workers).
+  The handoff saves the round trip only for requests that do **not** block.
 
 ## 2.5 What moves
 
@@ -548,3 +543,29 @@ the handoff when the flags differ.
 `T->io_uring` is NULL, and `io_uring_task_sleeping()` does not check it. T
 is safe only because `PF_IO_WORKER` is tested first in the `else if`
 chain. A NULL check would make it robust.
+
+**4. A closed file stays open until another request ends.** *Tested in a
+VM.* The last `fput()` queues `____fput` as task_work on `current`, to run
+before the thread returns to user space. The handoff moves only io_uring's
+own task_work, so this one stays on T:
+
+```
+ one io_uring_enter():  SQE 1 CLOSE(fd with a flock)   SQE 2 FSYNC(big file)
+
+ T  CLOSE → last fput → ____fput queued on T
+    FSYNC → blocks → handoff
+ W  returns to user as tid 100             ← the file is still open
+ T  ...FSYNC done... → ____fput → the flock is released
+```
+
+[`fput_test.c`]({{ site.baseurl }}/code/io-uring-handoff/fput_test.c), ext4
+on null_blk, 5 runs each, ms after the submit:
+
+| `io_uring_handoff` | CLOSE CQE | lock free | FSYNC CQE |
+|---|---|---|---|
+| 0 | 0.2–0.5 | **0.2–0.7** | 337–963 |
+| 1 | 1.1–2.5 | **314–385** | 314–385 |
+
+`flock()`, an `O_EXCL` open or `umount` still see the file as open. The
+last `mntput()` has the same problem. Fix: refuse the handoff in
+`__io_handoff_begin()` when task_work is pending.
