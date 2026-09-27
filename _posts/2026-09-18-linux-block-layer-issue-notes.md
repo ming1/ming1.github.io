@@ -416,13 +416,19 @@ Run the request in T. If it does not block, there is no worker at all. If
 it **does** block, T gives its **identity** to an idle worker W:
 
 ```
- T (tid 100)                          idle worker W
- issue inline → about to sleep
-   hand the ring to W ──────────────→ wake up
-   T becomes an io-wq worker          submit the rest of the SQEs
- ...sleeps...                         take T's identity (tid, registers,
- request done → post the CQE            signals, creds, ...)
-                                      return from io_uring_enter() as tid 100
+ T (tid 100)                            idle worker W
+ io_issue_sqe()
+   io_handoff_begin()
+   __io_issue_sqe() → ... → schedule()
+     io_uring_task_sleeping()
+       io_wq_handoff_claim() ─────────→ io_wq_worker_promoted(): wake up
+       io_wq_handoff_commit():          io_handoff_resume()
+         T becomes an io-wq worker        io_submit_sqes(): the rest
+ ...sleeps...                             thread_handoff_finish(): take T's
+ request done                               tid, registers, signals, creds
+   io_handoff_complete(): queue CQE     ret_from_fork()
+   io_wq_handoff_worker(): worker loop    syscall_exit_to_user_mode():
+                                          return as tid 100
 ```
 
 Why move the identity, and not the work? A blocked request is a half-done
