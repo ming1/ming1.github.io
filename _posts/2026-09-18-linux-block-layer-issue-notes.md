@@ -552,11 +552,19 @@ own task_work, so this one stays on T:
 ```
  one io_uring_enter():  SQE 1 CLOSE(fd with a flock)   SQE 2 FSYNC(big file)
 
- T  CLOSE → last fput → ____fput queued on T
+ T  CLOSE: last fput → ____fput queued on T; CLOSE CQE deferred
     FSYNC → blocks → handoff
- W  returns to user as tid 100             ← the file is still open
+ W  io_submit_flush_completions()          → CLOSE CQE posted
+    returns to user as tid 100             ← the file is still open
  T  ...FSYNC done... → ____fput → the flock is released
 ```
+
+**This breaks what apps expect from a CLOSE CQE: if the fd held the last
+reference, the file is released,** like after `close(2)`. Without the
+handoff, an inline CLOSE releases the file before the call returns. With
+it, the app sees the CLOSE CQE as soon as the call returns (W flushes T's
+deferred completions early in `io_handoff_resume()`), but the file
+is released only when the unrelated FSYNC ends.
 
 [`fput_test.c`]({{ site.baseurl }}/code/io-uring-handoff/fput_test.c), ext4
 on null_blk, 5 runs each, ms after the submit:
@@ -566,6 +574,8 @@ on null_blk, 5 runs each, ms after the submit:
 | 0 | 0.2–0.5 | **0.2–0.7** | 337–963 |
 | 1 | 1.1–2.5 | **314–385** | 314–385 |
 
-`flock()`, an `O_EXCL` open or `umount` still see the file as open. The
-last `mntput()` has the same problem. Fix: refuse the handoff in
+The CLOSE CQE arrives with the return, about 300 ms before the file is
+released. An app that acts on it, by taking the lock again, opening a
+block device with `O_EXCL`, or unmounting, fails in that window. The last
+`mntput()` has the same problem. Fix: refuse the handoff in
 `__io_handoff_begin()` when task_work is pending.
