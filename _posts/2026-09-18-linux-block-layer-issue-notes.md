@@ -572,16 +572,23 @@ it, the app sees the CLOSE CQE as soon as the call returns (W flushes T's
 deferred completions early in `io_handoff_resume()`), but the file
 is released only when the unrelated FSYNC ends.
 
-[`fput_test.c`]({{ site.baseurl }}/code/io-uring-handoff/fput_test.c), ext4
-on null_blk, 5 runs each, ms after the submit:
+[`fput_test.c`]({{ site.baseurl }}/code/io-uring-handoff/fput_test.c)
+checks the file from userspace when each CQE arrives: a new fd tries
+`flock(LOCK_NB)`, and `/proc/locks` is read. ext4 on null_blk:
 
-| `io_uring_handoff` | CLOSE CQE | lock free | FSYNC CQE |
-|---|---|---|---|
-| 0 | 0.2–0.5 | **0.2–0.7** | 337–963 |
-| 1 | 1.1–2.5 | **314–385** | 314–385 |
+```
+ kernel.io_uring_handoff=1
+ enter returned      1.4 ms
+ CLOSE CQE           1.5 ms: flock(new fd) EWOULDBLOCK, the file is still open
+                  /proc/locks: 1: FLOCK  ADVISORY  WRITE 259 fc:00:13 0 EOF
+ FSYNC CQE         337.2 ms: flock(new fd) ok, the file is released
 
-The CLOSE CQE arrives with the return, about 300 ms before the file is
-released. An app that acts on it, by taking the lock again, opening a
-block device with `O_EXCL`, or unmounting, fails in that window. The last
+ kernel.io_uring_handoff=0
+ CLOSE CQE           0.2 ms: flock(new fd) ok, the file is released
+```
+
+The same in 3 of 3 runs each way. An app that acts on the CLOSE CQE, by
+taking the lock again, opening a block device with `O_EXCL`, or
+unmounting, fails until the unrelated FSYNC ends. The last
 `mntput()` has the same problem. Fix: refuse the handoff in
 `__io_handoff_begin()` when task_work is pending.
