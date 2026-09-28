@@ -364,11 +364,21 @@ head of it:
 
 ```
 00000000  01 01 21 10 00 00 20 00  00 00 00 00 00 00 01 00
-          └DENC v1,c1,len=0x1021┘  └── seq = 32 (le64) ──┘ └ops:1
 00000010  00 00 01 01 0b 10 00 00  01 01 58 01 00 00 07 00
-                └DENC op, len 0x100b┘      └lba┘  └len┘
 00000020  10 00 00 34 17 40 d1 4a  f3 93 f1 0c ca 7b 66 47
-          └4096─┘   └────────── payload starts ──────────┘
+```
+
+```
+0x00  01 01 21 10 00 00          DENC v1, compat 1, len 0x1021
+0x06  20 00 00 00 00 00 00 00    seq = 32 (le64)
+0x0e  01 00 00 00                ops: 1
+0x12  01 01 0b 10 00 00          op DENC v1, compat 1, len 0x100b
+0x18  01                         op = OP_WRITE
+0x19  01                         extents: 1 (varint)
+0x1a  58 01 00 00                offset, denc_lba
+0x1e  07                         length, varint_lowz: 1 << 12 = 0x1000
+0x1f  00 10 00 00                data: bufferlist length 4096
+0x23  34 17 40 d1 ...            the payload, 4096 B; then 4 B of empty `released`
 ```
 
 `58 01 00 00` is a `denc_lba`: low bit clear selects the 12-bit-shift
