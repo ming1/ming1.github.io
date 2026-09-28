@@ -299,9 +299,10 @@ _deferred_aio_finish
 ```
 
 The trigger is visible in the log line itself: the target blob is already
-allocated (`0x95000~2000,0x7f000~1000,0x98000~d000`), so overwriting in
-place would be a read-modify-write against live data. Deferring turns that
-into a WAL append now plus a clean overwrite later.
+allocated (`0x95000~2000,0x7f000~1000,0x98000~d000`), and a direct write
+never overwrites live sectors before the commit: a crash in between would
+leave new bytes under the old checksum. Deferring turns the overwrite into
+a WAL append now plus an in-place write later, here at `0x99000` (§3.5.3).
 
 ```
 direct :  data ──► disk ─┐
@@ -1425,9 +1426,11 @@ above, so absolute LBAs differ), by data-device LBA:
 ```
 
 Both modes copy-on-write for a direct overwrite: punch the old AU,
-allocate a new one. The split is the deferred overwrite. Classic still
-allocates a new AU — the WAL only changes *when* the data lands, not
-*where*; the replay writes freshly allocated space. v2's
+allocate a new one. The split is the deferred overwrite. Here the 4 KiB
+object's overwrite covers its whole physical extent, so classic's in-place
+deferral falls back and it still allocates a new AU — the WAL only changes
+*when* the data lands, not *where*. (When the overwrite covers only part of
+an extent, classic defers in place too; §3.5.3 traces both cases.) v2's
 `_defer_or_allocate` instead points the write at the extents
 `_punch_hole_2` just released (`disk_allocs.it = released.begin()`,
 [`Writer.cc:1326`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/Writer.cc#L1326))
@@ -2865,6 +2868,650 @@ in §3.3.8, engaging it removes one line from every remote shard's lane
 and changes nothing else in the trace. The measurement behind this
 paragraph, on both EC pipelines, is in §7.4's companion
 [tracker-notes post]({% post_url 2026-08-12-ceph-tracker-notes %}).
+
+## 3.5 Deferred write handling
+
+§1.6.3 showed the log lines of one deferred write. This case study
+follows one from `_do_write` to the moment its `L` record is deleted,
+then kills the OSD inside that window to show what the `L` record is
+for. The lab is §1.1 rebuilt (single OSD on `/dev/nvme0n1`, `p1` = pool
+2, 32 PGs, size 1), same tree `cc6b5e2da077`, built RelWithDebInfo.
+Absolute times belong to this VM's emulated NVMe, where an fdatasync
+costs 1–3 ms. Read the order, not the microseconds. Bare `:NNNN` is
+`BlueStore.cc` at v21.3.0.
+
+### 3.5.1 The workload and the trace
+
+```bash
+head -c 65536 /dev/urandom > /root/64k
+head -c 4096  /dev/urandom > /root/4k-new
+rados -p p1 put dfr /root/64k                     # deferred still OFF: one direct 64 KiB write
+ceph tell osd.0 config set bluestore_prefer_deferred_size 32768
+rados -p p1 put dfr /root/4k-new --offset 16384   # the traced op: write 16384~4096
+```
+
+`--offset` makes `rados put` send a plain `write`, not `writefull`
+(`rados.cc:643`). What BlueStore has when the write arrives, from the
+`debug_bluestore=20` pass:
+
+```
+_do_write #2:02561aac:::dfr:head# 0x4000~1000 - have 0x10000 (65536) bytes
+_do_write_big Blob(blob([0x7f000~10000] llen=0x10000 csum crc32c/0x1000/64) ...)
+```
+
+| | |
+|---|---|
+| object | `dfr`, 64 KiB, pg 2.0 |
+| layout | one blob, one physical extent `0x7f000~0x10000`, 16 crc32c values (one per 4 KiB) |
+| write | 4 KiB at 0x4000, aligned to min_alloc (4 KiB) and to the csum chunk (4 KiB) |
+| target | fully allocated, written, inside that one extent |
+| `bluestore_prefer_deferred_size` | 32768; the generic key overrides `_ssd` = 0 (`_set_alloc_sizes`, `:7225`) |
+| `bluestore_deferred_batch_ops_ssd` | 16 |
+| `bluestore_max_defer_interval` | 3 s |
+| `bluestore_write_v2` | false, the classic `_do_write` |
+| BlueFS | shares the one device (vstart, no separate DB/WAL) |
+
+The trace is [`wdefer.bt`]({{ site.baseurl }}/code/ceph/wdefer.bt), which is §2.3's wtrace plus the deferred
+functions, plus `PrimaryLogPG::log_op_stats` (one statement before the
+reply is sent, PLP:4476→4480), plus the rados client's
+`Objecter::handle_osd_op_reply`. On this optimized build it has to be
+address-resolved first, like §3.2's ([`wfsrun.py`]({{ site.baseurl }}/code/ceph/wfsrun.py)). [`wdefercollect.sh`]({{ site.baseurl }}/code/ceph/wdefercollect.sh)
+runs the whole collection: this trace (pass A), the debug-log pass
+(B), the direct-path control (C), the second deferred path (D), and
+the control's debug log (E).
+After the write it waits 8 s,
+then sends two metadata-only ops (`setomapval`, "nudges") so the
+cleanup happens inside the capture. §3.5.7 explains why an idle OSD
+needs them. Trimmed to the client txc and the kv cycles; `..214000` is
+BlueFS's `KernelDevice`, `..fb7c00` BlueStore's, both on `nvme0n1`
+(§1.7):
+
+```
+ #         us     tid  thread           function                                 event
+ 1          2   45454  tp_osd_tp        BlueStore::queue_transactions            transaction arrives
+ 2         26   45454  tp_osd_tp        BlueStore::_do_write                     txc 0x..905200 off=0x4000 len=0x1000
+ 3         29   45454  tp_osd_tp        BlueStore::_do_write_big                 off=0x4000 len=0x1000
+ 4         33   45454  tp_osd_tp        BigDeferredWriteContext::can_defer       prefer=0x8000 off=0x4000 l=0x1000
+ 5         36   45454  tp_osd_tp        BigDeferredWriteContext::can_defer       -> 1  b_off=0x4000 used=0x1000 head_read=0x0 tail_read=0x0
+ 6         40   45454  tp_osd_tp        BigDeferredWriteContext::apply_defer     -> 1
+ 7         41   45454  tp_osd_tp        BlueStore::_do_write_big_apply_deferred  logical 0x4000~0x1000 -> disk 0x83000~0x1000
+ 8         48   45454  tp_osd_tp        BlueStore::_get_deferred_op              txc 0x..905200 len=0x1000
+ 9         51   45454  tp_osd_tp        BlueStore::_do_alloc_write               txc 0x..905200          (0 blobs: returns at once)
+10         60   45454  tp_osd_tp        RocksDBTransactionImpl::set              P keylen=40 val=203B
+11         67   45454  tp_osd_tp        RocksDBTransactionImpl::set              P keylen=18 val=194B
+12         77   45454  tp_osd_tp        RocksDBTransactionImpl::set              O keylen=36 val=432B
+13         81   45454  tp_osd_tp        RocksDBTransactionImpl::set              L keylen=8 val=4135B
+14         97   45454  tp_osd_tp        BlueStore::_txc_state_proc               txc 0x..905200 PREPARE
+15        100   45454  tp_osd_tp        BlueStore::_txc_finish_io                txc 0x..905200
+16        101   45454  tp_osd_tp        BlueStore::_txc_state_proc               txc 0x..905200 IO_DONE
+17        125   45421  bstore_kv_sync   RocksDBStore::submit_transaction         async (no fsync)
+18        180   45421  bstore_kv_sync   RocksDBStore::submit_transaction_sync    start
+19        190   45421  bstore_kv_sync   KernelDevice::aio_write                  bdev=0x..214000 off=0xff1000 len=0x2000
+20       4503   45421  bstore_kv_sync   KernelDevice::flush                      fdatasync bdev=0x..214000 1232 us
+21       4519   45421  bstore_kv_sync   RocksDBStore::submit_transaction_sync    done (4340 us)
+22       4754   45422  bstore_kv_final  BlueStore::_txc_state_proc               txc 0x..905200 KV_SUBMITTED
+23       4758   45422  bstore_kv_final  BlueStore::_txc_committed_kv             txc 0x..905200 -> oncommits queued
+24       4771   45422  bstore_kv_final  BlueStore::_deferred_queue               txc 0x..905200 -> osr->deferred_pending
+25       4775   45422  bstore_kv_final  DeferredBatch::prepare_write             seq 26 0x83000~0x1000 -> iomap
+26       4827   45446  tp_osd_tp        PrimaryLogPG::log_op_stats               reply -> client
+27       5335   46926  msgr-worker-0    Objecter::handle_osd_op_reply            ondisk reply received (rados)
+28    1375180   45423  bstore_mempool   BlueStore::deferred_try_submit
+29    1375189   45423  bstore_mempool   BlueStore::_deferred_submit_unlock       osr 0x..3078c0
+30    1375193   45423  bstore_mempool   KernelDevice::aio_write                  bdev=0x..fb7c00 off=0x83000 len=0x1000
+31    1375196   45423  bstore_mempool   KernelDevice::aio_submit                 bdev=0x..fb7c00
+32    1377775   45052  bstore_aio       BlueStore::_deferred_aio_finish          osr 0x..3078c0 -> deferred_done_queue
+      4387622   45423  bstore_mempool   BlueStore::deferred_try_submit           (nothing pending)
+      7398540   45423  bstore_mempool   BlueStore::deferred_try_submit           (nothing pending)
+33    8052389   45458  tp_osd_tp        BlueStore::queue_transactions            nudge 1 (setomapval)
+34    8052558   45421  bstore_kv_sync   RocksDBStore::submit_transaction_sync    start
+35    8054513   45421  bstore_kv_sync   KernelDevice::flush                      fdatasync bdev=0x..214000 1109 us
+36    9094487   45458  tp_osd_tp        BlueStore::queue_transactions            nudge 2
+37    9094941   45421  bstore_kv_sync   RocksDBTransactionImpl::rm_single_key    L keylen=8
+38    9094953   45421  bstore_kv_sync   RocksDBStore::submit_transaction_sync    start
+39    9097965   45421  bstore_kv_sync   KernelDevice::flush                      fdatasync bdev=0x..214000 2099 us
+40    9098360   45422  bstore_kv_final  BlueStore::_txc_state_proc               txc 0x..905200 DEFERRED_CLEANUP
+41    9098364   45422  bstore_kv_final  BlueStore::_txc_finish                   txc 0x..905200 retired
+```
+
+The same txc appears from #2 to #41, 9.1 s apart. The client had its
+answer at #27, 5.3 ms in. The data reached its LBA at #30–#32, 1.37 s
+later. The bytes at `0x83000` change once, at #30. No other line
+writes the data device.
+
+### 3.5.2 The map — two writes, one transaction
+
+```
+ tp_osd_tp              bstore_kv_sync          bstore_kv_final          bstore_mempool         bstore_aio
+ (PG worker)            (kv committer)          (finisher)               (1 s tick)             (aio reaper)
+ #1   queue_transactions    ⋮                       ⋮                        ⋮                      ⋮
+ #2-7 _do_write_big:        ⋮                       ⋮                        ⋮                      ⋮
+      defer in place,       ⋮                       ⋮                        ⋮                      ⋮
+      target 0x83000        ⋮                       ⋮                        ⋮                      ⋮
+ #8   _get_deferred_op      ⋮                       ⋮                        ⋮                      ⋮
+ #10-12 set P,P,O           ⋮                       ⋮                        ⋮                      ⋮
+ #13  set L  4135 B   ◄── WAL write starts here: the 4 KiB rides the kv txn
+ #14-16 PREPARE → IO_DONE   ⋮                       ⋮                        ⋮                      ⋮
+      inline, no aio        ⋮                       ⋮                        ⋮                      ⋮
+      │ kv_queue.push + notify                      ⋮                        ⋮                      ⋮
+      └──────────────► #17-19 WAL append 8 KiB      ⋮                        ⋮                      ⋮
+                       #20  ONE fdatasync           ⋮                        ⋮                      ⋮
+                       ═══ P, O, L durable ═══      ⋮                        ⋮                      ⋮
+                            │ kv_finalize_cond      ⋮                        ⋮                      ⋮
+                            └───────────────► #22-23 KV_SUBMITTED            ⋮                      ⋮
+                                                    → oncommits              ⋮                      ⋮
+                                              #24-25 _deferred_queue         ⋮                      ⋮
+                                                    → iomap[0x83000]         ⋮                      ⋮
+ #26  reply ◄──── commit_queue ─────────────────────┘                        ⋮                      ⋮
+      (#27: client has it, +5.3 ms)                                          ⋮                      ⋮
+ ════════ client done · 0x83000 still holds the OLD 4 KiB ═══════════════════════════════════════════════
+                                                                   #28-31 +1.37 s: timer
+                                                                   placement write: 0x83000
+                                                                             │ io_submit
+                                                                             └──────────────► #32 done → deferred_done_queue
+                                                                                                  (no wakeup)
+      … 6.7 s: no kv cycle, the L record stays live …
+ #33  nudge 1 ─────► #34-35 commit + fdatasync:
+                            the flush also covers 0x83000 → "stable"
+ #36  nudge 2 ─────► #37  rm_single_key(L) into synct
+                     #38-39 commit
+                            └───────────────► #40 DEFERRED_CLEANUP
+                                              #41 _txc_finish: txc and buffer released
+```
+
+Two device writes carry the same 4 KiB. The **WAL write** is
+sequential and inside the commit. The **placement write** goes to the
+final LBA, later, with no commit waiting on it. They are one
+transaction's two halves. §3.1's path writes the data once, straight
+to its final place.
+
+Four points in that map:
+
+- the client's durability costs one fdatasync (#20), not two;
+- the reply leaves while the target LBA still holds the old bytes;
+- the final write is started by a timer, not by the write;
+- the txc outlives its reply by 9 s, pinning its payload and the
+  `L` record (the deferred throttle comes back earlier, at #32).
+
+### 3.5.3 Lines 2–9, the overwrite becomes deferred
+
+```
+#2  _do_write            :17851    "0x4000~1000 - have 0x10000"
+    └► _do_write_data → _do_write_big :17077   4 KiB = whole min_alloc unit
+#3     loop, one chunk l = 0x1000 (≤ target_blob_size)
+       gate: prefer_deferred_size && l ≤ 2 × prefer           :17112
+#4,5   head_info.can_defer(ep = lextent at 0x4000)             :16959
+          blob mutable; b_off = 0x4000; used = 0x1000
+          head_read = p2phase(b_off, chunk) = 0                  csum chunk 4 KiB,
+          tail_read = p2nphase(b_off+used, chunk) = 0            write aligned: no read
+          aligned len 0x1000 < prefer 0x8000
+          && blob.is_allocated(0x4000, 0x1000)                 :16984   → 1
+#6     head_info.apply_defer()                                 :16995
+          map blob 0x4000~0x1000 → pextent 0x7f000~0x10000
+          pextent sticks out on both sides → keep, res = 0x83000~0x1000
+          (a pextent wholly inside the write → -1, fall back)  :17003
+#7     _do_write_big_apply_deferred                            :17014
+          _buffer_cache_write  → STATE_WRITING buffer on the onode
+          calc_csum(b_off, bl)  → the blob's crc for chunk 4 = new bytes  :17059
+          set_lextent           → extent map still points at this blob
+#8        _get_deferred_op → op->extents = res_extents,
+                             op->data = the 4 KiB           :17070-17074
+       continue — skips punch_hole + new-space path         :17197
+#9  _do_alloc_write: "0 blobs"                              :17299   nothing to allocate
+    _txc_finalize_kv: "allocated 0x[] released 0x[]"
+```
+
+The whole decision rests on two facts about the blob. It is **already
+allocated and written**. And the write **does not cover a whole
+physical extent**, so the extent survives. BlueStore turns that into a
+**deferred overwrite in place**: `0x83000` is the blob's own sector
+(`0x7f000 + 0x4000`), and the only thing that changes in the onode is
+one checksum. The extent map, the blob and the allocator stay as
+they were.
+
+**The direct path cannot do that**, because it would overwrite the
+only copy of committed data before the commit. With the aio landing
+first and the kv commit lost in a crash, `0x83000` would hold new
+bytes under an onode whose crc still describes the old ones. Neither
+version would be readable. So a direct write in classic mode never
+targets live sectors. `_do_write_big` punches the range and places
+the data in fresh space (`:17197`), and `_do_write_small`'s direct
+aio only fills never-written parts of a blob (§4.3.2). Control pass C
+runs the same write with `prefer_deferred_size=0`. Pass E repeats it on
+a fresh same-shape object (`dir2`) at `debug_bluestore=20`, twice, and
+shows what that costs:
+
+```
+_do_write_big lookup for blocks to reuse...
+_do_write_big reuse blob Blob(blob([0x1c4000~4000,!~1000,0x1c9000~b000] ...))   ← punched
+AvlAllocator _allocate allocated 0x43000~1000
+_do_alloc_write blob Blob(blob([0x1c4000~4000,0x43000~1000,0x1c9000~b000] ...))
+_txc_finalize_kv allocated 0x[43000~1000] released 0x[1c8000~1000]
+                                     (second overwrite: 0x43000 → 0x46000, again)
+```
+
+One contiguous extent becomes three. Every later overwrite of that
+4 KiB allocates again and frees again. §1.6.3's
+`[0x95000~2000,0x7f000~1000,0x98000~d000]` is exactly this, left over
+from earlier direct overwrites.
+
+This particular write needs **no read** on either path:
+`head_read = tail_read = 0` because it is aligned to the 4 KiB csum
+chunk. Read-modify-write enters only for writes narrower than a csum
+chunk. `can_defer` then pads to the chunk, and
+`_do_write_big_apply_deferred` reads the head and tail from the device
+(`:17024-17052`). What this deferral saves here is the new
+allocation, the fragmentation, and the data-device barrier in the
+commit (§3.5.5).
+
+**A deferred write does not always stay in place.** Pass D re-runs
+the deferred overwrite on the control object after C fragmented it.
+Now `0x4000~0x1000` *is* a whole pextent:
+
+```
+BigDeferredWriteContext::can_defer       -> 1  b_off=0x4000 used=0x1000
+BigDeferredWriteContext::apply_defer     -> 0            ← pextent wholly covered: fall back
+BlueStore::_do_alloc_write               txc 0x..0fdb00  ← punch, allocate
+BlueStore::_get_deferred_op              len=0x1000      ← data_size 4 KiB < 32 KiB   :17552
+DeferredBatch::prepare_write             seq 1 0x42000~0x1000   ← a NEW LBA
+```
+
+That is the case §3.1.8 traced on a 4 KiB object. Classic has
+two deferred paths with one WAL-first shape: `_do_write_big_apply_deferred`
+(in place, when the overwrite only breaks a pextent) and
+`_do_alloc_write`'s whole-plan test (fresh space, when the plan is
+smaller than `prefer_deferred_size`). Only the first saves the
+allocation.
+
+### 3.5.4 Lines 10–13, the transaction records the data before writing it
+
+After #8 the payload is a field of the txc:
+
+```
+txc->deferred_txn : bluestore_deferred_transaction_t     bluestore_types.h:1363
+   seq       ++deferred_seq, an in-memory counter          :16011
+   ops[0]  : bluestore_deferred_op_t                       bluestore_types.h:1340
+      op        OP_WRITE (the only op type)
+      extents   [0x83000~0x1000]    dctx.res_extents: physical, not logical
+      data      the 4 KiB bufferlist (a reference; §7.5 counts the copies)
+   released  {}  (kraken-era; asserted empty)              :15451
+```
+
+`queue_transactions` turns it into a kv record once every op has been
+planned, right after `_txc_write_nodes` has staged `O`:
+
+```
+queue_transactions                                        :16009-16017
+   if (txc->deferred_txn)
+      seq = ++deferred_seq
+      encode(*deferred_txn, bl)                           DENC v1
+      get_deferred_key(seq) = _key_encode_u64 → 8 bytes BE  :568
+      txc->t->set(PREFIX_DEFERRED /* "L" */, key, bl)       #13
+```
+
+So `L` joins `P`, `P` and `O` in the one `WriteBatch` of §4.3.6. The
+record is readable after a crash, so here is one taken from §3.5.8's
+killed OSD (seq 28, same shape, LBA `0x93000`). `ceph-dencoder` is not
+built in this tree, so [`ldecode.py`]({{ site.baseurl }}/code/ceph/ldecode.py) reads it from the DENC layout:
+
+```
+$ ceph-kvstore-tool bluestore-kv dev/osd0 get L %00%00%00%00%00%00%00%1c out L.bin
+$ xxd -l 48 L.bin
+00000000: 0101 2110 0000 1c00 0000 0000 0000 0100  ..!.............
+00000010: 0000 0101 0b10 0000 0101 2601 0000 0700  ..........&.....
+00000020: 1000 00b5 ad52 2965 dccc 639a 453b 4f27  .....R)e..c.E;O'
+$ ldecode.py L.bin 4k-crash
+value 4135 B   DENC v1 compat1 len=0x1021   seq 28
+  op[0] OP_WRITE  0x93000~0x1000  data 4096 B  md5 ad0635480ad23dc70223aaca9df11e43
+        == 4k-crash: True
+  released: 0 intervals   (0 B left over)
+```
+
+```
+01 01 21100000  struct v1/compat1, len 0x1021
+1c00000000000000                 seq 28
+01000000                         1 op
+01 01 0b100000  op v1/compat1, len 0x100b
+01                               OP_WRITE
+01                               1 extent (varint)
+26010000                         denc_lba: 0x126 → 0x93 << 12 = 0x93000
+07                               varint_lowz: 1 << 12 = 0x1000
+00100000 + 4096 B                bufferlist
+00000000                         released: empty          6+8+4+6+1+1+4+1+4+4096+4 = 4135
+```
+
+What is on media at #20, and what is not:
+
+| Where | What |
+|---|---|
+| RocksDB WAL, BlueFS file on `nvme0n1` (`0xff1000~0x2000`, #19) | one `WriteBatch`: `P` log entry, `P` `_fastinfo`, `O`, `L`, fdatasynced (#20) |
+| `L` key | 8-byte big-endian seq, so iteration order = replay order |
+| `L` value | 4135 B: seq, `OP_WRITE`, **physical** extent `0x83000~0x1000`, the 4096 payload bytes |
+| `O` value | onode, 432 B: same extent map, same blob; chunk 4's crc now describes the **new** bytes |
+| data device `0x83000` | the **old** 4 KiB, until #30 |
+
+The metadata already describes the new data, and the new data exists
+only inside the WAL.
+
+### 3.5.5 Lines 14–16, `io_done` without `aio_wait`
+
+```
+case STATE_PREPARE:                                  :14641
+  if (txc->ioc.has_pending_aios()) {                 :14643   direct: §3.1 #8
+    set_state(AIO_WAIT); _txc_aio_submit(txc); return;
+  }
+  // ** fall-thru **                                          deferred: no aio was queued
+case STATE_AIO_WAIT:
+  _txc_finish_io(txc);                               :14668   #15, same thread, same call
+      → state IO_DONE → kv_queue.push + notify               #16
+```
+
+Nothing ever queued an aio on `txc->ioc`: `_do_write_big_apply_deferred`
+puts the data in `deferred_txn`, and `_do_alloc_write` had no blobs.
+So PREPARE falls through the AIO_WAIT *case* without entering the
+AIO_WAIT *state*. The log prints `prepare` then `io_done`, and no
+`aio_wait`. §1.6.2's branch, observed: #14→#16 takes 4 µs on
+`tp_osd_tp`. §3.1's lane #9, `bstore_aio` waking on an aio
+completion, does not exist.
+
+The kv thread sees the difference as `aios = 0`. On a single shared
+device that skips barrier #1 (`force_flush`, `:15364-15377`; §4.3.7):
+
+```
+_kv_sync_thread committed 1 cleaned 0 in 0.008059749s (0.000000107s flush + 0.008059642s kv commit)
+```
+
+(pass B, `debug_bluestore=20`). By the timestamps:
+
+```
++101 us      IO_DONE: the txc is ready to commit
++190 us      WAL aio_write (#19)
++4 503 us    WAL fdatasync returns (#20): committed
++1 375 193 us  first data-device write for this txc (#30)
+```
+
+**At the commit point the final-location write had not happened, and
+it had not even been issued.** In §3.1 the order is the reverse: data
+aio (#4, #8) → aio done (#9) → data flush (#10) → commit.
+
+### 3.5.6 Lines 17–27, the WAL pays for the client-visible durability
+
+```
+ the 4 KiB payload
+      │
+      ├───────────────────────────┐
+      ▼                           ▼
+ L value (#13)             O: crc of chunk 4 (#12)   + P, P (#10,#11)
+      │                           │
+      └────────── one WriteBatch ─┘
+                     │  submit_transaction, async      #17   (WAL buffer + memtable)
+                     │  submit_transaction_sync        #18   (synct: nearly empty)
+                     ▼
+              WAL append 8 KiB                          #19
+                     │
+              fdatasync (bluefs bdev)                   #20   ← the durability point
+                     │
+              _txc_committed_kv → oncommits             #23
+                     │
+              reply (tp_osd_tp)                         #26   ondisk
+```
+
+then, off the client path:
+
+```
+ _deferred_queue → iomap[0x83000]      #24-25   (bstore_kv_final, before #26)
+      │  … timer …
+ aio_write 0x83000 → io_submit          #30-31   (bstore_mempool)
+      │
+ _deferred_aio_finish                   #32      (bstore_aio)
+```
+
+"Durable" at #26 means **recoverable, not placed**. After #20 a power
+cut loses nothing. RocksDB replays the WAL and restores `L`, `O` and
+both `P` together, since a `WriteBatch` is all-or-nothing (§4.3.6).
+BlueStore's mount then replays `L` onto `0x83000` before the store
+accepts any op (§3.5.8). The claim is not that the bytes are at their
+final address. They are not, until #30, and not stable there until
+#35.
+
+Two properties make the early reply correct:
+
+- **The data and the metadata that describes it commit atomically.**
+  The onode's new crc and the bytes it is the crc of are in the same
+  batch, so no crash state has the crc without the payload.
+- **Nobody reads the LBA before the replay.** In a running OSD, reads
+  of `0x4000~0x1000` hit the `STATE_WRITING` buffer that #7 put on the
+  onode. Writing buffers hang on the txc's `writings` list, not the
+  cache LRU (`:1716-1746`), and are released only by
+  `_txc_finish → finish_writing` (`:14994`), which is #41. After a
+  crash there is no cache. Instead `_mount` runs `_deferred_replay`
+  (`:9636`) before `mounted = true`.
+
+The reply (#26) comes 56 µs after `_deferred_queue` (#24). The
+finisher queues the deferred IO in the same `_txc_state_proc` call
+that handed the commit callbacks to the OSD: `_txc_committed_kv` sets
+`KV_DONE` (`:14958`) and the switch falls into it (`:14724-14729`).
+Queued is not issued, though. Nothing touches the data device until
+#30.
+
+### 3.5.7 Lines 24–41, after the reply — replaying the deferred write
+
+**Queue (#24–#25).** `_deferred_queue` (`:15645`) appends the txc to
+its sequencer's open batch, `osr->deferred_pending` (a
+`DeferredBatch`, `BlueStore.h:2202`). For each op extent,
+`prepare_write` (`:5161`) files the bytes in `iomap`, keyed by
+physical offset. `_discard` first trims any older entry of the same
+batch that overlaps it, so a sector rewritten twice before submit is
+written once. The target offset is `op.extents`, the blob's pextent
+computed at #6; nothing is re-planned. The first txc of a batch also
+puts its sequencer on the global `deferred_queue`.
+
+**Submit (#28–#31).** Nothing at #24 starts IO. `deferred_try_submit`
+(`:15690`) has these callers:
+
+| Trigger | Where | Fired here? |
+|---|---|---|
+| `deferred_queue_size ≥ deferred_batch_ops` (16 on SSD) | `_kv_finalize_thread` `:15612` | no, 1 txc |
+| deferred throttle past its midpoint | same, `should_submit_deferred` | no |
+| a sequencer holding > `bluestore_max_deferred_txc` (32) txcs | `_txc_finish` `:15020` | no |
+| throttle exhausted in `queue_transactions` (aggressive) | `:16032-16050` | no |
+| `last_submitted + max_defer_interval < now`, checked every interval/3 | `MempoolThread` `:5656-5664` | **yes: #28 on `bstore_mempool`** |
+| drain, umount, mount replay | `_osr_drain_all` | §3.5.8 |
+
+A lone write therefore waits for the mempool timer. The tick runs every
+1 s, and `deferred_try_submit` stamps `deferred_last_submitted` even
+when it finds nothing. So the replay starts 0–4 s after the reply,
+depending on phase: 1.37 s in pass A, 2.03 s in pass B, 1.77 s in pass
+D. The idle ticks at +4.39 s and +7.40 s are the same timer, 3.01 s
+apart.
+
+`_deferred_submit_unlock` (`:15726`) moves the batch to
+`deferred_running`, walks `iomap` in offset order, and `claim_append`s
+runs of contiguous entries into one bufferlist (`:15776`). It issues
+one `aio_write` per run (`:15758`) and a single `aio_submit` for the
+batch (`:15780`), on the **data** `KernelDevice` (`..fb7c00`, #30).
+The replay computes no checksum and verifies none. The crc went into
+`O` at #7, and the replay writes the exact bytes that crc covers:
+
+```
+_deferred_submit_unlock   seq 27 0x83000~1000
+_deferred_submit_unlock write 0x83000~1000 crc 737dd6f2      ← pass B
+```
+
+**Complete (#32).** `bstore_aio` calls `DeferredBatch::aio_finish` →
+`_deferred_aio_finish` (`:15791`). It returns the deferred throttle
+bytes, marks each txc `DEFERRED_CLEANUP`, and pushes the batch onto
+`deferred_done_queue`. It does not wake the kv thread; the source
+comment says "in the normal case, do not bother waking up the kv
+thread; it will catch us on the next commit anyway" (`:15838`).
+
+**Clean (#33–#41). The key comes out two kv cycles later, on this
+layout.** "Done" is not yet "stable": the aio completed into the
+drive's volatile cache. `_kv_sync_thread` promotes it (§4.3.7):
+
+```
+nudge 1  "committing 1 submitting 1 deferred done 1 stable 0"
+         single shared device, aios = 0, a txc to commit → no bdev->flush   :15364-15372
+         its WAL fdatasync (#35) flushes the same device → covers 0x83000
+         after the commit: deferred_stable_queue.swap(deferred_done)       :15557
+nudge 2  "committing 1 submitting 1 deferred done 0 stable 1"
+         rm_single_key(L, seq) into synct                                   :15448-15456  #37
+         committed ... "cleaned 1"                                          #39
+         → bstore_kv_final: DEFERRED_CLEANUP → FINISHING → _txc_finish      :15600-15608  #40-41
+```
+
+The `L` delete rides a commit that happens only after a flush covering
+the replayed LBA. That is the crash-safety order of §4.3.7, observed.
+On this idle OSD nothing else committed for 6.7 s, so the `L` record,
+the txc, its `STATE_WRITING` buffer and its `iomap` bytes stayed live
+until the nudges. Under load, other txcs' commits supply the two
+cycles. A layout with a separate DB device takes a different
+branch: it flushes the data device in the next cycle and cleans in
+that same cycle (`:15373-15377`).
+
+### 3.5.8 The crash/recovery story
+
+[`wdefercrash.sh`]({{ site.baseurl }}/code/ceph/wdefercrash.sh) stops the replay from happening by itself
+(`max_defer_interval 0` disables the timer; `deferred_batch_ops 4096`),
+issues the same shape of overwrite on a new object, and kills the OSD
+after the ondisk reply:
+
+```
+old 16K..20K md5 87ecfc34fc09f79d29b39dcba3461d7d          the 64 KiB object's original 4 KiB
+new 4 KiB    md5 ad0635480ad23dc70223aaca9df11e43          the overwrite
+--- overwrite 4 KiB @ 16 KiB
+ondisk reply: rc=0
+rados get, 16K..20K md5 ad0635480ad23dc70223aaca9df11e43   new: served from the writing buffer
+--- kill -9 osd.0
+--- surviving L records
+L	%00%00%00%00%00%00%00%1c                                  seq 28
+  op[0] OP_WRITE  0x93000~0x1000  data 4096 B  md5 ad0635480ad23dc70223aaca9df11e43   == new
+raw /dev/nvme0n1 @ 0x93000 md5 87ecfc34fc09f79d29b39dcba3461d7d   == OLD
+--- restart osd.0 (debug_bluestore=20 for the mount)
+raw /dev/nvme0n1 @ 0x93000 md5 ad0635480ad23dc70223aaca9df11e43   == new
+rados get, whole object md5 70bc8fd4b35c4b6f29117433c44252b2
+expected,  whole object md5 70bc8fd4b35c4b6f29117433c44252b2
+--- L records after the replayed mount
+0
+```
+
+Before the restart, the only copy of the acknowledged 4 KiB on the
+device was inside RocksDB. Its final address still held the old
+bytes, under an onode whose crc already described the new ones. The
+mount repairs that before anything can read it:
+
+```
+_mount → _deferred_replay start                                    :9636, :15847
+_deferred_replay replay 0x000000000000001C                         iterate PREFIX_DEFERRED in key order
+_txc_state_proc txc 0x..78ef00 kv_done                             txc rebuilt, born in KV_DONE  :15890
+_deferred_queue txc 0x..78ef00                                     the same path as #24
+prepare_write seq 28 0x93000~1000 crc 75a164c7
+_osr_drain_all                                                     deferred_aggressive: submit now
+_deferred_submit_unlock write 0x93000~1000 crc 75a164c7
+aio_write 0x93000~1000 (direct)
+_deferred_aio_finish
+_kv_sync_thread committing 0 submitting 0 deferred done 1 stable 0
+                                                                   nothing else to commit → force_flush  :15367
+_txc_state_proc txc 0x..78ef00 deferred_cleanup
+_kv_sync_thread committed 0 cleaned 1 in 0.001552255s (0.000538503s flush + 0.001013752s kv commit)
+```
+
+Before inserting, `_eliminate_outdated_deferred` (`:15886`) drops any
+extent that BlueFS has since claimed. The whole replay took 2 ms and
+ran before `mounted = true`. The in-memory `deferred_seq` then starts
+again from 0 (the pass D trace after this restart shows `seq 1`),
+which is safe only because no `L` record survives the mount.
+
+Why a replay can never damage newer data:
+
+- **Same bytes, same place.** Replaying a record whose aio already
+  landed rewrites identical bytes. A crash between #32 and #37 costs
+  one redundant 4 KiB write.
+- **Order.** Keys are big-endian seq, so two records for one LBA
+  replay oldest first and the newest bytes win.
+- **No reuse under a live record.** Space that a later txc frees goes
+  back to the allocator only after every earlier txc on the sequencer,
+  deferred ones included, has finished. The comment at `:15043`:
+  "release to allocator only after all preceding txc's have also
+  finished any deferred writes that potentially land in these blocks".
+
+**The durability model, in nine answers**, for this trace:
+
+| # | Question | Answer | Evidence |
+|---|---|---|---|
+| 1 | When does the `ondisk` reply leave? | after the WAL fdatasync returns: 324 µs later | #20 → #26 |
+| 2 | Where is the payload then? | on media only in the WAL; in memory as `deferred_txn.ops[0].data`, the `iomap` entry, the `STATE_WRITING` buffer (one raw, shared), plus RocksDB's memtable copy (§7.5) | #13, #25, #7 |
+| 3 | Is the final LBA written? | no: first write at #30, 1.37 s later; old bytes until then | #30; crash run, raw read |
+| 4 | What makes it recoverable? | `L` (physical extent + bytes) committed atomically with `O` | §3.5.4 |
+| 5 | Crash after the reply, before `_deferred_aio_finish`? | WAL replay restores `L`; `_mount` replays it to the LBA before serving I/O | crash run |
+| 6 | When is `L` deleted? | in the kv commit *after* the one whose flush made the replayed LBA stable: `rm_single_key` into `synct` | #37, `:15454` |
+| 7 | What happens on restart? | `_deferred_replay` → txc in `KV_DONE` → queue → aggressive submit → flush → `rm L` → retire, ~2 ms | mount log |
+| 8 | Is the payload duplicated? | on media twice (WAL #19, LBA #30); in memory as the shared refs of row 2, plus RocksDB's own copies | #19, #30, §7.5 |
+| 9 | Which copies survive a crash? | only the WAL/`L` copy, and the LBA copy once #30 has been flushed (#35). All memory copies are temporary | crash run |
+
+### 3.5.9 Direct vs deferred — same write, two paths
+
+Pass A against control pass C: same 64 KiB object, same 4 KiB at
+0x4000, same lab, a minute apart:
+
+| | direct (C, `prefer=0`) | deferred (A, `prefer=32768`) |
+|---|---|---|
+| placement | punch + allocate `0x6b000` (copy-on-write) | in place, `0x83000` = `0x7f000 + 0x4000` |
+| allocator | +1 AU allocated, 1 AU released | nothing (`allocated 0x[] released 0x[]`) |
+| blob afterwards | 3 pextents (`dir2` log, §3.5.3) | still 1 |
+| `O` record | 442 B | 432 B |
+| extra kv record | — | `L`, 4135 B |
+| data aio before commit | yes (+101 µs, done +3 074 µs) | none |
+| states | PREPARE → AIO_WAIT (`bstore_aio`) → IO_DONE | PREPARE → IO_DONE (inline, `tp_osd_tp`) |
+| barriers before the reply | 2: data flush 2 121 µs + WAL flush 1 858 µs | 1: WAL flush 1 232 µs |
+| WAL append | `0x1000` | `0x2000` (the payload is in it) |
+| reply sent / received | +10 354 / +10 928 µs | +4 827 / +5 335 µs |
+| data-device write | before the reply | 1.37 s after it, by the mempool timer |
+| device bytes for 4 KiB | 4 KiB data + 4 KiB WAL | 8 KiB WAL + 4 KiB data |
+| txc retired | +9 970 µs | +9.1 s (two kv cycles after the replay) |
+| crash after reply | nothing to do | `_deferred_replay` rewrites the LBA |
+
+Or, as §3.1's order against this one:
+
+```
+ §3.1 / direct:   data aio ─► aio_wait ─► flush data ─► WAL + flush ─► reply
+ §3.5 / deferred:             payload in L ─► WAL + flush ─► reply ─► … ─► data aio ─► (next flush) ─► rm L
+```
+
+The state machine allows the inversion because the data a direct
+commit waits on (AIO_WAIT, barrier #1) is, in the deferred case, part
+of the committed batch. The commit waits on the WAL copy, and the
+`L` record keeps that copy alive until the placed copy is stable.
+
+**Why delay the physical write.** On this layout the choice is not
+"write now or write later" but "copy-on-write or journal". Journaling
+buys:
+
+- an in-place overwrite, so the object stays one extent and the
+  allocator sees nothing;
+- one barrier on the client path instead of two, with the payload
+  going to the sequential WAL;
+- a final write off the client path, merged with neighbours
+  (`iomap` coalescing) and superseded rewrites (`_discard`) when many
+  are pending. With `deferred_batch_ops` 16 on SSD, a lone write gets
+  none of that.
+
+It costs:
+
+- the payload written twice to the device, 12 KiB for 4 KiB here
+  against 8 KiB direct;
+- three more in-memory copies inside RocksDB (§7.5);
+- payload, `L` record and txc held for seconds, 9.1 s on this idle
+  OSD; `throttle_deferred_bytes` until the placement write completes
+  (#32, 1.37 s);
+- a replay step in every mount;
+- when the blob's csum chunk is wider than the write, head/tail
+  device reads in `_do_write_big_apply_deferred` (`:17024-17052`).
+  They are zero here, and the direct path's `_do_write_small` RMW
+  reads the same way.
+
+On the SSD defaults of §1.1 (`prefer_deferred_size_ssd = 0`) this
+trade is switched off. Only `_do_write_small`'s read-modify-write
+still goes through `L` (§4.3.2).
 
 # 4. Code analysis
 
