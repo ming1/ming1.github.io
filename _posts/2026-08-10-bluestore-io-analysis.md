@@ -2901,7 +2901,7 @@ rados -p p1 put dfr /root/4k-new --offset 16384   # the traced op: write 16384~4
 ```
 
 `--offset` makes `rados put` send a plain `write`, not `writefull`
-(`rados.cc:643`). What BlueStore has when the write arrives, from the
+([`rados.cc:643`](https://github.com/ceph/ceph/blob/v21.3.0/src/tools/rados/rados.cc#L643)). What BlueStore has when the write arrives, from the
 `debug_bluestore=20` pass:
 
 ```
@@ -2915,7 +2915,7 @@ _do_write_big Blob(blob([0x7f000~10000] llen=0x10000 csum crc32c/0x1000/64) ...)
 | layout | one blob, one physical extent `0x7f000~0x10000`, 16 crc32c values (one per 4 KiB) |
 | write | 4 KiB at 0x4000, aligned to min_alloc (4 KiB) and to the csum chunk (4 KiB) |
 | target | fully allocated, written, inside that one extent |
-| `bluestore_prefer_deferred_size` | 32768; the generic key overrides `_ssd` = 0 (`_set_alloc_sizes`, `:7225`) |
+| `bluestore_prefer_deferred_size` | 32768; the generic key overrides `_ssd` = 0 (`_set_alloc_sizes`, [`:7225`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L7225)) |
 | `bluestore_deferred_batch_ops_ssd` | 16 |
 | `bluestore_max_defer_interval` | 3 s |
 | `bluestore_write_v2` | false, the classic `_do_write` |
@@ -2923,7 +2923,7 @@ _do_write_big Blob(blob([0x7f000~10000] llen=0x10000 csum crc32c/0x1000/64) ...)
 
 The trace is [`wdefer.bt`]({{ site.baseurl }}/code/ceph/wdefer.bt), which is §2.3's wtrace plus the deferred
 functions, plus `PrimaryLogPG::log_op_stats` (one statement before the
-reply is sent, PLP:4476→4480), plus the rados client's
+reply is sent, [`PrimaryLogPG.cc:4476→4480`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L4476-L4480)), plus the rados client's
 `Objecter::handle_osd_op_reply`. On this optimized build it has to be
 address-resolved first, like §3.2's ([`wfsrun.py`]({{ site.baseurl }}/code/ceph/wfsrun.py)). [`wdefercollect.sh`]({{ site.baseurl }}/code/ceph/wdefercollect.sh)
 runs the whole collection: this trace (pass A), the debug-log pass
@@ -3084,7 +3084,7 @@ first and the kv commit lost in a crash, `0x83000` would hold new
 bytes under an onode whose crc still describes the old ones. Neither
 version would be readable. So a direct write in classic mode never
 targets live sectors. `_do_write_big` punches the range and places
-the data in fresh space (`:17197`), and `_do_write_small`'s direct
+the data in fresh space ([`:17197`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L17197)), and `_do_write_small`'s direct
 aio only fills never-written parts of a blob (§4.3.2). Control pass C
 runs the same write with `prefer_deferred_size=0`. Pass E repeats it on
 a fresh same-shape object (`dir2`) at `debug_bluestore=20`, twice, and
@@ -3109,7 +3109,7 @@ This particular write needs **no read** on either path:
 chunk. Read-modify-write enters only for writes narrower than a csum
 chunk. `can_defer` then pads to the chunk, and
 `_do_write_big_apply_deferred` reads the head and tail from the device
-(`:17024-17052`). What this deferral saves here is the new
+([`:17024-17052`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L17024-L17052)). What this deferral saves here is the new
 allocation, the fragmentation, and the data-device barrier in the
 commit (§3.5.5).
 
@@ -3224,7 +3224,7 @@ AIO_WAIT *state*. The log prints `prepare` then `io_done`, and no
 completion, does not exist.
 
 The kv thread sees the difference as `aios = 0`. On a single shared
-device that skips barrier #1 (`force_flush`, `:15364-15377`; §4.3.7):
+device that skips barrier #1 (`force_flush`, [`:15364-15377`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15364-L15377); §4.3.7):
 
 ```
 _kv_sync_thread committed 1 cleaned 0 in 0.008059749s (0.000000107s flush + 0.008059642s kv commit)
@@ -3291,24 +3291,24 @@ Two properties make the early reply correct:
 - **Nobody reads the LBA before the replay.** In a running OSD, reads
   of `0x4000~0x1000` hit the `STATE_WRITING` buffer that #7 put on the
   onode. Writing buffers hang on the txc's `writings` list, not the
-  cache LRU (`:1716-1746`), and are released only by
-  `_txc_finish → finish_writing` (`:14994`), which is #41. After a
+  cache LRU ([`:1716-1746`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1716-L1746)), and are released only by
+  `_txc_finish → finish_writing` ([`:14994`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L14994)), which is #41. After a
   crash there is no cache. Instead `_mount` runs `_deferred_replay`
-  (`:9636`) before `mounted = true`.
+  ([`:9636`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L9636)) before `mounted = true`.
 
 The reply (#26) comes 56 µs after `_deferred_queue` (#24). The
 finisher queues the deferred IO in the same `_txc_state_proc` call
 that handed the commit callbacks to the OSD: `_txc_committed_kv` sets
-`KV_DONE` (`:14958`) and the switch falls into it (`:14724-14729`).
+`KV_DONE` ([`:14958`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L14958)) and the switch falls into it ([`:14724-14729`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L14724-L14729)).
 Queued is not issued, though. Nothing touches the data device until
 #30.
 
 ### 3.5.7 Lines 24–41, after the reply — replaying the deferred write
 
-**Queue (#24–#25).** `_deferred_queue` (`:15645`) appends the txc to
+**Queue (#24–#25).** `_deferred_queue` ([`:15645`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15645)) appends the txc to
 its sequencer's open batch, `osr->deferred_pending` (a
-`DeferredBatch`, `BlueStore.h:2202`). For each op extent,
-`prepare_write` (`:5161`) files the bytes in `iomap`, keyed by
+`DeferredBatch`, [`BlueStore.h:2202`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2202)). For each op extent,
+`prepare_write` ([`:5161`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L5161)) files the bytes in `iomap`, keyed by
 physical offset. `_discard` first trims any older entry of the same
 batch that overlaps it, so a sector rewritten twice before submit is
 written once. The target offset is `op.extents`, the blob's pextent
@@ -3316,15 +3316,15 @@ computed at #6; nothing is re-planned. The first txc of a batch also
 puts its sequencer on the global `deferred_queue`.
 
 **Submit (#28–#31).** Nothing at #24 starts IO. `deferred_try_submit`
-(`:15690`) has these callers:
+([`:15690`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15690)) has these callers:
 
 | Trigger | Where | Fired here? |
 |---|---|---|
-| `deferred_queue_size ≥ deferred_batch_ops` (16 on SSD) | `_kv_finalize_thread` `:15612` | no, 1 txc |
+| `deferred_queue_size ≥ deferred_batch_ops` (16 on SSD) | `_kv_finalize_thread` [`:15612`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15612) | no, 1 txc |
 | deferred throttle past its midpoint | same, `should_submit_deferred` | no |
-| a sequencer holding > `bluestore_max_deferred_txc` (32) txcs | `_txc_finish` `:15020` | no |
-| throttle exhausted in `queue_transactions` (aggressive) | `:16032-16050` | no |
-| `last_submitted + max_defer_interval < now`, checked every interval/3 | `MempoolThread` `:5656-5664` | **yes: #28 on `bstore_mempool`** |
+| a sequencer holding > `bluestore_max_deferred_txc` (32) txcs | `_txc_finish` [`:15020`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15020) | no |
+| throttle exhausted in `queue_transactions` (aggressive) | [`:16032-16050`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L16032-L16050) | no |
+| `last_submitted + max_defer_interval < now`, checked every interval/3 | `MempoolThread` [`:5656-5664`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L5656-L5664) | **yes: #28 on `bstore_mempool`** |
 | drain, umount, mount replay | `_osr_drain_all` | §3.5.8 |
 
 A lone write therefore waits for the mempool timer. The tick runs every
@@ -3334,11 +3334,11 @@ depending on phase: 1.37 s in pass A, 2.03 s in pass B, 1.77 s in pass
 D. The idle ticks at +4.39 s and +7.40 s are the same timer, 3.01 s
 apart.
 
-`_deferred_submit_unlock` (`:15726`) moves the batch to
+`_deferred_submit_unlock` ([`:15726`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15726)) moves the batch to
 `deferred_running`, walks `iomap` in offset order, and `claim_append`s
-runs of contiguous entries into one bufferlist (`:15776`). It issues
-one `aio_write` per run (`:15758`) and a single `aio_submit` for the
-batch (`:15780`), on the **data** `KernelDevice` (`..fb7c00`, #30).
+runs of contiguous entries into one bufferlist ([`:15776`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15776)). It issues
+one `aio_write` per run ([`:15758`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15758)) and a single `aio_submit` for the
+batch ([`:15780`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15780)), on the **data** `KernelDevice` (`..fb7c00`, #30).
 The replay computes no checksum and verifies none. The crc went into
 `O` at #7, and the replay writes the exact bytes that crc covers:
 
@@ -3348,11 +3348,11 @@ _deferred_submit_unlock write 0x83000~1000 crc 737dd6f2      ← pass B
 ```
 
 **Complete (#32).** `bstore_aio` calls `DeferredBatch::aio_finish` →
-`_deferred_aio_finish` (`:15791`). It returns the deferred throttle
+`_deferred_aio_finish` ([`:15791`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15791)). It returns the deferred throttle
 bytes, marks each txc `DEFERRED_CLEANUP`, and pushes the batch onto
 `deferred_done_queue`. It does not wake the kv thread; the source
 comment says "in the normal case, do not bother waking up the kv
-thread; it will catch us on the next commit anyway" (`:15838`).
+thread; it will catch us on the next commit anyway" ([`:15838`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15838)).
 
 **Clean (#33–#41). The key comes out two kv cycles later, on this
 layout.** "Done" is not yet "stable": the aio completed into the
@@ -3376,7 +3376,7 @@ the txc, its `STATE_WRITING` buffer and its `iomap` bytes stayed live
 until the nudges. Under load, other txcs' commits supply the two
 cycles. A layout with a separate DB device takes a different
 branch: it flushes the data device in the next cycle and cleans in
-that same cycle (`:15373-15377`).
+that same cycle ([`:15373-15377`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15373-L15377)).
 
 ### 3.5.8 The crash/recovery story
 
@@ -3425,7 +3425,7 @@ _txc_state_proc txc 0x..78ef00 deferred_cleanup
 _kv_sync_thread committed 0 cleaned 1 in 0.001552255s (0.000538503s flush + 0.001013752s kv commit)
 ```
 
-Before inserting, `_eliminate_outdated_deferred` (`:15886`) drops any
+Before inserting, `_eliminate_outdated_deferred` ([`:15886`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15886)) drops any
 extent that BlueFS has since claimed. The whole replay took 2 ms and
 ran before `mounted = true`. The in-memory `deferred_seq` then starts
 again from 0 (the pass D trace after this restart shows `seq 1`),
@@ -3440,7 +3440,7 @@ Why a replay can never damage newer data:
   replay oldest first and the newest bytes win.
 - **No reuse under a live record.** Space that a later txc frees goes
   back to the allocator only after every earlier txc on the sequencer,
-  deferred ones included, has finished. The comment at `:15043`:
+  deferred ones included, has finished. The comment at [`:15043`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15043):
   "release to allocator only after all preceding txc's have also
   finished any deferred writes that potentially land in these blocks".
 
@@ -3453,7 +3453,7 @@ Why a replay can never damage newer data:
 | 3 | Is the final LBA written? | no: first write at #30, 1.37 s later; old bytes until then | #30; crash run, raw read |
 | 4 | What makes it recoverable? | `L` (physical extent + bytes) committed atomically with `O` | §3.5.4 |
 | 5 | Crash after the reply, before `_deferred_aio_finish`? | WAL replay restores `L`; `_mount` replays it to the LBA before serving I/O | crash run |
-| 6 | When is `L` deleted? | in the kv commit *after* the one whose flush made the replayed LBA stable: `rm_single_key` into `synct` | #37, `:15454` |
+| 6 | When is `L` deleted? | in the kv commit *after* the one whose flush made the replayed LBA stable: `rm_single_key` into `synct` | #37, [`:15454`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15454) |
 | 7 | What happens on restart? | `_deferred_replay` → txc in `KV_DONE` → queue → aggressive submit → flush → `rm L` → retire, ~2 ms | mount log |
 | 8 | Is the payload duplicated? | on media twice (WAL #19, LBA #30); in memory as the shared refs of row 2, plus RocksDB's own copies | #19, #30, §7.5 |
 | 9 | Which copies survive a crash? | only the WAL/`L` copy, and the LBA copy once #30 has been flushed (#35). All memory copies are temporary | crash run |
@@ -3515,13 +3515,63 @@ It costs:
   (#32, 1.37 s);
 - a replay step in every mount;
 - when the blob's csum chunk is wider than the write, head/tail
-  device reads in `_do_write_big_apply_deferred` (`:17024-17052`).
+  device reads in `_do_write_big_apply_deferred` ([`:17024-17052`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L17024-L17052)).
   They are zero here, and the direct path's `_do_write_small` RMW
   reads the same way.
 
 On the SSD defaults of §1.1 (`prefer_deferred_size_ssd = 0`) this
 trade is switched off. Only `_do_write_small`'s read-modify-write
 still goes through `L` (§4.3.2).
+
+### 3.5.10 Code references
+
+All links point at `v21.3.0`. `#N` is the §3.5.1 trace line.
+
+| Code | Role |
+|---|---|
+| **Plan: which path the overwrite takes** | |
+| [`BlueStore::_do_write()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L17851) | entry for an `OP_WRITE`; #2 |
+| [`BlueStore::_do_write_big()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L17077) | whole-min_alloc part: the deferral gate (`:17112`), the in-place branch, punch + new space (`:17197`); #3 |
+| [`BlueStore::BigDeferredWriteContext`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2386) | `off`, `b_off`, `used`, `head_read`, `tail_read`, `res_extents`, which wdefer.bt reads at #5 and #7 |
+| [`BigDeferredWriteContext::can_defer()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L16959) | blob mutable, allocated, chunk-aligned length `< prefer_deferred_size`; #4–#5 |
+| [`BigDeferredWriteContext::apply_defer()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L16995) | map to pextents; a pextent wholly covered → fall back (`:17003`); #6, pass D |
+| [`BlueStore::_do_write_big_apply_deferred()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L17014) | head/tail reads if needed, writing buffer, `calc_csum`, the deferred op; #7 |
+| [`BlueStore::_do_alloc_write()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L17290) | allocate for the plan; whole-plan defer test (`:17552`); #9, pass D |
+| [`BlueStore::_do_write_small()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L16566) | sub-min_alloc part: RMW, always deferred (§4.3.2) |
+| [`BlueStore::_set_alloc_sizes()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L7221) | generic `prefer_deferred_size` / `deferred_batch_ops` override the `_ssd`/`_hdd` values |
+| **Record: the payload in the kv transaction** | |
+| [`bluestore_deferred_op_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h#L1340) | `op`, `extents` (physical), `data` |
+| [`bluestore_deferred_transaction_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h#L1363) | `seq`, `ops`, `released`: the `L` value |
+| [`BlueStore::_get_deferred_op()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15633) | creates `txc->deferred_txn`, appends an op; #8 |
+| [`get_deferred_key()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L568) | `L` key = 8-byte big-endian seq |
+| [`BlueStore::queue_transactions()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15980) | `seq = ++deferred_seq`, encode, `t->set(PREFIX_DEFERRED, …)` (`:16009-16017`); #13 |
+| [`denc_lba()`](https://github.com/ceph/ceph/blob/v21.3.0/src/include/denc.h#L602) | extent offset encoding, decoded in §3.5.4 and by ldecode.py |
+| [`denc_varint_lowz()`](https://github.com/ceph/ceph/blob/v21.3.0/src/include/denc.h#L494) | extent length encoding |
+| **Commit: the state machine and the kv threads** | |
+| [`BlueStore::_txc_state_proc()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L14634) | PREPARE falls through with no aio (`:14641-14668`); KV_DONE → `_deferred_queue` (`:14724`); #14–#16, #22, #40 |
+| [`BlueStore::_txc_finish_io()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L14753) | IO_DONE in submission order; #15 |
+| [`BlueStore::_kv_sync_thread()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15290) | `force_flush` (`:15364`), `L` deletes into `synct` (`:15448`), done → stable (`:15557`); #17–#21, #34–#39 |
+| [`BlueStore::_txc_committed_kv()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L14952) | sets KV_DONE, queues the oncommits; #23 |
+| [`BlueStore::_kv_finalize_thread()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15564) | runs committed txcs and stable deferred batches; batch trigger (`:15612`) |
+| [`BlueStore::BlueStoreThrottle::try_start_transaction()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L19370) | a deferred txc also takes `throttle_deferred_bytes` |
+| [`PrimaryLogPG::execute_ctx()`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L4473) | the commit lambda: `log_op_stats`, then the reply; #26 |
+| [`Objecter::handle_osd_op_reply()`](https://github.com/ceph/ceph/blob/v21.3.0/src/osdc/Objecter.cc#L3797) | the client receives the `ondisk` reply; #27 |
+| **Place: the write to the final LBA** | |
+| [`BlueStore::DeferredBatch`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2202) | per-sequencer batch: `iomap` by physical offset, `txcs`, its own `IOContext` |
+| [`DeferredBatch::prepare_write()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L5161) | file the bytes in `iomap`; `_discard` (`:5183`) drops overlapped older entries; #25 |
+| [`BlueStore::_deferred_queue()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15645) | append to `osr->deferred_pending`; #24 |
+| [`BlueStore::deferred_try_submit()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15690) | submit every sequencer with a pending batch; #28 |
+| [`BlueStore::MempoolThread::entry()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L5548) | the `max_defer_interval` timer (`:5656-5664`) that fired #28 |
+| [`BlueStore::_deferred_submit_unlock()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15726) | merge contiguous `iomap` runs, `aio_write` + `aio_submit`; #29–#31 |
+| [`BlueStore::_deferred_aio_finish()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15791) | DEFERRED_CLEANUP, throttle back, `deferred_done_queue`, no kv wakeup; #32 |
+| [`BlueStore::_txc_finish()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L14989) | retire; releases space only behind earlier deferred txcs (`:15043`); #41 |
+| **Read and recover** | |
+| [`BlueStore::BufferSpace::_add_buffer()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1705) | writing buffers stay off the cache LRU (`:1745`) |
+| [`BlueStore::TransContext::finish_writing()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L2047) | releases them at `_txc_finish` |
+| [`BlueStore::_mount()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L9556) | calls `_deferred_replay` (`:9636`) before `mounted = true` |
+| [`BlueStore::_deferred_replay()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15847) | rebuild a txc per `L` record, born in KV_DONE; drain |
+| [`BlueStore::_eliminate_outdated_deferred()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15907) | drop extents BlueFS has claimed since |
+| [`do_put()`](https://github.com/ceph/ceph/blob/v21.3.0/src/tools/rados/rados.cc#L596) | `rados put --offset` sends `write`, not `writefull` (`:643`) |
 
 # 4. Code analysis
 
