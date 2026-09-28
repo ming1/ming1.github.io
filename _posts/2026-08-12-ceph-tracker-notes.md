@@ -2260,10 +2260,11 @@ keep `B` queued for as long as possible.
 
 #### 8.3.1 Root cause, top to bottom
 
-All lines are from `src/os/bluestore/Writer.cc` on main `986f3c892e7`.
+All lines are from `src/os/bluestore/Writer.cc` on main
+[`986f3c892e7`](https://github.com/ceph/ceph/tree/986f3c892e759443a07b45f58d0287e71485394b); §8.6 lists every function and structure with a link.
 
 **#2: released space becomes a deferred target.** `_defer_or_allocate()`
-(1312) decides between a new allocation and reusing what this transaction
+([`1312`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/Writer.cc#L1312)) decides between a new allocation and reusing what this transaction
 has just released:
 
 ```cpp
@@ -2275,7 +2276,7 @@ if (do_deferred) {
 
 **#3: the promise.** `_blob_create_with_data()` then creates the blob on
 that space and, for any AU larger than a block, marks all of it unused
-(513):
+([`513`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/Writer.cc#L513)):
 
 ```cpp
 if (min_alloc_size != block_size) {
@@ -2285,7 +2286,7 @@ if (min_alloc_size != block_size) {
 
 **#4: the promise is used.** A later write next to the blob's data reuses
 the blob's allocated space (`_try_reuse_allocated_l/r()`), and
-`_schedule_io_masked()` (713) splits it per chunk:
+`_schedule_io_masked()` ([`713`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/Writer.cc#L713)) splits it per chunk:
 
 ```cpp
 if (chunk_is_unused) {
@@ -2301,7 +2302,7 @@ targets X+8K.
 #### 8.3.2 Why the v1 write path is safe
 
 v1 never reuses released space in the same transaction. It releases space to
-the allocator in `_txc_finish()` (BlueStore.cc:15195), and only after the
+the allocator in `_txc_finish()` ([`BlueStore.cc:15195`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/BlueStore.cc#L15195)), and only after the
 earlier transactions have finished their deferred writes:
 
 ```cpp
@@ -2322,7 +2323,7 @@ Both are needed:
   it. The code has been in main since PR #54504.
 - `min_alloc_size` larger than the block size and smaller than
   `prefer_deferred_size`: a released AU is reused only while
-  `released_size < prefer_deferred_size` (Writer.cc:1320).
+  `released_size < prefer_deferred_size` ([`Writer.cc:1320`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/Writer.cc#L1320)).
 
 With default deferred settings (64K for HDD, 0 for SSD) that means an HDD
 OSD with a 16K or 32K AU, set explicitly; the current default is 4K. The old
@@ -2387,6 +2388,32 @@ blob test suites pass with it.
 - **The failure hides until a restart.** The buffer cache serves the new
   data, so a read right after the writes is correct. A reproducer has to
   drop the cache, and a restart is the simplest way.
+
+### 8.6 Code references
+
+All links point at main `986f3c892e7`.
+
+| Code | Role |
+|---|---|
+| [`BlueStore::Writer`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/Writer.h#L21) | the write_v2 write path; holds `released`, `do_deferred` |
+| [`Writer::_defer_or_allocate()`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/Writer.cc#L1312) | reuse released space as a deferred target, or allocate (#2) |
+| [`Writer::_blob_create_with_data()`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/Writer.cc#L485) | new blob on that space; marks the rest of the AU unused (#3) |
+| [`Writer::_blob_put_data_subau_allocate()`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/Writer.cc#L447) | second place the fix clears the unused bits |
+| [`Writer::_try_reuse_allocated_l()`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/Writer.cc#L825) | later write reuses the blob's allocated space, left side (#4) |
+| [`Writer::_try_reuse_allocated_r()`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/Writer.cc#L897) | same, right side |
+| [`Writer::_schedule_io_masked()`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/Writer.cc#L713) | unused chunk -> direct aio, used chunk -> deferred op (#1, #4) |
+| [`BlueStore::_get_deferred_op()`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/BlueStore.cc#L15785) | queues a deferred write on the transaction |
+| [`BlueStore::_txc_finish()`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/BlueStore.cc#L15141) | v1 releases space only after earlier deferred writes (§8.3.2) |
+| [`BlueStore::_verify_csum()`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/BlueStore.cc#L13447) | the read-side check that reports the lost write (#6) |
+| [`bluestore_blob_t`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/bluestore_types.h#L544) | on-disk blob; its `unused` bitmap is the promise |
+| [`bluestore_blob_t::unused`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/bluestore_types.h#L563) | one bit per chunk that has never been written |
+| [`bluestore_blob_t::add_unused_all()`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/bluestore_types.h#L796) | marks the whole blob unused |
+| [`bluestore_blob_t::mark_used()`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/bluestore_types.h#L802) | clears unused bits for a range |
+| [`bluestore_blob_t::get_unused_mask()`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/bluestore_types.h#L827) | per-chunk unused mask handed to `_schedule_io_masked()` |
+| [`bluestore_deferred_op_t`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/bluestore_types.h#L1377) | a deferred write record: disk extents + data, kept in RocksDB |
+| [`bluestore_write_v2`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/common/options/global.yaml.in#L5385) | enables the Writer path (default false) |
+| [`bluestore_min_alloc_size_hdd`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/common/options/global.yaml.in#L4767) | AU size on HDD (default 4K) |
+| [`bluestore_prefer_deferred_size_hdd`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/common/options/global.yaml.in#L4833) | deferred-write threshold on HDD (default 64K) |
 
 # Part II — OSD
 
