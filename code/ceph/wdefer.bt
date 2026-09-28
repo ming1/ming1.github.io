@@ -1,0 +1,240 @@
+#!/usr/bin/env bpftrace
+/*
+ * wdefer.bt -- one deferred write, end to end: planning, the L record,
+ * the kv commit, the client reply, and the background replay that writes
+ * the data to its final LBA seconds later.  wtrace.bt's event log with
+ * the deferred-path functions added.
+ *
+ * Usage:  bpftrace wdefer.bt <ceph-osd> <libceph-common.so>
+ *   e.g.  bpftrace wdefer.bt /root/git/ceph/test-v21.3.0/build/bin/ceph-osd \
+ *                  /root/git/ceph/test-v21.3.0/build/lib/libceph-common.so.2
+ *
+ *   Wait for the header line, issue ONE overwrite, wait > 3 s
+ *   (bluestore_max_defer_interval) so the replay is captured, Ctrl-C.
+ *
+ * Built against v21.3.0 (cc6b5e2da077), RelWithDebInfo.  The two raw
+ * offsets below come from that build's DWARF (gdb ptype /o):
+ *   TransContext::state            txc + 0x2fc
+ *   BigDeferredWriteContext        off @0, b_off @8, used @12,
+ *                                  head_read @16, tail_read @24,
+ *                                  res_extents (PExtentVector) @48,
+ *                                  its begin pointer @48+16
+ *
+ * Columns as wtrace.bt: us since the first queue_transactions, tid,
+ * thread (comm), function, event.  _txc_state_proc lines are printed only
+ * for txcs that ran _do_write (the client's), so the PG-stat upkeep
+ * transactions of an idle OSD show up only as their kv cycles.
+ */
+
+BEGIN
+{
+  printf("%10s %7s  %-16s %-40s %s\n", "us", "tid", "thread", "function", "event");
+  @st[0] = "PREPARE";        @st[1] = "AIO_WAIT";      @st[2] = "IO_DONE";
+  @st[3] = "KV_QUEUED";      @st[4] = "KV_SUBMITTED";  @st[5] = "KV_DONE";
+  @st[6] = "DEFERRED_QUEUED"; @st[7] = "DEFERRED_CLEANUP";
+  @st[8] = "DEFERRED_DONE";  @st[9] = "FINISHING";     @st[10] = "DONE";
+}
+
+/* ---- OSD -> BlueStore ----------------------------------------------- */
+uprobe:$1:_ZN9BlueStore*queue_transactionsE*
+{
+  if (@t0 == 0) { @t0 = nsecs; }
+  printf("%10lld %7d  %-16s %-40s transaction arrives\n",
+         (nsecs-@t0)/1000, tid, comm, "BlueStore::queue_transactions");
+}
+
+/* _do_write(txc=arg1, c, o, offset=arg4, length=arg5, bl, flags) */
+uprobe:$1:_ZN9BlueStore9_do_writeE*
+/@t0/
+{ @wtx[arg1] = 1;
+  printf("%10lld %7d  %-16s %-40s txc %p off=0x%lx len=0x%lx\n",
+         (nsecs-@t0)/1000, tid, comm, "BlueStore::_do_write", arg1, arg4, arg5); }
+
+uprobe:$1:_ZN9BlueStore13_do_write_bigE*
+/@t0/
+{ printf("%10lld %7d  %-16s %-40s off=0x%lx len=0x%lx\n",
+         (nsecs-@t0)/1000, tid, comm, "BlueStore::_do_write_big", arg4, arg5); }
+
+uprobe:$1:_ZN9BlueStore15_do_write_smallE*
+/@t0/
+{ printf("%10lld %7d  %-16s %-40s off=0x%lx len=0x%lx\n",
+         (nsecs-@t0)/1000, tid, comm, "BlueStore::_do_write_small", arg4, arg5); }
+
+/* ---- the deferred decision (classic _do_write_big) ------------------- */
+/* can_defer(this=dctx, ep, prefer_deferred_size, block_size, offset, l) */
+uprobe:$1:_ZN9BlueStore23BigDeferredWriteContext9can_deferE*
+/@t0/
+{ @cd[tid] = arg0;
+  printf("%10lld %7d  %-16s %-40s prefer=0x%lx off=0x%lx l=0x%lx\n",
+         (nsecs-@t0)/1000, tid, comm, "BigDeferredWriteContext::can_defer",
+         arg2, arg4, arg5); }
+uretprobe:$1:_ZN9BlueStore23BigDeferredWriteContext9can_deferE*
+/@cd[tid]/
+{ $d = @cd[tid];
+  printf("%10lld %7d  %-16s %-40s -> %d  b_off=0x%x used=0x%x head_read=0x%lx tail_read=0x%lx\n",
+         (nsecs-@t0)/1000, tid, comm, "BigDeferredWriteContext::can_defer",
+         retval & 0xff, *(uint32*)($d+8), *(uint32*)($d+12),
+         *(uint64*)($d+16), *(uint64*)($d+24));
+  delete(@cd[tid]); }
+
+uretprobe:$1:_ZN9BlueStore23BigDeferredWriteContext11apply_deferEv
+/@t0/
+{ printf("%10lld %7d  %-16s %-40s -> %d  (1 = every pextent only partly overwritten)\n",
+         (nsecs-@t0)/1000, tid, comm, "BigDeferredWriteContext::apply_defer",
+         retval & 0xff); }
+
+/* _do_write_big_apply_deferred(this, txc, c, o, dctx=arg4, blp, wctx) */
+uprobe:$1:_ZN9BlueStore28_do_write_big_apply_deferredE*
+/@t0/
+{ $d = arg4; $e = *(uint64*)($d+64);
+  printf("%10lld %7d  %-16s %-40s logical 0x%lx~0x%x -> disk 0x%lx~0x%x\n",
+         (nsecs-@t0)/1000, tid, comm, "BlueStore::_do_write_big_apply_deferred",
+         *(uint64*)$d, *(uint32*)($d+12), *(uint64*)$e, *(uint32*)($e+8)); }
+
+/* _get_deferred_op(this, txc, len): the op that will carry the payload */
+uprobe:$1:_ZN9BlueStore16_get_deferred_opE*
+/@t0/
+{ printf("%10lld %7d  %-16s %-40s txc %p len=0x%lx\n",
+         (nsecs-@t0)/1000, tid, comm, "BlueStore::_get_deferred_op", arg1, arg2); }
+
+uprobe:$1:_ZN9BlueStore15_do_alloc_writeE*
+/@t0/
+{ printf("%10lld %7d  %-16s %-40s txc %p\n",
+         (nsecs-@t0)/1000, tid, comm, "BlueStore::_do_alloc_write", arg1); }
+
+/* ---- RocksDB staging ------------------------------------------------- */
+uprobe:$1:_ZN12RocksDBStore*3setE*S8_RK*
+/@t0/
+{ printf("%10lld %7d  %-16s %-40s %s keylen=%lld val=%dB\n",
+         (nsecs-@t0)/1000, tid, comm, "RocksDBTransactionImpl::set",
+         str(*(uint64*)arg1), *(uint64*)(arg2+8), *(uint32*)(arg3+24)); }
+uprobe:$1:_ZN12RocksDBStore*3setE*PKcmRK*
+/@t0/
+{ printf("%10lld %7d  %-16s %-40s %s keylen=%lld val=%dB\n",
+         (nsecs-@t0)/1000, tid, comm, "RocksDBTransactionImpl::set",
+         str(*(uint64*)arg1), arg3, *(uint32*)(arg4+24)); }
+uprobe:$1:_ZN12RocksDBStore22RocksDBTransactionImpl13rm_single_keyE*
+/@t0/
+{ printf("%10lld %7d  %-16s %-40s %s keylen=%lld\n",
+         (nsecs-@t0)/1000, tid, comm, "RocksDBTransactionImpl::rm_single_key",
+         str(*(uint64*)arg1), *(uint64*)(arg2+8)); }
+
+/* ---- txc state machine ------------------------------------------------ */
+uprobe:$1:_ZN9BlueStore15_txc_state_procEPNS_12TransContextE
+/@t0 && @wtx[arg1]/
+{ printf("%10lld %7d  %-16s %-40s txc %p %s\n",
+         (nsecs-@t0)/1000, tid, comm, "BlueStore::_txc_state_proc", arg1,
+         @st[*(uint32*)(arg1+0x2fc)]); }
+
+uprobe:$1:_ZN9BlueStore15_txc_aio_submitE*
+/@t0/
+{ printf("%10lld %7d  %-16s %-40s txc %p\n",
+         (nsecs-@t0)/1000, tid, comm, "BlueStore::_txc_aio_submit", arg1); }
+
+uprobe:$1:_ZN9BlueStore14_txc_finish_ioE*
+/@t0 && @wtx[arg1]/
+{ printf("%10lld %7d  %-16s %-40s txc %p\n",
+         (nsecs-@t0)/1000, tid, comm, "BlueStore::_txc_finish_io", arg1); }
+
+uprobe:$1:_ZN9BlueStore17_txc_committed_kvE*
+/@t0 && @wtx[arg1]/
+{ printf("%10lld %7d  %-16s %-40s txc %p -> oncommits queued\n",
+         (nsecs-@t0)/1000, tid, comm, "BlueStore::_txc_committed_kv", arg1); }
+
+uprobe:$1:_ZN9BlueStore11_txc_finishE*
+/@t0 && @wtx[arg1]/
+{ printf("%10lld %7d  %-16s %-40s txc %p retired\n",
+         (nsecs-@t0)/1000, tid, comm, "BlueStore::_txc_finish", arg1);
+  delete(@wtx[arg1]); }
+
+/* ---- kv commit -------------------------------------------------------- */
+uprobe:$1:_ZN12RocksDBStore18submit_transactionE*
+/@t0/
+{ printf("%10lld %7d  %-16s %-40s async (no fsync)\n",
+         (nsecs-@t0)/1000, tid, comm, "RocksDBStore::submit_transaction"); }
+
+uprobe:$1:_ZN12RocksDBStore*submit_transaction_syncE*
+/@t0/
+{ @ts_kv[tid] = nsecs;
+  printf("%10lld %7d  %-16s %-40s start\n",
+         (nsecs-@t0)/1000, tid, comm, "RocksDBStore::submit_transaction_sync"); }
+uretprobe:$1:_ZN12RocksDBStore*submit_transaction_syncE*
+/@ts_kv[tid]/
+{ printf("%10lld %7d  %-16s %-40s done (%lld us)\n",
+         (nsecs-@t0)/1000, tid, comm, "RocksDBStore::submit_transaction_sync",
+         (nsecs-@ts_kv[tid])/1000); delete(@ts_kv[tid]); }
+
+/* ---- block device ----------------------------------------------------- */
+uprobe:$1:_ZN12KernelDevice*aio_writeE*
+/@t0/
+{ printf("%10lld %7d  %-16s %-40s bdev=%p off=0x%lx len=0x%x\n",
+         (nsecs-@t0)/1000, tid, comm, "KernelDevice::aio_write",
+         arg0, arg1, *(uint32*)(arg2+24)); }
+
+uprobe:$1:_ZN12KernelDevice*flushE*
+/@t0/
+{ @ts_fl[tid] = nsecs; @fl_dev[tid] = arg0; }
+uretprobe:$1:_ZN12KernelDevice*flushE*
+/@ts_fl[tid]/
+{ printf("%10lld %7d  %-16s %-40s fdatasync bdev=%p %lld us\n",
+         (nsecs-@t0)/1000, tid, comm, "KernelDevice::flush",
+         @fl_dev[tid], (nsecs-@ts_fl[tid])/1000);
+  delete(@ts_fl[tid]); delete(@fl_dev[tid]); }
+
+/* ---- the reply -------------------------------------------------------- */
+/* log_op_stats runs in the commit lambda one statement before
+ * send_message_osd_client (PrimaryLogPG.cc:4476 -> :4480) */
+uprobe:$1:_ZN12PrimaryLogPG12log_op_statsE*
+/@t0/
+{ printf("%10lld %7d  %-16s %-40s reply -> client\n",
+         (nsecs-@t0)/1000, tid, comm, "PrimaryLogPG::log_op_stats"); }
+
+/* the client receiving it (any process but the OSD mapping libceph-common) */
+uprobe:$2:_ZN8Objecter19handle_osd_op_replyE*
+/@t0 && comm != "ceph-osd"/
+{ printf("%10lld %7d  %-16s %-40s ondisk reply received (pid %d)\n",
+         (nsecs-@t0)/1000, tid, comm, "Objecter::handle_osd_op_reply", pid); }
+
+/* ---- the deferred life after the reply -------------------------------- */
+uprobe:$1:_ZN9BlueStore15_deferred_queueE*
+/@t0/
+{ printf("%10lld %7d  %-16s %-40s txc %p -> osr->deferred_pending\n",
+         (nsecs-@t0)/1000, tid, comm, "BlueStore::_deferred_queue", arg1); }
+
+/* prepare_write(this, cct, seq, offset, length, blp) */
+uprobe:$1:_ZN9BlueStore13DeferredBatch13prepare_writeE*
+/@t0/
+{ printf("%10lld %7d  %-16s %-40s seq %ld 0x%lx~0x%lx -> iomap\n",
+         (nsecs-@t0)/1000, tid, comm, "DeferredBatch::prepare_write",
+         arg2, arg3, arg4); }
+
+uprobe:$1:_ZN9BlueStore19deferred_try_submitEv
+/@t0/
+{ printf("%10lld %7d  %-16s %-40s\n",
+         (nsecs-@t0)/1000, tid, comm, "BlueStore::deferred_try_submit"); }
+
+uprobe:$1:_ZN9BlueStore23_deferred_submit_unlockE*
+/@t0/
+{ printf("%10lld %7d  %-16s %-40s osr %p\n",
+         (nsecs-@t0)/1000, tid, comm, "BlueStore::_deferred_submit_unlock", arg1); }
+
+uprobe:$1:_ZN12KernelDevice10aio_submitEP9IOContext
+/@t0/
+{ printf("%10lld %7d  %-16s %-40s bdev=%p ioc %p\n",
+         (nsecs-@t0)/1000, tid, comm, "KernelDevice::aio_submit", arg0, arg1); }
+
+uprobe:$1:_ZN9BlueStore20_deferred_aio_finishE*
+/@t0/
+{ printf("%10lld %7d  %-16s %-40s osr %p -> deferred_done_queue\n",
+         (nsecs-@t0)/1000, tid, comm, "BlueStore::_deferred_aio_finish", arg1); }
+
+/* ---- restart: the replay of surviving L records ------------------------ */
+uprobe:$1:_ZN9BlueStore16_deferred_replayEv
+{ printf("%10lld %7d  %-16s %-40s mount: iterate PREFIX_DEFERRED\n",
+         @t0 ? (nsecs-@t0)/1000 : 0, tid, comm, "BlueStore::_deferred_replay"); }
+
+END
+{
+  clear(@t0); clear(@st); clear(@wtx); clear(@cd); clear(@ts_kv);
+  clear(@ts_fl); clear(@fl_dev);
+}
