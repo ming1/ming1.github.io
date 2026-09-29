@@ -966,7 +966,63 @@ io_uring cancel callback does. STOP_DEV never sets it.
 If the fetching server is a new one, STOP_DEV also cancels a command it was
 never meant to stop.
 
-### 3.8.3 The partition scan in the window
+### 3.8.3 FETCH: published before it is cancelable
+
+FETCH makes its command visible in `io->cmd` first, and puts it on
+io_uring's cancelable list only later, after `ub->mutex` is dropped:
+
+```
+ FETCH (server)                               STOP_DEV cancel pass
+ lock ub->mutex                         (:3303)
+   __ublk_fetch(): io->cmd = C, ACTIVE  (:3282)
+   ublk_mark_io_ready()
+ unlock ub->mutex                       (:3311)
+                                              T: ACTIVE, take C
+                                              io_uring_cmd_done(C)   C completed
+ ublk_prep_cancel(C)                    (:3419)
+   io_uring_cmd_mark_cancelable(C)            → a completed request is added to
+                                                the ring's cancelable list
+```
+
+- A later io_uring cancel walks that list and calls into ublk with a request
+  that is already freed: use after free.
+- `io_uring_cmd_done()` removes a command from the list
+  (`io_uring/uring_cmd.c:160`), so the order "marked, then done" is safe.
+  Only "done, then marked" is broken.
+- `ub->mutex` can't close it: FETCH has dropped the mutex before the window
+  opens.
+
+COMMIT_AND_FETCH does the same on a live device: `io->cmd = C` at `:3463`,
+`ublk_prep_cancel()` at `:3491`. After `del_gendisk()` a commit that just
+re-armed its command can have it completed by STOP_DEV's pass in between.
+QUIESCE_DEV's pass has the same window.
+
+**Fix direction, no lock in the fast path:** mark the command cancelable
+*before* it is published.
+
+```
+ today                           reordered
+ publish io->cmd = C             ublk_prep_cancel(C)    on the list
+ ...  ← window                   publish io->cmd = C
+ ublk_prep_cancel(C)             any pass that sees ACTIVE can done(C)
+```
+
+- FETCH marks before it takes `ub->mutex`. Marking under the mutex would
+  take `uring_lock` for a FETCH from io-wq: `ub->mutex → uring_lock`, the
+  old AB-BA.
+- COMMIT_AND_FETCH makes the same call as today, only earlier, so the fast
+  path costs nothing more.
+- An error after the mark must complete through `io_uring_cmd_done()` and
+  return `-EIOCBQUEUED`. A plain error return leaves the command on the list
+  (`io_uring/uring_cmd.c:282`).
+- The io_uring cancel callback may now see a command that is not published
+  yet (only when it was issued from io-wq). Return instead of
+  `WARN_ON_ONCE(io->cmd != cmd)`; io_uring retries the cancel.
+
+Josef's patch 5 fixes the same window with `io->lock`, which needs his
+patches 3–4: a spinlock on every COMMIT_AND_FETCH.
+
+### 3.8.4 The partition scan in the window
 
 *From Josef's patch 8.*
 
@@ -985,7 +1041,7 @@ never meant to stop.
 No crash, but a lost scan. Josef moves `cancel_work_sync()` before the
 unlock.
 
-### 3.8.4 What each fix does
+### 3.8.5 What each fix does
 
 | fix | sequential | START in W | FETCH in W |
 |---|---|---|---|
@@ -993,7 +1049,9 @@ unlock.
 | mark in `ublk_cancel_cmd()` after (b), before (c) | ok | **not closed**: R can start between (b) and the quiesce inside the mark | marks, but still cancels a new server's command |
 | claim under `ub->mutex`, complete after the unlock (Josef's patch 8) | ok | ok: START waits for the mutex, then sees the mark | ok: a later FETCH is not claimed |
 
-The partition scan (§3.8.3) needs its own one-line move in every case.
+The partition scan (§3.8.4) needs its own one-line move in every case, and
+the cancelable window (§3.8.3) its own reorder: none of these fixes closes
+it.
 
 The last one keeps the claim inside the mutex that START_DEV and FETCH need:
 
