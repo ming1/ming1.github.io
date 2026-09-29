@@ -669,6 +669,7 @@ so START_DEV or END_USER_RECOVERY brings up a disk that dispatches to NULL.
 
 ```
 #1–#3   3.2 report → 3.3 analysis         #4   3.4 fix → 3.5 validation → 3.6 review
+sibling  3.7 QUIESCE_DEV cancels too little, or the wrong round
 ```
 
 ## 3.2 Report
@@ -848,15 +849,110 @@ The canceled commands can never be fetched again: FETCH gets `-EBUSY`
 
 Not fixed by this series (from the cover letter):
 
-- **QUIESCE_DEV can hang.** Its one cancel pass skips an io that is with
-  the server or started. Then COMMIT_AND_FETCH queues a new cmd on a
-  canceling queue, and nobody completes it. The device stays LIVE. About
-  2% of quiesces under fio on for-next, 4% with the series (maybe because
-  the claim now takes `io->lock` per io).
+- **QUIESCE_DEV** can hang, and can cancel a new server's commands:
+  see §3.7.
 - `ublk_batch_attach()` publishes a fetch cmd before io_uring marks it
   cancelable. A separate fix is coming.
 
-## 3.7 Takeaways
+## 3.7 QUIESCE_DEV: cancels too little, or the wrong round
+
+*Reported in the same cover letter, not fixed by the series. Josef: "I am
+working on those separately, tying the cancel to the server it is meant
+for." Mechanism below is from reading the code at `fe2ec83746e5`, not
+reproduced here.*
+
+`UBLK_U_CMD_QUIESCE_DEV` (`UBLK_F_QUIESCE`) stops a live device so that a
+server can hand over to a new one without losing I/O. It must end with every
+command of the old server completed, so that the old server can exit.
+
+```
+ublk_ctrl_quiesce_dev()                                          (:5266)
+  lock ub->mutex
+  DEAD → -ENODEV; QUIESCED/FAIL_IO → ret = 0, skip the rest  (:5285)
+  quiesce, ublk_set_canceling(), unquiesce
+  ublk_wait_for_idle_io(): until each queue has ONE idle io      (:5223)
+  unlock ub->mutex
+  if (!ret) ublk_cancel_dev()        one pass, no lock, no round  (:5306)
+```
+
+### 3.7.1 Problem 1: the server never exits (device stays LIVE)
+
+The single pass only takes commands that are idle at that moment:
+
+```
+ io state when the pass runs         ublk_cancel_cmd()     later
+ idle, ACTIVE                        taken, ABORT          ok
+ owned by the server (has a req)     skipped: not ACTIVE   server COMMIT_AND_FETCH:
+                                                           req done, NEW cmd armed (:3491)
+ ACTIVE, req started                 skipped               dispatch gives it to the server
+                                                           → same as above
+                                               ↓
+                                     new cmd on a canceling queue:
+                                     no request reaches it (->canceling aborts/requeues),
+                                     no cancel runs again (only at ring exit)
+                                     → server waits for it forever, never exits
+                                     → no release, device stays LIVE
+```
+
+- Why it usually works: one io that is busy at the moment of the pass is
+  enough, so it needs I/O load during QUIESCE_DEV.
+- Josef's numbers under fio: about **2%** of quiesces hang on for-next,
+  **4%** with his series.
+
+### 3.7.2 Problem 2: a second QUIESCE_DEV cancels the new server's commands
+
+```
+ old server gone → release → device QUIESCED, reset (new round)
+ START_USER_RECOVERY, new server FETCHes all tags
+ QUIESCE_DEV again:
+   state is QUIESCED → ret = 0, but ublk_cancel_dev() still runs  (:5285, :5306)
+   → takes the NEW server's idle commands
+```
+
+- **Stock:** all queues of the new round are ready, so `->canceling` is
+  clear, and `ublk_cancel_dev()` does not mark anything. END_USER_RECOVERY
+  goes live over NULL `io->cmd`: the same oops as §3.3.
+- **A stalled first QUIESCE_DEV** hits the same thing: its pass stalls
+  between the unlocked `ACTIVE` read and the take, and wakes up in the next
+  round.
+
+```
+ QUIESCE_DEV (C)              old server / release          new server
+ pass reaches tag T, stalls
+                              server exits, reset: round 2
+                                                            recovery, FETCH T
+ wakes: takes T's command  ←  round 2's command, unmarked
+                                                            END_USER_RECOVERY → oops
+```
+
+### 3.7.3 Root cause
+
+A cancel pass is not tied to the round it was meant for:
+
+```
+ QUIESCE_DEV means   "cancel the commands of THIS server"
+ ublk_cancel_dev()   "cancel whatever is ACTIVE now"
+                     → too little now (problem 1), too much later (problem 2)
+```
+
+### 3.7.4 Fix direction
+
+| part | idea | status |
+|---|---|---|
+| problem 2, both forms | take a command only in its own round: check and take under `cancel_mutex`, which a reset needs; skip a queue that is no longer canceling (Josef's patch 8 does the second) | an alternative fix being prepared marks the round in the same section: the stalled form is closed, and a resent QUIESCE_DEV fails END_USER_RECOVERY with `-ENODEV` instead of an oops, but still loses the commands |
+| problem 2, resend | don't run `ublk_cancel_dev()` when QUIESCE_DEV returned early for a non-LIVE device | open |
+| problem 1 | keep canceling until the old server has no command left, e.g. cancel the commands armed by COMMIT_AND_FETCH on a canceling queue right away | open, Josef working on it |
+
+**Why a fix must be round-based, not just a second pass:** a later pass
+cannot tell an old server's late command from a new server's first one.
+Only the round (reset by `ublk_reset_ch_dev()`) separates them.
+
+**Validation:** none yet. The cover letter gives the hang rate; problem 2
+is from code reading. A test needs a server that keeps ios busy while
+QUIESCE_DEV runs (problem 1), and a QUIESCE_DEV sent during recovery after
+all FETCHes (problem 2).
+
+## 3.8 Takeaways
 
 - **Two facts need one invariant.** "The slot is counted as ready" and "the
   slot has a command" are stored separately. A cancel breaks the second but
@@ -872,3 +968,7 @@ Not fixed by this series (from the cover letter):
 - **The fix has a hot-path cost.** Taking `io->lock` on every commit is the
   price of cancels from the control path while the server is still
   committing. Whether that is acceptable decides v2.
+- **A cancel must know which round it belongs to.** QUIESCE_DEV's one
+  lockless pass takes too little while the server still commits, and too
+  much once a new server has fetched. Tie the take to the round, under the
+  lock that a reset needs.
