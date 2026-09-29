@@ -623,3 +623,252 @@ continuous. What stays with the `task_struct` shows the problem:
 
 The same class as problem 1: state keyed by the `task_struct`, not the
 tid.
+
+# 3. ublk: a canceled io command still counts as ready, and the disk dispatches to it
+
+| | |
+|---|---|
+| Report | [PATCH 0/9](https://lore.kernel.org/linux-block/20260928-b4-ublk-cancel-stop-v1-0-4a4360232a46@toxicpanda.com/), Josef Bacik, 2026-09-28, found by own testing (QEMU, KASAN, lockdep, KCSAN) |
+| Affects | by `Fixes:` tag — route 1: v6.7+, `85248d670b71` ("ublk: move ublk_cancel_dev() out of ub->mutex"); route 2: v6.15+, `728cbac5fe21` ("ublk: move device reset into ublk_ch_release()"); route 3: v7.0+, `3f3850785594` ("ublk: fix batch I/O recovery -ENODEV error") |
+| Component | ublk, `drivers/block/ublk_drv.c` |
+| Fix | keep the queue `->canceling` while it has a canceled command; claim commands under the lock the ready path takes; refuse START_DEV over canceled commands |
+| Status | posted v1 (9 patches, +344/−65), in review, v2 announced |
+| Code base | `fe2ec83746e5` (v7.3-rc4+70); all `file:line` refer to it |
+
+## 3.1 The story in one view
+
+A cancel completes a fetched io command and sets `io->cmd = NULL`. The slot
+still counts as ready. From then on, only `ubq->canceling` keeps
+`ublk_queue_rq()` away from the NULL. Three control paths leave it `false`,
+so START_DEV or END_USER_RECOVERY brings up a disk that dispatches to NULL.
+
+```
+          state of one io slot           nr_io_ready  io->cmd  CANCELED  ubq->canceling   ublk_queue_rq()
+#1        fetched, idle                  counted      cmd      -         false            dispatch to cmd       OK
+#2        canceled                       counted      NULL     set       true             abort the rq          OK
+#3        canceled, ->canceling lost     counted      NULL     set       false            ublk_queue_cmd(NULL)  OOPS
+          after last close of ublkcN     reset        NULL     cleared   -                needs a new FETCH     OK
+
+#3 how ->canceling gets lost
+   route 1   STOP_DEV before START_DEV:     cancels commands, never sets ->canceling
+   route 2   partial FETCH, task exits:     the last FETCH of the queue clears ->canceling
+   route 3   recovery, ready queue exits:   ublk_start_cancel() skips marking the queue
+
+#4 fix      ->canceling stays set while the queue has a CANCELED io     (patches 1, 2, 7, 8)
+            START_DEV / END_USER_RECOVERY → -ENODEV                     (patch 9, RFC)
+```
+
+1. **#1** A FETCH counts the slot as ready. When all slots are ready,
+   START_DEV adds the disk.
+2. **#2** A cancel takes the command away. The count stays the same, and
+   `->canceling` protects the slot.
+3. **#3** Three paths clear or skip `->canceling`, but the count stays
+   full, so the device goes live over dead slots.
+4. **#4** Make the ready transition look at CANCELED, and make every
+   cancel mark the queues first.
+
+```
+#1–#3   3.2 report → 3.3 analysis         #4   3.4 fix → 3.5 validation → 3.6 review
+```
+
+## 3.2 Report
+
+The crash is in `ublk_queue_cmd()` (`:2085`):
+
+```c
+	struct io_uring_cmd *cmd = ubq->ios[rq->tag].cmd;	/* NULL after a cancel */
+	struct ublk_uring_cmd_pdu *pdu = ublk_get_uring_cmd_pdu(cmd);
+
+	pdu->req = rq;						/* oops */
+	io_uring_cmd_complete_in_task(cmd, ublk_cmd_tw_cb);
+```
+
+- Before `f7700a4415af` ("ublk: fix use-after-free in ublk_cancel_cmd()"),
+  `io->cmd` was not cleared, so the same path used a **freed** io_uring
+  request.
+- `1133b93fc7f6` ("ublk: set canceling flag even when disk is not
+  allocated") fixed one route: io_uring exit before the first start.
+  The three routes below were still open.
+- One small io_uring reproducer per route; each one oopses on for-next.
+  They are not attached to the posting.
+
+## 3.3 Analysis
+
+From the symptom down to the cause:
+
+```
+ublk_queue_cmd() uses io->cmd == NULL                                  (:2087)
+ └─ why?   __ublk_queue_rq_common(): ubq->canceling is false           (:2193)
+ └─ who set io->cmd = NULL?
+           ublk_cancel_cmd(): sets CANCELED, io->cmd = NULL, completes  (:2794)
+           nr_io_ready is not decremented; ACTIVE stays set
+ └─ why can the disk go live?
+           START_DEV / END_USER_RECOVERY only wait for the count        (:4536, :5136)
+           → count is full, canceled or not
+ └─ why is ->canceling false?   route 1, 2 or 3 below
+```
+
+**Why it usually works:** a server usually exits as a whole. The last close
+of `/dev/ublkcN` runs `ublk_reset_ch_dev()` (`:2405`), which resets the
+count and every io. A new server must FETCH again. The bug needs a cancel
+**while the char device stays open**, or a cancel with no close at all.
+
+### Route 1: STOP_DEV on a ready device, then START_DEV
+
+```
+ server                   STOP_DEV  (ublk_stop_dev, :3009)              START_DEV
+ FETCH all tags
+ → ready, no disk yet
+                          lock ub->mutex
+                          ublk_stop_dev_unlocked(): state DEAD → return (:2999)
+                          unlock ub->mutex
+                          ublk_cancel_dev(): all io->cmd = NULL         (:3015)
+                          ->canceling is never set
+                                                                        wait ready: passes (:4536)
+                                                                        add_disk() (:4584)
+                                                                        partition scan read → OOPS
+```
+
+- `ublk_cancel_dev()` runs without `ub->mutex` since `85248d670b71`
+  ("ublk: move ublk_cancel_dev() out of ub->mutex").
+- A START_DEV can also take `ub->mutex` just after STOP_DEV drops it. Then
+  the idle commands of a live disk are canceled, and nothing orders that
+  against `ublk_queue_rq()`.
+
+### Route 2: partial FETCH, the task exits, another task finishes the queue
+
+A and B are two server threads. They share one open file of `/dev/ublkcN`,
+so when A exits, the file is not released.
+
+```
+ task A (tags 0-3)          task B (tags 4-7)        queue 0
+ FETCH 0-3                                           nr_io_ready 4/8
+ exits → cancel_fn
+   ublk_start_cancel()                               ->canceling = true
+   ublk_cancel_cmd() 0-3                             cmd[0-3] = NULL, still counted
+                            FETCH 4-7                nr_io_ready 8/8 → queue ready
+                            ublk_queue_reset_io_flags()
+                                                     ->canceling = false     ✗ (:3030)
+ START_DEV (first start) or END_USER_RECOVERY (disk attached) → rq on tag 0 → OOPS
+```
+
+- `ublk_queue_reset_io_flags()` clears `->canceling` and does not check
+  for CANCELED ios.
+- A second race hides the flag even when a check exists. `__ublk_fetch()`
+  publishes `io->cmd` (`:3282`); later, `ublk_mark_io_ready()` →
+  `ublk_reset_io_flags()` (`:3047`) clears CANCELED. A control path cancel
+  between the two sets CANCELED, and then the flag is lost. This is not
+  the race that `f7700a4415af` fixed; that one was cancel vs.
+  `ublk_reset_ch_dev()`.
+
+### Route 3: recovery, a queue is ready and its task exits early
+
+`ub->canceling` means "every queue is marked". Since `3f3850785594`, a queue
+clears its own flag when it becomes ready, but `ub->canceling` is cleared
+only when **all** queues are ready (`:3068`). So the meaning is wrong
+during this window:
+
+```
+ recovery, new server                  ub->canceling   q0->canceling
+ q0 ready                              true            false
+ q0 task exits → cancel_fn
+   ublk_start_cancel(): ub->canceling
+     is true → goto out (:2738)        true            false     ✗ q0 not marked
+   ublk_cancel_cmd(): q0 cmd = NULL
+ next rq on q0: a new one, or a requeued one that
+ END_USER_RECOVERY kicks (:5158)                       false     → OOPS
+```
+
+There is a second window in the same path. `ublk_uring_cmd_cancel_fn()`
+drops `cancel_mutex` after it marks the queues and before it cancels the
+command:
+
+```
+ cancel_fn                           last FETCH of the queue
+ ublk_start_cancel(): queues marked
+   cancel_mutex dropped
+                                     ublk_mark_io_ready(): ready, no CANCELED io
+                                       ->canceling = false
+ ublk_cancel_cmd(): io->cmd = NULL   → same OOPS
+```
+
+## 3.4 Fix
+
+The invariant: **a slot that counts as ready either has its command, or its
+queue is canceling.** Each patch makes one path respect it.
+
+| patch | change | route |
+|---|---|---|
+| 1 | at the ready transition, keep `->canceling` if any io is CANCELED (batch: if `->force_abort` is set); clear CANCELED and publish `io->cmd` in one `cancel_lock` section | 2 |
+| 2 | clear `ub->canceling` together with the queue flag, so a later cancel marks and quiesces again | 3 |
+| 3, 4 | switch `io->cmd`/`io->req` (one union) under `io->lock` in all commit paths; cancel reads under `io->lock` | prep |
+| 5 | a cancel that comes before `io_uring_cmd_mark_cancelable()` sets `UBLK_IO_FLAG_CANCEL_DEFERRED`; the issuer completes the command later | prep |
+| 6 | split `ublk_claim_cmd()` (take the cmd) out of `ublk_cancel_cmd()` (complete it) | prep |
+| 7 | cancel_fn marks the queues and claims the cmd in one `cancel_mutex` hold | 3 |
+| 8 | STOP_DEV marks the queues and claims the cmds **under `ub->mutex`**, completes them after unlock | 1 |
+| 9 | START_DEV / END_USER_RECOVERY return `-ENODEV` if a queue is canceling or has a canceled cmd | behaviour change |
+
+Why patch 8 must claim under `ub->mutex`: START_DEV needs `ub->mutex` before
+it can add a disk. So a queue that becomes ready later sees the CANCELED
+ios and stays canceling. Setting `->canceling` alone is not enough: the
+last FETCH of the round can still come first and clear it.
+
+Why patch 9: with 1–8, the device no longer crashes, but START_DEV still
+brings up a disk on which every request fails:
+
+```
+ plain device                      every rq → -EIO
+ USER_RECOVERY, no FAIL_IO         every rq requeued, never kicked
+                                   → partition scan hangs, holds disk->open_mutex
+                                   → every open() of the disk hangs behind it
+```
+
+The canceled commands can never be fetched again: FETCH gets `-EBUSY`
+(device ready) or `-EINVAL` (io still ACTIVE). Failing early is clearer. Patches 1–8 can go in without 9.
+
+## 3.5 Validation
+
+*From the cover letter; I did not run it.*
+
+| test | for-next | + series |
+|---|---|---|
+| one reproducer per route | OOPS | `-ENODEV` or pass |
+| server exit + restart, full USER_RECOVERY cycle (controls) | not given | pass |
+| ublk selftests | not given | pass |
+| ADD_DEV vs STOP_DEV / DEL_DEV race under fio, every commit path incl. `UBLK_F_BATCH_IO` | not given | pass |
+
+## 3.6 Review and open issues
+
+| from | point | answer |
+|---|---|---|
+| Caleb | patch 1 clears `->force_abort` again; `8a14be55bdc6` ("ublk: clear force_abort in ublk_queue_reset_io_flags()") does it already | patch 1 reads the flag **before** that clear, so an old quiesce would keep the new queue canceling. v2 moves the clear to the release work instead of adding a second one |
+| Caleb | the fetch-side lock duplicates `f7700a4415af` | different race: that one is cancel vs. reset; this one is cancel vs. fetch |
+| Caleb | patch 3 takes a spinlock on **every** COMMIT_AND_FETCH; can the `ublk_cancel_dev()` callers wait for tags to go idle instead? | no answer yet: **the main open question** |
+| Randy | doc wording in patch 9 | — |
+
+Not fixed by this series (from the cover letter):
+
+- **QUIESCE_DEV can hang.** Its one cancel pass skips an io that is with
+  the server or started. Then COMMIT_AND_FETCH queues a new cmd on a
+  canceling queue, and nobody completes it. The device stays LIVE. About
+  2% of quiesces under fio on for-next, 4% with the series (maybe because
+  the claim now takes `io->lock` per io).
+- `ublk_batch_attach()` publishes a fetch cmd before io_uring marks it
+  cancelable. A separate fix is coming.
+
+## 3.7 Takeaways
+
+- **Two facts need one invariant.** "The slot is counted as ready" and "the
+  slot has a command" are stored separately. A cancel breaks the second but
+  not the first, and one flag (`->canceling`) must cover the gap. Every path
+  that clears the flag must check the gap first.
+- **A summary flag breaks when a per-item flag starts to change alone.**
+  `ub->canceling` meant "all queues marked". `3f3850785594` let a queue
+  clear its own flag, and the summary became false without anybody
+  noticing.
+- **Claim under the lock that the other side needs.** STOP_DEV canceled
+  after dropping `ub->mutex`, which START_DEV takes. Claiming under that
+  mutex gives the order for free.
+- **The fix has a hot-path cost.** Taking `io->lock` on every commit is the
+  price of cancels from the control path while the server is still
+  committing. Whether that is acceptable decides v2.
