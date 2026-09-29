@@ -670,6 +670,7 @@ so START_DEV or END_USER_RECOVERY brings up a disk that dispatches to NULL.
 ```
 #1–#3   3.2 report → 3.3 analysis         #4   3.4 fix → 3.5 validation → 3.6 review
 sibling  3.7 QUIESCE_DEV cancels too little, or the wrong round
+race     3.8 STOP_DEV's cancel runs outside ub->mutex
 ```
 
 ## 3.2 Report
@@ -732,9 +733,8 @@ count and every io. A new server must FETCH again. The bug needs a cancel
 
 - `ublk_cancel_dev()` runs without `ub->mutex` since `85248d670b71`
   ("ublk: move ublk_cancel_dev() out of ub->mutex").
-- A START_DEV can also take `ub->mutex` just after STOP_DEV drops it. Then
-  the idle commands of a live disk are canceled, and nothing orders that
-  against `ublk_queue_rq()`.
+- START_DEV or FETCH can also run while STOP_DEV is still canceling: see
+  §3.8.
 
 ### Route 2: partial FETCH, the task exits, another task finishes the queue
 
@@ -910,7 +910,110 @@ for-next, 4% with his series.
 A second pass can't fix it. Only the round, reset by `ublk_reset_ch_dev()`,
 tells an old command from a new one.
 
-## 3.8 Takeaways
+## 3.8 STOP_DEV's cancel runs outside ub->mutex
+
+*Code reading at `fe2ec83746e5`; the sequential case is route 1 (§3.3) and
+is reproduced, the concurrent cases are not.*
+
+`ublk_stop_dev()` drops the mutex before it cancels:
+
+```
+ublk_stop_dev()                                            (:3009)
+  lock ub->mutex
+  ublk_stop_dev_unlocked()     never started: state DEAD, does nothing
+  unlock ub->mutex                                         (:3013)
+  ── window W: START_DEV and FETCH can take ub->mutex ──
+  cancel_work_sync(partition scan)                         (:3014)
+  ublk_cancel_dev()            no lock, marks nothing      (:3015)
+    per io, ublk_cancel_cmd():                             (:2763)
+      (a) ACTIVE?              unlocked read               (:2772)
+      (b) request started?     skip if yes                 (:2786)
+      (c) take io->cmd         under cancel_lock           (:2789)
+      (d) io_uring_cmd_done(ABORT)
+```
+
+Check (b) is only safe if no request can start after it. That holds only
+when the queue is quiesced and `->canceling` is set *before* (b), as the
+io_uring cancel callback does. STOP_DEV never sets it.
+
+### 3.8.1 START_DEV in the window
+
+```
+ STOP_DEV (cancel pass)          START_DEV                    request R on tag T
+ unlock ub->mutex
+                                 lock ub->mutex, all ready
+                                 add_disk(): LIVE
+ T: (a) ACTIVE, (b) not started
+                                                              queue_rq: canceling false
+                                                              ublk_queue_cmd(io->cmd)
+                                                              → task work queued on cmd
+ T: (c) take cmd, (d) done(ABORT)                             task work runs on the
+                                                              same, completed cmd:
+                                                              completed twice (:2776)
+ ── or R comes after (c) ──                                   ublk_queue_cmd(NULL) → oops
+```
+
+### 3.8.2 FETCH in the window
+
+```
+ STOP_DEV (cancel pass)          server
+ unlock ub->mutex
+                                 FETCH tag T (ub->mutex)
+ T: taken, nothing marked
+                                 queues ready → START_DEV → oops, as route 1
+```
+
+If the fetching server is a new one, STOP_DEV also cancels a command it was
+never meant to stop.
+
+### 3.8.3 The partition scan in the window
+
+*From Josef's patch 8.*
+
+```
+ STOP_DEV                        START_DEV
+ unlock ub->mutex
+                                 set GD_SUPPRESS_PART_SCAN, add_disk()
+                                 schedule_work(partition scan)        (:4598)
+                                 (trusted server, auto scan on)
+ cancel_work_sync(scan)  ← cancels the NEW disk's scan               (:3014)
+                                 the scan work is the only one that clears
+                                 GD_SUPPRESS_PART_SCAN (:2444)
+                                 → the new disk never shows its partitions
+```
+
+No crash, but a lost scan. Josef moves `cancel_work_sync()` before the
+unlock.
+
+### 3.8.4 What each fix does
+
+| fix | sequential | START in W | FETCH in W |
+|---|---|---|---|
+| mark the round in `ublk_stop_dev()` before the unlock | ok | ok | ok, but also marks a device where nothing was fetched: a later new server can't start it |
+| mark in `ublk_cancel_cmd()` after (b), before (c) | ok | **not closed**: R can start between (b) and the quiesce inside the mark | marks, but still cancels a new server's command |
+| claim under `ub->mutex`, complete after the unlock (Josef's patch 8) | ok | ok: START waits for the mutex, then sees the mark | ok: a later FETCH is not claimed |
+
+The partition scan (§3.8.3) needs its own one-line move in every case.
+
+The last one keeps the claim inside the mutex that START_DEV and FETCH need:
+
+```
+lock ub->mutex
+  ublk_stop_dev_unlocked()
+  cancel_work_sync(partition scan)
+  claim every idle ACTIVE io: set CANCELED, keep io->cmd    (cancel_lock)
+  claimed anything → mark the round
+unlock ub->mutex
+complete the claimed ios: io->cmd = NULL, io_uring_cmd_done(ABORT)
+```
+
+- Completing after the unlock is needed: `io_uring_cmd_done()` may take
+  the ring's `uring_lock`, and FETCH holds `uring_lock` before `ub->mutex`.
+  That is why `85248d670b71` moved the cancel out of the mutex.
+- CANCELED already means "someone owns this command": the io_uring cancel
+  callback skips it, and a reset can't run before the commands are done.
+
+## 3.9 Takeaways
 
 - **Two facts need one invariant.** "The slot is counted as ready" and "the
   slot has a command" are stored separately. A cancel breaks the second but
@@ -928,3 +1031,6 @@ tells an old command from a new one.
   committing. Whether that is acceptable decides v2.
 - **A cancel must belong to one round.** Take commands under the lock that
   a reset needs, or a late cancel hits the next server.
+- **"Is the request started?" is only a check if nothing can start
+  after it.** Quiesce and set `->canceling` first, or take the commands
+  under the lock that starting the device needs.
