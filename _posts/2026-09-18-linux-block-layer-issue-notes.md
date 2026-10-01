@@ -1071,6 +1071,88 @@ complete the claimed ios: io->cmd = NULL, io_uring_cmd_done(ABORT)
 - CANCELED already means "someone owns this command": the io_uring cancel
   callback skips it, and a reset can't run before the commands are done.
 
+### 3.8.6 The fix: count under the mutex, complete exactly that many
+
+*Patches `fd25fc8ae457`, `4a4c74742213`, `4bfd622129a1` (branch
+`ublk-stop-cancel-mutex`).*
+**A** = the server attached when STOP_DEV runs. **B** = a new server that
+opens the device after A's release.
+
+```
+ublk_stop_dev()
+lock stop_mutex                     one STOP_DEV / TRY_STOP_DEV / DEL_DEV at a time
+lock ub->mutex                      FETCH, PREP, START_DEV wait
+  ublk_stop_dev_unlocked()          disk gone: no request holds a command
+  cancel_work_sync(scan)            §3.8.4
+  lock cancel_mutex                 cancel callbacks wait
+    per queue: stop_nr = pending    per io: ACTIVE && !CANCELED
+                                    batch: linked fcmds except the active one,
+                                           and set force_abort
+    N > 0: set STOPPING, stop_canceling
+  unlock cancel_mutex
+unlock ub->mutex
+N > 0:
+  wake a waiting START_DEV
+  per queue: complete stop_nr cmds  io_uring_cmd_done(ABORT), may take uring_lock
+  stop_canceling = false
+unlock stop_mutex
+```
+
+| state | checked by | effect | cleared by |
+|---|---|---|---|
+| `STOPPING` | FETCH, PREP, START_DEV | ABORT / `-EBUSY` | reset in A's release |
+| `stop_canceling` | both cancel callbacks, under `cancel_mutex` | leave the command to STOP_DEV | STOP_DEV, after its pass |
+| `stop_nr` | STOP_DEV | complete exactly this many | next STOP_DEV |
+| `stop_mutex` | `ublk_stop_dev()` | one at a time | — |
+
+**Why A's commands pin the device.** Only STOP_DEV can complete a counted
+command (QUIESCE_DEV aside, §3.7), so `/dev/ublkcN` stays open until the
+last one:
+
+```
+STOP_DEV completes  cmd 1 ... cmd N      then only clears stop_canceling
+A's release                         ──▶  reset clears STOPPING
+B opens, fetches                         ──▶  never touched by this STOP_DEV
+```
+
+**Why an exact count, not a walk.** `ublk_cancel_dev()` takes every
+ACTIVE io and can't tell A from B:
+
+```
+walk: completes A's last cmd ─▶ A released ─▶ B fetches tag k
+      ...reaches tag k          ─▶ takes B's cmd: NULL io->cmd, queue not canceling
+```
+
+**Why `stop_canceling` ends with the pass, not at release.** A batch fetch
+command that was active during the count is not counted. After the pass,
+A's cancel callback takes it. A skip until release would leave nobody to
+complete it, and A's exit would spin forever.
+
+**Why `stop_mutex`.** Two STOP_DEVs share `stop_nr`. The first could resume
+after A's release and use the second one's budget. Lock order:
+`stop_mutex → ub->mutex → cancel_mutex`. `stop_mutex → uring_lock` is fine:
+these control commands get `-EAGAIN` under `IO_URING_F_NONBLOCK` and run
+from io-wq, never under `uring_lock`.
+
+What the cases from §3.8.1–§3.8.4 do now:
+
+| case | result |
+|---|---|
+| STOP_DEV, then START_DEV (route 1) | `-EBUSY` until A is gone |
+| START_DEV in W | waits for `ub->mutex`, then `-EBUSY` |
+| FETCH in W | `UBLK_IO_RES_ABORT` while STOPPING |
+| nothing fetched yet | nothing canceled: the server can still fetch and start |
+| B after A's release | not touched |
+| partition scan | canceled under `ub->mutex`, before START_DEV can run |
+
+Compared with the claim (§3.8.5, last row): both pin A's commands. The
+count marks nothing per command and needs no claimed list for batch; in
+exchange, the cancel callbacks check `stop_canceling` under `cancel_mutex`.
+
+Validation: `generic_18` (9 modes) passes on KASAN and lockdep kernels, with
+no splat. One full-suite run hung once in `generic_18`; that is still being
+investigated.
+
 ## 3.9 Takeaways
 
 - **Two facts need one invariant.** "The slot is counted as ready" and "the
