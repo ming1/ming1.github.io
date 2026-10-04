@@ -29,6 +29,12 @@ authority for anything that changes.
 Concrete recipes that come up often. Each one names the exact files,
 flags, and prompt patterns rather than gesturing at the idea.
 
+![Claude command cheat sheet](/assets/images/claude-code-command.jpg)
+
+*Cheat sheet by Swadesh Kumar. Most entries are prompt-intent keywords
+(`/brainstorm`, `/tldr`), not built-in Claude Code slash commands —
+only a few (`/clear`, `/memory`, `/review`, …) ship with the CLI.*
+
 ## Subagents: use cases and exact commands
 
 A subagent is a separate Claude invocation with its own context window,
