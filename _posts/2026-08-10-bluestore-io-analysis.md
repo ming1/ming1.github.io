@@ -3036,32 +3036,43 @@ of the extents it covers.
 
 The read is driven by **checksum chunk alignment** (`csum_chunk_size`, typically
 4 KB), not by `min_alloc_size`. A checksum cannot be recomputed for a chunk
-unless all its bytes are present. Only the head and tail pads are read — never the
-whole allocation unit.
+unless all its bytes are present. Only the gap between the write and the chunk
+boundary is filled, at each end — never the whole allocation unit.
 
 ```
   csum chunk boundaries:   |<--4K-->|<--4K-->|<--4K-->|
                            +--------+--------+--------+
-  on disk (old data):      |AAAAAAAA|BBBBBBBB|CCCCCCCC|
+  blob (old data):         |AAAAAAAA|BBBBBBBB|........|    . = nothing mapped
                            +--------+--------+--------+
   client write:                 |####### new #####|
-                           head_pad^                ^tail_pad
-                           |<-->|                |<->|
+                           |<-->|                 |<->|
+                          head gap               tail gap
 
-  step 1 READ    : _do_read() head_pad "AAA"  and tail_pad "CCC"
-  step 2 MODIFY  : padded = head_bl + new_data + tail_bl   (3 chunks, aligned)
-  step 3 CHECKSUM: calc_csum(b_off, padded)
-  step 4 RECORD  : op->data = padded        <-- complete, hence idempotent
+  head gap "AAA": a lextent is mapped there  -> head_read, the old bytes are needed
+  tail gap "...": nothing is mapped there    -> tail_pad,  zeros will do
+
+  step 1 PAD     : _apply_padding()  append tail_pad zeros          (no I/O)
+  step 2 READ    : _do_read()        head_read "AAA"
+  step 3 MODIFY  : bl = head_bl + new_data + zeros     (3 chunks, aligned)
+  step 4 CHECKSUM: calc_csum(b_off, bl)
+  step 5 RECORD  : op->data = bl            <-- complete, hence idempotent
 ```
 
-Three ways the read is skipped:
+So each gap is one of two things in the code: `head_pad` / `tail_pad` when
+zeros can fill it, `head_read` / `tail_read` when the old bytes must be read.
 
-- **[`is_unused(b_off, b_len)`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h#L723)** — the blob's `unused` bitmap says the region was
-  allocated but never written, so it is known-zero. [`_pad_zeros()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L16504) fills it in.
+Four ways the device read is avoided:
+
+- **nothing mapped in the gap** — [`has_any_lextents()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L4513) is false (a hole, or past EOF).
+  The gap stays a pad and [`_apply_padding()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L19601) fills it with zeros.
+- **never-written blocks** — after padding, the range is chunk-aligned and
+  [`is_unused(b_off, b_len)`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h#L723) says the blob never wrote it. There are no old bytes to keep
+  ([`:16670-16714`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L16670-L16714)). This write is deferred only below `prefer_deferred_size`.
 - **buffer cache** — [`_do_read()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L13138) checks [`BufferSpace`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L427) first; a recently touched
-  region costs nothing.
-- **no underlying extent** — [`has_any_lextents()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L4513) is false (a hole, or past EOF),
-  so the pad is dropped.
+  region costs no device I/O.
+- **too much to read** — the reads are kept only if `head_read + tail_read <
+  min_alloc_size` ([`:16719-16727`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L16719-L16727)). Otherwise the write falls through to the
+  reuse-blob / new-blob branches, which pad with [`_pad_zeros()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L16504) and do not read.
 
 When none apply, a synchronous device read lands in the write path. On HDD this
 is a real and often overlooked cost of small unaligned overwrites.
@@ -3126,7 +3137,8 @@ Inside [`_do_write_small()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bl
 | [`Blob::can_reuse_blob()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L2379) | may we overwrite inside this blob? |
 | [`bluestore_blob_t::get_chunk_size()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h#L660) | csum chunk size → head/tail pad |
 | [`bluestore_blob_t::is_unused()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h#L723) | region never written → skip the read |
-| [`_pad_zeros()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L16504) | zero-fill instead of reading |
+| [`_apply_padding()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L19601) | zero-fill `head_pad` / `tail_pad`: a gap with nothing mapped |
+| [`_pad_zeros()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L16504) | chunk-pad a write that goes to a reused or new blob |
 | [`_do_read()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L13138) | **the actual read** of head / tail pad |
 | [`bufferlist::claim_append()`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/buffer.cc#L1291) | **modify**: assemble padded content |
 | [`Blob::dirty_blob()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L757), [`calc_csum()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.cc#L908) | recompute checksums over whole chunks |
