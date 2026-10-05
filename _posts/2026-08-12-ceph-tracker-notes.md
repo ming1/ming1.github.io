@@ -2219,6 +2219,30 @@ read after restart        csum mismatch -> EIO    #6
    rest of the AU unused. `D` then becomes a deferred write too, and the
    deferred queue applies writes in order.
 
+The BlueStore functions behind each step, on main `986f3c892e7`. Every op
+enters through [`queue_transactions()`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/BlueStore.cc#L16132) → [`_txc_add_transaction()`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/BlueStore.cc#L16250). A write then runs [`_write()`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/BlueStore.cc#L18254) → [`_do_write_v2()`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/BlueStore.cc#L18115) → [`Writer::do_write()`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/Writer.cc#L1415) → [`do_write_with_blobs()`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/Writer.cc#L1435), which in order punches the
+old references ([`_punch_hole_2()`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/Writer.cc#L44)), writes into space the object
+already has ([`_try_put_data_on_allocated()`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/Writer.cc#L980)), and places the
+rest ([`_defer_or_allocate()`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/Writer.cc#L1312), [`_do_put_blobs()`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/Writer.cc#L1092)).
+After the ops, `queue_transactions()` adds the txc's deferred writes to its
+RocksDB batch ([`PREFIX_DEFERRED`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/BlueStore.cc#L16168)) and starts
+[`_txc_state_proc()`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/BlueStore.cc#L14784).
+
+| Step | BlueStore path |
+|---|---|
+| #1 `B` deferred | `do_write_with_blobs()` → `_try_put_data_on_allocated()` → [`_try_reuse_allocated_l()`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/Writer.cc#L825) → [`get_unused_mask()`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/bluestore_types.h#L827) = 0 → [`_schedule_io_masked()`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/Writer.cc#L713) → [`_get_deferred_op()`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/BlueStore.cc#L15785). After the KV commit: `_txc_state_proc()` → [`_deferred_queue()`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/BlueStore.cc#L14878) keeps it queued |
+| zero 4K~16K | [`_zero()`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/BlueStore.cc#L18285) → [`_do_zero()`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/BlueStore.cc#L18306) → [`ExtentMap::punch_hole()`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/BlueStore.cc#L4588) → [`_wctx_finish()`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/BlueStore.cc#L17749). Not write_v2; the 0~4K reference keeps the AU |
+| #2 AU reused | `do_write_with_blobs()` → `_punch_hole_2()` puts the AU in `released` → [`_defer_or_allocate()`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/Writer.cc#L1320): `do_deferred` |
+| #3 rest unused | `_do_put_blobs()` (A's blob was pruned, so neither [`_find_mutable_blob_left()`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/Writer.cc#L237) nor `_right()` finds a blob) → [`_do_put_new_blobs()`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/Writer.cc#L1046) → [`_blob_create_with_data()`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/Writer.cc#L485): [`_get_disk_space()`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/Writer.cc#L299) from `released`, [`add_unused_all()`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/Writer.cc#L513), [`_schedule_io()`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/Writer.cc#L764) → `_get_deferred_op()`, `mark_used()` for 0~4K |
+| #4 `D` direct | `_try_put_data_on_allocated()` → `_try_reuse_allocated_l()` on C's blob → `get_unused_mask()` = 1 → [`_schedule_io_masked()`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/Writer.cc#L726) → `bdev->aio_write()`; submitted by `_txc_state_proc()` → [`_txc_aio_submit()`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/BlueStore.cc#L14801) |
+| #5 `B` lands | [`MempoolThread::entry()`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/BlueStore.cc#L5664) (every ~`bluestore_max_defer_interval`, 3 s) or [`_kv_finalize_thread()`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/BlueStore.cc#L15766) once the batch fills (`bluestore_deferred_batch_ops`) → [`deferred_try_submit()`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/BlueStore.cc#L15842) → [`_deferred_submit_unlock()`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/BlueStore.cc#L15878) → [`bdev->aio_write()`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/BlueStore.cc#L15910) → [`_deferred_aio_finish()`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/BlueStore.cc#L15943) |
+| #6 EIO | [`read()`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/BlueStore.cc#L12907) → [`_do_read()`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/BlueStore.cc#L13286) → [`_read_cache()`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/BlueStore.cc#L12978) miss → [`_prepare_read_ioc()`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/BlueStore.cc#L13075) → [`_generate_read_result_bl()`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/BlueStore.cc#L13144) → [`_verify_csum()`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/BlueStore.cc#L13191) fails |
+
+#1 and #4 run the same `_schedule_io_masked()` and take opposite branches;
+one bit from `get_unused_mask()` decides. In this sequence the fix (#7)
+touches only #3; §8.4.1 closes the same hole in
+`_blob_put_data_subau_allocate()`.
+
 Map: §8.2 shows the live OSD and the gtest. §8.3 proves #2–#5 in the code
 and explains why the v1 write path is safe. §8.4 is the fix (#7), why it
 leaks no space, and its validation.
@@ -2229,8 +2253,8 @@ leaks no space, and its validation.
 
 A vstart OSD with `bluestore_write_v2=true` and
 `bluestore_min_alloc_size_hdd=16384`, all other options default. The steps
-of §8.1 are five plain librados ops on one object. Before the restart the
-object reads back correctly (served from cache). After the restart:
+of §8.1 are five plain librados ops on one object, then an OSD restart and
+a read:
 
 ```
 read FAILED: [errno 110] RADOS timed out (Ioctx.read(p): failed to read race)
@@ -2241,6 +2265,13 @@ _verify_csum bad crc32c/0x1000 checksum at blob offset 0x2000,
 `0x9042a7fd` is the crc32c of a 4K block of `B`. The block at X+8K holds the
 data of the older write. The OSD gets EIO from `_verify_csum`; with a single
 OSD there is no replica to repair from, so the client read times out.
+
+The restart is not needed to corrupt the data, only to see it. `B` lands
+within seconds (#5). A single read 10 s after the writes, with no restart,
+fails the same way. But a read before `B` lands returns the right data and,
+with `bluestore_default_buffered_read=true`, caches it: the 0 s read fills
+the cache, and the reads at 2, 7 and 17 s are served from it. The restart
+drops the cache.
 
 #### 8.2.2 Reproducing it
 
@@ -2285,7 +2316,8 @@ if (min_alloc_size != block_size) {
 ```
 
 **#4: the promise is used.** A later write next to the blob's data reuses
-the blob's allocated space (`_try_reuse_allocated_l/r()`), and
+the blob's allocated space (`_try_reuse_allocated_l()`, or `_r()` on the
+right), and
 `_schedule_io_masked()` ([`713`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/os/bluestore/Writer.cc#L713)) splits it per chunk:
 
 ```cpp
@@ -2357,7 +2389,7 @@ space:
 
 - The whole AU belongs to the blob (`bblob.allocated()`) with or without the
   fix. It returns to the allocator when the blob's last reference goes.
-- `_try_reuse_allocated_l/r()` reuses any allocated part of the blob; the
+- `_try_reuse_allocated_l()`/`_r()` reuses any allocated part of the blob; the
   unused bits play no part in deciding whether to reuse. With the fix, `D` still lands in the same AU,
   at X+8K.
 - The cost is one deferred write instead of a direct one, and only for the
@@ -2385,9 +2417,8 @@ blob test suites pass with it.
 - **Immediate reuse is where write_v2 departs from v1.** Every assumption
   v1 made about freed space, here that its deferred writes have landed,
   has to be rechecked on that path.
-- **The failure hides until a restart.** The buffer cache serves the new
-  data, so a read right after the writes is correct. A reproducer has to
-  drop the cache, and a restart is the simplest way.
+- **The read cache can hide the corruption.** A reproducer must read only
+  after the deferred flush, or drop the cache; a restart does both.
 
 ### 8.6 Code references
 
