@@ -3135,6 +3135,37 @@ Inside [`_do_write_small()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bl
 | [`ExtentMap::punch_hole()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L4585), [`set_lextent()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L4642) | metadata update |
 | [`_buffer_cache_write()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L3068) → [`BufferSpace::write()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L491) | keep buffer cache coherent: discard the old range, add a `STATE_WRITING` buffer |
 
+The read-modify-write read, from the pad arithmetic to the device. It runs
+in the op thread, before the txc reaches the kv queue:
+
+```
+_do_write_small()                                    :16566
+  ├─ head_pad / tail_pad: distance to the csum chunk boundary     :16652
+  │    └─ has_any_lextents() in the pad?  yes → pad = 0, zeros cannot go there   :16659
+  ├─ head_read / tail_read: what is still missing to the boundary :16717
+  │    └─ kept only if head_read + tail_read < min_alloc_size     :16721
+  ├─ _do_read(head)                                  :16741
+  ├─ _do_read(tail)                                  :16755
+  │    ├─ ExtentMap::fault_range()                   :13178  load the extent map shard if needed
+  │    ├─ _read_cache()                              :13196
+  │    │    └─ BufferSpace::read()                   :12860  hit → ready_regions, miss → blobs2read
+  │    ├─ _prepare_read_ioc()                        :13205
+  │    │    └─ blob.map() → bdev->aio_read()         :12975  one aio per pextent
+  │    ├─ bdev->aio_submit(), ioc.aio_wait()         :13213  synchronous: the op thread sleeps
+  │    └─ _generate_read_result_bl()                 :13256
+  │         ├─ _verify_csum()                        :13043  the old bytes are checked first
+  │         └─ BufferSpace::did_read()               :13054  cache them, if the read is buffered
+  └─ head_bl + bl + tail_bl, by claim_append()       :16749, :16763
+
+_do_write_big_apply_deferred()                       :17014
+  └─ the same two _do_read() calls                   :17026, :17043
+```
+
+Each `_do_read()` here adds one to the `write_penalty_read_ops` counter, and
+`_do_write_small` adds one to `write_small_pre_read`
+([`:16751-16766`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L16751-L16766)),
+so `ceph daemon osd.N perf dump` shows how often a workload pays for it.
+
 Apply and recover:
 
 ```
