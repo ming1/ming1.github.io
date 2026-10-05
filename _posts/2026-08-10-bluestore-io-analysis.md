@@ -302,7 +302,7 @@ The trigger is visible in the log line itself: the target blob is already
 allocated (`0x95000~2000,0x7f000~1000,0x98000~d000`), and a direct write
 never overwrites live sectors before the commit: a crash in between would
 leave new bytes under the old checksum. Deferring turns the overwrite into
-a WAL append now plus an in-place write later, here at `0x99000` (§3.5.3).
+a WAL append now plus an in-place write later, here at `0x99000` (§3.5.4).
 
 ```
 direct :  data ──► disk ─┐
@@ -1440,7 +1440,7 @@ allocate a new one. The split is the deferred overwrite. Here the 4 KiB
 object's overwrite covers its whole physical extent, so classic's in-place
 deferral falls back and it still allocates a new AU — the WAL only changes
 *when* the data lands, not *where*. (When the overwrite covers only part of
-an extent, classic defers in place too; §3.5.3 traces both cases.) v2's
+an extent, classic defers in place too; §3.5.4 traces both cases.) v2's
 `_defer_or_allocate` instead points the write at the extents
 `_punch_hole_2` just released (`disk_allocs.it = released.begin()`,
 [`Writer.cc:1326`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/Writer.cc#L1326))
@@ -2890,7 +2890,281 @@ Absolute times belong to this VM's emulated NVMe, where an fdatasync
 costs 1–3 ms. Read the order, not the microseconds. Bare `:NNNN` is
 `BlueStore.cc` at v21.3.0.
 
-### 3.5.1 The workload and the trace
+§3.5.1 gives the idea without the trace; the trace starts at §3.5.2.
+
+### 3.5.1 Deferred write
+
+#### 3.5.1.1 Why it exists
+
+BlueStore writes object data directly to a raw block device, with no filesystem
+underneath. Data layout, checksums and other metadata live in RocksDB.
+
+This creates one hard problem: **a partial overwrite of already-allocated space
+is not atomic.**
+
+Suppose a client writes 1 KB into the middle of an extent that already holds
+data. Doing it in place requires a read-modify-write:
+
+1. read the surrounding bytes,
+2. patch 1 KB into them,
+3. write the whole aligned chunk back.
+
+If the machine dies during step 3, the chunk on disk is half old and half new.
+The checksum stored in RocksDB matches neither version. Ceph cannot tolerate
+this, because every layer above assumes a transaction either happened completely
+or not at all.
+
+There is a second, softer problem: on HDD, many small random writes are slow
+because the head must seek for each one.
+
+Deferred write solves both.
+
+#### 3.5.1.2 The principle
+
+> Do not write small data to its final location immediately. First write it into
+> RocksDB together with the metadata, in one atomic commit. Write it to the real
+> location later, in the background.
+
+The payload itself is stored temporarily in RocksDB under the deferred key prefix
+`L`, as a `bluestore_deferred_op_t` containing:
+
+- the target device extents (offset + length),
+- the exact bytes that must end up there.
+
+Because the RocksDB commit is atomic, **the write is durable the moment that
+commit returns** — even though the final location still holds stale data. The
+client is acknowledged at this point.
+
+The record is **idempotent**: it holds the complete final content of those
+extents. Applying it once or ten times gives the same result. So crash recovery
+is trivial — replay every surviving `L` record at mount time. A torn chunk can
+never be observed, because the authoritative copy lives in RocksDB until the
+in-place write is confirmed.
+
+#### 3.5.1.3 Two write paths
+
+BlueStore picks a path per fragment of the incoming write:
+
+| | **Direct write** | **Deferred write** |
+|---|---|---|
+| When | new allocation, or never-written blocks of a blob, at or above `prefer_deferred_size` | sub-`min_alloc_size` overwrite of written blocks (always, it is a read-modify-write), or any write below `prefer_deferred_size` |
+| Order | data → device, *then* metadata → RocksDB | data + metadata → RocksDB, *then* data → device |
+| Crash in the middle | new blocks are unreferenced garbage, allocator reclaims them | `L` record is replayed, correct result |
+| Payload written | **once** | **twice** |
+
+The size heuristic is `bluestore_prefer_deferred_size_hdd` / `_ssd`; a non-zero
+`bluestore_prefer_deferred_size` overrides both. At v21.3.0 the HDD default is
+64 KiB; **the SSD default is 0**, meaning deferred write is
+effectively off for SSD/NVMe except where correctness demands it. That asymmetry
+is the whole trade-off in one line: on HDD you convert a random write into a log
+append and win; on NVMe the second write costs more than the seek you avoided.
+
+#### 3.5.1.4 The two writes
+
+```
+            client: overwrite 1 KB at an unaligned offset
+                               |
+                               v
+   +---------------------------------------------------------------+
+   |  PREPARE   _do_write_small() / _do_write_big()                 |
+   |    read head/tail pads  -> assemble full aligned content       |
+   |    recompute checksums  -> build bluestore_deferred_op_t       |
+   +---------------------------------------------------------------+
+                               |
+                               v
+   == WRITE 1 ==  kv_sync_thread: ONE atomic RocksDB transaction
+      +-----------------------------------------------+
+      |  onode / extent map / csum   (metadata)       |   sequential
+      |  key "L"+seq  ->  payload    (DATA!)          |   append to WAL
+      +-----------------------------------------------+   often on block.db SSD
+                               |
+                   commit ok --+--> *** CLIENT ACKNOWLEDGED ***
+                               |     (final location still holds OLD data;
+                               |      RocksDB now holds the truth)
+                               v
+   == WRITE 2 ==  background: _deferred_submit_unlock() -> bdev->aio_write()
+      +-----------------------------------------------+
+      |  payload -> final offset on the data device   |   random, in place
+      +-----------------------------------------------+   batched & sorted
+                               |
+                               v
+   == CLEANUP ==  next kv txn: delete key "L"+seq   (metadata only, no payload)
+```
+
+Three properties worth noting:
+
+**Write 1 is sequential.** Whatever the user's offset was, the physical I/O is an
+append to the RocksDB WAL.
+
+**The two writes often target different devices.** In the usual deployment
+`block.db` / `block.wal` sit on SSD while `block` is HDD. So "double write" is
+not double traffic on one spindle — it is one fast write plus one slow write, and
+the client only waits for the fast one.
+
+**Write 2 is the one that may be torn** by a crash. That is exactly why it is
+safe: the `L` record still exists, and `_deferred_replay()` will redo it.
+
+While write 2 is pending, a read of those extents is served from the blob's
+buffer cache, not from the stale device content: `_buffer_cache_write()` files
+the new bytes as a `STATE_WRITING` buffer, which stays pinned until the txc
+retires (§3.5.9). The `DeferredBatch` only feeds the device write.
+
+#### 3.5.1.5 How many writes, really?
+
+Two is the best case. The `L` key is normally deleted while still in the same
+memtable, so the payload is dropped at flush time and never reaches an SST.
+
+If the deferred queue drains slowly, the memtable is flushed before the tombstone
+arrives, and the payload escapes:
+
+```
+  WAL  ->  L0 SST (flush)  ->  L1 (compaction)  ->  L2 ...  +  device write
+   1          2                   3                  4          + 1
+```
+
+Each surviving level is another full copy of user data moving through the disk.
+This is a feedback loop: a saturated data device means records live longer, which
+creates more RocksDB work, which competes for I/O. `bluestore_throttle_deferred_bytes`
+exists to bound it; `bluestore_deferred_batch_ops` helps by draining the queue
+faster.
+
+#### 3.5.1.6 Read-modify-write
+
+The read happens **early, at preparation time** — not in the background. By the
+time the deferred record is built, it already contains the complete final content
+of the extents it covers.
+
+The read is driven by **checksum chunk alignment** (`csum_chunk_size`, typically
+4 KB), not by `min_alloc_size`. A checksum cannot be recomputed for a chunk
+unless all its bytes are present. Only the head and tail pads are read — never the
+whole allocation unit.
+
+```
+  csum chunk boundaries:   |<--4K-->|<--4K-->|<--4K-->|
+                           +--------+--------+--------+
+  on disk (old data):      |AAAAAAAA|BBBBBBBB|CCCCCCCC|
+                           +--------+--------+--------+
+  client write:                 |####### new #####|
+                           head_pad^                ^tail_pad
+                           |<-->|                |<->|
+
+  step 1 READ    : _do_read() head_pad "AAA"  and tail_pad "CCC"
+  step 2 MODIFY  : padded = head_bl + new_data + tail_bl   (3 chunks, aligned)
+  step 3 CHECKSUM: calc_csum(b_off, padded)
+  step 4 RECORD  : op->data = padded        <-- complete, hence idempotent
+```
+
+Three ways the read is skipped:
+
+- **`is_unused(b_off, b_len)`** — the blob's `unused` bitmap says the region was
+  allocated but never written, so it is known-zero. `_pad_zeros()` fills it in.
+- **buffer cache** — `_do_read()` checks `BufferSpace` first; a recently touched
+  region costs nothing.
+- **no underlying extent** — `has_any_lextents()` is false (a hole, or past EOF),
+  so the pad is dropped.
+
+When none apply, a synchronous device read lands in the write path. On HDD this
+is a real and often overlooked cost of small unaligned overwrites.
+
+#### 3.5.1.7 Transaction state machine
+
+```
+  STATE_PREPARE
+      |  (only if direct writes were issued)
+      v
+  STATE_AIO_WAIT  ->  STATE_IO_DONE
+      |
+      v
+  STATE_KV_QUEUED            kv_sync_thread: metadata + "L" payload, one txn
+      |
+      v
+  STATE_KV_SUBMITTED         commit is durable; _txc_committed_kv()
+      |
+      v
+  STATE_KV_DONE  -----------------------> oncommit queued, client acknowledged
+      |
+      v
+  STATE_DEFERRED_QUEUED      _deferred_submit_unlock(): real device I/O
+      |
+      v
+  STATE_DEFERRED_CLEANUP     remove "L" keys in a later kv txn
+      |
+      v
+  STATE_FINISHING  ->  STATE_DONE
+```
+
+`STATE_DEFERRED_DONE` is in the enum but no code sets it at v21.3.0.
+
+Deferred ops are accumulated per `OpSequencer` into a `DeferredBatch`, merged and
+sorted before submission, which turns scattered small overwrites into fewer,
+better-ordered device operations. Ordering within a sequencer is preserved, so two
+deferred writes to the same extent apply in the correct order.
+
+#### 3.5.1.8 Involved functions
+
+Write path, from transaction decode down to the deferred record:
+
+```
+BlueStore::_txc_add_transaction()
+  └─ BlueStore::_write()
+       └─ BlueStore::_do_write()
+            ├─ _choose_write_options()           // picks deferred threshold, csum type
+            ├─ _do_write_data()
+            │    ├─ _do_write_small()            // RMW: always deferred; unused blocks: deferred if < prefer
+            │    └─ _do_write_big()              // aligned: in-place deferred if < prefer, else new blob
+            │         └─ _do_write_big_apply_deferred()
+            ├─ _do_alloc_write()                 // allocate + direct aio; deferred if < prefer
+            └─ _wctx_finish()                    // release replaced extents
+```
+
+Inside `_do_write_small()`:
+
+| Function | Role |
+|---|---|
+| `ExtentMap::seek_lextent()` | find the lextent / blob covering this offset |
+| `Blob::can_reuse_blob()` | may we overwrite inside this blob? |
+| `bluestore_blob_t::get_chunk_size()` | csum chunk size → head/tail pad |
+| `bluestore_blob_t::is_unused()` | region never written → skip the read |
+| `_pad_zeros()` | zero-fill instead of reading |
+| `_do_read()` | **the actual read** of head / tail pad |
+| `bufferlist::claim_append()`, `substr_of()` | **modify**: assemble padded content |
+| `Blob::dirty_blob().calc_csum()` | recompute checksums over whole chunks |
+| `_get_deferred_op()` | allocate op in `txc->deferred_txn` |
+| `bluestore_blob_t::map()` | logical offset → device extents, into `op->extents` |
+| `ExtentMap::punch_hole()`, `set_lextent()` | metadata update |
+| `BufferSpace::_write()`, `did_overwrite()` | keep buffer cache coherent |
+
+Apply and recover:
+
+```
+_txc_state_proc()
+  └─ _deferred_queue()
+       ├─ DeferredBatch::prepare_write()      // merge + sort per sequencer
+       └─ _deferred_submit_unlock()
+            └─ BlockDevice::aio_write()
+                 └─ _deferred_aio_finish()
+                      └─ (next kv txn) erase PREFIX_DEFERRED keys
+
+BlueStore::_mount()
+  └─ _deferred_replay()                        // decode each "L" key, re-apply, erase
+```
+
+#### 3.5.1.9 Summary
+
+Deferred write buys **atomicity for partial overwrites** and **low latency for
+small random writes on slow media**. It pays with **write amplification** — the
+same bytes reach stable storage at least twice — and with pressure on RocksDB.
+
+A useful mental model: deferred write is BlueStore's own journal, but a
+*selective* one. FileStore journalled every write; BlueStore journals only the
+writes that actually need it.
+
+> Defaults and internal names have drifted across Ceph releases
+> (`_choose_write_options()` and `_get_deferred_op()` are relatively recent;
+> older code inlined them). Check `src/os/bluestore/BlueStore.cc` on the branch
+> you actually run — the structure is stable, the details are not.
+
+### 3.5.2 The workload and the trace
 
 ```bash
 head -c 65536 /dev/urandom > /root/64k
@@ -2931,7 +3205,7 @@ runs the whole collection: this trace (pass A), the debug-log pass
 the control's debug log (E).
 After the write it waits 8 s,
 then sends two metadata-only ops (`setomapval`, "nudges") so the
-cleanup happens inside the capture. §3.5.7 explains why an idle OSD
+cleanup happens inside the capture. §3.5.8 explains why an idle OSD
 needs them. Trimmed to the client txc and the kv cycles; `..214000` is
 BlueFS's `KernelDevice`, `..fb7c00` BlueStore's, both on `nvme0n1`
 (§1.7):
@@ -2988,7 +3262,7 @@ answer at #27, 5.3 ms in. The data reached its LBA at #30–#32, 1.37 s
 later. The bytes at `0x83000` change once, at #30. No other line
 writes the data device.
 
-### 3.5.2 The map — two writes, one transaction
+### 3.5.3 The map — two writes, one transaction
 
 ```
  tp_osd_tp              bstore_kv_sync          bstore_kv_final          bstore_mempool         bstore_aio
@@ -3042,7 +3316,7 @@ Four points in that map:
 - the txc outlives its reply by 9 s, pinning its payload and the
   `L` record (the deferred throttle comes back earlier, at #32).
 
-### 3.5.3 Lines 2–9, the overwrite becomes deferred
+### 3.5.4 Lines 2–9, the overwrite becomes deferred
 
 ```
 #2  _do_write            :17851    "0x4000~1000 - have 0x10000"
@@ -3111,7 +3385,7 @@ chunk. `can_defer` then pads to the chunk, and
 `_do_write_big_apply_deferred` reads the head and tail from the device
 ([`:17024-17052`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L17024-L17052)). What this deferral saves here is the new
 allocation, the fragmentation, and the data-device barrier in the
-commit (§3.5.5).
+commit (§3.5.6).
 
 **A deferred write does not always stay in place.** Pass D re-runs
 the deferred overwrite on the control object after C fragmented it.
@@ -3132,7 +3406,7 @@ two deferred paths with one WAL-first shape: `_do_write_big_apply_deferred`
 smaller than `prefer_deferred_size`). Only the first saves the
 allocation.
 
-### 3.5.4 Lines 10–13, the transaction records the data before writing it
+### 3.5.5 Lines 10–13, the transaction records the data before writing it
 
 After #8 the payload is a field of the txc:
 
@@ -3159,7 +3433,7 @@ queue_transactions                                        :16009-16017
 ```
 
 So `L` joins `P`, `P` and `O` in the one `WriteBatch` of §4.3.6. The
-record is readable after a crash, so here is one taken from §3.5.8's
+record is readable after a crash, so here is one taken from §3.5.9's
 killed OSD (seq 28, same shape, LBA `0x93000`). `ceph-dencoder` is not
 built in this tree, so [`ldecode.py`]({{ site.baseurl }}/code/ceph/ldecode.py) reads it from the DENC layout:
 
@@ -3202,7 +3476,7 @@ What is on media at #20, and what is not:
 The metadata already describes the new data, and the new data exists
 only inside the WAL.
 
-### 3.5.5 Lines 14–16, `io_done` without `aio_wait`
+### 3.5.6 Lines 14–16, `io_done` without `aio_wait`
 
 ```
 case STATE_PREPARE:                                  :14641
@@ -3243,7 +3517,7 @@ _kv_sync_thread committed 1 cleaned 0 in 0.008059749s (0.000000107s flush + 0.00
 it had not even been issued.** In §3.1 the order is the reverse: data
 aio (#4, #8) → aio done (#9) → data flush (#10) → commit.
 
-### 3.5.6 Lines 17–27, the WAL pays for the client-visible durability
+### 3.5.7 Lines 17–27, the WAL pays for the client-visible durability
 
 ```
  the 4 KiB payload
@@ -3279,7 +3553,7 @@ then, off the client path:
 cut loses nothing. RocksDB replays the WAL and restores `L`, `O` and
 both `P` together, since a `WriteBatch` is all-or-nothing (§4.3.6).
 BlueStore's mount then replays `L` onto `0x83000` before the store
-accepts any op (§3.5.8). The claim is not that the bytes are at their
+accepts any op (§3.5.9). The claim is not that the bytes are at their
 final address. They are not, until #30, and not stable there until
 #35.
 
@@ -3303,7 +3577,7 @@ that handed the commit callbacks to the OSD: `_txc_committed_kv` sets
 Queued is not issued, though. Nothing touches the data device until
 #30.
 
-### 3.5.7 Lines 24–41, after the reply — replaying the deferred write
+### 3.5.8 Lines 24–41, after the reply — replaying the deferred write
 
 **Queue (#24–#25).** `_deferred_queue` ([`:15645`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15645)) appends the txc to
 its sequencer's open batch, `osr->deferred_pending` (a
@@ -3325,7 +3599,7 @@ puts its sequencer on the global `deferred_queue`.
 | a sequencer holding > `bluestore_max_deferred_txc` (32) txcs | `_txc_finish` [`:15020`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15020) | no |
 | throttle exhausted in `queue_transactions` (aggressive) | [`:16032-16050`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L16032-L16050) | no |
 | `last_submitted + max_defer_interval < now`, checked every interval/3 | `MempoolThread` [`:5656-5664`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L5656-L5664) | **yes: #28 on `bstore_mempool`** |
-| drain, umount, mount replay | `_osr_drain_all` | §3.5.8 |
+| drain, umount, mount replay | `_osr_drain_all` | §3.5.9 |
 
 A lone write therefore waits for the mempool timer. The tick runs every
 1 s, and `deferred_try_submit` stamps `deferred_last_submitted` even
@@ -3378,7 +3652,7 @@ cycles. A layout with a separate DB device takes a different
 branch: it flushes the data device in the next cycle and cleans in
 that same cycle ([`:15373-15377`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15373-L15377)).
 
-### 3.5.8 The crash/recovery story
+### 3.5.9 The crash/recovery story
 
 [`wdefercrash.sh`]({{ site.baseurl }}/code/ceph/wdefercrash.sh) stops the replay from happening by itself
 (`max_defer_interval 0` disables the timer; `deferred_batch_ops 4096`),
@@ -3451,284 +3725,12 @@ Why a replay can never damage newer data:
 | 1 | When does the `ondisk` reply leave? | after the WAL fdatasync returns: 324 µs later | #20 → #26 |
 | 2 | Where is the payload then? | on media only in the WAL; in memory as `deferred_txn.ops[0].data`, the `iomap` entry, the `STATE_WRITING` buffer (one raw, shared), plus RocksDB's memtable copy (§7.5) | #13, #25, #7 |
 | 3 | Is the final LBA written? | no: first write at #30, 1.37 s later; old bytes until then | #30; crash run, raw read |
-| 4 | What makes it recoverable? | `L` (physical extent + bytes) committed atomically with `O` | §3.5.4 |
+| 4 | What makes it recoverable? | `L` (physical extent + bytes) committed atomically with `O` | §3.5.5 |
 | 5 | Crash after the reply, before `_deferred_aio_finish`? | WAL replay restores `L`; `_mount` replays it to the LBA before serving I/O | crash run |
 | 6 | When is `L` deleted? | in the kv commit *after* the one whose flush made the replayed LBA stable: `rm_single_key` into `synct` | #37, [`:15454`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15454) |
 | 7 | What happens on restart? | `_deferred_replay` → txc in `KV_DONE` → queue → aggressive submit → flush → `rm L` → retire, ~2 ms | mount log |
 | 8 | Is the payload duplicated? | on media twice (WAL #19, LBA #30); in memory as the shared refs of row 2, plus RocksDB's own copies | #19, #30, §7.5 |
 | 9 | Which copies survive a crash? | only the WAL/`L` copy, and the LBA copy once #30 has been flushed (#35). All memory copies are temporary | crash run |
-
-### 3.5.9 Deferred write
-
-#### 3.5.9.1 Why it exists
-
-BlueStore writes object data directly to a raw block device, with no filesystem
-underneath. Data layout, checksums and other metadata live in RocksDB.
-
-This creates one hard problem: **a partial overwrite of already-allocated space
-is not atomic.**
-
-Suppose a client writes 1 KB into the middle of an extent that already holds
-data. Doing it in place requires a read-modify-write:
-
-1. read the surrounding bytes,
-2. patch 1 KB into them,
-3. write the whole aligned chunk back.
-
-If the machine dies during step 3, the chunk on disk is half old and half new.
-The checksum stored in RocksDB matches neither version. Ceph cannot tolerate
-this, because every layer above assumes a transaction either happened completely
-or not at all.
-
-There is a second, softer problem: on HDD, many small random writes are slow
-because the head must seek for each one.
-
-Deferred write solves both.
-
-#### 3.5.9.2 The principle
-
-> Do not write small data to its final location immediately. First write it into
-> RocksDB together with the metadata, in one atomic commit. Write it to the real
-> location later, in the background.
-
-The payload itself is stored temporarily in RocksDB under the deferred key prefix
-`L`, as a `bluestore_deferred_op_t` containing:
-
-- the target device extents (offset + length),
-- the exact bytes that must end up there.
-
-Because the RocksDB commit is atomic, **the write is durable the moment that
-commit returns** — even though the final location still holds stale data. The
-client is acknowledged at this point.
-
-The record is **idempotent**: it holds the complete final content of those
-extents. Applying it once or ten times gives the same result. So crash recovery
-is trivial — replay every surviving `L` record at mount time. A torn chunk can
-never be observed, because the authoritative copy lives in RocksDB until the
-in-place write is confirmed.
-
-#### 3.5.9.3 Two write paths
-
-BlueStore picks a path per fragment of the incoming write:
-
-| | **Direct write** | **Deferred write** |
-|---|---|---|
-| When | new allocation, or never-written blocks of a blob, at or above `prefer_deferred_size` | sub-`min_alloc_size` overwrite of written blocks (always, it is a read-modify-write), or any write below `prefer_deferred_size` |
-| Order | data → device, *then* metadata → RocksDB | data + metadata → RocksDB, *then* data → device |
-| Crash in the middle | new blocks are unreferenced garbage, allocator reclaims them | `L` record is replayed, correct result |
-| Payload written | **once** | **twice** |
-
-The size heuristic is `bluestore_prefer_deferred_size_hdd` / `_ssd`; a non-zero
-`bluestore_prefer_deferred_size` overrides both. At v21.3.0 the HDD default is
-64 KiB; **the SSD default is 0**, meaning deferred write is
-effectively off for SSD/NVMe except where correctness demands it. That asymmetry
-is the whole trade-off in one line: on HDD you convert a random write into a log
-append and win; on NVMe the second write costs more than the seek you avoided.
-
-#### 3.5.9.4 The two writes
-
-```
-            client: overwrite 1 KB at an unaligned offset
-                               |
-                               v
-   +---------------------------------------------------------------+
-   |  PREPARE   _do_write_small() / _do_write_big()                 |
-   |    read head/tail pads  -> assemble full aligned content       |
-   |    recompute checksums  -> build bluestore_deferred_op_t       |
-   +---------------------------------------------------------------+
-                               |
-                               v
-   == WRITE 1 ==  kv_sync_thread: ONE atomic RocksDB transaction
-      +-----------------------------------------------+
-      |  onode / extent map / csum   (metadata)       |   sequential
-      |  key "L"+seq  ->  payload    (DATA!)          |   append to WAL
-      +-----------------------------------------------+   often on block.db SSD
-                               |
-                   commit ok --+--> *** CLIENT ACKNOWLEDGED ***
-                               |     (final location still holds OLD data;
-                               |      RocksDB now holds the truth)
-                               v
-   == WRITE 2 ==  background: _deferred_submit_unlock() -> bdev->aio_write()
-      +-----------------------------------------------+
-      |  payload -> final offset on the data device   |   random, in place
-      +-----------------------------------------------+   batched & sorted
-                               |
-                               v
-   == CLEANUP ==  next kv txn: delete key "L"+seq   (metadata only, no payload)
-```
-
-Three properties worth noting:
-
-**Write 1 is sequential.** Whatever the user's offset was, the physical I/O is an
-append to the RocksDB WAL.
-
-**The two writes often target different devices.** In the usual deployment
-`block.db` / `block.wal` sit on SSD while `block` is HDD. So "double write" is
-not double traffic on one spindle — it is one fast write plus one slow write, and
-the client only waits for the fast one.
-
-**Write 2 is the one that may be torn** by a crash. That is exactly why it is
-safe: the `L` record still exists, and `_deferred_replay()` will redo it.
-
-While write 2 is pending, a read of those extents is served from the blob's
-buffer cache, not from the stale device content: `_buffer_cache_write()` files
-the new bytes as a `STATE_WRITING` buffer, which stays pinned until the txc
-retires (§3.5.8). The `DeferredBatch` only feeds the device write.
-
-#### 3.5.9.5 How many writes, really?
-
-Two is the best case. The `L` key is normally deleted while still in the same
-memtable, so the payload is dropped at flush time and never reaches an SST.
-
-If the deferred queue drains slowly, the memtable is flushed before the tombstone
-arrives, and the payload escapes:
-
-```
-  WAL  ->  L0 SST (flush)  ->  L1 (compaction)  ->  L2 ...  +  device write
-   1          2                   3                  4          + 1
-```
-
-Each surviving level is another full copy of user data moving through the disk.
-This is a feedback loop: a saturated data device means records live longer, which
-creates more RocksDB work, which competes for I/O. `bluestore_throttle_deferred_bytes`
-exists to bound it; `bluestore_deferred_batch_ops` helps by draining the queue
-faster.
-
-#### 3.5.9.6 Read-modify-write
-
-The read happens **early, at preparation time** — not in the background. By the
-time the deferred record is built, it already contains the complete final content
-of the extents it covers.
-
-The read is driven by **checksum chunk alignment** (`csum_chunk_size`, typically
-4 KB), not by `min_alloc_size`. A checksum cannot be recomputed for a chunk
-unless all its bytes are present. Only the head and tail pads are read — never the
-whole allocation unit.
-
-```
-  csum chunk boundaries:   |<--4K-->|<--4K-->|<--4K-->|
-                           +--------+--------+--------+
-  on disk (old data):      |AAAAAAAA|BBBBBBBB|CCCCCCCC|
-                           +--------+--------+--------+
-  client write:                 |####### new #####|
-                           head_pad^                ^tail_pad
-                           |<-->|                |<->|
-
-  step 1 READ    : _do_read() head_pad "AAA"  and tail_pad "CCC"
-  step 2 MODIFY  : padded = head_bl + new_data + tail_bl   (3 chunks, aligned)
-  step 3 CHECKSUM: calc_csum(b_off, padded)
-  step 4 RECORD  : op->data = padded        <-- complete, hence idempotent
-```
-
-Three ways the read is skipped:
-
-- **`is_unused(b_off, b_len)`** — the blob's `unused` bitmap says the region was
-  allocated but never written, so it is known-zero. `_pad_zeros()` fills it in.
-- **buffer cache** — `_do_read()` checks `BufferSpace` first; a recently touched
-  region costs nothing.
-- **no underlying extent** — `has_any_lextents()` is false (a hole, or past EOF),
-  so the pad is dropped.
-
-When none apply, a synchronous device read lands in the write path. On HDD this
-is a real and often overlooked cost of small unaligned overwrites.
-
-#### 3.5.9.7 Transaction state machine
-
-```
-  STATE_PREPARE
-      |  (only if direct writes were issued)
-      v
-  STATE_AIO_WAIT  ->  STATE_IO_DONE
-      |
-      v
-  STATE_KV_QUEUED            kv_sync_thread: metadata + "L" payload, one txn
-      |
-      v
-  STATE_KV_SUBMITTED         commit is durable; _txc_committed_kv()
-      |
-      v
-  STATE_KV_DONE  -----------------------> oncommit queued, client acknowledged
-      |
-      v
-  STATE_DEFERRED_QUEUED      _deferred_submit_unlock(): real device I/O
-      |
-      v
-  STATE_DEFERRED_CLEANUP     remove "L" keys in a later kv txn
-      |
-      v
-  STATE_FINISHING  ->  STATE_DONE
-```
-
-`STATE_DEFERRED_DONE` is in the enum but no code sets it at v21.3.0.
-
-Deferred ops are accumulated per `OpSequencer` into a `DeferredBatch`, merged and
-sorted before submission, which turns scattered small overwrites into fewer,
-better-ordered device operations. Ordering within a sequencer is preserved, so two
-deferred writes to the same extent apply in the correct order.
-
-#### 3.5.9.8 Involved functions
-
-Write path, from transaction decode down to the deferred record:
-
-```
-BlueStore::_txc_add_transaction()
-  └─ BlueStore::_write()
-       └─ BlueStore::_do_write()
-            ├─ _choose_write_options()           // picks deferred threshold, csum type
-            ├─ _do_write_data()
-            │    ├─ _do_write_small()            // RMW: always deferred; unused blocks: deferred if < prefer
-            │    └─ _do_write_big()              // aligned: in-place deferred if < prefer, else new blob
-            │         └─ _do_write_big_apply_deferred()
-            ├─ _do_alloc_write()                 // allocate + direct aio; deferred if < prefer
-            └─ _wctx_finish()                    // release replaced extents
-```
-
-Inside `_do_write_small()`:
-
-| Function | Role |
-|---|---|
-| `ExtentMap::seek_lextent()` | find the lextent / blob covering this offset |
-| `Blob::can_reuse_blob()` | may we overwrite inside this blob? |
-| `bluestore_blob_t::get_chunk_size()` | csum chunk size → head/tail pad |
-| `bluestore_blob_t::is_unused()` | region never written → skip the read |
-| `_pad_zeros()` | zero-fill instead of reading |
-| `_do_read()` | **the actual read** of head / tail pad |
-| `bufferlist::claim_append()`, `substr_of()` | **modify**: assemble padded content |
-| `Blob::dirty_blob().calc_csum()` | recompute checksums over whole chunks |
-| `_get_deferred_op()` | allocate op in `txc->deferred_txn` |
-| `bluestore_blob_t::map()` | logical offset → device extents, into `op->extents` |
-| `ExtentMap::punch_hole()`, `set_lextent()` | metadata update |
-| `BufferSpace::_write()`, `did_overwrite()` | keep buffer cache coherent |
-
-Apply and recover:
-
-```
-_txc_state_proc()
-  └─ _deferred_queue()
-       ├─ DeferredBatch::prepare_write()      // merge + sort per sequencer
-       └─ _deferred_submit_unlock()
-            └─ BlockDevice::aio_write()
-                 └─ _deferred_aio_finish()
-                      └─ (next kv txn) erase PREFIX_DEFERRED keys
-
-BlueStore::_mount()
-  └─ _deferred_replay()                        // decode each "L" key, re-apply, erase
-```
-
-#### 3.5.9.9 Summary
-
-Deferred write buys **atomicity for partial overwrites** and **low latency for
-small random writes on slow media**. It pays with **write amplification** — the
-same bytes reach stable storage at least twice — and with pressure on RocksDB.
-
-A useful mental model: deferred write is BlueStore's own journal, but a
-*selective* one. FileStore journalled every write; BlueStore journals only the
-writes that actually need it.
-
-> Defaults and internal names have drifted across Ceph releases
-> (`_choose_write_options()` and `_get_deferred_op()` are relatively recent;
-> older code inlined them). Check `src/os/bluestore/BlueStore.cc` on the branch
-> you actually run — the structure is stable, the details are not.
 
 ### 3.5.10 Direct vs deferred — same write, two paths
 
@@ -3739,7 +3741,7 @@ Pass A against control pass C: same 64 KiB object, same 4 KiB at
 |---|---|---|
 | placement | punch + allocate `0x6b000` (copy-on-write) | in place, `0x83000` = `0x7f000 + 0x4000` |
 | allocator | +1 AU allocated, 1 AU released | nothing (`allocated 0x[] released 0x[]`) |
-| blob afterwards | 3 pextents (`dir2` log, §3.5.3) | still 1 |
+| blob afterwards | 3 pextents (`dir2` log, §3.5.4) | still 1 |
 | `O` record | 442 B | 432 B |
 | extra kv record | — | `L`, 4135 B |
 | data aio before commit | yes (+101 µs, done +3 074 µs) | none |
@@ -3797,7 +3799,7 @@ still goes through `L` (§4.3.2).
 
 ### 3.5.11 Code references
 
-All links point at `v21.3.0`. `#N` is the §3.5.1 trace line.
+All links point at `v21.3.0`. `#N` is the §3.5.2 trace line.
 
 | Code | Role |
 |---|---|
@@ -3817,7 +3819,7 @@ All links point at `v21.3.0`. `#N` is the §3.5.1 trace line.
 | [`BlueStore::_get_deferred_op()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15633) | creates `txc->deferred_txn`, appends an op; #8 |
 | [`get_deferred_key()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L568) | `L` key = 8-byte big-endian seq |
 | [`BlueStore::queue_transactions()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15980) | `seq = ++deferred_seq`, encode, `t->set(PREFIX_DEFERRED, …)` (`:16009-16017`); #13 |
-| [`denc_lba()`](https://github.com/ceph/ceph/blob/v21.3.0/src/include/denc.h#L602) | extent offset encoding, decoded in §3.5.4 and by ldecode.py |
+| [`denc_lba()`](https://github.com/ceph/ceph/blob/v21.3.0/src/include/denc.h#L602) | extent offset encoding, decoded in §3.5.5 and by ldecode.py |
 | [`denc_varint_lowz()`](https://github.com/ceph/ceph/blob/v21.3.0/src/include/denc.h#L494) | extent length encoding |
 | **Commit: the state machine and the kv threads** | |
 | [`BlueStore::_txc_state_proc()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L14634) | PREPARE falls through with no aio (`:14641-14668`); KV_DONE → `_deferred_queue` (`:14724`); #14–#16, #22, #40 |

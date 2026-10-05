@@ -1,5 +1,5 @@
 #!/bin/bash
-# wdefercrash.sh -- §3.5.8: kill the OSD after the ondisk reply of a
+# wdefercrash.sh -- §3.5.9: kill the OSD after the ondisk reply of a
 # deferred overwrite but before the replay, show where each copy of the
 # 4 KiB lives, restart, and show the replay put it at its final LBA.
 #
