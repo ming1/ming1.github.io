@@ -2926,7 +2926,7 @@ Deferred write solves both.
 > location later, in the background.
 
 The payload itself is stored temporarily in RocksDB under the deferred key prefix
-`L`, as a `bluestore_deferred_op_t` containing:
+`L`, as a [`bluestore_deferred_op_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h#L1340) containing:
 
 - the target device extents (offset + length),
 - the exact bytes that must end up there.
@@ -2952,8 +2952,8 @@ BlueStore picks a path per fragment of the incoming write:
 | Crash in the middle | new blocks are unreferenced garbage, allocator reclaims them | `L` record is replayed, correct result |
 | Payload written | **once** | **twice** |
 
-The size heuristic is `bluestore_prefer_deferred_size_hdd` / `_ssd`; a non-zero
-`bluestore_prefer_deferred_size` overrides both. At v21.3.0 the HDD default is
+The size heuristic is [`bluestore_prefer_deferred_size_hdd`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L4757) / [`_ssd`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L4767); a non-zero
+[`bluestore_prefer_deferred_size`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L4746) overrides both ([`_set_alloc_sizes()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L7221)). At v21.3.0 the HDD default is
 64 KiB; **the SSD default is 0**, meaning deferred write is
 effectively off for SSD/NVMe except where correctness demands it. That asymmetry
 is the whole trade-off in one line: on HDD you convert a random write into a log
@@ -3002,12 +3002,12 @@ not double traffic on one spindle — it is one fast write plus one slow write, 
 the client only waits for the fast one.
 
 **Write 2 is the one that may be torn** by a crash. That is exactly why it is
-safe: the `L` record still exists, and `_deferred_replay()` will redo it.
+safe: the `L` record still exists, and [`_deferred_replay()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15847) will redo it.
 
 While write 2 is pending, a read of those extents is served from the blob's
-buffer cache, not from the stale device content: `_buffer_cache_write()` files
+buffer cache, not from the stale device content: [`_buffer_cache_write()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L3068) files
 the new bytes as a `STATE_WRITING` buffer, which stays pinned until the txc
-retires (§3.5.9). The `DeferredBatch` only feeds the device write.
+retires (§3.5.9). The [`DeferredBatch`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2202) only feeds the device write.
 
 #### How many writes, really?
 
@@ -3024,8 +3024,8 @@ arrives, and the payload escapes:
 
 Each surviving level is another full copy of user data moving through the disk.
 This is a feedback loop: a saturated data device means records live longer, which
-creates more RocksDB work, which competes for I/O. `bluestore_throttle_deferred_bytes`
-exists to bound it; `bluestore_deferred_batch_ops` helps by draining the queue
+creates more RocksDB work, which competes for I/O. [`bluestore_throttle_deferred_bytes`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L5564)
+exists to bound it; [`bluestore_deferred_batch_ops`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L5600) helps by draining the queue
 faster.
 
 #### Read-modify-write
@@ -3056,11 +3056,11 @@ whole allocation unit.
 
 Three ways the read is skipped:
 
-- **`is_unused(b_off, b_len)`** — the blob's `unused` bitmap says the region was
-  allocated but never written, so it is known-zero. `_pad_zeros()` fills it in.
-- **buffer cache** — `_do_read()` checks `BufferSpace` first; a recently touched
+- **[`is_unused(b_off, b_len)`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h#L723)** — the blob's `unused` bitmap says the region was
+  allocated but never written, so it is known-zero. [`_pad_zeros()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L16504) fills it in.
+- **buffer cache** — [`_do_read()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L13138) checks [`BufferSpace`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L427) first; a recently touched
   region costs nothing.
-- **no underlying extent** — `has_any_lextents()` is false (a hole, or past EOF),
+- **no underlying extent** — [`has_any_lextents()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L4513) is false (a hole, or past EOF),
   so the pad is dropped.
 
 When none apply, a synchronous device read lands in the write path. On HDD this
@@ -3093,7 +3093,7 @@ is a real and often overlooked cost of small unaligned overwrites.
   STATE_FINISHING  ->  STATE_DONE
 ```
 
-`STATE_DEFERRED_DONE` is in the enum but no code sets it at v21.3.0.
+[`STATE_DEFERRED_DONE`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1918) is in the enum but no code sets it at v21.3.0.
 
 Deferred ops are accumulated per `OpSequencer` into a `DeferredBatch`, merged and
 sorted before submission, which turns scattered small overwrites into fewer,
@@ -3102,51 +3102,52 @@ deferred writes to the same extent apply in the correct order.
 
 #### Involved functions
 
-Write path, from transaction decode down to the deferred record:
+Write path, from transaction decode down to the deferred record (`:NNNN` is
+`BlueStore.cc` at v21.3.0):
 
 ```
-BlueStore::_txc_add_transaction()
-  └─ BlueStore::_write()
-       └─ BlueStore::_do_write()
-            ├─ _choose_write_options()           // picks deferred threshold, csum type
-            ├─ _do_write_data()
-            │    ├─ _do_write_small()            // RMW: always deferred; unused blocks: deferred if < prefer
-            │    └─ _do_write_big()              // aligned: in-place deferred if < prefer, else new blob
-            │         └─ _do_write_big_apply_deferred()
-            ├─ _do_alloc_write()                 // allocate + direct aio; deferred if < prefer
-            └─ _wctx_finish()                    // release replaced extents
+BlueStore::_txc_add_transaction()                :16098
+  └─ BlueStore::_write()                         :18085
+       └─ BlueStore::_do_write()                 :17851
+            ├─ _choose_write_options()           :17702  picks deferred threshold, csum type
+            ├─ _do_write_data()                  :17648
+            │    ├─ _do_write_small()            :16566  RMW: always deferred; unused blocks: deferred if < prefer
+            │    └─ _do_write_big()              :17077  aligned: in-place deferred if < prefer, else new blob
+            │         └─ _do_write_big_apply_deferred()  :17014
+            ├─ _do_alloc_write()                 :17290  allocate + direct aio; deferred if < prefer
+            └─ _wctx_finish()                    :17582  release replaced extents
 ```
 
-Inside `_do_write_small()`:
+Inside [`_do_write_small()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L16566), linked to each definition:
 
 | Function | Role |
 |---|---|
-| `ExtentMap::seek_lextent()` | find the lextent / blob covering this offset |
-| `Blob::can_reuse_blob()` | may we overwrite inside this blob? |
-| `bluestore_blob_t::get_chunk_size()` | csum chunk size → head/tail pad |
-| `bluestore_blob_t::is_unused()` | region never written → skip the read |
-| `_pad_zeros()` | zero-fill instead of reading |
-| `_do_read()` | **the actual read** of head / tail pad |
-| `bufferlist::claim_append()`, `substr_of()` | **modify**: assemble padded content |
-| `Blob::dirty_blob().calc_csum()` | recompute checksums over whole chunks |
-| `_get_deferred_op()` | allocate op in `txc->deferred_txn` |
-| `bluestore_blob_t::map()` | logical offset → device extents, into `op->extents` |
-| `ExtentMap::punch_hole()`, `set_lextent()` | metadata update |
-| `BufferSpace::_write()`, `did_overwrite()` | keep buffer cache coherent |
+| [`ExtentMap::seek_lextent()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L4439) | find the lextent / blob covering this offset |
+| [`Blob::can_reuse_blob()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L2379) | may we overwrite inside this blob? |
+| [`bluestore_blob_t::get_chunk_size()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h#L660) | csum chunk size → head/tail pad |
+| [`bluestore_blob_t::is_unused()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h#L723) | region never written → skip the read |
+| [`_pad_zeros()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L16504) | zero-fill instead of reading |
+| [`_do_read()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L13138) | **the actual read** of head / tail pad |
+| [`bufferlist::claim_append()`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/buffer.cc#L1291) | **modify**: assemble padded content |
+| [`Blob::dirty_blob()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L757), [`calc_csum()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.cc#L908) | recompute checksums over whole chunks |
+| [`_get_deferred_op()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15633) | allocate op in `txc->deferred_txn` |
+| [`bluestore_blob_t::map()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h#L875) | logical offset → device extents, into `op->extents` |
+| [`ExtentMap::punch_hole()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L4585), [`set_lextent()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L4642) | metadata update |
+| [`_buffer_cache_write()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L3068) → [`BufferSpace::write()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L491) | keep buffer cache coherent: discard the old range, add a `STATE_WRITING` buffer |
 
 Apply and recover:
 
 ```
-_txc_state_proc()
-  └─ _deferred_queue()
-       ├─ DeferredBatch::prepare_write()      // merge + sort per sequencer
-       └─ _deferred_submit_unlock()
-            └─ BlockDevice::aio_write()
-                 └─ _deferred_aio_finish()
-                      └─ (next kv txn) erase PREFIX_DEFERRED keys
+_txc_state_proc()                             :14634
+  └─ _deferred_queue()                        :15645
+       ├─ DeferredBatch::prepare_write()      :5161   merge + sort per sequencer
+       └─ _deferred_submit_unlock()           :15726
+            └─ BlockDevice::aio_write()       BlockDevice.h:294
+                 └─ _deferred_aio_finish()    :15791
+                      └─ (next kv txn) _kv_sync_thread(): rm_single_key(PREFIX_DEFERRED)  :15454
 
-BlueStore::_mount()
-  └─ _deferred_replay()                        // decode each "L" key, re-apply, erase
+BlueStore::_mount()                           :9556
+  └─ _deferred_replay()                       :15847  decode each "L" key, re-apply, erase
 ```
 
 #### Summary
@@ -3160,8 +3161,8 @@ A useful mental model: deferred write is BlueStore's own journal, but a
 writes that actually need it.
 
 > Defaults and internal names have drifted across Ceph releases
-> (`_choose_write_options()` and `_get_deferred_op()` are relatively recent;
-> older code inlined them). Check `src/os/bluestore/BlueStore.cc` on the branch
+> ([`_choose_write_options()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L17702) and [`_get_deferred_op()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15633) are relatively recent;
+> older code inlined them). Check [`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc) on the branch
 > you actually run — the structure is stable, the details are not.
 
 ### 3.5.2 The workload and the trace
