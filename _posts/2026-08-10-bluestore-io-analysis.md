@@ -2894,7 +2894,7 @@ costs 1–3 ms. Read the order, not the microseconds. Bare `:NNNN` is
 
 ### 3.5.1 Deferred write
 
-#### 3.5.1.1 Why it exists
+#### Why it exists
 
 BlueStore writes object data directly to a raw block device, with no filesystem
 underneath. Data layout, checksums and other metadata live in RocksDB.
@@ -2919,7 +2919,7 @@ because the head must seek for each one.
 
 Deferred write solves both.
 
-#### 3.5.1.2 The principle
+#### The principle
 
 > Do not write small data to its final location immediately. First write it into
 > RocksDB together with the metadata, in one atomic commit. Write it to the real
@@ -2941,7 +2941,7 @@ is trivial — replay every surviving `L` record at mount time. A torn chunk can
 never be observed, because the authoritative copy lives in RocksDB until the
 in-place write is confirmed.
 
-#### 3.5.1.3 Two write paths
+#### Two write paths
 
 BlueStore picks a path per fragment of the incoming write:
 
@@ -2959,7 +2959,7 @@ effectively off for SSD/NVMe except where correctness demands it. That asymmetry
 is the whole trade-off in one line: on HDD you convert a random write into a log
 append and win; on NVMe the second write costs more than the seek you avoided.
 
-#### 3.5.1.4 The two writes
+#### The two writes
 
 ```
             client: overwrite 1 KB at an unaligned offset
@@ -3009,7 +3009,7 @@ buffer cache, not from the stale device content: `_buffer_cache_write()` files
 the new bytes as a `STATE_WRITING` buffer, which stays pinned until the txc
 retires (§3.5.9). The `DeferredBatch` only feeds the device write.
 
-#### 3.5.1.5 How many writes, really?
+#### How many writes, really?
 
 Two is the best case. The `L` key is normally deleted while still in the same
 memtable, so the payload is dropped at flush time and never reaches an SST.
@@ -3028,7 +3028,7 @@ creates more RocksDB work, which competes for I/O. `bluestore_throttle_deferred_
 exists to bound it; `bluestore_deferred_batch_ops` helps by draining the queue
 faster.
 
-#### 3.5.1.6 Read-modify-write
+#### Read-modify-write
 
 The read happens **early, at preparation time** — not in the background. By the
 time the deferred record is built, it already contains the complete final content
@@ -3066,7 +3066,7 @@ Three ways the read is skipped:
 When none apply, a synchronous device read lands in the write path. On HDD this
 is a real and often overlooked cost of small unaligned overwrites.
 
-#### 3.5.1.7 Transaction state machine
+#### Transaction state machine
 
 ```
   STATE_PREPARE
@@ -3100,7 +3100,7 @@ sorted before submission, which turns scattered small overwrites into fewer,
 better-ordered device operations. Ordering within a sequencer is preserved, so two
 deferred writes to the same extent apply in the correct order.
 
-#### 3.5.1.8 Involved functions
+#### Involved functions
 
 Write path, from transaction decode down to the deferred record:
 
@@ -3149,7 +3149,7 @@ BlueStore::_mount()
   └─ _deferred_replay()                        // decode each "L" key, re-apply, erase
 ```
 
-#### 3.5.1.9 Summary
+#### Summary
 
 Deferred write buys **atomicity for partial overwrites** and **low latency for
 small random writes on slow media**. It pays with **write amplification** — the
