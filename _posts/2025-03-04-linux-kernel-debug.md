@@ -267,7 +267,7 @@ ubq: idx 1 flags 42 force_abort False canceling 0 fail_io False
     io-3 flags 1 cmd ffff8ab6500d2000 res (0,)
 ```
 
-[ublk io hang analysis](https://ming1.github.io/tech/ublk-notes#io-hang-when-running-stress-remove-test-with-heavy-io)
+[ublk io hang analysis](https://ming1.github.io/storage/ublk-notes#io-hang-when-running-stress-remove-test-with-heavy-io)
 
 
 
