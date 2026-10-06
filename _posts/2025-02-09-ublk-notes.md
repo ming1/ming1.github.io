@@ -150,6 +150,361 @@ __ublk_fail_req(ubq, io, rq);
 - `(io->flags & UBLK_IO_FLAG_ACTIVE) != 0`
 - Call `io_uring_cmd_done(io->cmd, UBLK_IO_RES_ABORT, ...)`.
 
+## contexts and races
+
+Code: mainline `fe2ec83746e5` (v7.3-rc4+), plus the series
+[ublk: don't dispatch to canceled io commands](https://lore.kernel.org/linux-block/20261001125422.1364260-1-tom.leiming@gmail.com/)
+where noted. Functions are in `drivers/block/ublk_drv.c`.
+
+### four contexts
+
+```text
+ management            server                     I/O                  async workers
+ (any process)         (ublk server tasks)        (any submitter)      (system wq / kblockd)
+ ---------------       --------------------       ---------------      --------------------
+ /dev/ublk-control     /dev/ublkcN + io_uring     /dev/ublkbN          release work (exit_work)
+ ADD_DEV               open()                     ublk_queue_rq()      partition scan work
+ SET_PARAMS            FETCH_REQ / PREP_IO_CMDS     ublk_prep_req()    blk-mq timeout
+ START_DEV             COMMIT_AND_FETCH_REQ         ublk_queue_cmd()
+ STOP_DEV / TRY_STOP   NEED_GET_DATA                  task work ------+
+ DEL_DEV               task / ring exit:                              |
+ START/END_RECOVERY      cancel_fn                                    |
+ QUIESCE_DEV           close(): last fput                             |
+       |                     ^                                        |
+       |                     +---- request runs in the server task <--+
+       +---- waits for / stops / cancels the server ----------------->
+```
+
+- The management and server contexts are different processes in general.
+  Nothing orders them except the locks below.
+- Sleeping control commands return `-EAGAIN` when issued non-blocking, so
+  io_uring runs them in an io-wq worker of the control ring (inferred from
+  `ublk_ctrl_uring_cmd()`).
+- An io command handler always runs under the server ring's `uring_lock`.
+  An unlocked issue is bounced to task work first (`ublk_ch_uring_cmd()`).
+  Batch commands are not bounced.
+
+### management context
+
+| command | locks | waits for | result |
+|---|---|---|---|
+| ADD_DEV | `ublk_ctl_mutex` | - | allocate `ub`, add `/dev/ublkcN` |
+| SET_PARAMS | `ub->mutex` | - | `ub->params`; refused once the disk is used |
+| START_DEV | `ub->mutex` (after the wait) | all queues ready | `add_disk()`, state LIVE, schedule the partition scan |
+| STOP_DEV | `ub->mutex`, then none | the scan work | `del_gendisk()`; then cancel the fetched commands |
+| TRY_STOP | `disk->open_mutex`, dropped before stop | - | stop only if no opener |
+| DEL_DEV | `ublk_ctl_mutex` | the device number is freed | stop + remove `/dev/ublkcN` |
+| START_USER_RECOVERY | `ub->mutex` | - | check only: QUIESCED or FAIL_IO, no server attached |
+| END_USER_RECOVERY | `ub->mutex` (after the wait) | all queues ready | state LIVE, kick the requeue list |
+| QUIESCE_DEV | `ub->mutex` -> `cancel_mutex` | in-flight I/O drains | mark queues canceling; cancel commands after unlock |
+
+START_DEV and END_USER_RECOVERY share one wait:
+
+```text
+ublk_wait_dev_ready_and_lock()
+  wait_var_event_interruptible(&ub->nr_queue_ready, ready)   no lock held
+  mutex_lock(&ub->mutex)
+  ready again?  no -> unlock, wait again
+                yes -> return with ub->mutex held
+```
+
+### server context
+
+One server lifetime is one **FETCH round**: it starts at `open()` of
+`/dev/ublkcN` and ends when the release work calls `ublk_reset_ch_dev()`.
+
+```text
+ open()            ublk_ch_open(): UB_STATE_OPEN, ublksrv_tgid
+   |
+ FETCH (per tag)   __ublk_fetch() under uring_lock -> ub->mutex
+   |                 io->cmd = cmd, nr_io_ready++
+   |                 queue full  -> ubq->canceling = false
+   |                 all queues  -> ub->canceling = false, wake START_DEV
+   v
+ serve             COMMIT_AND_FETCH: complete rq, io->cmd = new cmd
+   |               (uring_lock only)
+   |
+ task/ring exit    io_uring calls cancel_fn under uring_lock
+   |                 ublk_start_cancel(): cancel_mutex, quiesce,
+   |                   ub->canceling = true, mark all queues canceling
+   |                 ublk_cancel_cmd(): io->cmd = NULL, done(ABORT)
+   |                   (skipped if the request has started)
+   v
+ last fput         ublk_ch_release(): schedule exit_work
+   |
+ exit_work         cancel_mutex: canceling = true, abort in-flight rq
+   |               ub->mutex:    no server -> stop, quiesce, or FAIL_IO
+   v
+ reset             ublk_reset_ch_dev(): io->cmd = NULL, nr_*_ready = 0,
+                   tgid = -1, clear UB_STATE_OPEN  -> next round
+```
+
+A canceled command is not fetched again in the same round. Only a new
+round (a new `open()`) can make the device ready again.
+
+### I/O context
+
+```text
+submitter task                                      server task
+ublk_queue_rq()
+  __ublk_queue_rq_common()
+    ublk_prep_req()
+      fail_io      -> BLK_STS_TARGET
+      force_abort  -> IOERR
+      blk_mq_start_request()
+    ubq->canceling -> requeue (recovery) or fail
+  ublk_queue_cmd(io->cmd)
+    io_uring_cmd_complete_in_task() ------------>   ublk_cmd_tw_cb()
+                                                      ublk_dispatch_req()
+                                                      CQE to the server
+```
+
+**The invariant every race below breaks:** if `ubq->canceling` is false,
+every ready io of the queue has a live `io->cmd`. Otherwise
+`ublk_queue_cmd()` uses a NULL `io->cmd` and oopses.
+
+### shared state and locks
+
+| state | written by | lock |
+|---|---|---|
+| `io->cmd`, io flags | FETCH, COMMIT (server); cancel (server exit, STOP_DEV, QUIESCE_DEV); reset | `uring_lock`; `ubq->cancel_lock` in the cancel |
+| `nr_io_ready`, `nr_queue_ready` | FETCH; reset | `ub->mutex` for FETCH; the reset takes none (`ub->mutex` after patch 5) |
+| `ubq->canceling` | `ublk_start_cancel()`, QUIESCE, exit_work (set); FETCH when the queue gets ready (clear) | set: `cancel_mutex`; clear: `ubq->cancel_lock` (`cancel_mutex` after patch 1) |
+| `ub->canceling` | same set paths; FETCH when all queues are ready (clear) | `cancel_mutex` |
+| `ub->ub_disk`, state | START_DEV, STOP_DEV, exit_work | `ub->mutex`; `ub->lock` for readers that don't hold it (`ublk_get_disk()`) |
+
+Lock order:
+
+```text
+ublk_ctl_mutex -> ub->mutex -> disk->open_mutex        (DEL_DEV -> stop -> del_gendisk)
+uring_lock     -> ub->mutex -> { cancel_lock, then cancel_mutex }   (FETCH; not nested)
+uring_lock     -> { cancel_mutex, then cancel_lock }               (cancel_fn; not nested)
+```
+
+Two rules follow:
+
+- `ublk_cancel_dev()` runs outside `ub->mutex`: `io_uring_cmd_done()` may
+  take `uring_lock`, and FETCH takes `ub->mutex` under it.
+- exit_work aborts requests under `cancel_mutex` before it takes
+  `ub->mutex`: a control task holding `ub->mutex` may sit in
+  `del_gendisk()` waiting for that I/O.
+
+These two rules open the windows: STOP_DEV cancels after it drops
+`ub->mutex`, and the reset ran without `ub->mutex`.
+
+### races: "ublk: don't dispatch to canceled io commands"
+
+[PATCH 0/8](https://lore.kernel.org/linux-block/20261001125422.1364260-1-tom.leiming@gmail.com/)
+· reported by Josef Bacik
+([report](https://lore.kernel.org/linux-block/20260928-b4-ublk-cancel-stop-v1-0-4a4360232a46@toxicpanda.com/))
+· Status: posted v1 (2026-10-01); Tested-by Josef for 1-6, with a kublk fix
+still needed.
+
+#### the story in one view
+
+A request is dispatched to a canceled io command, because some path lets a
+queue leave the canceling state, or go live, while a canceled command is
+still in it.
+
+```text
+     management                server                      I/O
+#1   STOP_DEV, START_DEV       commands canceled           read -> NULL io->cmd
+#2                             task A fetches 0-2, exits;  read -> NULL io->cmd
+                               task B fetches 3: ready
+#3   END_USER_RECOVERY         q0 task exits before q1     read on q0 -> NULL
+                               is ready
+#4   STOP_DEV / QUIESCE        FETCH: io->cmd = C; mark    ring exit walks a
+                               cancelable  <- cancel here  completed C -> GPF
+#5   new server FETCH          old release: no disk,       device can only be
+                               no reset                    deleted
+#6   START_DEV: ready? yes     release work: reset         go live -> NULL
+#7   fix: one FETCH round keeps canceling once it saw a cancel; the reset
+     always runs, under ub->mutex; STOP_DEV pins the server's file
+```
+
+1. Normal path: FETCH publishes `io->cmd`; I/O uses it; a cancel sets it
+   NULL and marks the queue canceling.
+2. Break: `canceling` is cleared when a queue (or all queues) gets ready,
+   even if this round already lost a command (#2, #3).
+3. Break: the control path runs without the server's ordering - STOP_DEV
+   cancels after `ub->mutex` (#1), the reset is skipped without a disk (#5)
+   or runs without `ub->mutex` (#6), and
+   the cancelable mark comes after publish (#4).
+4. Cost: oops in `ublk_queue_cmd()`, a GPF at ring exit, or a device that
+   can only be deleted.
+5. Fix (#7): no new lock in the I/O path. Make "this round saw a cancel" a
+   sticky fact, and close each control-path window.
+
+Map: route #2/#3 → patch 1; #4 → patches 2-3; #5 → patch 4; #6 → patch 5;
+#1 → patches 4-6 (patch 6 closes the window; patch 4 makes the reset that
+clears STOPPING run when STOP_DEV has removed the disk).
+
+#### patch 1: a canceled round stays canceling
+
+```text
+ partial FETCH round                 recovery, two queues
+ task A: FETCH tags 0-2              q0 ready: q0->canceling = false
+ task A exits:                       q0 task exits:
+   start_cancel(): mark queues         start_cancel(): ub->canceling
+   tags 0-2: io->cmd = NULL              still set -> q0 not marked
+ task B: FETCH tag 3                   q0: io->cmd = NULL
+   queue ready: canceling = false    q1 ready
+ START_DEV                           END_USER_RECOVERY
+ read -> ublk_queue_cmd(NULL)        read on q0 -> ublk_queue_cmd(NULL)
+```
+
+- Fix: clear `ub->canceling` only in `ublk_reset_ch_dev()`. A queue that
+  gets ready clears `ubq->canceling` only if `ub->canceling` is not set,
+  checked under `cancel_mutex`.
+- Why safe: `cancel_mutex` orders the check and the cancel.
+
+```text
+check first:  queue cleared -> start_cancel() marks it again -> cmd taken
+cancel first: check sees ub->canceling -> queue stays canceling
+```
+
+- Batch I/O follows the same rule. It never dispatches through `io->cmd`,
+  so it never oopsed.
+- `Fixes: 728cbac5fe21 ("ublk: move device reset into ublk_ch_release()")`,
+  `Fixes: 3f3850785594 ("ublk: fix batch I/O recovery -ENODEV error")`
+
+#### patches 2-3: mark cancelable before publish
+
+```text
+ issue path (uring_lock)            control-path cancel (STOP_DEV, QUIESCE)
+ io->cmd = C
+                                    take C, io_uring_cmd_done(C):
+                                      C not marked, nothing to unlink
+ ublk_prep_cancel(C)
+   completed C linked on the cancelable list
+ ring exit: cancel walk hits C -> GPF
+```
+
+- Fix: mark first, then publish. `smp_wmb()` orders the mark before the
+  `io->cmd` store; the cancel reads `READ_ONCE(io->cmd)`. Marking needs no
+  lock: the handler and io_uring's cancel walk both hold `uring_lock`.
+- A marked command must end in `io_uring_cmd_done()`, so failed FETCH and
+  the inline OK of NEED_GET_DATA now use it. The CQE is the same.
+- Batch (patch 3): `UBLK_U_IO_FETCH_IO_CMDS` is marked before it is linked
+  under `evts_lock`. Batch commands can run from io-wq without
+  `uring_lock`, so the cancel walk can now see an unlinked fetch command:
+  init `fcmd->node`, and complete it with `io_uring_cmd_done()` before
+  freeing it on `-ENODEV`.
+- `Fixes: 216c8f5ef0f2 ("ublk: replace monitor with cancelable uring_cmd")`,
+  `Fixes: a4d883755399 ("ublk: add UBLK_U_IO_FETCH_IO_CMDS for batch I/O processing")`
+
+#### patches 4-5: reset the round always, under ub->mutex
+
+```text
+ patch 4: no disk                      patch 5: reset vs START_DEV
+ server fetches, never starts;         START_DEV (ub->mutex)
+ or STOP_DEV removed the disk            all queues ready? yes
+ old server exits                        tgid matches? yes
+ release work: no disk -> skip reset                     release work:
+ new server FETCH: -EBUSY / -EINVAL                        io->cmd = NULL
+ -> the device can only be deleted                         nr_queue_ready = 0
+                                         go live -> NULL io->cmd
+```
+
+- Patch 4: all uring_cmds are done when the release work runs, so the
+  reset is safe with or without a disk.
+  `Fixes: 82a8a30c581b ("ublk: improve detection and handling of ublk server exit")`
+- Patch 5: reset under `ub->mutex`, so START_DEV sees the round either
+  ready or reset. Nothing holding `ub->mutex` waits for the work.
+  `Fixes: 728cbac5fe21`
+
+#### patch 6: STOP_DEV pins the server's file
+
+Before: the cancel runs after `ub->mutex` is dropped, and START_DEV or
+FETCH runs in the gap.
+
+```text
+ STOP_DEV                          START_DEV / FETCH
+ lock ub->mutex
+   ublk_stop_dev_unlocked()        (not started: no-op)
+ unlock ub->mutex
+                                   START_DEV goes live, schedules scan
+                                   FETCH publishes a new command
+ cancel_work_sync(scan)            cancels the new disk's scan
+ ublk_cancel_dev()                 takes the new command:
+                                   NULL io->cmd on a queue not canceling
+```
+
+After:
+
+```text
+ STOP_DEV
+ lock ub->mutex
+   ublk_stop_dev_unlocked()
+   cancel_work_sync(scan)
+   server attached? file_ref_get(ub->ch_file), set UB_STATE_STOPPING
+ unlock ub->mutex
+ ublk_cancel_dev()                 release cannot run: no new server,
+                                   only this server's commands
+ __fput_sync(file)                 last ref -> release now, not deferred
+```
+
+- STOPPING: FETCH/PREP get `UBLK_IO_RES_ABORT`, START_DEV gets `-EBUSY`, a
+  waiting START_DEV / END_USER_RECOVERY wakes up. The release's reset
+  clears it.
+- The cancel stays outside `ub->mutex` (lock order above).
+- `__fput_sync()`, not `fput()`: a deferred release would run as task work
+  of this task, and DEL_DEV then waits for the device to be freed.
+- `Fixes: 85248d670b71 ("ublk: move ublk_cancel_dev() out of ub->mutex")`
+
+#### review comments (Josef, 2026-10-05)
+
+Tested 1-8 on for-next `d70609a2f68c` under QEMU + KASAN + lockdep. No oops
+or lockdep report. Findings:
+
+| # | finding | owner |
+|---|---|---|
+| 1 | kublk batch daemon: PREP racing STOP_DEV now gets `-ENODEV`; kublk asserts `cqe->res == 0`, aborts before the start eventfd, `kublk add` hangs in `eventfd_read()`. generic_18 has no batch mode. | kublk fix |
+| 2 | Routes #2/#3 still go live: START_DEV returns 0 and every request fails, or (plain USER_RECOVERY) reads park forever after END_USER_RECOVERY. | follow-up patch |
+| 3 | `ublk_start_cancel()` samples `ub_disk` before `cancel_mutex`: a server dying during its own START_DEV marks queues without quiescing the new disk; first I/O passes the check. Older than the series. | follow-up patch |
+| 4 | Patch 5: the release work decides "no disk" before taking `ub->mutex`; a START_DEV that slips in can go LIVE, then the work resets a LIVE device. No oops (queues stay canceling), but requests fail or park until STOP/DEL. | open |
+| 5 | Patch 6 changes STOP_DEV's contract: a server still holding `/dev/ublkcN` gets ABORT on FETCH/PREP and `-EBUSY` on START_DEV until it closes the node. | document in `ublk.rst` |
+
+Comment 3 as a lane:
+
+```text
+ START_DEV (server's own)              cancel_fn (same server dies)
+                                       disk = ub_disk   (NULL)
+ ub_disk = disk, go live               lock cancel_mutex
+ first I/O: canceling? no -> dispatch    no disk: don't quiesce
+                                         mark queues canceling
+                                       -> I/O already past the check
+```
+
+Josef's follow-up
+"\[PATCH\] ublk: refuse to go live after an io command was canceled"
+(on top of the series) fixes 2 and 3:
+
+```text
+ START_DEV                              ublk_start_cancel()
+ lock cancel_mutex                      lock cancel_mutex
+   ub->canceling? -> -ENODEV              disk = ub_disk
+   else ub_disk = disk                    quiesce disk, mark queues
+ unlock                                 unlock
+ => either START_DEV sees the cancel, or the cancel sees the disk
+```
+
+- END_USER_RECOVERY also returns `-ENODEV` while `ub->canceling` is set.
+  Best effort: a cancel after the check is the new server's ordinary death,
+  handled by quiesce + mark.
+- Documents both `-ENODEV` cases in `Documentation/block/ublk.rst`: start
+  again after the server closes `/dev/ublkcN`.
+
+#### takeaways
+
+- Two contexts can meet in each ublk state change: the management path and
+  the dying server. Check each state change from both sides.
+- "Did this round see a cancel" is one sticky bit per FETCH round. Clear it
+  only when the round ends, not when a queue gets ready.
+- Publish a command only after it is cancelable, or the cancel can miss it.
+- Moving the cancel out of `ub->mutex` (for lock order) opened a window.
+  Pin the server's file to close it, instead of adding a lock.
+
 ## ublk error handling
 
 ### overview
