@@ -13,75 +13,62 @@ Title: ublk notes
 
 ## terms
 
-- client
+```text
+ client (app)                         frontend = client + ublk driver
+     |  read/write /dev/ublkbN
+     v
+ +--------------------------+
+ | blk-mq: ublk request     |  tag = blk-mq request tag
+ | hw queue == ublk queue   |
+ +--------------------------+
+ | ublk driver              |  ublk_io[tag]: flags, buffer, result, uring_cmd
+ +--------------------------+
+     ^  uring_cmd (FETCH / COMMIT_AND_FETCH)
+     |  one io_uring per ublk queue
+ +--------------------------+
+ | ublk server              |  backend
+ +--------------------------+
+```
 
-application of ublk block device(`/dev/ublkbN`)
+| Term | Meaning |
+|---|---|
+| client | Application that uses the ublk block device (`/dev/ublkbN`). |
+| frontend | The `client` plus the ublk driver. |
+| backend | The `ublk server`. |
+| ublk server | Same as backend. |
+| tag | |
+| ublk queue | Maps 1:1 to a blk-mq hardware queue. One io_uring serves it. |
+| io command | Represented by a `ublk request`. Each io command has a unique tag, taken from the blk-mq request tag. |
+| uring_cmd | The key one is `UBLK_U_IO_COMMIT_AND_FETCH_REQ`: it completes the previous io command with `result`, and in the same call fetches the next io command for this slot. Its lifetime differs from the `ublk request`. |
+| ublk request | Block layer request for `/dev/ublkbN`. Its lifetime differs from the `uring_cmd`. |
+| ublk_io | Per-slot state: io flags, io buffer, result, uring_cmd. Lives as long as the ublk queue. |
 
-- frontend
+Lifetimes of one slot (`tag`):
 
-`client` and the ublk driver
+```text
+ublk_io[tag]   |<------------------ ublk queue lifetime ------------------>|
+uring_cmd         [FETCH .......]     [COMMIT_AND_FETCH ......]   [ ... ]
+ublk request               [rq A ..........]           [rq B .......]
+                           ^ cmd completes to server   ^ rq A completed by
+                             with rq A                   COMMIT, cmd re-armed
+```
 
-- backend
+Execution contexts:
 
-`ublk server`
-
-- ublk server
-
-backend
-
-- tag
-
-- ublk queue
-
-Aligned with blk-mq's hardqueue, which is served by io_uring.
-
-- io command
-
-Represents by `ublk request`, each io command has unique tag, which is
-originated from blk-mq request's tag.
-
-- uring_cmd
-
-The most important uring_cmd is `UBLK_U_IO_COMMIT_AND_FETCH_REQ` which
-completes previous io command with `result`, meantime starts to fetch new
-io command for this slot automatically.
-
-It has different lifetime with `ublk request`
-
-- ublk request
-
-block layer IO request for ublk block device(`/dev/ublkbN`) 
-
-It has different lifetime with `uring_cmd`.
-
-- ublk_io
-
-For storing per-io flags/io buffer/result/uring_cmd for this slot.
-
-its lifetime is same with ublk queue.
-
-- ublk char dev open()/close() context
-
+- ublk char dev `open()`/`close()` context
     - single opener
-
-    - should be in same process with ublkq_daemon
-
-    - might in same context with ubq_daemon
-
-- ubq_daemon context
-
-    - uring_cmd handler is run in this context
-
-    - uring_cmd cancel_fn is run in this context
-
-    - is it possible to run from fallback wq?
-
+    - must be in the same process as `ubq_daemon`
+    - may be the same context as `ubq_daemon`
+- `ubq_daemon` context
+    - the uring_cmd handler runs here
+    - the uring_cmd `cancel_fn` runs here
+    - Open question: can it also run from the io_uring fallback workqueue?
 
 ## use cases
 
 [SNIA SDC 2025 - Optimizing Hyperscale Flash Storage: Efficient QLC, Infinite Scale](https://www.snia.org/sniadeveloper/session/19357)
 
-[UBLK Frontend Support for SUSE Storage (Longhorn) v2 Data Engine](<https://www.suse.com/c/ublk-frontend-support-for-suse-storage-longhorn-v2-data-engine/)
+[UBLK Frontend Support for SUSE Storage (Longhorn) v2 Data Engine](https://www.suse.com/c/ublk-frontend-support-for-suse-storage-longhorn-v2-data-engine/)
 
 [Android OTA](https://android.googlesource.com/platform/system/core/+/refs/heads/android16-qpr2-release/fs_mgr/libsnapshot/snapuserd/ublk_block_server.cpp)
 
@@ -89,61 +76,79 @@ its lifetime is same with ublk queue.
 
 [Multikernel: Isolating Storage Queues With ublk (LPC2025)](https://lpc.events/event/19/contributions/2074/attachments/1776/3957/Multikernel-LPC2025.pdf)
 
-
 ## cancel code path
 
 ### three related variables
 
-- `ubq->canceling`
+All three are read in `ublk_queue_rq()`. Each one makes a new request fail
+(or requeue) instead of going to the ublk server.
 
-    - set true in ublk_uring_cmd_cancel_fn() when queue is quiesced
+```text
+ublk_queue_rq(rq)
+  |
+  +-- ubq->fail_io ?      --> fail rq (always)
+  |
+  +-- ubq->force_abort && recovery queues IO ?  --> fail rq
+  |
+  +-- ubq->canceling ?    --> abort rq: fail, or requeue (recovery)
+  |
+  +-- else: hand rq to ublk server
+```
 
-    - read in ublk_queue_rq() for aborting request: fail or requeue(recovery)
+| Variable | Set by | Set when | Effect in `ublk_queue_rq()` |
+|---|---|---|---|
+| `ubq->canceling` | `ublk_uring_cmd_cancel_fn()` | queue is quiesced | abort rq: fail, or requeue with recovery |
+| `ubq->force_abort` | `ublk_unquiesce_dev()` <- `ublk_stop_dev()` | device stop | fail rq, only if `ublk_nosrv_dev_should_queue_io(ubq)` |
+| `ubq->fail_io` | `ublk_nosrv_work()` | `!ublk_nosrv_dev_should_queue_io(ubq)` | fail rq unconditionally |
 
-- `ubq->force_abort`
+The recovery condition, written out:
 
-    - set in ublk_unquiesce_dev() <- ublk_stop_dev()
+```c
+// ublk_nosrv_dev_should_queue_io(ubq)  -> force_abort path
+(ubq->flags & UBLK_F_USER_RECOVERY) && !(ubq->flags & UBLK_F_USER_RECOVERY_FAIL_IO)
 
-    - read in ublk_queue_rq() for failing request if:
+// !ublk_nosrv_dev_should_queue_io(ubq) -> fail_io path
+!(ubq->flags & UBLK_F_USER_RECOVERY) || (ubq->flags & UBLK_F_USER_RECOVERY_FAIL_IO)
+```
 
-            // if ublk_nosrv_dev_should_queue_io(ubq)
-
-            if (ubq->flags & UBLK_F_USER_RECOVERY) && !(ubq->flags & UBLK_F_USER_RECOVERY_FAIL_IO)
-
-- `ubq->fail_io`
-
-    - set in ublk_nosrv_work() if:
-
-            // if !ublk_nosrv_dev_should_queue_io(ubq)
-
-            if !(ubq->flags & UBLK_F_USER_RECOVERY) || (ubq->flags & UBLK_F_USER_RECOVERY_FAIL_IO)
-
-    - read in ublk_queue_rq() for failing request unconditionally
+(current mainline, v7.3-rc4: the checks live in `ublk_prep_req()`;
+`canceling` is set via `ublk_set_canceling()` from `ublk_start_cancel()` and
+the char device release path; `force_abort` is set in `ublk_force_abort_dev()`
+and in release when the device must stop; `fail_io` is set in release when
+the device goes to `UBLK_S_DEV_FAIL_IO`.)
 
 ### two jobs
 
+Each slot is in one of two states when canceling starts. Each state needs a
+different job:
+
+```text
+             ublk_io[tag].flags & UBLK_IO_FLAG_ACTIVE
+                 /                          \
+             == 0                          != 0
+   uring_cmd already completed      uring_cmd still waiting,
+   to server; request inflight      no request from frontend
+                |                           |
+     abort inflight request          cancel uring_cmd
+```
+
 #### abort inflight requests
 
-- the uring_cmd has been done for notifying ublk server to handle IO
-  command
+- The uring_cmd is already completed, to tell the ublk server to handle the
+  io command.
+- `(io->flags & UBLK_IO_FLAG_ACTIVE) == 0`
+- Abort the request:
 
-- (io->flags & UBLK_IO_FLAG_ACTIVE) == 0
-
-- aborting request:
-
-    io->flags |= UBLK_IO_FLAG_ABORTED;
-
-    __ublk_fail_req(ubq, io, rq);
-
+```c
+io->flags |= UBLK_IO_FLAG_ABORTED;
+__ublk_fail_req(ubq, io, rq);
+```
 
 #### cancel uring_cmd
 
-- no request comming from ublk frontend
-
-- (io->flags & UBLK_IO_FLAG_ACTIVE) != 0
- 
-- call io_uring_cmd_done(io->cmd, UBLK_IO_RES_ABORT, ...)
-
+- No request is coming from the ublk frontend.
+- `(io->flags & UBLK_IO_FLAG_ACTIVE) != 0`
+- Call `io_uring_cmd_done(io->cmd, UBLK_IO_RES_ABORT, ...)`.
 
 ## ublk error handling
 
@@ -152,21 +157,14 @@ its lifetime is same with ublk queue.
 #### basic functions
 
 - handle ublk server exception
-
-
 - handle IO timeout
-
-
-- support recover feature
-
+- support the recovery feature
 
 #### key points
 
-- provide forward progress guarantee
-
+- provide a forward progress guarantee
 
 #### in-tree implementation
-
 
 ### two-stage canceling (merged to v6.15)
 
@@ -174,53 +172,68 @@ its lifetime is same with ublk queue.
 
 [[PATCH v3] ublk: improve detection and handling of ublk server exit](https://lore.kernel.org/linux-block/20250403-ublk_timeout-v3-1-aa09f76c7451@purestorage.com/)
 
-- cancel active uring commands in uring_cmd ->cancel_fn() via IORING_URING_CMD_CANCELABLE
-
-- move request aborting into ublk char device ->release()
+```text
+ublk server exits
+  |
+  | stage 1: io_uring ctx teardown
+  v
+uring_cmd ->cancel_fn()            (IORING_URING_CMD_CANCELABLE)
+  -> cancel active uring_cmds      (slots with UBLK_IO_FLAG_ACTIVE)
+  |
+  | stage 2: last reference to /dev/ublkcN dropped
+  v
+ublk char device ->release()
+  -> abort inflight requests       (slots without UBLK_IO_FLAG_ACTIVE)
+```
 
 #### big improvement & cleanup
 
-
 #### issues
 
-- can't use ub->mutex in the two stages
-
+- `ub->mutex` can't be used in either stage.
 
 # iopolling support
 
 ## use IOPOLL for polling backing IO
 
-- use one standalone io_uring for handling polling
+Use a separate io_uring only for polling backing IO:
 
-    - communication between the two rings?
+```text
+ main ring (ublk uring_cmds)          iopoll ring (IORING_SETUP_IOPOLL)
+ +-------------------------+          +-----------------------------+
+ | FETCH / COMMIT_AND_FETCH|  ring fd | IORING_OP_POLL_ADD(main fd) |
+ |                         |--------->| backing file IO (polled)    |
+ +-------------------------+          +-----------------------------+
+```
 
-        use IORING_OP_POLL_ADD to add main ring FD into iopoll ring.
-
-    - F_AUTO_BUF_REG can't be used
+- Communication between the two rings: add the main ring FD into the iopoll
+  ring with `IORING_OP_POLL_ADD`.
+- `F_AUTO_BUF_REG` can't be used.
 
 ### ublk server side for IOPOLL
 
-- enter polling state if ->io_inflight is > 0 and IOPOLL feature is enabled
+```text
+         io_inflight > 0 && IOPOLL enabled
+ [normal] ----------------------------------> [polling]
+     ^                                            |
+     +------------- io_inflight == 0 -------------+
+```
 
-- keep polling until ->io_inflight becomes zero
-
+- Enter the polling state if `->io_inflight > 0` and the IOPOLL feature is
+  enabled.
+- Keep polling until `->io_inflight` becomes zero.
 
 ## use single io_ring_ctx for both ublk commands and backing IO
 
-- can support auto buffer registration
-
-- easier implementation
-
-- add ->uring_cmd_iopoll() for ublk char device
-
-    - only support poll FETCH_IO_CMDS
-
-    - use BLK_POLL_ONESHOT to decide if sleep is needed
+- Supports auto buffer registration.
+- Simpler to implement.
+- Add `->uring_cmd_iopoll()` for the ublk char device:
+    - only poll `FETCH_IO_CMDS`
+    - use `BLK_POLL_ONESHOT` to decide if sleep is needed
 
 ### IOPOLL vs. MULTISHOT
 
-- does io_uring allow it?
-
+- Open question: does io_uring allow IOPOLL together with MULTISHOT?
 
 # **ublk2**
 
@@ -228,68 +241,59 @@ its lifetime is same with ublk queue.
 
 ### batch delivery
 
-- one uring_cmd can deliver one batch of io commands
+One uring_cmd carries a batch of IO commands, in both directions:
 
-- one uring_cmd can commit & deliver one batch of io commands
+```
+FETCH          : 1 uring_cmd  --> delivers N io commands to ublk server
+FETCH + COMMIT : 1 uring_cmd  --> commits N results, then delivers N new io commands
+```
 
 ### uring_cmd can be issued from any task context
 
-- uring_cmd is task-agnostic
-
-- requires ublk driver to cover multiple task situation
+- A uring_cmd is not bound to a task.
+- So the ublk driver must handle commands that come from several tasks.
 
 ## requirements
 
 ### save uring_cmd cost
 
-- cost is big for each uring_cmd, especially securing_uring_cmd() 
-
-- focus on performance improvement on batched IO workload, not cause
-  regression on low batch IO workload
+- Each uring_cmd is expensive. `security_uring_cmd()` is a big part of the cost.
+- Goal: faster batched IO workloads, with no regression on low-batch IO workloads.
 
 ### support io command migration in easy way
 
-- single task may be not enough to provide best performance
+- One task may not be enough for the best performance.
+- The smallest unit to migrate is one batch of IO commands.
+- Open question: can IO migration be controlled by uring_cmd priority?
 
-- the minimum migration unit should be one batch of IO commands
-
-- how to support IO migration by controlling uring_cmd's priority?
-
-    -- queue less uring_cmd if this task context is saturated, and queue
-    more if this task context isn't saturated any more
-
-    -- increase priority of uring_cmd in other task contexts
+```
+task A saturated     --> A queues fewer uring_cmds
+                     --> uring_cmds from task B get higher priority
+task A not saturated --> A queues more uring_cmds again
+```
 
 ### IO level ZC or buffer copy
 
-- needn't to be all or nothing
+- The choice can be made per IO. It does not need to be all-zero-copy or all-copy.
 
 ### UBLK_F_IOPOLL
 
-- key points
+Key points:
 
-    - io_uring multiqueue handling(ublk uring_cmd and backend io)
+- One io_uring polls two kinds of requests: ublk uring_cmds and backend IO.
+- Polling must stop when the backend has no IO to poll.
+- Or: io_uring must skip ublk uring_cmds for iopoll.
 
-    - need to stop polling if backend hasn't io for polling
+Idea (rejected: cross-ring handling is too complex):
 
-    - or need io_uring to ignore ublk uring_cmd wrt. iopoll
-
-- ideas
-
-    - add new ring for iopoll and register buffer to this dedicated poll ring(too complicated to deal with cross-rings)
+- Add a dedicated iopoll ring, and register buffers to that ring.
 
 ### batched request completion
 
-- use blk_mq_add_to_batch() and blk_mq_end_request_batch()
-
-- easy to apply it in case both ZERO_COPY and AUTO_BUF_REG are not enabled
-
-- for AUTO_BUF_REG(), ublk_io_release() is often called from io handle cqe
-  context because io_kiocb release can be re-ordered
-
-- another problem is that kernel doesn't support to per-task memory
-  allocator
-
+- Use `blk_mq_add_to_batch()` and `blk_mq_end_request_batch()`.
+- Easy when neither ZERO_COPY nor AUTO_BUF_REG is enabled.
+- With AUTO_BUF_REG, `ublk_io_release()` often runs from the "handle io CQE" context, because `io_kiocb` release can be reordered. So the request may not end in the batch context.
+- Another problem: the kernel has no per-task memory allocator.
 
 ## design
 
@@ -297,121 +301,100 @@ its lifetime is same with ublk queue.
 
 [design mind map](https://coggle.it/diagram/aByre8eQzBRMl405/t/ublk2)
 
-- carry buffer(IN/OUT direction)
+The command carries one buffer (IN/OUT). The buffer covers many IO commands, often one batch. Each IO element has a fixed size.
 
-    - cover multiple IO commands, often one batch of IO commands
-    
-    - each IO takes fixed-length bytes
+```
+buffer (fixed buffer only, at first: more efficient)
++------------------------------------------------+
+| header: q_id | flags | nr_ios | io_bytes | prio |
++------------------------------------------------+
+| io element 0                                   |
+| io element 1                                   |
+| ...           (nr_ios elements, io_bytes each) |
++------------------------------------------------+
 
-    - buffer header:
+io element, by use:
 
-        - q_id
+  issue FETCH          : TI = tag + buf_idx
+                         TB = tag + buffer_address
 
-        - flags
+  issue FETCH_COMMIT   : TI|TB|NONE + result                     (8 bytes)
+                         TI|TB|NONE + result + zoned_append_lba  (16 bytes)
 
-        - nr_ios
+  deliver IO commands  : hint: how many IO commands are queued,
+                               and whether a new FETCH is needed
+                         tag of each IO in this queue
+                         result: nr_io * 2
+```
 
-        - io_bytes
-           
-        - io element
- 
-            - for issuing FETCH only, it is for storing:
+Rules:
 
-                - tag + buf_idx  (TI)
-
-                - tag + buffer_address (TB)
-
-            - for issuing FETCH_COMMIT, it can be 
-
-                    - TI|TB|NONE + result (8bytes)
-
-                    - TI|TB|NONE + result + zoned_append_lba (16bytes)
-        
-            - for delivering IO commands
-
-                - hint: how many IO commands in queue, and need new command for fetch
-
-                - tag for each IO in this queue
-
-                - result: nr_io * 2
-
-
-        - priority
-
-    - start with fixed buffer only, which is more efficient
-
-- try best to keep at least one such command in driver side anytime
-
-    - need ublk server to co-operate
-
-    - all inflight uring_cmd needs to hold all io commands
-
-- can be issued from any task context
-
-    - single task is the most typical implementation
-
-- ublk driver has to store incoming io commands in driver internal fifo
-
-    - ublk server can't guarantee that uring_cmd is queued always in time
-
-- for addressing typical cases: deliver one batch io commands
-
+- Keep at least one such command in the driver at all times.
+    - This needs ublk server cooperation.
+    - All inflight uring_cmds together must be able to hold all io commands.
+- It can be issued from any task. A single task is the typical setup.
+- The driver must keep incoming io commands in an internal FIFO, because the ublk server cannot always queue a uring_cmd in time.
+- Main target: deliver one batch of io commands per uring_cmd.
 
 ### ublk_queue_rq() change
 
 #### per-queue IO buffer
 
-- each element is for storing inflight request tag
+Each element stores one inflight request tag. All elements are flushed to a uring_cmd together.
 
-- all elements are flushed to uring_cmd together
-
-- in case of non-batch mode, one tag is added one time, but flushed to
-  uring_cmd once in .commit_rqs() if there are enough uring_cmds
-
-- in case of batch mode(ublk_queue_rqs()), tags are flushed to uring_cmd
-directly, if all tags can be held in pending uring_cmd
-
+```
+non-batch: ublk_queue_rq()            batch: ublk_queue_rqs()
+  add 1 tag to per-queue buffer         all tags of the batch
+  ...                                         |
+  .commit_rqs()                               v
+     |                                  fit in pending uring_cmd(s)?
+     v                                        | yes
+  enough uring_cmds? --yes--> flush           v
+                                        flush directly to uring_cmd
+```
 
 ### how to organize uring_cmds
 
-- priority table or queues
+```
+prio 3 (or 7) : uring_cmd -> uring_cmd -> ...   <-- picked first
+prio 2        : uring_cmd -> ...
+prio 1        : ...
+prio 0        : uring_cmd -> ...
+```
 
-- 4 or 8 priorities(0 ~ 3) or (0 ~ 7)
-
-- each priority has one linked list, stores uring_cmd
-
-- always pick high priority uring_cmd first
-
+- A priority table, or one queue per priority.
+- 4 or 8 levels: 0-3 or 0-7.
+- Each level has one linked list of uring_cmds.
+- Always pick the highest-priority uring_cmd first.
 
 ### UPDATE_CMD_PRIORITY
 
-- for load balancing
-
+- Used for load balancing.
 
 ### CANCEL_CMD
 
-- simplify cancel & stop disk & remove disk
+- Makes cancel, stop disk and remove disk simpler.
 
 ### HOUSEKEEP_CMD
 
 ### load balancing
 
-- when one task is saturated, wakeup new task to issue uring_cmd with higher priority
-
-- when the task becomes not saturated, reduce uring command priority issued from new task
-
+```
+task A saturated     --> wake task B; B issues uring_cmds with higher priority
+task A not saturated --> lower the priority of uring_cmds from task B
+```
 
 ## implementation policy
 
 ### new file_operations for ublk char device
 
-
 ### new queue_rq() 
-
 
 ## test result
 
 ### trace fetch & submit batch
+
+Default CPU placement:
 
 ```
 iops: 360K 
@@ -441,6 +424,8 @@ iops: 360K
 
 ```
 
+Pinned with `taskset -c 8`:
+
 ```
 taskset -c 8
 iops: 398K
@@ -468,38 +453,38 @@ iops: 398K
 
 ```
 
+Pinning gives 360K -> 398K IOPS. Completion batches shift up: size 1 drops from 56577 to 7292, [8, 32) grows. Most fetches carry 32-63 commands in both runs.
 
 ## Issues
 
+### IOPOLL performance
 
-### IOPOLLL performance
-
-- not observe obvious performance improvement 
-
+- No clear performance gain seen.
 
 ### IOPOLL failure
 
 #### overview
 
-- create 2 queue loop backed by nvme
+Reproduce:
 
+```
+# 2-queue loop target backed by nvme
 ./kublk add -t loop -q 2 -d 4 -p --auto_zc -b --foreground --debug_mask 0xffff /dev/nvme0n1
 
-- running IO
+# from another terminal
+fio/t/io_uring -p0 /dev/ublkb0
+```
 
-fio/t/io_uring -p0 /dev/ublkb0 (run from another terminal)
-
-- kublk failure triggered:
+kublk fails:
 
 ```
 ublk_handle_cqe: res -16 (thread 1 qid 1 tag 4 cmd_op 26 data 100000001260004 target 0/1) stopping 0
 ublk_batch_compl_commit_cmd 419: assert!
 ```
 
-- not observe such issue in case of single queue
-
-- not observer this issue after retrieving ubq from pdu directly
-
+- res -16 is -EBUSY.
+- Not seen with a single queue.
+- Gone after getting `ubq` from the uring_cmd pdu directly.
 
 ### Fetch commands silently done
 
@@ -507,31 +492,22 @@ ublk_batch_compl_commit_cmd 419: assert!
 
 ##### how to reproduce
 
-- ./kublk add -t null -b -r 1 -d 8
-
-- fio/t/io_uring -p0 /dev/ublkb0 (run from another terminal)
-
-- kill -9 kublk
-
-- ./kublk recover -t null -b -r 1 -d 8 -n 0 --foreground
-
+```
+./kublk add -t null -b -r 1 -d 8
+fio/t/io_uring -p0 /dev/ublkb0          # from another terminal
+kill -9 kublk
+./kublk recover -t null -b -r 1 -d 8 -n 0 --foreground
+```
 
 #### Observations
 
-- IOPS becomes zero on `fio/t/io_uring` 
-
-- all fetch commands are done when dumping ublk driver state, however they
-are not completed from __io_uring_cmd_done()
-
-- not got failure code from kublk side
-
-    - t->cmd_inflight is wrong
-
-    - t->io_inflight is zero
-
-    - t->state is UBLKS_T_BATCH_IO, and UBLKS_T_STOPPING isn't set
-
-- the following log is found:
+- IOPS of `fio/t/io_uring` drops to zero.
+- The ublk driver state dump shows all fetch commands as done. But they were not completed through `__io_uring_cmd_done()`.
+- kublk reports no failure code. Its thread state:
+    - `t->cmd_inflight` is wrong.
+    - `t->io_inflight` is zero.
+    - `t->state` is `UBLKS_T_BATCH_IO`; `UBLKS_T_STOPPING` is not set.
+- Log:
 
 ```
 [root@ktest-40 ublk]# ./kublk recover -t null -b -r 1 -d 8 -n 0 --foreground
@@ -547,41 +523,28 @@ dev id 0: nr_hw_queues 2 queue_depth 8 block size 512 dev_capacity 524288000
 
 #### comments
 
-- cqe is missed?
-
-No.
-
-- one pthread is done because of `ublk_batch_compl_cmd: got error -19`
-
+- Is a CQE missed? No.
+- One pthread exits because of `ublk_batch_compl_cmd: got error -19` (-ENODEV).
 
 ## comments
 
 ### extra complexity
 
-- maintaining per-queue fifo for holding inflight request tag
-
-- has to handle situation in which new inflight request comes but there
-  isn't uring_cmd for handling it
+- A per-queue FIFO must hold inflight request tags.
+- The driver must handle a new inflight request when no uring_cmd is available for it.
 
 ### potential performance regression
 
-- no batched IO
-
-each uring_cmd just handles single request
-
-typical sequential IO use case
-
+- No batched IO: each uring_cmd handles a single request.
+- Typical case: sequential IO.
 
 ### sys_ringbuffer
 
 [sys_ringbuffer wip](https://lore.kernel.org/all/ytprj7mx37dna3n3kbiskgvris4nfvv63u3v7wogdrlzbikkmt@chgq5hw3ny3r/#t)
 
-[sys_ringbufer patch v1](https://lore.kernel.org/all/20240603003306.2030491-1-kent.overstreet@linux.dev/)
+[sys_ringbuffer patch v1](https://lore.kernel.org/all/20240603003306.2030491-1-kent.overstreet@linux.dev/)
 
-Essentially, it is same with nvme's SQ/CQ, so one ringbuffer between driver
-and application is more straightforward.
-
-
+This is the same model as an nvme SQ/CQ pair. One ring buffer between driver and application is simpler.
 
 # UBLK_F_QUIESCE_DEV
 
@@ -594,6 +557,8 @@ I am seeking advice on whether it is possible to upgrade the ublksrv version
 without terminating the daemon abruptly. Specifically, I would like the daemon to
 exit gracefully, ensuring all necessary cleanups are performed.
 ```
+
+Goal: upgrade the ublk server binary without killing the daemon; let it exit cleanly.
 
 ## design
 
@@ -633,17 +598,40 @@ and userspace can replace the binary and recover device with new
 application via UBLK_CMD_START_USER_RECOVERY & UBLK_CMD_END_USER_RECOVERY
 ```
 
+Flow:
+
+```
+QUIESCE_DEV (UBLK_F_USER_RECOVERY only)
+   |
+   v
+freeze queue -> ubq->canceling = true -> unfreeze     no new ublk IO
+   |
+   v
+complete all uring_cmds with UBLK_IO_RES_ABORT        no new uring_cmd
+   |                                                  (__ublk_ch_uring_cmd() gate)
+   v
+ublk server: release resources, close char device
+   |
+   v
+wait until UB_STATE_OPEN is cleared
+   |
+   v
+state = UBLK_S_DEV_QUIESCED or UBLK_S_DEV_FAIL_IO
+   |
+   v
+replace binary
+   -> UBLK_CMD_START_USER_RECOVERY -> UBLK_CMD_END_USER_RECOVERY
+
+(io_uring exiting at any point -> normal cancel path)
+```
+
 ## problems
 
 ### what if there isn't any active uring_cmd?
 
-- it could be true if all inflight io command is handled by ublk server
-
-- wait until one request is completed
-
-- fail if timeout
-
-
+- This can happen when the ublk server is handling all inflight io commands.
+- Then: wait until one request completes (its uring_cmd comes back).
+- Fail on timeout.
 
 # UBLK_F_AUTO_BUF_REG
 
@@ -653,9 +641,20 @@ application via UBLK_CMD_START_USER_RECOVERY & UBLK_CMD_END_USER_RECOVERY
 
 ### per-context buffer register
 
-- cross-context register/unregister
+Problem: the buffer is registered in one io_uring context, but it may be unregistered from another one.
 
-[Caleb Sander Mateos's comment](https://lore.kernel.org/linux-block/CADUfDZoY7rC=SxpFnN6bqBg1SiBccSyYTsKAVe2Rx0wAxBdD6Q@mail.gmail.com/)
+```
+io_uring ctx A                         io_uring ctx B
+--------------                         --------------
+request comes
+auto-register buffer
+  (index in ctx A's buffer table)
+                                       UBLK_IO_COMMIT_AND_FETCH_REQ
+                                         auto-unregister?
+                                         ctx B != ctx A  -> buffer is not in ctx B
+```
+
+Proposal from [Caleb Sander Mateos's comment](https://lore.kernel.org/linux-block/CADUfDZoY7rC=SxpFnN6bqBg1SiBccSyYTsKAVe2Rx0wAxBdD6Q@mail.gmail.com/): if the contexts do not match, skip the unregister. Do not return -EINVAL.
 
 ```
 > True. I think it might be better to just skip the unregister if the
@@ -669,7 +668,15 @@ application via UBLK_CMD_START_USER_RECOVERY & UBLK_CMD_END_USER_RECOVERY
 > the old io_uring to unregister the buffer.
 ```
 
-[Two invariants](https://lore.kernel.org/linux-block/aC6N9w4ijVEkHN0l@fedora/)
+| Case at COMMIT_AND_FETCH from another ctx | Result |
+|---|---|
+| old ctx already closed | buffer is gone with the ctx; skipping is correct |
+| old ctx still open, server does nothing | userspace bug; buffer stays registered, request gets stuck |
+| old ctx still open, server wants it freed | server sends `UBLK_IO_UNREGISTER_IO_BUF` on the old ctx |
+
+(current mainline: the driver saves `io->buf_ctx_handle` at register time. On commit it auto-unregisters only if `io->buf_ctx_handle == io_uring_cmd_ctx_handle(cmd)`; otherwise unregister is the server's job.)
+
+The fix relies on [two invariants](https://lore.kernel.org/linux-block/aC6N9w4ijVEkHN0l@fedora/):
 
 ```
 - ublk_io_release() is always called once no matter if it is called
@@ -684,110 +691,103 @@ is completed & new request comes
 
 ## overview
 
-- ublk queue pthread context is only for retrieving & completing io command
+The ublk queue pthread only fetches and completes io commands. Another pthread handles them. Both directions use eventfd for wakeup.
 
-- io command is handled in another pthread
+```
+ublk queue pthread                         offload pthread
+(io_uring_enter loop)                      (handles io command)
+-------------------                        ----------------
+fetch io command
+   | queue io, write(eventfd) ----------->  wakes up
+   |                                        handle io
+   |  <---------- write(eventfd) ---------  io done
+wakes up from io_uring_enter()
+complete io command
+```
 
-- communication is done via eventfd, which need to wakeup io_uring_enter()
-
-- the offload pthread needs to be waken up for handling io command, still
-  use eventfd
+The eventfd must wake up the queue pthread from `io_uring_enter()`.
 
 ## races
 
-- io handing pthread is sending eventfd, however the ublk queue pthread
-  isn't in io_uring_enter()
+Race: the offload pthread writes the eventfd, but the ublk queue pthread is not in `io_uring_enter()` at that moment. The wakeup can be missed.
 
-  Solved by using IORING_OP_READ_MULTISHOT to read eventfd automatically
-
-
+Fix: use `IORING_OP_READ_MULTISHOT` on the eventfd. io_uring reads the eventfd by itself and posts a CQE, so the event is never lost.
 
 ## use read mshot for getting eventfd notification
 
-[ublk.nfs: use read_mshort for getting eventfd notification](https://github.com/ublk-org/ublksrv/commit/38d5d19f28ff8c9f9f21bfd0f9ffc308ff072a1d)
+[ublk.nfs: use read mshot for getting eventfd notification](https://github.com/ublk-org/ublksrv/commit/38d5d19f28ff8c9f9f21bfd0f9ffc308ff072a1d)
 
-- avoids the above race
-
-- more efficient
+- Avoids the race above.
+- More efficient: one SQE serves many events.
 
 ## selftest offload design
 
 ### data structure
 
-- `struct ublk_offload_ctx`
+`struct ublk_offload_ctx`: one pthread context that handles offloaded IOs.
 
-    - represents one pthread context for offloading IOs
+```
+struct ublk_offload_ctx            (lifetime == ublk device)
+  device
+  io_uring
+  need_exit
+  pthread, thread_fn, default uring_fn
+  sq instance (per ctx)            owned by ublk_offload_ctx, has evtfd
+  cq references (per ublk_queue)   owned by ublk_queue,       has evtfd
+```
 
-    - fields
-            - device
+- Uses read_mshot to accept new events.
+- Accepts IOs from all queues of the device.
 
-            - io_uring
+Interfaces:
 
-            - need_exit
+```
+ctx = create_offload_ctx(device, thread_fn)
+destroy_offload_ctx(ctx)
+ublk_submit_offload_io(ctx, q, tag)
+ublk_complete_offload_io(ctx, qid, tag, res)
+```
 
-            - pthread & thread_fn & default uring_fn
+`struct ublk_offload_queue`:
 
-            - sq instance (perf ctx), owned by `ublk_offload_ctx`
-                evtfd
+- Uses READ_MULTISHOT to wake up the io_uring context.
+- Its ring buffer stores the tag, or queue/tag.
+- Push one by one; pop all at once.
 
-            - cq references (per ublk_queue) owned by `ublk_queue`
-                evtfd
+```
+producer                    ring buffer               consumer
+push(tag) ... push(tag) --> [ t0 | t1 | t2 | ... ] --> pop all
+          write(evtfd)                                 (woken by read_mshot CQE)
+```
 
-    - interfaces
+`->user_data` encoding:
 
-            - ctx = create_offload_ctx(device, thread_fn)
+- Define a generic EVENT_NOTIFY op for receiving events.
+- Pass qid in the `tgt_data` field of `->user_data`.
+- Use the same encoding (`build_user_data()`) as non-offload handling.
 
-            - destroy_offload_ctx(ctx)
+init_queue & deinit_queue support:
 
-            - ublk_submit_offload_io(ctx, q, tag)
-            
-            - ublk_complete_offload_io(ctx, qid, tag, res)
-
-    - lifetime is aligned with device
-
-    - use read_mshot for accepting new events
-
-    - can accept IOs from all queues for this device
-
-- `struct ublk_offload_queue`
-
-    - use READ_MULTISHOT to wakeup io_uring contex
-
-    - store tag or queue/tag in its ring buffer
-
-    - one by one push and pop all style
-
-
-- ->user_data encoding
-
-    - define generic EVENT_NOFIFY OP for receiving EVENT
-
-    - pass qid via tgt_data field of ->user_data
-
-    - use same encoding approach(build_user_data()) with non-offload handling
-
-- init_queue & deinit_queue support
-
-    - each ublk queue needs to setup ublk_offload_queue
+- Each ublk queue must set up its `ublk_offload_queue`.
 
 ### interface
 
-- add ->offload_queue_io() & ->offload_io_done() operation
-
-    - both two are completed in context pthread context
-
+- Add `->offload_queue_io()` and `->offload_io_done()`.
+- Both run in the offload pthread context.
 
 # *relax ublk task context limitation*
 
 ## motivation/requirement
 
-- remove the ubq_daemon context limitation
+Remove the ubq_daemon context limitation:
 
-    - all uring_cmd can be submitted from different context
+- Any task can submit any uring_cmd.
+- The task that commits a uring_cmd result can differ from the task that submitted the uring_cmd.
 
-    - task context for commiting uring_cmd result can be different with
-    the task context for submitting uring_cmd
-
+```
+before:  queue  <-1:1->  ubq_daemon task   (fetch, commit, cancel all here)
+after:   queue  <-any->  any task          (per-io task, may change)
+```
 
 ## design
 
@@ -800,145 +800,95 @@ is completed & new request comes
 #### task context for issuing uring_cmd
 
 - fetching
-
 - committing result
 
 #### task contexts for canceling uring_cmd
 
-
 #### timeout context
-
 
 ## implementation
 
 ### cleanup all ubq_daemon references
 
-- timeout
+- timeout path
+- cancel path
 
-- cancel code path
-
-io_uring_cancel_generic() can be called from multiple pthread context at
-the same time
+`io_uring_cancel_generic()` can run from multiple pthread contexts at the same time. The cancel code must not assume one daemon task.
 
 ### add per-io spinlock
-
-
 
 ### ublk server
 
 #### offload abstract
 
-- use standalone io_uring for offloading
+- Use a standalone io_uring for offloading.
+- Use eventfd for notification. The offload pthread reads the eventfd via read_mshot.
+- Add an offload ring buffer. `->queue_io()` produces data; the offload pthread consumes it after the eventfd notification.
+- Add `->handle_io_bg()`: produce data for the whole batch, then send it to the offload pthread with a single `write(eventfd)`.
 
-- use eventfd for notification, offload pthread reads evevtfd
-via read_mshot()
+```
+queue task                                   offload task
+----------                                   ------------
+->queue_io()   x N   -> push to ring buf
+->handle_io_bg()     -> write(eventfd) once  -> read_mshot CQE
+                                                pop whole batch, handle
+```
 
-- add offload ring_buffer
+Support moving work in both directions:
 
-data is produced in ->queue_io(), and consumed in offload pthread
-context, notified by eventfd
+- Notify the queue task context if the offload task is fully overloaded.
+- Keep `->queue_io()` working (handle IO in the queue task).
+- Borrow Uday's design and add a `ublk_task_ctx` structure.
+- Is there a balanced state? Essentially, no.
+- Good batching vs. saturation?
+    - Open question: how to keep the requests of one batch in the same task context?
+    - Per-io migration does not work for this.
+    - The whole io batch must stay in the same task context.
 
-- add ->handle_io_bg()
+`ublk_task_ctx`:
 
-produce data for whole batch, and send it to offload pthread by single
-write(eventfd)
+```
+struct ublk_task_ctx               (shared device wide; handles IO of multiple queues)
+  io_uring                         (sqe allocation is wired to it)
+  accounting
+  io_ring_buf                      (stores out/in IOs)
+  eventfd, read_mshot, event_buffer
+  buffer index allocation
+```
 
-- support back and forth
+- Handle IO of a single queue or multiple queues? Multiple queues: `ublk_task_ctx` is shared device wide.
+- Store `ublk_task_ctx` in a pthread_key? No. Pass it directly as a function parameter.
+- `ublk_task_ctx` ID:
+    - Store it in `struct ublk_io`.
+    - The last `ublk_task_ctx` has higher priority if it is not saturated.
+- Pass `ublk_task_ctx *` to `->queue_io()`, `->tgt_io_done()` and `->handle_io_bg()`.
 
-    - notify queue task context if offload task is in full overload
+Migration logic:
 
-    - keep ->queue_io() work
+- What is the migration logic? It can be static mapping or dynamic balancing.
+- Compare IOPS of the two sides; offload the side with higher IOPS.
+- Dynamic load balancing, implemented in `->queue_io()`.
+- Get `voluntary context switches` from `getrusage()` (libc).
+- Sampling: every 5 seconds (use IOPS to estimate time), or simply every 100K syscalls.
+- Or use a multishot timer (`IORING_TIMEOUT_MULTISHOT`); it is much more efficient. Open questions: 1 sec timer? How many io commands to migrate each time?
 
-    - borrow Uday's design, and introduce 'ublk_task_ctx' structure
+How to handle auto buffer register?
 
-    - if there exists balanced state? Essentially, no.
-
-    - good batch vs. saturation?
-
-        - how to make sure one batch requests stay in same task_context?
-        (good question)
-
-        - so io migration idea doesn't work
-
-        - we have to keep whole io batch in same task_context
-
-
-- ublk_task_ctx
-
-    - io_uring
-
-    - accounting
-
-    - io_ring_buf for storing out/in IOs
-
-    - eventfd & read_mshot & event_buffer
-
-    - only handle single queue IO or multiple queue IO?
-
-        - multiple queue's IO
-        
-        - ublk_task_ctx is shared among ublk_device wide
-
-    - store ublk_task_ctx via pthread_key
-
-        no, pass it from function parameter directly
-
-    - buffer index allocation
-
-    - ublk_task_ctx ID:
-
-            - store in 'struct ublk_io'
-
-            - last ublk_task_ctx has higher priority if it isn't saturated
-
-    - pass `ublk_task_ctx *` to `->queue_io() & ->tgt_io_done() & ->handle_io_bg()`
-
-    - wire sqe allocation with ublk_task_ctx
-
-- migration logic
-
-    - what is the migrate logic?
-
-        - can be static mapping or dynamic balanceing
-
-    - check if the two side's IOPS is same, offload the one with higher IOPS
-
-    - dynamic load-balancing
-
-    - implement the migration logic in ->queue_io()
-
-    - get `voluntary context switches` from getrusage() provided by libc
-
-    - sample every 5 seconds, use IOPS to estimate time, or simply do it
-    every 100K syscalls
-
-    - or use multishot timer(IORING_TIMEOUT_MULTISHOT) which provides much
-      efficient way to use timer, 1sec timer? and migrate how many io commands?
-
-- how to deal with auto buffer register?
-
-    - add unregister_buffers uring_cmd
-
-    - add register_buffers uring_cmd
-
-    - flags?
-
-    - track `io_ring_ctx` to check if registered buffer can be unregistered
-      which is required for AUTO_BUF_REG too, can be one bug-fix too
-
+- Add an unregister_buffers uring_cmd.
+- Add a register_buffers uring_cmd.
+- Flags? (open)
+- Track `io_ring_ctx` to check whether a registered buffer can be unregistered. AUTO_BUF_REG needs this too, so it can also be a bug fix. (See [per-context buffer register](#per-context-buffer-register).)
 
 #### add per-io lock
 
-- protect ublk_queue_io_cmd()
+- Protects `ublk_queue_io_cmd()`.
 
 #### updating q->cmd_inflight / q->io_inflight
 
-- convert to atomic variable
-
-- more it to `ublk_task_ctx`
+- Convert to atomic variables.
+- Move them to `ublk_task_ctx`.
 
 #### clear SINGLE_ISSUER flag
-
 
 # ublk zero copy
 
@@ -946,58 +896,62 @@ write(eventfd)
 
 ### basic zero copy function
 
-IO comes at `/dev/ublkbN`, bio & request of `/dev/ublkbN` is generated in linux
-kernel for each IO from client application, it can be direct IO or buffered IO.
+```
+ app (direct IO or buffered IO)
+   |
+   v
+ /dev/ublkbN: bio -> block layer request (owns the data buffer)
+   |
+   v
+ ublk driver: builds IO command for the request
+   |
+   v
+ ublk server: handles IO command
+     no zc: copy data between request buffer and server buffer (1 copy)
+     zc   : use the request buffer directly (0 copy)
+```
 
-ublk driver builds IO command for this block layer `request` and delivers
-it to ublk server.
-
-Without ublk zero copy, when ublk server handles the IO command, it has to copy
-data from buffer in the original block layer `request`, so there is one time of
-data copy for ublk server to handle IO command.
-
-ublk zero copy tries to remove the data copy and uses the data in original block
-layer `request` directly.
+Goal of ublk zero copy: remove this one data copy.
 
 ### IO lifetime
 
-The original block layer `request` from `/dev/ublkbN` has to be live when ublk
-server handles the IO command, otherwise the buffer in the `request` may be freed,
-and user-after-free on kernel buffer can be caused. And it should be linux kernel's
-responsibility to provide this guarantee, instead of relying on ublk server to
-do things correctly.
+- The `/dev/ublkbN` request must stay live while the ublk server handles the IO
+  command.
+- If not, the request buffer may be freed -> use-after-free on a kernel buffer.
+- The kernel must guarantee this. It must not depend on the ublk server being
+  correct.
 
 ### short read handling
 
-The ublk IO request may be originated from page cache, when handling READ IO command,
-short read may happen. The remained bytes in the `buffer` should be zeroed for
-avoiding to leak kernel data to userspace.
-
-Note short read is from IO command handling, and the original `request` buffer may
-be partitioned to multiple parts, short read may happen on when reading data to
-each part of the buffer from multiple destinations, see section [stackable device support](#stackable-device-support)
+- A ublk READ may come from the page cache.
+- Handling the READ command may return a short read.
+- The remaining bytes of the buffer must be zeroed. Otherwise kernel data leaks
+  to userspace.
+- The request buffer may be split into several parts, each read from a
+  different destination. A short read can happen on each part. See
+  [stackable device support](#stackable-device-support).
 
 ### buffer direction
 
-- avoid to leak kernel data, or over-write kernel buffer
-
+- Do not leak kernel data (READ buffer exposed as write source), and do not
+  overwrite a kernel buffer (WRITE buffer used as read destination).
 
 ### application level requirements
 
 #### stackable device support
 
-In mirror-like stackable block device, same ublk IO need to be submitted to more
-than one destinations.
+```
+ mirror-like:  one ublk IO --+--> dest 0
+                             +--> dest 1 ...
 
-In stripe-like stackable block device, same ublk IO need to be split to multiple
-parts, and each part needs to be submitted to more than one destinations.
+ stripe-like:  one ublk IO --split--> part 0 --+--> dest 0
+                                               +--> dest 1 ...
+                                      part 1 --+--> ...
+```
 
-The destination can be network or local FS IO.
-
-It could be more efficient to handle these multiple submissions in single syscall
-because zero copy is applied for handling single ublk IO command, such as, submitting
-them all via io_uring's io_uring_enter().
-
+- A destination can be network IO or local FS IO.
+- Zero copy works per ublk IO command. So it is more efficient to submit all
+  these IOs in one syscall, e.g. all via io_uring's `io_uring_enter()`.
 
 ## Attempts
 
@@ -1005,16 +959,13 @@ them all via io_uring's io_uring_enter().
 
 [Zero-copy I/O for ublk, three different ways](https://lwn.net/Articles/926118/)
 
-
 ### SQE group
 
 [\[PATCH V10 0/12\] io_uring: support group buffer & ublk zc](https://lore.kernel.org/linux-block/20241107110149.890530-1-ming.lei@redhat.com/)
 
-This patchset introduces SQE group concept, and implements all requirements.
-
-IO request is guaranteed to be live in the whole SQE group lifetime.
-
-But io-uring community thinks the change or implementation is too complicated.
+- Adds the SQE group concept. Meets all requirements above.
+- The IO request is guaranteed live for the whole SQE group lifetime.
+- Rejected: the io_uring community thinks the change is too complicated.
 
 ### io_uring buffer table
 
@@ -1022,82 +973,88 @@ But io-uring community thinks the change or implementation is too complicated.
 
 [\[PATCH 0/6\] ublk zero-copy support](https://lore.kernel.org/linux-block/20250203154517.937623-1-kbusch@meta.com/)
 
-The initial version doesn't work really, IO lifetime requirement isn't addressed, and
-short read isn't handled correctly too.
-
+The initial version does not really work: the IO lifetime requirement is not
+addressed, and short read is not handled correctly.
 
 [\[PATCHv8 0/6\] ublk zero copy support](https://lore.kernel.org/linux-block/20250227223916.143006-1-kbusch@meta.com/)
 
 ##### overview
 
-- add two uring APIs `io_buffer_register_bvec()` & `io_buffer_unregister_bvec()`
+```
+ ublk server SQEs                    kernel
+ ----------------                    ------
+ ublk REGISTER_BUF cmd  ---------->  io_buffer_register_bvec()
+                                       grab a ref on each page of the ublk request
+                                       put request bvec into the buffer table
+ IORING_OP_READ_FIXED /  --------->  look up registered buffer in ->prep()
+ IORING_OP_WRITE_FIXED                 page ref dropped after the OP consumes the page
+ ublk UNREGISTER_BUF cmd ---------->  io_buffer_unregister_bvec()
+```
 
-`io_buffer_register_bvec()` grabs reference of each page in ublk `request`, and
-the reference is dropped after the page is consumed from io_uring read/write OPs
-
-- add two ublk buffer commands: one is for register buffer, another is for un-register
-buffer
-
-The two commands call `io_buffer_register_bvec()` & `io_buffer_unregister_bvec()`.
-
-- reuse `IORING_OP_READ_FIXED` / `IORING_OP_WRITE_FIXED`
-
-The two OPs looks up register buffer in ->prep(), when the ublk register buffer can't
-be done yet, so one fatal problem
-
+- New io_uring APIs: `io_buffer_register_bvec()` / `io_buffer_unregister_bvec()`.
+- New ublk commands: register buffer / unregister buffer. They call the two
+  APIs.
+- Reuses `IORING_OP_READ_FIXED` / `IORING_OP_WRITE_FIXED`.
+- Fatal problem: the FIXED OPs look up the buffer in `->prep()`. If they are
+  in the same submission as the register command, the register has not run
+  yet at that time, so the lookup fails.
 
 ##### Question: will grabbing ublk request page work really?
 
-ublk request can be freed earlier inevitably when the request buffer crosses multiple
-OPs.
+- When the request buffer is used by several OPs, the ublk request may be
+  completed and freed before all OPs finish. This cannot be avoided.
+- From the storage driver view: once a request is completed, page ownership
+  goes back to the upper layer (FS).
+- Open question: does holding a page ref beyond request completion cause
+  kernel trouble?
 
-Will this way cause kernel trouble? From storage driver viewpoint, after one request
-is completed, request page ownership are transferred to upper layer(FS)
-
-[commit 875f1d0769cd("iov_iter: add ITER_BVEC_FLAG_NO_REF flag")](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=f5eb4d3b92a6a1096ef3480b54782a9409281300)
+[commit 875f1d0769cd("iov_iter: add ITER_BVEC_FLAG_NO_REF flag")](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=875f1d0769cd)
+and its follow-up [commit f5eb4d3b92a6 ("iov_iter: fix iov_iter_type")](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=f5eb4d3b92a6a1096ef3480b54782a9409281300)
 
 [comment bvec page lifetime isn't aligned with ublk request](https://lore.kernel.org/linux-block/5f6f6798-8658-4676-8626-44ac6e9b66af@bsbernd.com/T/#mb2c2e712c9cc8b79292fbd2941e3397a9b99a9b0)
 
 - buffered IO
 
-How page cache read deals with the page after reading IO is complete?
+  Open question: what does page cache read do with the page after the read IO
+  completes?
 
 - direct IO
 
-
 ##### Question: how to avoid to leak kernel buffer?
 
-un-register buffer can't be called from application panic, then when/how to un-register
-it?
+Open question: if the application panics, it never sends unregister buffer.
+When and how is the buffer unregistered then?
 
 #### io_uring buffer table V2
 
 [[PATCHv2 0/6] ublk zero-copy support](https://lore.kernel.org/linux-block/20250211005646.222452-1-kbusch@meta.com/)
 
-
 ##### overview
 
-- add ->release() callback
+- Adds an optional `->release()` callback, called when the resource node has
+  no more references.
+- It handles buggy applications that complete the request and unregister the
+  index while IO is still in flight.
+- The request cannot complete before `->release()`, so no extra page
+  references are needed.
 
-Introduced an optional 'release' callback when the resource node is
-no longer referenced. The callback addresses any buggy applications
-that may complete their request and unregister their index while IO
-is in flight. This obviates any need to take extra page references
-since it prevents the request from completing.
+```
+ node refs: register cmd + each in-flight FIXED OP
+       |
+       v  last ref dropped
+ ->release()  ==>  ublk request may now complete
+```
 
-Note:
-
-- it avoids buffer leak issue when application panics, because
-io_sqe_buffers_unregister() is called from io_ring_ctx_free() to
-unregister the buffer automatically if the kernel buffer is registered
-to the buffer table.
+Note: this also fixes the buffer leak on application panic.
+`io_ring_ctx_free()` calls `io_sqe_buffers_unregister()`, which unregisters
+any kernel buffer still in the buffer table.
 
 ##### issue: double completion from buggy application
 
 [double completion from buggy application](https://lore.kernel.org/linux-block/Z6xo0mhJDRa0eaxv@fedora/)
 
-The command `UBLK_IO_COMMIT_AND_FETCH_REQ` can only be completed once, so
-double completion won't happen.
+`UBLK_IO_COMMIT_AND_FETCH_REQ` can complete a command only once, so double
+completion does not happen.
 
 ##### buffer direction isn't respected
 
@@ -1107,45 +1064,49 @@ double completion won't happen.
 
 [\[RFC PATCH 00/22\] ublk: support bpf](https://lore.kernel.org/linux-block/20250107120417.1237392-1-tom.leiming@gmail.com/#r)
 
-This approach relies on bpf prog to handle IO command, and bpf-aio kfuncs are introduced
-for submitting IO, and it is natural zero-copy because bpf prog works in kernel space.
+- A bpf prog handles the IO command.
+- New bpf-aio kfuncs submit the IO.
+- Zero copy by nature: the bpf prog runs in kernel space.
 
 ### buffer table with io_uring bpf OP
 
 #### ideas
 
-- implement basic buffer table feature
-
-- re-factor rw/net code, and export kfuncs for bpf to customerized rw/net
-
-  lots of work is involved, is it acceptable? 
-
-- more flexible
-
-  support memory compression, buffer copy, ...
+- Implement the basic buffer table feature.
+- Refactor io_uring rw/net code and export kfuncs, so bpf can build customized
+  rw/net OPs.
+  - Open question: this is a lot of work. Is it acceptable?
+- More flexible: supports memory compression, buffer copy, ...
 
 ### following up things
 
-- add more ublk limits(segment, ...), for aligning with backing file
-
+- Add more ublk limits (segment, ...) to match the backing file.
 
 ## automatic buffer register 
 
 ### core idea
 
-- register request buffer automatically before delivering io command to ublk server
+```
+ ublk driver                                ublk server
+ -----------                                -----------
+ request arrives
+ register request buffer (auto)
+ complete FETCH uring_cmd   ----------->    handle IO with FIXED OPs
+                                            UBLK_IO_COMMIT_AND_FETCH_REQ
+ unregister request buffer (auto) <------
+ complete request
+```
 
-- unregister request buffer automatically when handling UBLK_IO_COMMIT_AND_FETCH_REQ
-
-- require to reuse the current uring_cmd
-
-looks fine because both io_buffer_register_bvec() and io_buffer_unregister_bvec()
-only uses `cmd` to retrieve `struct io_ring_ctx` instance.
+- Register the request buffer automatically before the IO command goes to the
+  ublk server.
+- Unregister it automatically when handling `UBLK_IO_COMMIT_AND_FETCH_REQ`.
+- Needs to reuse the current uring_cmd. This looks fine:
+  `io_buffer_register_bvec()` and `io_buffer_unregister_bvec()` use `cmd` only
+  to get the `struct io_ring_ctx`.
 
 ### `io_uring_register_get_file()` can't be called in arbitrary context
 
-- should be easy to address
-
+- Should be easy to fix.
 
 ### external context lock
 
@@ -1161,11 +1122,10 @@ only uses `cmd` to retrieve `struct io_ring_ctx` instance.
 > it's done for files.
 ```
 
-It can be re-tried in this way, however please keep in mind the
-taskwork vs cancel race.
-
-Need to understand msg_ring.c first.
-
+- Suggested approach: trylock the target ring's lock; if it fails, punt to
+  task work on that ring (like `msg_ring.c` does for files).
+- Watch out for the task work vs cancel race.
+- TODO: understand `msg_ring.c` first.
 
 ## Race when unregistering buffer from io_sqe_buffers_unregister
 
@@ -1185,11 +1145,11 @@ worker_thread+599
 
 - `ublk_ch_release` stack trace
 
-Could be from io_uring cancel code path too
+  Can also come from the io_uring cancel code path.
 
-- io_sqe_buffers_unregister() can be called after files are unregistered 
+- Can `io_sqe_buffers_unregister()` be called after files are unregistered?
 
-No.
+  No. Buffers are unregistered before files in `io_ring_ctx_free()`:
 
 ```
 do_exit()
@@ -1212,81 +1172,64 @@ io_ring_ctx_free
                 io_uring_release
 ```
 
-
 # ublk/nbd
 
 ## design
 
-- raw C++21 coroutine based & event driven
+- Raw C++20 coroutine based, event driven.
 
-- in request queueing side, it looks like one complete coroutine based
-implementation
+```
+ queue side (one coroutine per request)       recv side (one dedicated coroutine)
+ --------------------------------------       -----------------------------------
+ TCP socket is a stream:                      receives replies + READ data
+   all sends on one socket are serialized
+   => only ONE active io_uring link chain
 
-    - tcp socket is stream style, so every tcp send in single socket has
-    
-    to be serialized, then there is only one active io_uring link chain
+ active chain:  send A -> send B -> send C
+ new request while chain busy:
+   -> put in next_chain (staggered)
+ active chain done:
+   -> submit next_chain as new active chain
 
-    - when send request in the active link chain aren't done, new send
-
-    request has to be staggered in next chain; and submitted when the
-
-    active chain is completed
-
-- recv side is for covering both reply and READ data, done in one extra
-  and dedicated coroutine context
-
-- event driven: done in nbd_tgt_io_done() and nbd_handle_io_bg()
-
-    -- deal with send first, next chain needs to be submitted
-
-    -- deal with recv work, can't cut into the active send chain
+ event driven: nbd_tgt_io_done(), nbd_handle_io_bg()
+   1. handle send first: submit next chain if needed
+   2. then handle recv work: must not cut into the active send chain
+```
 
 ### how to do it with Rust async/.await?
 
-- for request handling, completely done in coroutine context
-
-    - how to deal with io_uring IO_LINK
-
-    - is there any way to figure out the last queued SQE from io-uring
-      crate?
-
-- how to deal with recv work?
-
-    - recv work should be handled after all sending things are done
-
-- communicating between recv io_task and send_req io_task?
-
-    - async mutex?  should work
-
+- Request handling: done fully in coroutine context.
+  - Open question: how to handle io_uring `IO_LINK`?
+  - Open question: can the io-uring crate tell which SQE was queued last?
+- recv work:
+  - It must run after all sends are done.
+- Communication between the recv io_task and the send_req io_task:
+  - async mutex? Should work.
 
 ## implementation
 
 ### nbd_handle_io_bg()
 
-- implements .handle_io_background() which is called after all pending
-CQEs are handled
+- Implements `.handle_io_background()`, called after all pending CQEs are
+  handled.
 
 ### q_data->in_flight_ios
 
-Track how many inflight nbd IO requests 
+Counts in-flight nbd IO requests.
 
 ### q_data->chained_send_ios
 
-We have ->in_flight_ios, why still need this counter?
+Question: we have `->in_flight_ios`, why need this counter too?
 
-It counts how many requests linked in current chain.
-
+Answer: it counts the requests linked in the current chain.
 
 ### q_data->send_sqe_chain_busy
 
-Why not add one function of nbd_uring_link_chain_busy()?
-And this function is implemented by checking q_data->chained_send_ios.
+Question: why not add `nbd_uring_link_chain_busy()`, implemented by checking
+`q_data->chained_send_ios`? Done.
 
-Done.
-
-It is TCP send, so if there is any linked nbd request not completed, we
-can't issue new nbd requests.
-
+Reason for the flag: it is TCP send. If any linked nbd request is not
+completed, no new nbd request can be issued.
 
 ```
 nbd_handle_io_async()
@@ -1337,7 +1280,7 @@ nbd_handle_io_bg
 
 ### why resume recv co in nbd_handle_recv_bg()?
 
-- for avoiding recv handling to cut into current send req chain
+- So recv handling does not cut into the current send request chain.
 
 # ublk/stripe
 
@@ -1351,45 +1294,90 @@ nbd_handle_io_bg
 
 ## key points
 
-ublk block IO request has one single bvec IO buffer, which has to spread
-among all backing files:
+A ublk block IO request has one bvec IO buffer. It must be spread over all
+backing files:
 
-- for non-zc, readv/writev is needed for deal with the spread
-
-- for zc, there isn't fixed readv/writev yet
+- non-zc: use readv/writev for the spread.
+- zc: there is no fixed-buffer readv/writev yet.
 
 ### mapping algorithm
 
-- logic_offset / length
+```
+ logical space (nr_files = 3)
 
-- unit
+ |<----------------- unit (unit_size = nr_files * chunk_size) ----------------->|
+ +--------------------------+--------------------------+--------------------------+
+ | chunk 0 -> file 0        | chunk 1 -> file 1        | chunk 2 -> file 2        |
+ +--------------------------+--------------------------+--------------------------+
+ ^ unit_offset                         ^ logic_offset (offset_in_chunk inside chunk 1)
+```
 
-unit_size = nr_files * chunk_size
-
-unit_offset = (logic_offset / unit_size)  * unit_size   #unit_size may not be power_of_2
-
-
-- chunk
+- Input: `logic_offset` / `length`
+- unit: `unit_size = nr_files * chunk_size`
+- `unit_offset = (logic_offset / unit_size) * unit_size` (unit_size may not be
+  a power of 2)
+- chunk: `chunk_size` bytes, mapped to one backing file
 
 #### how to calculate mapped sequence of backing file
 
+```
 (logical_offset - unit_offset) / chunk_size
+```
 
 #### how to calculate mapped offset in the actual backing file
 
+```
 (unit_offset / nr_files) + offset_in_chunk
+```
 
 #### how to calculate nr_iov for IO over backing file
 
+```
 (end / unit_size) - (start / unit_size) + 1
-
+```
 
 # Issues
 
-
 ## panic from ublk_cancel_dev()/ublk_stop_dev()
 
+### The story in one view
+
+STOP_DEV runs in an io-wq worker of the **control** ring. It cancels the
+I/O commands that the server queued on its **data** ring. Completing one of
+them takes the data ring's `uring_lock`, and that mutex is not valid.
+
+```
+ iou-wrk (control ring)                         data ring of ublk server
+ ----------------------                         ------------------------
+ io_wq_submit_work()
+   ublk_ctrl_uring_cmd(STOP_DEV)
+     ublk_stop_dev()
+       ublk_cancel_dev()
+         ublk_cancel_queue()
+           ublk_cancel_cmd(tag)
+             cmd = io->cmd  ------------------> io_uring_cmd of an
+             io_uring_cmd_done(cmd, ABORT)      UBLK_IO_FETCH_REQ / COMMIT
+               io_uring_cmd_del_cancelable()
+                 ctx = cmd_to_io_kiocb(cmd)->ctx   (data ring ctx)
+                 io_ring_submit_lock(ctx)
+                   mutex_lock(&ctx->uring_lock)
+                   #! DEBUG_LOCKS_WARN_ON(lock->magic != lock)
+```
+
+1. `ublk_cancel_queue()` always passes `IO_URING_F_UNLOCKED` (v6.19
+   `ublk_drv.c:1959`), so the cancel path takes `uring_lock` from any caller
+   context; here it is an io-wq worker of the control ring.
+2. The lock it takes belongs to the ring that owns `io->cmd`, not to the
+   control ring.
+3. `lock->magic != lock` means this mutex is not initialized or its memory
+   is freed or reused (inferred, not proven).
+
+Open question: how can `io->cmd` still point into a ring whose
+`io_ring_ctx` is no longer valid when STOP_DEV cancels it?
+
 ### stack trace
+
+Kernel 6.19.11-dirty, QEMU.
 
 ```
 ------------[ cut here ]------------
@@ -1445,19 +1433,74 @@ softirqs last disabled at (0): [<0000000000000000>] 0x0
 
 #### related code paths
 
-
-
-
-
 ## I/O hang triggered by a fio test #170
-
 
 ### Overview
 
 [I/O hang triggered by a fio test #170](https://github.com/ublk-org/ublksrv/issues/170)
 
+#### The story in one view
 
-- ublk.loop contexts
+The ublk server task (`ublk.loop`) runs the final `fput()` of `/dev/ublkb20`.
+`bdev_release()` then waits for `disk->open_mutex`. `udev-synth` holds this
+mutex and waits for a partition-table read. Only `ublk.loop` can serve that
+read. This is an ABBA deadlock.
+
+```
+ app (fio, libaio)       ublk.loop (server of ublkb20)        (udev-synth)
+ -----------------       -----------------------------        ------------
+ #1 io_submit() on
+    /dev/ublkb20
+    close(fd); exit
+    -> the aio kiocb
+       holds the last
+       file ref
+                                                              #2 ioctl(BLKRRPART)
+                                                                 disk_scan_partitions()
+                                                                   bdev_open()
+                                                                   [holds open_mutex]
+                                                                     efi_partition()
+                                                                       read_lba()
+                                                                       wait folio IO
+                                                                       on ublkb20 ...
+                         #3 io_uring_enter(COMMIT_AND_FETCH)
+                            ublk_ch_uring_cmd_local()
+                              blk_update_request()
+                                blkdev_bio_end_io_async()
+                                  aio_complete_rw()
+                                    fput()  -- last ref
+                                    -> task_work on ublk.loop
+                         #4 io_cqring_wait()
+                              io_run_task_work()
+                                __fput()
+                                  blkdev_release()
+                                    bdev_release()
+                                      mutex_lock(open_mutex)
+                                      #! blocks: udev-synth owns it
+                         #5 ublk.loop never serves  ------->  #2 read never completes
+```
+
+1. **#1** The app submits AIO, closes the fd and exits. The in-flight kiocb
+   now holds the last reference of the block device file.
+2. **#2** `udev-synth` rescans partitions. It takes `disk->open_mutex` and
+   reads the partition table from ublkb20.
+3. **#3** `ublk.loop` commits an I/O result. ublk completes the request
+   inline, in the server task. The AIO completion drops the last file
+   reference. `fput()` from task context queues `__fput()` as task work on
+   the current task, which is `ublk.loop`.
+4. **#4** `ublk.loop` runs this task work in `io_cqring_wait()`.
+   `bdev_release()` blocks on `disk->open_mutex`.
+5. **#5** `ublk.loop` stops serving I/O. The partition read in #2 never
+   completes, so `open_mutex` is never released.
+
+Why it is rare: it needs (a) the last file ref to be dropped by an AIO
+completion, not by `close()`, and (b) a partition rescan running at the same
+time. Fix ideas are under "Solutions" below.
+
+### Evidence
+
+- ublk.loop context: blocked in `bdev_release()` on `disk->open_mutex`,
+  from task work run in `io_cqring_wait()`.
 
 ```
 [Dec 5 12:42] INFO: task ublk.loop:3877 blocked for more than 122 seconds.
@@ -1486,6 +1529,9 @@ softirqs last disabled at (0): [<0000000000000000>] 0x0
 [  +0.000007]  entry_SYSCALL_64_after_hwframe+0x76/0x7e
 ```
 
+- bpftrace: `ublk.loop` calls `fput()` on `ublkb20` from the AIO completion,
+  inside `ublk_ch_uring_cmd_local()`.
+
 ```
 @[kfunc:vmlinux:fput, ublkb20, ublk.loop, 
     bpf_prog_772db7720b2728e9_sd_fw_ingress+30364
@@ -1506,7 +1552,8 @@ softirqs last disabled at (0): [<0000000000000000>] 0x0
 ]: 20443
 ```
 
-- udev-synth context
+- udev-synth context: holds `disk->open_mutex` (`bdev_open()`) and waits for
+  the partition-table read.
 
 ```
 [  +0.001213] INFO: task ublk.loop:3877 is blocked on a mutex likely owned by task (udev-synth):4041.
@@ -1550,13 +1597,12 @@ softirqs last disabled at (0): [<0000000000000000>] 0x0
 
 #### Add PF_ASYNC_FILE_RELEASE
 
-
 #### release open_disk when reading partition table
-
 
 #### refactor bdev_release()
 
-- has to refactor the following things first
+Goal: do not take `disk->open_mutex` in `bdev_release()`. First these steps
+must be refactored, because they need `disk->open_mutex`:
 
 ```
           bdev_yield_write_access(bdev_file);
@@ -1565,29 +1611,28 @@ softirqs last disabled at (0): [<0000000000000000>] 0x0
                   bd_yield_claim(bdev_file);
 ```
 
-which need disk->open_mutex.
-
-
 ### Contexts
 
 #### how to trigger this issue
 
-- submit AIO via libio & close FD & exit immediately
- 
+- Submit AIO via libaio, close the fd, and exit at once.
 
 #### understand story of delayed fput()
 
-[deferred fput](https://ming1.github.io/tech/filesystem#deferred-fput)
+[deferred fput](https://ming1.github.io/filesystem/filesystem#deferred-fput)
 
 #### is there such same issue for other block devices?
 
-- ioctl(RRPART) for nvme device
+Open question. Candidate case on nvme:
 
-- complete nvme io from thread context, fput() schedules task work
-to call blkdev_release() from current's task work.
-
+- `ioctl(BLKRRPART)` on an nvme device holds `disk->open_mutex`.
+- If nvme completes the I/O from thread context, `fput()` queues task work.
+  That task work calls `blkdev_release()` from the current task.
 
 #### disk->open_mutex
+
+All paths that take `disk->open_mutex`. Line numbers are from the tree used
+at the time of writing.
 
 ```
 
@@ -1610,7 +1655,6 @@ TREE 1: bdev_open() path (block/bdev.c:962)
    └─ 2. bdev_file_open_by_dev()                  [block/bdev.c:1076]
          └─ 3. [Various in-kernel block device openers - EXPORT_SYMBOL]
 
-
 TREE 2: bdev_release() path (block/bdev.c:1145)
 ================================================
 
@@ -1624,14 +1668,12 @@ TREE 2: bdev_release() path (block/bdev.c:1145)
                      │           └─ 7. sys_exit() / sys_exit_group()  [SYSCALL - STOP]
                      └─ 5. dup2/close path        [Various syscalls]
 
-
 TREE 3: bdev_fput() path (block/bdev.c:1186)
 =============================================
 
 1. bdev_fput()                                    [grabs disk->open_mutex at block/bdev.c:1186]
                                                   [EXPORT_SYMBOL - STOP]
    └─ Called by external modules/drivers who obtained bdev_file
-
 
 TREE 4: bdev_add_partition() path (block/partitions/core.c:433)
 ================================================================
@@ -1645,7 +1687,6 @@ TREE 4: bdev_add_partition() path (block/partitions/core.c:433)
                                  └─ 7. do_vfs_ioctl() [fs/ioctl.c]
                                        └─ 8. sys_ioctl()      [SYSCALL - STOP]
 
-
 TREE 5: bdev_del_partition() path (block/partitions/core.c:462)
 ================================================================
 
@@ -1657,7 +1698,6 @@ TREE 5: bdev_del_partition() path (block/partitions/core.c:462)
                            └─ 6. vfs_ioctl()      [fs/ioctl.c]
                                  └─ 7. do_vfs_ioctl() [fs/ioctl.c]
                                        └─ 8. sys_ioctl()      [SYSCALL - STOP]
-
 
 TREE 6: bdev_resize_partition() path (block/partitions/core.c:495)
 ===================================================================
@@ -1671,7 +1711,6 @@ TREE 6: bdev_resize_partition() path (block/partitions/core.c:495)
                                  └─ 7. do_vfs_ioctl() [fs/ioctl.c]
                                        └─ 8. sys_ioctl()      [SYSCALL - STOP]
 
-
 TREE 7: del_gendisk() path (block/genhd.c:710, 725)
 ====================================================
 
@@ -1679,7 +1718,6 @@ TREE 7: del_gendisk() path (block/genhd.c:710, 725)
                                                   [EXPORT_SYMBOL - STOP]
    └─ Called by block device drivers during device removal
       (e.g., loop_remove, nvme_ns_remove, etc.)
-
 
 TREE 8: bd_link_disk_holder() path (block/holder.c:77)
 =======================================================
@@ -1689,14 +1727,12 @@ TREE 8: bd_link_disk_holder() path (block/holder.c:77)
    └─ Called by stacking block drivers
       (e.g., device-mapper, md/raid, bcache)
 
-
 TREE 9: sync_bdevs() path (block/bdev.c:1305)
 ==============================================
 
 1. sync_bdevs()                                   [grabs disk->open_mutex at block/bdev.c:1305]
    └─ 2. ksys_sync()                              [fs/sync.c]
          └─ 3. sys_sync()                         [SYSCALL - STOP]
-
 
 ADDITIONAL PATHS (device-specific)
 ===================================
@@ -1708,7 +1744,6 @@ LOOP device path:
          └─ 3. blkdev_ioctl()                     [via driver fops]
                └─ 4. sys_ioctl()                  [SYSCALL - STOP]
 
-
 ZRAM device path:
 -----------------
 1. reset_store()                                  [grabs disk->open_mutex at drivers/block/zram/zram_drv.c:2824, 2839]
@@ -1716,14 +1751,12 @@ ZRAM device path:
          └─ 3. kernfs_fop_write_iter()
                └─ 4. sys_write()                  [SYSCALL - STOP]
 
-
 NVME multipath:
 ---------------
 1. nvme_mpath_set_live()                          [grabs head->disk->open_mutex at drivers/nvme/host/multipath.c:660]
    └─ 2. nvme_update_ns_ana_state()
          └─ 3. nvme_parse_ana_log()
                └─ 4. nvme_ana_work()              [workqueue handler]
-
 
 SUMMARY OF STOPPING POINTS
 ===========================
@@ -1743,7 +1776,6 @@ EXPORT_SYMBOL functions (Module/driver entry points):
 - bd_link_disk_holder()   [EXPORT_SYMBOL_GPL]  - Called by stacking drivers (dm, md)
 - bdev_fput()             [EXPORT_SYMBOL]      - Called by code holding bdev_file references
 
-
 DEPTH ANALYSIS
 ==============
 
@@ -1756,33 +1788,59 @@ Deepest paths (syscall -> mutex acquisition):
 5. EXPORT_SYMBOL paths:     1-2 levels (direct calls from drivers)
 ```
 
-
 ### Comments
 
 #### Same issue exists on io_uring polling
 
-- reading partition table won't use iopoll, so no this problem
+No. Reading the partition table does not use iopoll.
 
 #### Same issue exists on nbd too
 
-No, nbd uses wq.
+No. nbd uses a workqueue.
 
 #### probably on loop if MQ is enabled
 
-No, loop uses wq
+No. loop uses a workqueue.
 
 #### could be one risk for any blk-mq disk
 
-No, still uses wq
+No. It still uses a workqueue.
 
 #### test performance effect by raising softirq
-
 
 ## io_uring panic when running ublksrv 'generic/002' test
 
 ### overview
 
 [v6.16-rc report](https://lore.kernel.org/linux-block/CAGVVp+VN9QcpHUz_0nasFf5q9i1gi8H8j-G-6mkBoqa3TyjRHA@mail.gmail.com/)
+
+Story in one view:
+
+```text
+ ublk server task (io_uring)          kblockd kworker (requeue)
+ ---------------------------          -------------------------
+ UBLK_IO_NEED_GET_DATA
+   ublk_get_data() fails          #1
+   (no pages / pending signal)
+   -> -EIOCBQUEUED, cmd is async
+   -> request is requeued
+   io->cmd and io->flags NOT set  #2   <-- invariant breaks
+                                       blk_mq_requeue_work()
+                                         ublk_queue_rq()
+                                           uses io->cmd (zeroed)  #3
+                                             __io_req_task_work_add()
+                                               req->ctx->flags
+                                               -> NULL deref     #4
+ fix: set up io->cmd and flags before the requeue                 #5
+```
+
+1. `ublk_get_data()` fails. The command becomes async and the request is requeued.
+2. Since 9810362a57cb, this path does not set `io->cmd` / flags.
+3. The requeued request is dispatched through a zeroed `io->cmd`.
+4. io_uring reads `req->ctx->flags` from a bad pointer: oops at address `0x1`.
+5. Fix: set up `ublk_io` correctly on `ublk_get_data()` failure.
+
+Evidence:
 
 ```
 [ 7044.064528] BUG: kernel NULL pointer dereference, address: 0000000000000001
@@ -1797,6 +1855,8 @@ No, still uses wq
 [ 7044.108565] Workqueue: kblockd blk_mq_requeue_work
 [ 7044.113374] RIP: 0010:__io_req_task_work_add+0x18/0x1f0
 ```
+
+The faulting line reads `req->ctx->flags`:
 
 ```
 (gdb) l *(__io_req_task_work_add+0x18)
@@ -1813,6 +1873,8 @@ No, still uses wq
 1255    }
 ```
 
+`flags` is the first field of `io_ring_ctx`, so `req->ctx` itself is bad:
+
 ```
   struct io_ring_ctx {
           /* const or read-mostly hot data */
@@ -1824,25 +1886,22 @@ No, still uses wq
 
 #### ublk issue?
 
-- looks yes, io->cmd is zeroed
+Yes. `io->cmd` is zeroed.
 
-- triggered in case that '-g & killing daemon & null'
+- Trigger: `-g` (NEED_GET_DATA) + killing the daemon + `null` target.
+- Introduced by 9810362a57cb ("ublk: don't call ublk_dispatch_req() for NEED_GET_DATA").
+- After that commit, `UBLK_IO_NEED_GET_DATA` can become async without setting `io->cmd`.
 
-- introduced in 9810362a57cb ("ublk: don't call ublk_dispatch_req() for NEED_GET_DATA")
-
-- UBLK_IO_NEED_GET_DATA becomes async without setting io->cmd
-
-[[PATCH] ublk: setup ublk_io correctly in case of ublk_get_data() failure](https://lore.kernel.org/linux-block/20250624022049.825370-1-ming.lei@redhat.com/)
+Fix: [[PATCH] ublk: setup ublk_io correctly in case of ublk_get_data() failure](https://lore.kernel.org/linux-block/20250624022049.825370-1-ming.lei@redhat.com/)
+(merged as 4c8a951787ff, same subject).
 
 #### io_uring regression in v6.16-rc3?
 
-- not true
-
+No.
 
 ## v5.14 `ublk del -a` hang and io_uring registered files leak
 
-It is reported that `ublk del -a` may hang forever when running ublk
-on v5.14 kernel by backporting ublk to v5.14:
+Report: ublk backported to a v5.14 kernel. `ublk del -a` may hang forever:
 
 ```
 ublk add -t null
@@ -1850,70 +1909,89 @@ pkill -9 ublk
 ublk del -a     #hang forever
 ```
 
-Turns out that it is caused by io_uring registered file leak bug:
+Story in one view:
 
-[\[PATCH 5.10/5.15\] io_uring: fix registered files leak](https://lore.kernel.org/io-uring/20240312142313.3436-1-pchelkin@ispras.ru/)
+```text
+ ublk daemon                    io_uring (v5.14)                 ublk del -a
+ -----------                    ----------------                 -----------
+ registers /dev/ublkcN
+ into the ring              #1
+ killed (pkill -9)          #2
+                                ring exits, but the registered
+                                file ref is leaked            #3
+                                -> /dev/ublkcN never released
+                                                                 waits for char dev
+                                                                 release -> hangs  #4
+ fix: io_uring registered-file leak fixes (below)                                  #5
+```
 
-[\[PATCH\] io_uring: Fix registered ring file refcount leak](https://lore.kernel.org/lkml/173457120329.744782.1920271046445831362.b4-ty@kernel.dk/T/)
+1. The daemon registers the ublk char device as a fixed file.
+2. The daemon is killed.
+3. io_uring leaks the registered file reference. The char device is never released.
+4. `ublk del -a` waits for the release forever.
+5. Root cause is in io_uring, not ublk. Fixes:
 
+- [\[PATCH 5.10/5.15\] io_uring: fix registered files leak](https://lore.kernel.org/io-uring/20240312142313.3436-1-pchelkin@ispras.ru/)
+- [\[PATCH\] io_uring: Fix registered ring file refcount leak](https://lore.kernel.org/lkml/173457120329.744782.1920271046445831362.b4-ty@kernel.dk/T/)
 
 ## IO hang when running stress remove test with heavy IO
 
+Story in one view (what drgn showed at the hang):
+
+```text
+ del_gendisk()                         ublk queue state
+ -------------                         ----------------
+ blk_mq_freeze_queue_wait()  #1        ub->state      = UBLK_S_DEV_QUIESCED
+   waits for ref == 0                  ubq->force_abort = true
+                                       ubq->canceling   = true          #2
+                                       ublk_io->cmd     = NULL (cancelled)
+                                       request: state IDLE, ref 1        #3
+                                         -> nobody owns it: no uring_cmd
+                                            to deliver it, not aborted
+   ... waits forever         #4
+```
+
+1. Device removal freezes the queue and waits for all requests.
+2. All uring_cmds are already cancelled (`canceling`, `cmd == NULL`).
+3. One request is still allocated (ref 1) but not in flight. No path can complete it.
+4. Freeze never finishes. IO hangs.
+5. Root cause: the `->queue_rqs()` patchset under test (see the last subsection).
+
 ### how to reproduce
 
-- patches for supporting ->queue_rqs()
-
-- run `make test T=generic/004`
-
-- result
-
-IO hang on blk_mq_freeze_queue_wait() <- del_gendisk()
+- Apply the patches that add `->queue_rqs()` support.
+- Run `make test T=generic/004`.
+- Result: IO hangs in `blk_mq_freeze_queue_wait()` <- `del_gendisk()`.
 
 #### some observations
 
-- not related with UBLK_IO_NEED_GET_DATA, still triggered by not using this
-  feature
+- Not related to `UBLK_IO_NEED_GET_DATA`: it still triggers without this feature.
+- Not related to the request reference: it still triggers when forcing request abort.
+- drgn dump:
 
-- not related with request reference, still triggered by forcing to abort
-  request
+```text
+ub
+  state  2      UBLK_S_DEV_QUIESCED
+  flags  4e
 
-- drgn observations:
+ubq
+  flags        0x4e  UBLK_F_URING_CMD_COMP_IN_TASK, UBLK_F_NEED_GET_DATA,
+                     UBLK_F_USER_RECOVERY, UBLK_F_CMD_IOCTL_ENCODE
+  force_abort  true
+  canceling    true
 
-    - ub:
+ublk_io
+  flags  6         UBLK_IO_FLAG_ABORTED, UBLK_IO_FLAG_OWNED_BY_SRV
+         e         UBLK_IO_FLAG_NEED_GET_DATA, UBLK_IO_FLAG_ABORTED, UBLK_IO_FLAG_OWNED_BY_SRV
+         80000001  UBLK_IO_FLAG_CANCELED, UBLK_IO_FLAG_ACTIVE
+  cmd    NULL
 
-        state 2:    UBLK_S_DEV_QUIESCED
-
-        flags 4e:   
-
-    - ubq:
-
-        flags: 0x4e (UBLK_F_URING_CMD_COMP_IN_TASK, UBLK_F_NEED_GET_DATA, UBLK_F_USER_RECOVERY, UBLK_F_CMD_IOCTL_ENCODE)
-        
-        force_abort: true
-    
-        canceling: true
-
-    - ublk_io
-
-        flags
-
-            6           :  UBLK_IO_FLAG_ABORTED, UBLK_IO_FLAG_OWNED_BY_SRV
-
-            e           :  UBLK_IO_FLAG_NEED_GET_DATA, UBLK_IO_FLAG_ABORTED, UBLK_IO_FLAG_OWNED_BY_SRV
-
-            80000001    :  UBLK_IO_FLAG_CANCELED, UBLK_IO_FLAG_ACTIVE
-
-        cmd:        NULL
-
-    - block request
-
-        rq_flags 100                :  RQF_IO_STAT
-
-        cmd_flags 8801 or 0         : 
-
-        state 0                     : IDLE
-
-        ref {'counter': 1}          : not completed
+block request
+  rq_flags   100        RQF_IO_STAT
+  cmd_flags  8801 or 0
+  state      0          IDLE
+  ref        {'counter': 1}   not completed
+```
 
 ### analysis
 
@@ -1921,7 +1999,7 @@ IO hang on blk_mq_freeze_queue_wait() <- del_gendisk()
 
 #### story about canceling uring_cmd
 
-[IO_URING_F_CANCEL](https://lore.kernel.org/io-uring/20241127-fuse-uring-for-6-10-rfc4-v7-0-934b3a69baca@ddn.com/)
+[IO_URING_F_CANCEL](https://lore.kernel.org/io-uring/20241127-fuse-uring-for-6-10-rfc4-v7-0-934b3a69baca@ddn.com/):
 
 ```
 A IO_URING_F_CANCEL doesn't cancel a request nor removes it
@@ -1932,157 +2010,121 @@ a request until the request is released.
 
 ### how ublk handling F_CANCEL
 
-- set ubq->canceling with request queue frozen
+Order matters:
 
-New ublk request won't be dispatched to task work any more, and it can't
-be so because io->cmd(uring_cmd) is done already
+```text
+ F_CANCEL on a ublk uring_cmd
+   1. freeze queue; set ubq->canceling; unfreeze
+        -> new requests are no longer sent to task work
+           (io->cmd is already done, so they cannot be)
+   2. abort in-flight ublk requests
+   3. cancel the uring_cmd (io_uring_cmd_done)
+```
 
-- aborting in-flight ublk request
-
-- cancel uring_cmd
-
-    `ubq->canceling` has to be handled as the last one, especially after
-    handling ->force_abort, otherwise it may cause io hang
+`ubq->canceling` must be handled last, after `->force_abort`. Otherwise IO may hang.
 
 ### how to conquer this one
 
-- brain storm
-
-attach `crash`/`drgn` on the running kernel after the hang is triggered
-
-drgn does help
+- Brainstorm.
+- After the hang, attach `crash` / `drgn` to the running kernel. drgn helped here.
 
 #### finally it is caused by the ->queue_rqs() patchset
-
 
 ## ublk/loop over nvme performs much slower
 
 ### overview
 
-- setup
+Setup:
 
-machine:
-    hp-dl380g10-01.lab.eng.pek2.redhat.com
-    nvme: optane 500K 4k iops
+```text
+ t/io_uring -> /dev/ublkb0 -> ublk server (loop, 2 queues, depth 512) -> /dev/nvme0n1
 
-    not observe this issue on
-        hpe-moonshot-01-c20.khw.eng.bos2.dc.redhat.com(single numa/socket)
+ machine: hp-dl380g10-01.lab.eng.pek2.redhat.com
+ nvme:    Optane, 500K 4k IOPS
+ not seen on: hpe-moonshot-01-c20.khw.eng.bos2.dc.redhat.com (single NUMA node / socket)
 
-ublk add -t loop -q 2 -d 512 -f /dev/nvme0n1
+ ublk add -t loop -q 2 -d 512 -f /dev/nvme0n1
+```
 
-- test result
+Result (QD 128):
 
-    - 32 batch(128 QD)
-
-        fio/t/io_uring -p0 /dev/ublkb0
-
-        280K
-
-        fio/t/io_uring -p0 /dev/nvme0n1
-
-        480K
-
-    - 1 batch(128 QD)
-
-        fio/t/io_uring -p0 -s 1 -c 1 /dev/ublkb0
-
-        250K
-
-        fio/t/io_uring -p0 -s -c 1 /dev/nvme0n1
-
-        350K
+| batch | command | IOPS |
+|---|---|---|
+| 32 | `fio/t/io_uring -p0 /dev/ublkb0` | 280K |
+| 32 | `fio/t/io_uring -p0 /dev/nvme0n1` | 480K |
+| 1 | `fio/t/io_uring -p0 -s 1 -c 1 /dev/ublkb0` | 250K |
+| 1 | `fio/t/io_uring -p0 -s -c 1 /dev/nvme0n1` | 350K |
 
 ### observations
 
-- ublk pthread doesn't saturate the CPU
-
-extra wait time for nvme IO
-
-- polling improves nothing
-
-    wait 0 events in ublk 
-
-- setup with (IORING_SETUP_SINGLE_ISSUER / IORING_SETUP_DEFER_TASKRUN)
-
-    -- easier to saturate io task, and iops is improved
-
-    -- but sometimes ublk io task still may block on nvme
-
-- queue pthread affinity is important for IO performance
-
-    - kublk doesn't support to set affinity yet
-
-    - it works when just setting one cpu for ublk io task
-
-    - with good affinity set, IOPS can reach ~360K(-z, security), or
-
-    380K(-z, without security builtin)
-
-- NUMA home node 
-
-    ublk/loop/nvme reaches top performance when running 't/io_uring'
-    on CPU not in NUMA home node
-
-    meantime 'ublk' pthread utilizes CPU by 100%
-
-- security_uring_cmd
-
-    After disabling security_uring_cmd(), IOPS is increased by 20 ~ 30K
-
-- /sys/block/ublkb0/queue/rq_affinity
-
-    IOPS isn't affected by setting 0, 1, 2 as `rq_affinity`
+- The ublk pthread does not saturate its CPU. It spends extra time waiting for nvme IO.
+- Polling does not help: the ublk loop waits for 0 events.
+- `IORING_SETUP_SINGLE_ISSUER` / `IORING_SETUP_DEFER_TASKRUN`:
+  - the io task saturates more easily, and IOPS improves;
+  - but the ublk io task may still block on nvme sometimes.
+- Queue pthread affinity matters for IO performance:
+  - kublk cannot set affinity yet;
+  - pinning the ublk io task to one CPU works;
+  - with good affinity: ~360K IOPS (`-z`, security on), 380K (`-z`, security not built in).
+- NUMA home node: ublk/loop/nvme is fastest when `t/io_uring` runs on a CPU *outside* the NUMA home node. The `ublk` pthread is then at 100% CPU.
+- `security_uring_cmd`: disabling `security_uring_cmd()` adds 20~30K IOPS.
+- `/sys/block/ublkb0/queue/rq_affinity`: values 0, 1, 2 give the same IOPS.
 
 ### analysis
 
 ### ideas
 
-- observe ublk/nvme nr_reqs in each batch 
+- Observe the number of requests per batch, for both ublk and nvme:
+  - a generic bpftrace script;
+  - the submission and completion pattern of both `t/io_uring` and ublk;
+  - number of SQ entries (cmds, IOs) on entry to `io_uring_enter()`;
+  - number of CQ entries (cmds, IOs) on exit from `io_uring_enter()`.
+  - `security_uring_cmd` cost in the profile:
 
-    - generic bptrace script
-
-    - observe both t/io_uring and ublk's io submission & completion pattern
-    
-    - observe how many entries(cmds, ios) in sq in the entry of io_uring_enter(), and
-   
-    - how many entries(cmds, ios) in cq in the exit of io_uring_enter() 
-
-
-    - security_uring_cmd
-    
     ```
       - 23.34% io_uring_cmd                                                                                                       ▒
       + 17.28% ublk_ch_uring_cmd                                                                                               ▒
       + 5.38% security_uring_cmd       
     ```
 
-- compare with fio/t/io_uring
-
-    - uring setup flags
-
-        IORING_SETUP_COOP_TASKRUN / IORING_SETUP_SINGLE_ISSUER / IORING_SETUP_DEFER_TASKRUN 
-
-    - reap events
-
-        `to_wait` calculation
-
-- maybe related with numa handling
-
-    - allocate io_cmd_buffer in numa way?
-
-        No difference
-
-
-- dedicated IO ring
-
-    - help to handle IO batch, not necessary to just wait one IO or
-      command
-
-    - inter-ring communication?
-
-- home node?
+- Compare with `fio/t/io_uring`:
+  - ring setup flags: `IORING_SETUP_COOP_TASKRUN` / `IORING_SETUP_SINGLE_ISSUER` / `IORING_SETUP_DEFER_TASKRUN`;
+  - event reaping: how `to_wait` is calculated.
+- NUMA handling?
+  - Allocate `io_cmd_buffer` NUMA-aware? Tried: no difference.
+- Dedicated IO ring:
+  - handles IO in batches, instead of waiting for one IO or one command;
+  - open question: how do the rings communicate?
+- Open question: home node?
 
 ## uring_cmd use-after-free between cancel_fn and normal completion 
+
+Story in one view:
+
+```text
+ any context                    ublk queue task (io_uring)        io_ring_exit_work
+ -----------                    --------------------------        -----------------
+ ublk_queue_rq(req A)
+   io_uring_cmd_complete_in_task()  #1
+   TW queued, not run yet
+                                                                  cancel_fn:
+                                                                    ubq->canceling = true
+                                                                    quiesce queue      #2
+                                                                    (TW is NOT drained)
+                                                                    ublk_cancel_cmd()
+                                                                      ACTIVE set ->
+                                                                      io_uring_cmd_done() #3
+                                TW runs: ublk_dispatch_req(A)
+                                  io_uring_cmd_done() on the
+                                  same cmd -> done twice / UAF  #4
+ fix: ublk_cancel_cmd() skips the cmd if its request is started   #5
+```
+
+1. Request A is sent to task work (TW). The TW function has not run yet.
+2. cancel_fn sets `->canceling` and quiesces the queue. Quiesce cannot drain pending TW.
+3. `ublk_cancel_cmd()` sees `UBLK_IO_FLAG_ACTIVE` and completes the uring_cmd.
+4. A's TW then runs and completes the same uring_cmd again.
+5. Fix: in `ublk_cancel_cmd()`, do not cancel when `req && blk_mq_request_started(req)`.
 
 ### report
 
@@ -2118,41 +2160,28 @@ extra wait time for nvme IO
 [  847.239979] [ T109312]  io_ring_exit_work+0xa4/0x500
 ```
 
-The warning is triggered in `ublk_cancel_cmd()` before calling
-io_uring_cmd_done().
+The warning fires in `ublk_cancel_cmd()`, before it calls `io_uring_cmd_done()`.
 
 ### analysis
 
-- when to call io_uring_try_cancel_uring_cmd()?
-
-uring_cmd is removed from the cancel list until it is done.
-
-
-- ublk_cancel_cmd()
-
-only cancel uring_cmd iff UBLK_IO_FLAG_ACTIVE is set
-
+- When is `io_uring_try_cancel_uring_cmd()` called? A uring_cmd stays on the cancel list until it is done.
+- `ublk_cancel_cmd()` cancels a uring_cmd only if `UBLK_IO_FLAG_ACTIVE` is set.
 
 #### race between io_uring_cmd_complete_in_task() and io_uring_cmd_done()
 
-- request A has been scheduled via TW for dispatch, but the TW function isn't
-run yet
+- Request A has been scheduled via TW for dispatch. The TW function has not run yet.
+- cancel_fn runs and sets the queue's `->canceling`. A's TW has not run, so the uring_cmd is cancelled.
+- `io_uring_cmd_complete_in_task()` can be called from any context.
+- `io_uring_cmd_done()` is always called from the ublk queue context, for both cancel and completion.
+- Queue quiesce cannot prevent the race: it does not drain TW.
 
-- cancel_fn is called, and the queue's ->canceling is marked as true, but
-request A TW isn't dispatched yet, then the uring_cmd is canceled
+Patches:
 
-- io_uring_cmd_complete_in_task() is called in arbitrary context
+- [[PATCH 0/2] ublk: fix race between io_uring_cmd_complete_in_task and ublk_cancel_cmd](https://lore.kernel.org/linux-block/20250423092405.919195-1-ming.lei@redhat.com/)
+- [[PATCH V2 0/2] ublk: fix race between io_uring_cmd_complete_in_task and ublk_cancel_cmd](https://lore.kernel.org/linux-block/20250425013742.1079549-1-ming.lei@redhat.com/)
+  (merged as f40139fde527, same subject)
 
-- io_uring_cmd_done() is always called from ublk queue contex, either for canceling
-or completing uring_cmd
-
-- queue quiesce can't avoid the race, because TW work can't be drained
-by queue quiesce
-
-
-[[PATCH 0/2] ublk: fix race between io_uring_cmd_complete_in_task and ublk_cancel_cmd](https://lore.kernel.org/linux-block/20250423092405.919195-1-ming.lei@redhat.com/)
-
-[[PATCH V2 0/2] ublk: fix race between io_uring_cmd_complete_in_task and ublk_cancel_cmd](https://lore.kernel.org/linux-block/20250425013742.1079549-1-ming.lei@redhat.com/)
+Why V2 dropped the barrier:
 
 ```
 Thinking of further, the added barrier is actually useless, because:
@@ -2180,14 +2209,34 @@ guarantees that it is called
 
 [Re: [PATCH V2 2/2] ublk: fix race between io_uring_cmd_complete_in_task and ublk_cancel_cmd](https://lore.kernel.org/linux-block/mruqwpf4tqenkbtgezv5oxwq7ngyq24jzeyqy4ixzvivatbbxv@4oh2wzz4e6qn/)
 
+Story in one view:
+
+```text
+ tag slot T: uring_cmd ACTIVE, waiting for a new request
+ tags[T] still caches an OLD request, already sent to the server
+   and recycled -> blk_mq_request_started(old) == true          #1
+
+ io_ring_exit_work (loops)                 ublk char dev release
+ -------------------------                 ---------------------
+ io_uring_try_cancel_requests()
+   io_uring_try_cancel_uring_cmd()
+     ublk_cancel_cmd(T)
+       stale req is "started" -> skip  #2
+   ... retry, skip, retry ...          #3   waits for all ACTIVE cmds
+                                            to be cancelled -> never  #4
+ fix: ignore a stale request in ublk_cancel_cmd()                    #5
+```
+
+1. The ACTIVE uring_cmd has no request of its own. `tags[tag]` holds a stale, recycled request.
+2. The new check sees that stale request as started and skips the cancel.
+3. io_uring retries the cancel forever.
+4. Request abort in the char device release depends on all ACTIVE cmds being cancelled. Dead loop.
+5. Fix: dd24f87f65c9 ("ublk: fix dead loop when canceling io command").
 
 #### problems
 
-- blktests: ./check ublk/002
-
-- observations
-
-    - drgn dump
+- Reproducer: blktests `./check ublk/002`.
+- drgn dump:
 
 ```
     ublk dev_info: id 0 state 1 flags 42 ub: state 3
@@ -2199,35 +2248,30 @@ guarantees that it is called
         io->flags: UBLK_IO_FLAG_OWNED_BY_SRV    (without UBLK_IO_FLAG_ACTIVE)
 ```
 
-    - io_uring is keeping canceling:
+- io_uring keeps cancelling:
+
 ```
         io_uring_try_cancel_requests
             io_uring_try_cancel_uring_cmd
                 ublk_cancel_cmd
-
-        so commands aren't completed? why? because of the added check,
-        which may not have request, but the same request may be re-cycled
-        for another slot
 ```
+
+Why are the commands never completed? Because of the added check. The slot may have no request of its own, but `tags[tag]` may hold the same request recycled for another slot.
 
 ### another observation
 
 #### core variables
 
 - request state is IN_FLIGHT
-
-- ACTIVE flag isn't cleared
-
-- during quiesce from stop_dev()
-
-- ->canceling is true
+- ACTIVE flag is not cleared
+- the device is in quiesce, from `stop_dev()`
+- `->canceling` is true
 
 #### questions
 
-- where is the request? TW work is lost?
+- Where is the request? Is the TW work lost?
 
-    Yeah, the tw work function isn't called, looks one io_uring issue
-
+  Yes, the TW function is never called. This looks like an io_uring issue.
 
 ```
 ublk dev_info: id 2 state 1 flags 18cb ub: state 3
@@ -2270,13 +2314,46 @@ pid 8382
 [<0>] ret_from_fork_asm+0x1a/0x30
 ```
 
+Stacks above: pid 8381 (exiting kublk) waits in `io_wq_put_and_exit()`; pid 8382 (io-wq worker running `STOP_DEV`) sleeps in `ublk_stop_dev_unlocked()`.
+
 # libublk-rs
 
 ## async implementation
 
 ### Q: Can you think about why 'while exe.try_tick()' is required in ublk_wait_and_handle_ios()? Is it possible to drop this line code?
 
-Answer from AI:
+Short answer: no. A waker only marks a task ready. The smol `LocalExecutor` runs
+ready tasks only when it is ticked. `try_tick()` runs one ready task and returns
+`true`, or returns `false` if none is ready. The loop drains all ready tasks,
+including tasks woken by other tasks in the same round.
+
+```
+ublk_wait_and_handle_ios()  (src/uring_async.rs), main loop:
+
+  wait for CQEs
+     |
+     v
+  q.flush_and_wake_io_tasks(|data, cqe, _| ublk_wake_task(data, cqe), 1)
+     |    ublk_wake_task():
+     |      if let Some(w) = &fd.waker { w.wake_by_ref(); }   // ready, NOT run
+     v
+  while exe.try_tick() {}     // run task A -> wakes B -> run B -> wakes C ...
+     |                        // until no task is ready
+     v
+  next iteration
+```
+
+Without the loop:
+
+- Woken tasks wait until the next loop iteration: more latency.
+- Cascading wakeups (A wakes B, B wakes C) progress only one step per iteration.
+- A task may never run if no new CQE arrives to start the next iteration: the
+  loop can hang.
+
+The same pattern is used in `ublk_process_queue_io()`, `ublk_run_task()` and
+`ublk_run_ctrl_task()`.
+
+The full AI answer, kept for reference:
 
 ```
   Now I can see the code in question. Let me look at the specific function ublk_wait_and_handle_ios() and the line while exe.try_tick() {} on
@@ -2354,40 +2431,28 @@ Answer from AI:
   maintaining the performance characteristics and correctness of the ublk async I/O system.
 ```
 
-
 # rublk2
 
 ## Overview
 
-- completely async/.await APIs
-
-- thread contexts management is left to user totally, include the
-  sync/protection among thread contexts
-
-- improving async/.await runtime/executor support
-
-- only support main ublk features 
-
+- Fully async/.await APIs.
+- The user owns all thread-context management, including sync/protection
+  between thread contexts.
+- Better async/.await runtime/executor support.
+- Only the main ublk features are supported.
 
 ## Requirements
 
-- easy to create many ublk devices in single contexts
-
-- simplify ublk target implementation, make code more readable & streamline
-
-- not affect performance
-
-- old interfaces will be retired
-
+- Easy to create many ublk devices in a single context.
+- Simpler ublk target code: more readable and streamlined.
+- No performance loss.
+- Old interfaces will be retired.
 
 ## How to complete the task
 
-- rely on AI
-
-- learn more async/.await more, include tokio/tokio_uring/smol
-
-- refactor UblkCtrl implementation first
-
+- Rely on AI.
+- Learn more async/.await, including tokio / tokio_uring / smol.
+- Refactor the `UblkCtrl` implementation first.
 
 # Todo list
 
@@ -2395,22 +2460,21 @@ Answer from AI:
 
 ## sequential or random IO pattern hint
 
-Figure out if current IO pattern is sequential or random, and provide this hint to
-target code for further optimization.
+Detect whether the current IO pattern is sequential or random. Pass this hint
+to the target code for optimization.
 
-One case is for improving rublk/zoned sequential perf, see details in
-[why rublk/zoned perfs worse than zloop in sequential write](https://lore.kernel.org/linux-block/Z6QrceGGAJl_X_BM@fedora/)
+Use case: rublk/zoned sequential write performance. See
+[why rublk/zoned perfs worse than zloop in sequential write](https://lore.kernel.org/linux-block/Z6QrceGGAJl_X_BM@fedora/).
 
-The feature should be added in libublk-rs.
+Belongs in libublk-rs.
 
 ## create ublk device in async way?
 
-ublk uses uring_cmd as control plane, so it is natural to support ublk creating in
-async way.
+The ublk control plane is uring_cmd, so async device creation fits naturally.
 
-One nice feature is to create many ublk device in single pthread context.
+Benefit: create many ublk devices from a single pthread context.
 
-The feature should be added in libublk-rs.
+Belongs in libublk-rs.
 
 ## support nbd in rublk
 
@@ -2418,38 +2482,43 @@ The feature should be added in libublk-rs.
 
 ### **simplify & refactor the existed ublk/nbd implementation**
 
-
 ## support ublk/nvme-tcp
 
 ### support host-wide tag first
 
 #### does it need host abstraction?
 
-At least host-wide tagset is required, right.
+Yes, at least a host-wide tagset is required.
 
-Can't borrow other ublk's tagset because it will pin that device.
+We cannot borrow another ublk device's tagset: that would pin that device.
 
 #### or add ctrl commands to create/remove ublk_controller
 
-Looks correct way.
+This looks like the correct way.
 
-Each ublk char device grabs one reference of the controller
+```
+CREATE_CTRL / START_CTRL           STOP_CTRL / REMOVE_CTRL
+        |                                  ^
+        v                                  |
+  ublk_controller (unique ID, owns the shared tagset)
+     ^            ^            ^
+     | ref        | ref        | ref     each ublk char dev holds one reference
+  ublkc0/ublkb0  ublkc1/ublkb1  ...      all bound devices share the tagset
+```
 
-- add ctrl command of CREATE_CTRL & REMOVE_CTRL
-
-- add ctrl command of START_CTRL & STOP_CTRL
-
-- each controller has unique ID, multiple ublk char/block devices
-can be bound to one controller, and share the same tagset.
+- Add ctrl commands `CREATE_CTRL` and `REMOVE_CTRL`.
+- Add ctrl commands `START_CTRL` and `STOP_CTRL`.
+- Each controller has a unique ID. Multiple ublk char/block devices can bind to
+  one controller and share its tagset.
+- Each ublk char device holds one reference of the controller.
 
 ### depends on libnvme
 
-- Fedora supports libnvme-devel
+- Fedora ships `libnvme-devel`.
 
 ## ublk-bpf
 
 [RFC patch](https://lore.kernel.org/linux-block/20250107120417.1237392-1-tom.leiming@gmail.com/)
-
 
 ## ublk: RFC fetch_req_multishot
 
@@ -2457,21 +2526,16 @@ can be bound to one controller, and share the same tagset.
 
 [ublk: RFC fetch_req_multishot](https://lore.kernel.org/linux-block/IA1PR12MB606744884B96E0103570A1E9B6852@IA1PR12MB6067.namprd12.prod.outlook.com/#t)
 
-
 ### deliver io command & commit result via read/write
 
 #### overview
 
 [deliver io command & commit result via read/write](https://lore.kernel.org/linux-block/aAscRPVcTBiBHNe7@fedora/)
 
-
 #### key points
 
-- how to not break user copy
-
-- async read on ublk char device
-
-
+- Open question: how to keep user copy working.
+- Async read on the ublk char device.
 
 # Ublk performance track
 
@@ -2481,8 +2545,6 @@ can be bound to one controller, and share the same tagset.
 
 [longhorn](https://github.com/longhorn/longhorn/wiki/Longhorn-Performance-Investigation)
 
-
-
 # Ideas
 
 ## ublk/loop with bmap
@@ -2491,33 +2553,37 @@ can be bound to one controller, and share the same tagset.
 
 [\[PATCH\] the dm-loop target](https://lore.kernel.org/dm-devel/7d6ae2c9-df8e-50d0-7ad6-b787cb3cfab4@redhat.com/)
 
-Two key points for loop device(From Dave)
+Two key properties of a loop device (from Dave):
 
-- a) sparse; and
+- a) sparse;
+- b) the file mapping can change through direct access to the loop file while
+  a filesystem is mounted on the loop device.
 
-- b) the mapping being mutable via direct access to the loop file whilst
-there is an active mounted filesystem on that loop file.
+Why a): no space is allocated up front, so the device is thin provisioned.
+fstrim on the mounted loop device can punch out unused space in the backing
+file.
 
-The reason for a) is obvious: we don't need to allocate space for
-the filesystem so it's effectively thin provisioned. Also, fstrim on
-the mounted loop device can punch out unused space in the mounted
-filesytsem.
+Why b): snapshots via file cloning, dedup via extent sharing. A clone atomically
+changes the backing file mapping. Later writes to shared extents trigger COW, so
+the mapping changes at write-IO time.
 
-The reason for b) is less obvious: snapshots via file cloning,
-deduplication via extent sharing.
+```
+write to LBA X
+   |
+   v
+backing file offset X ---> extent shared by clone/dedup?
+                              | no             | yes
+                              v                v
+                          write in place    COW: allocate new extent,
+                                            mapping of X changes NOW
+```
 
-The clone operaiton is an atomic modification of the underlying file
-mapping, which then triggers COW on future writes to those mappings,
-which causes the mapping to the change at write IO time.
-
+Consequence: a cached FIEMAP result can become stale at any write.
 
 [[PATCH] dm: make it possible to open underlying devices in shareable mode](https://lore.kernel.org/dm-devel/40160815-d4b4-668e-389c-134c75ac87f1@redhat.com/T/#t)
 
-Use ioctl(FS_IOC_FIEMAP) to retrieve mapping between file offset with LBA, then
-submit IO to device directly.
-
-
-
+Approach: use `ioctl(FS_IOC_FIEMAP)` to get the file offset -> LBA mapping, then
+submit IO to the underlying device directly.
 
 ## compressed block device
 
@@ -2527,46 +2593,38 @@ submit IO to device directly.
 
 ### overview
 
-- for SSD to decrease WAF
-
-- 1:1 size
-
+- For SSD: lower WAF.
+- 1:1 size (exported size equals backing size).
 
 ### other compression ideas
 
-- use kv store to store mapping
+- Use a KV store for the mapping.
 
 [nebari: ACID-compliant database storage implementation using an append-only file format](https://crates.io/crates/nebari) 
-
 
 ## dedup feature
 
 ### overview
 
-- can be enabled for almost all target
-
-- easier to support than compression target
-
-- but we already have vdo?
-
+- Can be enabled for almost all targets.
+- Easier to support than a compression target.
+- Open question: is it needed, given that vdo exists?
 
 ## extend ublk for supporting real hardware
 
 ### motivation
 
-Allow to support real block storage device with ublk.
+Support real block storage hardware with ublk.
 
 ### approach
 
-Register bpf struct_ops for setting up hardware, register irq, submitting IO &
-completing IO.
+Register bpf struct_ops to set up the hardware, register irq, submit IO and
+complete IO.
 
-- kernel kfuncs
-
-provide hardware device abstraction, pci bus, pci device, and export it to bpf prog
-
-provide irq register/unregister kfunc
-
+- Kernel kfuncs:
+  - provide a hardware device abstraction (pci bus, pci device) and export it
+    to the bpf prog;
+  - provide irq register/unregister kfuncs.
 
 ## host-wide tags
 
@@ -2578,79 +2636,91 @@ provide irq register/unregister kfunc
 
 ### approach
 
-- Add ADD_HOST control command
+```
+ADD_HOST(id) ---> host controller [id]  (refcount)
+                     ^      ^
+       add ublk with |      | each ublk device holds one ref
+       host id       |      |
+                  ublk0   ublk1 ...
 
-    - each host has unique ID, host-wide ublk is added by providing the
-      host controller ID
+DEL_HOST(id) ---> reject new host-wide ublk for this host
+                  release host after its last ublk device is removed
+```
 
-    - each ublk device grabs one reference of the host controller instance
-
-- Add DEL_HOST control command
-
-    - don't allow new host-wide ublk to be added
-
-    - this host controller will be released after all its ublk devices are
-    removed from this host controller
-
+- `ADD_HOST` control command:
+  - each host has a unique ID; a host-wide ublk device is added by passing the
+    host controller ID;
+  - each ublk device holds one reference of the host controller instance.
+- `DEL_HOST` control command:
+  - no new host-wide ublk device can be added;
+  - the host controller is released after all its ublk devices are removed.
 
 ### ideas
 
-- generic kernel framework for bpf driver? based on both uio and bpf
-
-- rust binding vs. bpf kfunc
-
+- Open question: a generic kernel framework for bpf drivers, based on both uio
+  and bpf?
+- Open question: rust binding vs. bpf kfunc.
 
 # nvme vfio target
 
 ## hugepage DMA safety on daemon crash
 
-Hugepage is used by the nvme vfio target for DMA. The NVMe device reads/writes
-hugepage-backed memory autonomously via IOVAs (or physical addresses in noiommu
-mode). If the daemon crashes while DMA is in-progress, the device doesn't know
-and keeps DMAing.
+The nvme vfio target uses hugepages for DMA. The NVMe device reads/writes this
+memory on its own, via IOVAs (or physical addresses in noiommu mode). If the
+daemon crashes during DMA, the device does not know and keeps DMAing.
 
 ### what happens when the daemon crashes mid-DMA
 
-1. The NVMe device has active DMA operations — it's reading from or writing to
-   hugepage-backed memory.
-
-2. The daemon is killed (e.g., SIGKILL, segfault) — the cleanup path
-   `nvme_vfio_cleanup()` may **not run**, meaning:
-   - No `nvme_shutdown_controller()` → the NVMe controller stays active
-   - No `nvme_delete_io_queue()` → submission/completion queues stay live
-   - No `IOMMU_IOAS_UNMAP` → DMA mappings persist (in IOMMU mode)
-   - No `munmap()` of the hugepage pool
-
-3. The hugepages get freed when the process dies (kernel reclaims the mmap),
-   but the device may still be DMAing to those physical pages.
+```
+daemon                         NVMe device
+------                         -----------
+SQ/CQ live, DMA in flight      reading/writing hugepages
+  |
+SIGKILL / segfault
+  |  nvme_vfio_cleanup() may NOT run:
+  |    - no nvme_shutdown_controller()   -> controller stays active
+  |    - no nvme_delete_io_queue()       -> SQ/CQ stay live
+  |    - no IOMMU_IOAS_UNMAP             -> DMA mappings persist (IOMMU mode)
+  |    - no munmap() of hugepage pool
+  v
+kernel exit path reclaims mm   device may still DMA to those physical pages
+```
 
 ### IOMMU mode (iommufd) — safer
 
-When the process dies, the kernel cleans up the iommufd file descriptors. The
-IOMMU driver will:
+When the process dies, the kernel closes the iommufd fds. The IOMMU driver then:
 
-- Tear down the IOAS (IO Address Space)
-- Remove IOVA→physical mappings from the IOMMU page table
-- Subsequent DMA from the device will be **blocked by the IOMMU** (IOMMU fault)
+- tears down the IOAS (IO Address Space);
+- removes IOVA -> physical mappings from the IOMMU page table;
+- **blocks** later device DMA (IOMMU fault).
 
-There is a small **race window** between the crash and the kernel's fd cleanup.
-During that window, in-flight DMA can still land. But the IOMMU guarantees that:
+There is a small **race window** between the crash and fd cleanup. In-flight
+DMA can still land in that window. The IOMMU still guarantees:
 
-- DMA is confined to the originally mapped regions (no wild writes)
-- Once the fd is closed, new DMA transactions are faulted
+- DMA stays inside the originally mapped regions (no wild writes);
+- after the fd is closed, new DMA transactions fault.
 
-The IOMMU acts as a hardware firewall — this is the primary safety mechanism.
+The IOMMU is a hardware firewall. It is the primary safety mechanism.
+
+(current mainline: iommufd pins the mapped pages, and `do_exit()` runs
+`exit_mm()` before `exit_files()`. So in IOMMU mode the hugepages stay pinned
+until the iommufd teardown; DMA in the race window hits still-owned pages, not
+reallocated ones.)
 
 ### noiommu mode — dangerous
 
-This is where the real risk lives. DMA uses **raw physical addresses** obtained
-from `/proc/self/pagemap` — no IOMMU protection:
+This is the real risk. DMA uses **raw physical addresses** from
+`/proc/self/pagemap`. There is no IOMMU protection:
 
-- If the daemon crashes, the NVMe device continues DMAing to those physical
-  pages
-- The kernel may **reallocate those physical pages** to another process
-- Result: **memory corruption** of arbitrary processes, potential security
-  vulnerability
+```
+crash -> mm torn down -> pages freed -> page allocator gives them to process B
+                                                  ^
+NVMe device keeps DMAing to the same phys addr ---+--> silent corruption of B
+```
+
+- After a daemon crash, the NVMe device keeps DMAing to those physical pages.
+- The kernel may **reallocate those pages** to another process.
+- Result: **memory corruption** of arbitrary processes; possible security hole.
 
 ### risk summary
 
@@ -2663,27 +2733,29 @@ from `/proc/self/pagemap` — no IOMMU protection:
 
 ### no crash-safety mechanisms in current code
 
-- No `signal()` or `sigaction()` handlers for SIGSEGV/SIGBUS/SIGABRT
-- No `atexit()` registration
-- No kernel-side device reset triggered by process death (in noiommu mode)
+- No `signal()` / `sigaction()` handlers for SIGSEGV/SIGBUS/SIGABRT.
+- No `atexit()` registration.
+- No kernel-side device reset on process death (noiommu mode).
 
-The cleanup in `nvme_vfio_deinit_tgt()` only runs during **graceful** shutdown
-via the ublksrv framework lifecycle.
+`nvme_vfio_deinit_tgt()` cleans up only on **graceful** shutdown, through the
+ublksrv framework lifecycle.
 
 ### possible mitigations
 
-1. **Always prefer IOMMU mode** — it's the primary safety net
-2. **Register signal handlers** for SIGSEGV/SIGABRT/SIGTERM to attempt
-   `nvme_shutdown_controller()` before dying
-3. **Use `atexit()`** to register cleanup for normal exit paths
-4. **Kernel-side reset**: the VFIO subsystem could trigger a PCI FLR (Function
-   Level Reset) when the group fd is closed — worth verifying this happens in
-   the kernel's vfio-pci driver
-5. For noiommu: consider **pinning hugepages** (`mlock`) and keeping them
-   reserved even after crash (though this leaks memory)
+1. **Always prefer IOMMU mode.** It is the primary safety net.
+2. **Register signal handlers** for SIGSEGV/SIGABRT/SIGTERM that try
+   `nvme_shutdown_controller()` before exit.
+3. **Use `atexit()`** to register cleanup for normal exit paths.
+4. **Kernel-side reset:** VFIO could trigger a PCI FLR (Function Level Reset)
+   when the device fd is closed. To verify in vfio-pci.
+   (current mainline: on last close, `vfio_pci_core_disable()` calls
+   `pci_clear_master()` to stop DMA, then tries `__pci_reset_function_locked()`
+   if reset works. This runs at fd close, i.e. after `exit_mm()`, so in noiommu
+   mode the window where freed pages can be hit remains.)
+5. For noiommu: **pin hugepages** (`mlock`) and keep them reserved even after a
+   crash (this leaks memory).
 
-The IOMMU mode is the architecturally correct answer — it's why IOMMU exists.
-NoIOMMU mode is inherently unsafe for production use, which is why the kernel
-requires `CAP_SYS_RAWIO` and marks it as dangerous.
-
+IOMMU mode is the architecturally correct answer; this is why the IOMMU exists.
+NoIOMMU mode is unsafe for production by design. That is why the kernel requires
+`CAP_SYS_RAWIO` for it and marks it as dangerous.
 
