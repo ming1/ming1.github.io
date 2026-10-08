@@ -1,7 +1,7 @@
 ---
 title: "Ceph Tracker Notes"
 category: storage
-tags: [ceph, bluestore, bluefs, write_v2, deferred, tracker, debugging, wal, ebpf, network, tcp, checksum, clone, libaio, posix-aio, freebsd, asan, containers, osd, messenger, throttle, mclock, latency, lease, peering, laggy, rdma, rgw, s3, ec, cuobject]
+tags: [ceph, bluestore, bluefs, aio, eventfd, io500, write_v2, deferred, tracker, debugging, wal, ebpf, network, tcp, checksum, clone, libaio, posix-aio, freebsd, asan, containers, osd, messenger, throttle, mclock, latency, lease, peering, laggy, rdma, rgw, s3, ec, cuobject]
 ---
 
 * TOC
@@ -16,10 +16,10 @@ Issues are grouped by the component where the root cause lives:
 
 | Part | Component | Sections |
 |---|---|---|
-| I | BlueStore and BlueFS | 1–8 |
-| II | OSD | 9–10 |
-| III | Messenger and the cluster network | 11–12 |
-| IV | RGW | 13 |
+| I | BlueStore and BlueFS | 1–9 |
+| II | OSD | 10–11 |
+| III | Messenger and the cluster network | 12–13 |
+| IV | RGW | 14 |
 
 # Part I — BlueStore and BlueFS
 
@@ -2452,22 +2452,333 @@ All links point at main `986f3c892e7`.
 | [`bluestore_min_alloc_size_hdd`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/common/options/global.yaml.in#L4767) | AU size on HDD (default 4K) |
 | [`bluestore_prefer_deferred_size_hdd`](https://github.com/ceph/ceph/blob/986f3c892e759443a07b45f58d0287e71485394b/src/common/options/global.yaml.in#L4833) | deferred-write threshold on HDD (default 64K) |
 
+## 9. PR #71122 — reaping write completions in the kv sync thread, and the ring it lets fill up
+
+[PR](https://github.com/ceph/ceph/pull/71122) · my own series, v4 at
+`a2518aac732` on `kv-committing-local` · affects: the BlueStore commit path
+on linux/libaio · component: `KernelDevice` aio completion,
+`BlueStore::_kv_sync_thread()` · Status: open. The ramdisk A/B that
+justified it never filled the aio ring; a reviewer's IO500 run did, and
+found 8.19 s submit stalls and a path to an OSD abort. Fix not yet posted.
+
+§4 covered one commit of this series, the synchronous path for a lone
+waited-on aio. This section is about the rest of it: what the series moves,
+and the load it was not measured under.
+
+### 9.1 The story in one view
+
+The series removes one thread and one handoff from every write's commit
+path by letting the kv sync thread collect the data device's write
+completions itself. The same thread also runs the commit cycle, and nothing
+drains the write ring while it does. At saturation the ring fills, and a
+full ring puts every submitter into an exponential backoff that ends in an
+assert.
+
+```
+          before: bstore_aio thread              after: direct mode (default)
+          ---------------------------            ----------------------------------
+submit    tp_osd_tp: io_submit(write)            tp_osd_tp: io_submit(write)
+complete  bstore_aio: io_getevents loop     #1   kernel -> eventfd -> kv_sync wakes    #2
+          -> txc_aio_finish -> kv_queue           kv_sync: reap <= 128, txc_aio_finish
+          -> notify kv_sync
+commit    kv_sync: fdatasync + rocksdb sync      kv_sync: fdatasync + rocksdb sync     #3
+                                                  (ring not drained while in here)
+ring      drained continuously                   <= 128 per commit cycle               #4
+full      io_submit -> EAGAIN, sleep 125us*2^n   16 retries = 8.19 s                   #5
+                                                  17th EAGAIN: ceph_assert, OSD aborts  #6
+```
+
+1. **Before.** Each `KernelDevice` had a thread, `bstore_aio`, that did
+   nothing but call `io_getevents()` and run the completion callbacks. The
+   callback for a data write (`txc_aio_finish`) pushed the transaction onto
+   `kv_queue` under `kv_lock` and woke the kv sync thread if it was idle: a
+   handoff per write.
+2. **After.** The data device attaches the kv sync thread's eventfd to
+   every write iocb. The kernel signals the fd on completion; the kv thread
+   wakes, reaps a batch and runs the callbacks itself. One fewer thread and
+   one fewer handoff; +10% iops at qd1 on a ramdisk.
+3. **The coupling.** The thread that now drains the ring is the thread that
+   runs `bdev->flush()` (an `fdatasync`) and the RocksDB sync, which take
+   milliseconds under load. During that time the ring only grows.
+4. **The bound.** The reap is one batch of `bdev_aio_reap_max` (128) per
+   wakeup, and the loop runs a whole commit cycle before the next one. At
+   17k writes/s a commit cycle longer than 7.5 ms cannot keep up, and the
+   ring's 1024 slots stay full.
+5. **The backoff.** A full ring makes `io_submit()` return `-EAGAIN`.
+   `submit_batch()` sleeps 125 µs, doubles, and retries up to 16 times:
+   125 µs × (2¹⁶ − 1) = 8.19 s. Every slow op in the report has exactly that
+   length. The submitter is an OSD op shard thread, so the shard stalls with
+   it (§11's amplifier).
+6. **The cliff.** The submit after the 16th sleep gets no further retry: if
+   it fails too, `submit_batch()` returns `-EAGAIN` and `aio_submit()` hits
+   `ceph_assert(r == 0)`. One IO500 run reached the 16-retry limit three
+   times, one failed submit short of that.
+
+Map: §9.2 = the report, with the reviewer's A/B numbers (#4–#6) · §9.3.1 =
+what each commit moves (#1–#2) · §9.3.2–§9.3.3 = the loop and the
+arithmetic (#3–#5) · §9.3.4 = a case the report did not hit · §9.3.5 = why
+my own A/B missed it · §9.4 = fix directions.
+
+### 9.2 Report
+
+Posted by Xiubo Li as a
+[review comment](https://github.com/ceph/ceph/pull/71122#discussion_r4219753351)
+on the kv-sync commit, 2026-10-08. Setup:
+
+- tentacle plus a backport of this series, Release build, vstart.
+- 2 BlueStore OSDs on Micron 7450 NVMe (PCIe Gen3 x4), pool size 2.
+- libaio, default `bdev_aio_max_queue_depth=1024`, `bdev_aio_reap_max=16`.
+  The backport reaps up to 8 passes × 16 per wakeup; this PR reaps one batch
+  of 128. Both drain about 128 per commit cycle.
+- Load: IO500, 16 ranks over 4 kernel CephFS mounts. During ior-easy-write
+  each OSD sees about 17k write IOPS.
+- A/B: the same build with only the kv-sync commit reverted.
+
+Every slow op has the same length:
+
+```
+log_latency slow operation observed for submit_transact, latency = 8.194863319s
+log_latency_fn slow operation observed for _txc_committed_kv, latency = 8.195657730s
+```
+
+The ring fills in both builds: at this load the drives are the bottleneck
+and more than 1024 writes are in flight. What changes is how long a
+submitter waits for a slot. `aio_submit()` logs its retry count, and the
+histogram of those counts over one run per side:
+
+| `aio_submit` retries | total backoff | with commit, osd.0 / osd.1 | reverted, osd.0 / osd.1 |
+|---:|---:|---:|---:|
+| 1–8 | ≤ 32 ms | 9,932 / 11,462 | 51,850 / 53,402 |
+| 9–10 | 64–128 ms | 19,535 / 16,793 | 6,957 / 6,902 |
+| 11–13 | 0.26–1 s | 2,367 / 2,139 | 1,359 / 1,299 |
+| 14–15 | 2–4 s | 20 / 15 | 6 / 8 |
+| 16 (limit) | 8.19 s | 3 / 0 | 0 / 0 |
+
+| IO500 phase | with commit | reverted | change |
+|---|---:|---:|---:|
+| ior-easy-write (GiB/s) | 1.080 | 1.254 | +16% |
+| ior-hard-write (GiB/s) | 0.215 | 0.202 | −6% |
+| BlueStore slow ops (osd.0) | 2 | 0 | |
+
+The ior-hard-write gain (47008-byte writes) may be the commit's latency
+benefit or noise; one run per side so far, medians of three to follow. The
+metadata and read phases are within a few percent.
+
+### 9.3 Analysis
+
+#### 9.3.1 What the series moves
+
+| Commit | What it does |
+|---|---|
+| `os/bluestore: make kv_committing a local in _kv_sync_thread` · `os/bluestore: name the swap-or-append handoff idiom` | cleanups of the loop the series then changes |
+| `blk: factor aio completion error checking into a helper` | prep: one `_aio_check_completion()` for every reaper |
+| `blk: keep read and write aios on separate lanes` | `IOContext` tracks reads and writes on separate lists, so submission routes by lane |
+| `blk: execute a lone waiter-style aio synchronously` | the §4 change in its final form: a device-side rule, not a BlueFS predicate. An `IOContext` with no callback and exactly one aio is run as a `preadv`/`pwritev` in the submitter |
+| `blk: factor completion processing out of _aio_thread` · `blk: drive the aio completion machinery through an explicit queue` | prep: `_reap_completions(queue, timeout, max)` with the queue passed in |
+| `blk: optional external completion reaping of write aio` | the device grows a second ring, `outer_io_queue`, when the owner installs an eventfd before `open()`. Writes go there with `io_set_eventfd()`; the owner drains it with `reap_completions()`. The device's own thread keeps the `inner_io_queue`, now reads only |
+| `common: WakeupFd` | an eventfd with `notify()`/`consume()`; sticky, coalescing, and a real fd the kernel can signal |
+| `os/bluestore: reap data-bdev write completions in the kv sync thread` | `kv_cond` becomes a `WakeupFd`; `_open_bdev()` lends its fd to the device; the kv thread's wait is a blocking read of that fd followed by one reap |
+| `blk: raise bdev_aio_reap_max default to 128` | 16 was sized for a thread that polls continuously |
+
+The important structural fact: in direct mode the kv sync thread is the
+write ring's **only** reaper. The device enforces the consequence it can
+see, that this thread must never submit write aio to the device (it would
+sleep in the `EAGAIN` retry waiting for slots only it can free). It cannot
+enforce the one that matters here: that the thread keeps reaping.
+
+#### 9.3.2 Reading the loop
+
+The reap lives in the idle branch of `_kv_sync_thread()`, the branch taken
+only when `kv_queue` is empty:
+
+```cpp
+if (kv_queue.empty() && ...) {
+  l.unlock();
+  kv_wake.wait_and_consume();
+  const int reap_max = std::clamp(int(cct->_conf->bdev_aio_reap_max),
+                                  1, BlockDevice::REAP_BATCH_MAX);
+  if (bdev->reap_completions(reap_max) == reap_max) {
+    kv_wake.notify();          // the ring may hold more: come back
+  }
+  l.lock();
+} else {
+  // commit: swap kv_queue out, bdev->flush(), submit_transaction_sync ...
+}
+```
+
+The self-notify only makes the next `wait_and_consume()` return at once.
+But the 128 callbacks just reaped pushed 128 transactions onto `kv_queue`,
+so the next iteration takes the commit branch. The reaper gets its next
+turn after `fdatasync` plus the RocksDB sync. One batch per commit cycle,
+exactly as the report says.
+
+#### 9.3.3 The arithmetic
+
+Three numbers decide whether the ring can stay drained:
+
+```
+completion rate      ~17,000 / s          (ior-easy-write, per OSD)
+drain rate           128 / commit cycle
+ring capacity        1024                  (bdev_aio_max_queue_depth)
+
+break-even cycle     128 / 17,000  =  7.5 ms
+```
+
+An `fdatasync` on a saturated NVMe plus a RocksDB WAL sync is routinely
+longer than 7.5 ms. Once the cycle exceeds it the backlog grows without
+bound, the ring fills, and `io_submit()` returns `-EAGAIN`.
+
+The retry loop in `aio_queue_t::submit_batch()`:
+
+```cpp
+if (r == -EAGAIN && attempts-- > 0) {
+  usleep(delay);
+  delay *= 2;
+  (*retries)++;
+  continue;
+}
+return r;
+```
+
+with `bdev_aio_submit_retry_initial_delay_us=125` and
+`bdev_aio_submit_retry_max=16`: the sleeps sum to 125 µs × (2¹⁶ − 1) =
+8,191,875 µs. The two log lines in §9.2 are 8.1949 s and 8.1957 s: the
+backoff plus a few milliseconds of real work. Nothing on a Micron 7450
+takes 8.19 s; an identical latency across every slow op is a software
+limit, not a device.
+
+The histogram says the same thing from the other side. Both builds fill the
+ring (the reverted build has 1,359 submits in the 0.26–1 s bucket too). The
+difference is the shape: the fast bucket (1–8 retries, ≤ 32 ms) shrinks
+five-fold and the 9–10 bucket triples. A slot that the old `bstore_aio`
+thread freed within a few hundred microseconds now frees when the commit
+cycle ends. The whole distribution shifts right by about one commit cycle.
+
+And the submitter that sleeps is not a background thread. `_txc_aio_submit()`
+runs in `_txc_state_proc()` on the OSD op shard thread (`tp_osd_tp`). Eight
+seconds asleep there is eight seconds during which every PG on that shard
+is frozen, the mechanism §11 describes.
+
+#### 9.3.4 A case the report did not hit: the reaper never runs
+
+The idle branch is the only place that reaps. It is entered only when
+`kv_queue` is empty. Transactions reach `kv_queue` two ways: after their
+aio completes (which needs the reaper), or **directly**, when they have no
+data aio at all: omap or xattr updates, and deferred-only writes on HDD. A
+steady stream of those
+keeps `kv_queue` non-empty across every loop iteration, the commit branch
+runs back to back, and the write ring is never drained. Every data write's
+submitter then backs off for the full 8.19 s and the 17th attempt aborts
+the OSD.
+
+The report's load does not produce this: on NVMe nothing is deferred
+(`bluestore_prefer_deferred_size_ssd=0`), and during the ior phases every
+transaction carries aio. A CephFS metadata phase, where the MDS updates
+directory fragments through omap while clients write data through the same
+OSDs, is the kind of mix that can. I have not reproduced it; it follows
+from the loop structure.
+
+#### 9.3.5 Why my own A/B missed it
+
+The PR's numbers come from a ramdisk OSD at qd1 and qd16 × 4 jobs. The
+ring held at most 64 in-flight writes against 1024 slots, and each
+completed in microseconds. The commit cycle was never the slow part, so the
+"one batch per cycle" bound was never binding. The test matrix measured the
+handoff that was removed and never measured the drain that was slowed. The
+load that exposes it needs the **device** to be the bottleneck, with more
+writes in flight than the ring holds: a saturated NVMe, or any HDD.
+
+### 9.4 Proposed solution
+
+Not implemented yet. The constraint is that the reaper's drain rate must
+not depend on the commit cycle's length. Three ways to get there, from
+smallest to largest:
+
+1. **Reap on every iteration, and drain to empty.** Move the
+   `reap_completions()` call to the top of the loop, after `kv_lock` is
+   dropped, and call it again after the commit before re-taking the lock.
+   Both places already run without `kv_lock`, which the callbacks need
+   (`txc_aio_finish` pushes onto `kv_queue` under it). Replace the count
+   bound with a time budget: the 128 bound was there so a completion stream
+   cannot starve the commit, but one batch of 1024 callbacks that only stage
+   work is cheaper than one `fdatasync`. With this, the ring grows only for
+   the duration of one `fdatasync`: at 17k/s and 5 ms, about 85 slots. This
+   closes §9.3.4 as well, since the commit branch reaps too.
+2. **A backstop in the submitter.** On `-EAGAIN`, let the submitting thread
+   reap the outer ring instead of sleeping. Lock-wise it is clean: both
+   submitters (`_txc_state_proc()` at `STATE_PREPARE`, and
+   `_deferred_submit_unlock()`, which drops `deferred_lock` first) hold no
+   BlueStore lock at `aio_submit()`, and the callbacks take `kv_lock`,
+   `qlock` and `deferred_lock` themselves. The obstacle is the device's own
+   rule: `reap_completions()` marks its caller as the ring's reaper for the
+   thread's lifetime (`tl_outer_reaper_dev`), and `aio_submit()` then asserts
+   if that thread submits writes, which an op thread does on every write.
+   The marker would need a scoped form first.
+3. **Default off.** Ship `bluestore_kv_sync_reap_write_completions=false`
+   until the mode has numbers from a saturated device. The sync fast path of
+   §4 stays in effect either way.
+
+(1) is the one I will post, A/B'd on the reviewer's IO500 setup rather than
+on a ramdisk, with the retry histogram as the primary metric: the fix is
+right when the "with commit" column matches or beats the reverted one in
+every bucket.
+
+### 9.5 Takeaways
+
+- **A reaper that shares a thread with millisecond work inherits that
+  work's latency as its drain interval.** Fine at qd1, where the thread is
+  mostly idle. Wrong at saturation, where commits are slowest exactly when
+  completions arrive fastest.
+- **A ramdisk A/B cannot fill a ring.** The matrix for any change to aio
+  completion must include a run where the device is the bottleneck and
+  in-flight exceeds `bdev_aio_max_queue_depth`; it is the only way the
+  `EAGAIN` path executes at all.
+- **An identical latency across every slow op is a limit, not a device.**
+  8.19 s is `bdev_aio_submit_retry_initial_delay_us` × (2^`retry_max` − 1).
+  Real device stalls scatter.
+- **The `EAGAIN` budget ends in an assert.** Sixteen retries were sized for
+  a reaper that polls continuously. Any change to who reaps has to re-derive
+  that budget, or the budget becomes an OSD abort under load.
+
+### 9.6 Code references
+
+All links point at the PR head `a2518aac732`.
+
+| Code | Role |
+|---|---|
+| [`BlueStore::_kv_sync_thread()`](https://github.com/ming1/ceph/blob/a2518aac732d4f4095caf97a593d485f4f4445b9/src/os/bluestore/BlueStore.cc#L15451) | the loop; [idle branch reap](https://github.com/ming1/ceph/blob/a2518aac732d4f4095caf97a593d485f4f4445b9/src/os/bluestore/BlueStore.cc#L15486) and [`bdev->flush()`](https://github.com/ming1/ceph/blob/a2518aac732d4f4095caf97a593d485f4f4445b9/src/os/bluestore/BlueStore.cc#L15563) in the commit branch |
+| [`BlueStore::_open_bdev()`](https://github.com/ming1/ceph/blob/a2518aac732d4f4095caf97a593d485f4f4445b9/src/os/bluestore/BlueStore.cc#L7276) | lends `kv_wake.fd()` to the device; selects direct mode |
+| [`BlueStore::_txc_state_proc()`](https://github.com/ming1/ceph/blob/a2518aac732d4f4095caf97a593d485f4f4445b9/src/os/bluestore/BlueStore.cc#L14852) | `STATE_IO_DONE` pushes onto `kv_queue` and notifies; the no-aio entry of §9.3.4 |
+| [`KernelDevice::reap_completions()`](https://github.com/ming1/ceph/blob/a2518aac732d4f4095caf97a593d485f4f4445b9/src/blk/kernel/KernelDevice.cc#L862) | the owner's drain of `outer_io_queue`; marks the caller as the ring's reaper |
+| [`KernelDevice::_reap_completions()`](https://github.com/ming1/ceph/blob/a2518aac732d4f4095caf97a593d485f4f4445b9/src/blk/kernel/KernelDevice.cc#L774) | one `io_getevents()` pass, bounded by `REAP_BATCH_MAX` (1024); runs the callbacks |
+| [`KernelDevice::set_completion_eventfd()`](https://github.com/ming1/ceph/blob/a2518aac732d4f4095caf97a593d485f4f4445b9/src/blk/kernel/KernelDevice.cc#L834) | creates `outer_io_queue`; libaio only |
+| [`KernelDevice::aio_submit()`](https://github.com/ming1/ceph/blob/a2518aac732d4f4095caf97a593d485f4f4445b9/src/blk/kernel/KernelDevice.cc#L1180) | [asserts](https://github.com/ming1/ceph/blob/a2518aac732d4f4095caf97a593d485f4f4445b9/src/blk/kernel/KernelDevice.cc#L1188) the reaper submits no writes; [`ceph_assert(r == 0)`](https://github.com/ming1/ceph/blob/a2518aac732d4f4095caf97a593d485f4f4445b9/src/blk/kernel/KernelDevice.cc#L1256) after the retries (#6) |
+| [`KernelDevice::_aio_lone_waiter_sync()`](https://github.com/ming1/ceph/blob/a2518aac732d4f4095caf97a593d485f4f4445b9/src/blk/kernel/KernelDevice.cc#L1137) | the §4 fast path in its final form |
+| [`KernelDevice::_aio_thread()`](https://github.com/ming1/ceph/blob/a2518aac732d4f4095caf97a593d485f4f4445b9/src/blk/kernel/KernelDevice.cc#L874) | the continuous poller; serves only `inner_io_queue` in direct mode |
+| [`aio_queue_t::submit_batch()`](https://github.com/ming1/ceph/blob/a2518aac732d4f4095caf97a593d485f4f4445b9/src/blk/aio/aio.cc#L18) | `io_submit()` with the [`EAGAIN` backoff](https://github.com/ming1/ceph/blob/a2518aac732d4f4095caf97a593d485f4f4445b9/src/blk/aio/aio.cc#L69) (#5) |
+| [`aio_queue_t::set_notify_eventfd()`](https://github.com/ming1/ceph/blob/a2518aac732d4f4095caf97a593d485f4f4445b9/src/blk/aio/aio.h#L130) | the fd attached to every iocb with `io_set_eventfd()` |
+| [`WakeupFd`](https://github.com/ming1/ceph/blob/a2518aac732d4f4095caf97a593d485f4f4445b9/src/common/WakeupFd.h#L53) | the eventfd both submitters and the kernel notify |
+| [`bdev_aio_max_queue_depth`](https://github.com/ming1/ceph/blob/a2518aac732d4f4095caf97a593d485f4f4445b9/src/common/options/global.yaml.in#L4096) | ring size, 1024 |
+| [`bdev_aio_reap_max`](https://github.com/ming1/ceph/blob/a2518aac732d4f4095caf97a593d485f4f4445b9/src/common/options/global.yaml.in#L4101) | completions per reap pass, 128 (was 16) |
+| [`bdev_aio_submit_retry_max`](https://github.com/ming1/ceph/blob/a2518aac732d4f4095caf97a593d485f4f4445b9/src/common/options/global.yaml.in#L4107) | `EAGAIN` retries before the assert, 16 |
+| [`bluestore_kv_sync_reap_write_completions`](https://github.com/ming1/ceph/blob/a2518aac732d4f4095caf97a593d485f4f4445b9/src/common/options/global.yaml.in#L5576) | selects direct mode; default true, read at start |
+
 # Part II — OSD
 
-## 9. The zero-copy path that never ran — every replicated write memcpys its payload on the replica
+## 10. The zero-copy path that never ran — every replicated write memcpys its payload on the replica
 
 Found by a bpftrace memory-copy census, not by a bug report · affects
 every replicated client write · component OSD (ReplicatedBackend /
 os/Transaction; BlueStore's throttle consumes the size) · fix: one line,
 plus a size-estimate correction found in code review · open: the
-aligned format assumes both ends have the same page size (§9.4.2) ·
+aligned format assumes both ends have the same page size (§10.4.2) ·
 Status: upstream [PR #71355](https://github.com/ceph/ceph/pull/71355)
 open with the one-liner; the size-estimate commit sits before it on the
 local branch, not yet pushed; both verified on a 2-OSD lab; the EC
-sibling patch is local, A/B-verified on five OSDs (§9.6); tracker ticket
+sibling patch is local, A/B-verified on five OSDs (§10.6); tracker ticket
 for tentacle + umbrella backports pending
 
-### 9.1 The story in one view
+### 10.1 The story in one view
 
 The encoding that lets a replica write without a copy has been in the
 tree since 2025-04. The classic OSD's client-write path never turned it on.
@@ -2510,13 +2821,13 @@ tree since 2025-04. The classic OSD's client-write path never turned it on.
    costs ~2 KB. Review caught it; the correction goes first.
 
 ```
-#1–#5  the copy         §9.2 report → §9.3 analysis → §9.4 fix
-#6     the accounting   §9.5
-       the EC sibling   §9.6   same gap, same fix, A/B on five OSDs
-       lessons          §9.7
+#1–#5  the copy         §10.2 report → §10.3 analysis → §10.4 fix
+#6     the accounting   §10.5
+       the EC sibling   §10.6   same gap, same fix, A/B on five OSDs
+       lessons          §10.7
 ```
 
-### 9.2 Report
+### 10.2 Report
 
 #### 9.2.1 The observation
 
@@ -2553,7 +2864,7 @@ grep -c "rebuilding buffer to be aligned" out/osd.*.log
 ```
 
 Unpatched: ~2 per write (one per 64 KiB blob) on the *replica* of each
-object (`osd map p1 rep-N`), zero on the primary. Patched (§9.4.1): zero
+object (`osd map p1 rep-N`), zero on the primary. Patched (§10.4.1): zero
 everywhere.
 
 **Signal 2 — v10 on the wire, and still a copy.** With `debug_ms 1`, the
@@ -2582,7 +2893,7 @@ uprobe:/path/to/bin/ceph-osd:0xADDR_OF_aio_write
 | unpatched | `off_in_raw=336`, second blob `65872` | `0` / `65536` |
 | patched | page multiples | page multiples |
 
-### 9.3 Analysis
+### 10.3 Analysis
 
 #### 9.3.1 Root cause, top to bottom
 
@@ -2699,7 +3010,7 @@ never wired
 ([PR #62556](https://github.com/ceph/ceph/pull/62556); recovery constructor:
 [`ReplicatedBackend.cc:989`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L989).) Both EC containers'
 `operator[]` value-initialize, so every shard transaction has
-`data_features` 0 and ECSubWrite v5 ships an empty aligned stream. §9.6
+`data_features` 0 and ECSubWrite v5 ships an empty aligned stream. §10.6
 closes it.
 
 So in the classic OSD no write path ships an aligned payload. Crimson
@@ -2785,11 +3096,11 @@ v10 aligned (the fix)  375 B    [payload 131072][attrs 332]          = 131404   
 | split *unit* (page size) | **no** | `decode_bl()` (`:717`) splits with the receiver's own `CEPH_PAGE_SIZE` = `sysconf(_SC_PAGESIZE)` (`common/page.cc:28`) |
 
 So both ends split the same way only when they have the same page size —
-the open hazard in §9.4.2. EC wraps the same thing: `ECSubWrite` v5 calls
+the open hazard in §10.4.2. EC wraps the same thing: `ECSubWrite` v5 calls
 `t.encode(p_bl, d_bl, features)`, v4 uses one stream
 ([`ECMsgTypes.cc:35`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ECMsgTypes.cc#L35)).
 
-### 9.4 Proposed solution
+### 10.4 Proposed solution
 
 #### 9.4.1 The fix
 
@@ -2907,7 +3218,7 @@ Same census, patched build, probes re-verified live:
 At pool `size=3` the line removes two full-payload memcpys, cluster-wide,
 from every client write.
 
-### 9.5 What review found — the throttle sees two kilobytes of a 128 KiB write
+### 10.5 What review found — the throttle sees two kilobytes of a 128 KiB write
 
 #### 9.5.1 The observation
 
@@ -2924,7 +3235,7 @@ Measured with the one-liner (two-OSD, `size 2`, BlueStore's
 `_txc_calc_cost` debug line): a 128 KiB put is charged **2171 / 1262**
 bytes on primary / replica. A 16 KiB write at offset 1 is charged for its
 4095-byte prefix, 1-byte suffix and metadata, not the 12 KiB between (full
-table in §9.5.8). Data and scrubs are fine; only the accounting is wrong.
+table in §10.5.8). Data and scrubs are fine; only the accounting is wrong.
 Without the one-liner the same writes are charged in full.
 
 #### 9.5.2 Reproducing it
@@ -3020,7 +3331,7 @@ admits about five thousand transactions of any size.
 #### 9.5.5 Why nobody saw it, and what "exact" means
 
 ```
-1. only recovery built aligned-format transactions (§9.3.2), and recovery
+1. only recovery built aligned-format transactions (§10.3.2), and recovery
    is paced by osd_recovery_max_active / osd_max_backfills long before the
    BlueStore throttle → nothing visible
    → the one-liner moves the undercount onto the hot path; fix this first
@@ -3149,11 +3460,11 @@ bytes, primary / replica:
 The deferred rows show `1 ios` (only the kv commit) and the same bytes as
 the direct rows: the accounting does not depend on the BlueStore path.
 
-### 9.6 The EC sibling — same gap, same fix, measured
+### 10.6 The EC sibling — same gap, same fix, measured
 
 #### 9.6.1 The gap
 
-The two EC **no** rows of §9.3.2:
+The two EC **no** rows of §10.3.2:
 
 ```
 optimized   RMWPipeline::cache_ready()           trans[shard];       ECCommon.cc:876
@@ -3172,7 +3483,7 @@ primary OSD) a client write touches.
 
 #### 9.6.2 The fix
 
-Same idea, once per pipeline (local, on top of §9.4.1 and §9.5.6, not yet
+Same idea, once per pipeline (local, on top of §10.4.1 and §10.5.6, not yet
 posted):
 
 ```cpp
@@ -3190,7 +3501,7 @@ serves legacy pools too.
 
 #### 9.6.3 Why it is safe — and where it is not yet
 
-**The encode-version assert is weaker than in §9.4.2.** EC reads two
+**The encode-version assert is weaker than in §10.4.2.** EC reads two
 *different* sources:
 
 ```
@@ -3218,7 +3529,7 @@ splits differently. A 16 KiB object at k=3:
 | legacy | 8 KiB on every shard (padded to the 12 KiB stripe) |
 | optimized | 8/4/4 KiB data, 8 KiB parity |
 
-The rest of §9.4.2 carries over: `append()` never sees these transactions,
+The rest of §10.4.2 carries over: `append()` never sees these transactions,
 sub-page writes stay in the misaligned stream, and an old peer drops
 TENTACLE and restores today's behavior.
 
@@ -3242,7 +3553,7 @@ bin/ceph osd pool set eco allow_ec_optimizations true
 - Arms: A = the two commits of this section; B = A + the EC patch.
   `ceph-osd` is rebuilt per arm (the rebuilt EC plugins carry the git
   version, so a saved A binary refuses them).
-- Signal: Signal 1 of §9.2.2, the rebuild line, counted per OSD.
+- Signal: Signal 1 of §10.2.2, the rebuild line, counted per OSD.
 - Workload per pool, 22 client writes (44 in all): puts of 4 × 16 KiB,
   4 × 64 KiB, 2 × 1 MiB; a 16 KiB overwrite at offset 1, 4095, 4097,
   12287 and 30000, each on its own 64 KiB object; a 5000-byte append to a
@@ -3282,9 +3593,9 @@ compared): a second copy inside the legacy read-modify-write path, which
 the patch neither causes nor removes. Not root-caused here.
 
 Not covered: every peer here has TENTACLE and 4 KiB pages, so neither
-§9.6.3 hazard is exercised.
+§10.6.3 hazard is exercised.
 
-### 9.7 Takeaways
+### 10.7 Takeaways
 
 - **A fix that ships but never runs looks exactly like a fix.** The aligned
   format was reviewed, merged and used daily — by recovery transactions
@@ -3299,7 +3610,7 @@ Not covered: every peer here has TENTACLE and 4 KiB pages, so neither
   *any* working alignment mechanism.
 - **Attribute leftovers; do not subtract them.** 214 → 5 reads as "98 %
   fixed". One write type at a time put all five on primaries, and that
-  copy is there with or without the patch (§9.6.4).
+  copy is there with or without the patch (§10.6.4).
 - **A reproducer can be the one input that cannot fail.** 128 KiB at
   offset 0 splits the same way under every page size. The mixed-page-size
   hazard appeared only when asking "what is *not* on the wire?".
@@ -3316,7 +3627,7 @@ Not covered: every peer here has TENTACLE and 4 KiB pages, so neither
   undercount was harmless for seventeen months; the correction is ordered
   before the one-liner.
 
-## 10. One hot op-queue shard freezes the whole OSD — `osd_client_message_cap` as a cluster-wide stall amplifier
+## 11. One hot op-queue shard freezes the whole OSD — `osd_client_message_cap` as a cluster-wide stall amplifier
 
 Found in two field diagnostics collections of a 4K random-read benchmark,
 not a bug report · affects any replicated pool under a high-IOPS,
@@ -3339,7 +3650,7 @@ between two snapshots, `dump_ops_in_flight`, `dump_historic_ops`,
 `messenger dump --tcp-info`, `pg dump`). Source references are to the
 `tentacle-dev` tree at `20a5b81442e`.
 
-### 10.1 The story in one view
+### 11.1 The story in one view
 
 A slow shard keeps its message-throttle slots for a long time, so the
 OSD-wide slots all drift to it. When they run out, the OSD stops reading
@@ -3391,13 +3702,13 @@ OSD-wide slots all drift to it. When they run out, the OSD stops reading
    (osd.38 on day one, osd.32 on day two).
 
 ```
-#1–#4  the freeze on one OSD         §10.2 report → §10.3.1–§10.3.3
-#2     why this OSD, this day        §10.3.4;  ruled out §10.3.5
-#1–#6  checks on a live cluster      §10.3.6
-#6     fix and validation plan       §10.4;    takeaways §10.5
+#1–#4  the freeze on one OSD         §11.2 report → §11.3.1–§11.3.3
+#2     why this OSD, this day        §11.3.4;  ruled out §11.3.5
+#1–#6  checks on a live cluster      §11.3.6
+#6     fix and validation plan       §11.4;    takeaways §11.5
 ```
 
-### 10.2 Report
+### 11.2 Report
 
 #### 10.2.1 The observation
 
@@ -3455,7 +3766,7 @@ A frozen OSD shows:
 Offline, two scripts (`gen_cluster_report.py`, `gen_4k_randread_report.py`)
 compute the tables above from any pair of `ceph-collect` snapshots.
 
-### 10.3 Analysis
+### 11.3 Analysis
 
 #### 10.3.1 Root cause, top to bottom
 
@@ -3496,7 +3807,7 @@ latency, device wait per drive model.
 A read passes two threads in the OSD: the messenger worker that owns the
 socket, then a shard thread that runs the PG. The clock (`recv_stamp`)
 starts when the worker has read the 32-byte frame preamble. Both counters
-from §10.2.1 measure from that stamp. The second one ends only after the PG
+from §11.2.1 measure from that stamp. The second one ends only after the PG
 lock is taken.
 
 ```
@@ -3601,7 +3912,7 @@ reproduces the straggler list exactly:
 
 | suspect | evidence against it |
 |---|---|
-| **Network** | Every socket of every OSD, both days: `tcpi_retransmits`, `tcpi_backoff`, `tcpi_lost`, `tcpi_retrans` all 0; RTO at the 200 ms floor; at most 3 unacked segments. The victim's client sockets match its neighbours' except that they hold fewer replies in flight. The cluster network does lose packets under replication load (§11), but reads never touch it. |
+| **Network** | Every socket of every OSD, both days: `tcpi_retransmits`, `tcpi_backoff`, `tcpi_lost`, `tcpi_retrans` all 0; RTO at the 200 ms floor; at most 3 unacked segments. The victim's client sockets match its neighbours' except that they hold fewer replies in flight. The cluster network does lose packets under replication load (§12), but reads never touch it. |
 | **The drive** | 119 µs device wait on the victim, the same as every other model-B OSD. The 8 ms is queueing in front of it. |
 | **Hot PG or object, scrub, recovery** | The 238 queued ops covered all 13 PGs of the shard evenly; all PGs `active+clean`. |
 | **NUMA on day two** | The victim ran on the node its drive attaches to. |
@@ -3610,7 +3921,7 @@ reproduces the straggler list exactly:
 #### 10.3.6 Confirming each link on a live cluster
 
 Everything above came from snapshots. Before changing anything, each link
-of §10.3.1 can be watched live while fio runs, top down. The first link
+of §11.3.1 can be watched live while fio runs, top down. The first link
 that does not confirm is where the story must change. No configuration is
 touched in this sequence.
 
@@ -3777,9 +4088,9 @@ watch -n1 'ceph -s | grep -E "rd,|op/s"; ceph tell osd.N messenger dump client \
 
 IOPS dip each time the throttled count jumps, and recover when it returns
 to zero. That is the stop-and-go cycle, seen live end to end. Only then do
-the changes in §10.4 have a number they are expected to move.
+the changes in §11.4 have a number they are expected to move.
 
-### 10.4 Proposed solution
+### 11.4 Proposed solution
 
 #### 10.4.1 Mitigations, in the order they act
 
@@ -3833,7 +4144,7 @@ Not yet done on the cluster: none of the settings were applied between the
 two collections. Plan for the next run, so the outcome is measured, not
 argued:
 
-| signal | today | expected after §10.4.1 |
+| signal | today | expected after §11.4.1 |
 |---|---|---|
 | connections in `THROTTLE_MESSAGE` at any snapshot | 90 of 91 on the victim | 0 |
 | `header_read → throttled` among the 20 slowest ops | 1.5–3.9 s | < 5 ms |
@@ -3845,7 +4156,7 @@ Collect twice *inside* the fio run (about 2 min after start and 1 min
 before the end). Then the counter window holds only the workload, and
 `dump_historic_ops` covers 600 s of it.
 
-### 10.5 Takeaways
+### 11.5 Takeaways
 
 - **An OSD-wide cap on top of per-shard queues is a stall amplifier.**
   Slots migrate to the slowest shard on their own. An exhausted cap first
@@ -3868,7 +4179,7 @@ before the end). Then the counter window holds only the workload, and
 
 # Part III — Messenger and the cluster network
 
-## 11. OSDs that froze for minutes — TCP retransmits, PG read leases, and where they meet
+## 12. OSDs that froze for minutes — TCP retransmits, PG read leases, and where they meet
 
 Found in a field diagnostics collection, not a bug report · affects any
 cluster whose cluster network drops packets · component OSD
@@ -3931,12 +4242,12 @@ minutes. The heartbeats never noticed.
    still open.
 
 ```
-#1-#4  the stall        §11.1 report -> §11.2.1-§11.2.3
-#5     the blind spot   §11.2.4
-#6     the fix          §11.3.1-§11.3.2;  loss location still open: §11.2.5, §11.3.3-§11.3.4
+#1-#4  the stall        §12.1 report -> §12.2.1-§12.2.3
+#5     the blind spot   §12.2.4
+#6     the fix          §12.3.1-§12.3.2;  loss location still open: §12.2.5, §12.3.3-§12.3.4
 ```
 
-### 11.1 Report
+### 12.1 Report
 
 #### 11.1.1 The observation
 
@@ -3948,8 +4259,8 @@ Every figure in this section comes from the collection, **except** three
 environment facts from outside it: the core count, the link speed, and
 that both VLANs share one bond. A standard Ceph collection has no usable
 CPU or interface detail: `orch host ls --detail` reports CPU as `N/A` and
-the NIC column as a bare count. This matters in §11.2.5. The ~40
-bluestore/kv/finisher threads in §11.2.5 are also an estimate.
+the NIC column as a bare count. This matters in §12.2.5. The ~40
+bluestore/kv/finisher threads in §12.2.5 are also an estimate.
 
 `ceph health detail` reported three warnings, all cosmetic: a failed
 prometheus placement, four dead node-exporters, one old crash. The real
@@ -3985,7 +4296,7 @@ currently in RTO backoff:
 ./ceph-net-retrans.py <collection-dir> --pairs --backoff
 ```
 
-### 11.2 Analysis
+### 12.2 Analysis
 
 #### 11.2.1 Root cause, top to bottom
 
@@ -4207,14 +4518,14 @@ Which host-side mechanism:
   socket's `retransmits=11` proves the window was open and the segments
   were really lost.
 - **Softirq starvation remains:** NIC ring overflow, `softnet` backlog
-  drops, or the qdisc. The four commands in §11.3.4 probe these.
+  drops, or the qdisc. The four commands in §12.3.4 probe these.
 
 NUMA auto-affinity is not in effect. `osd_numa_auto_affinity` is `true` but
 inert: the metadata lists `network_numa_unknown_ifaces`. Ceph never
 resolved the interface (a bond defeats its `/sys/class/net` walk), so
 `osd_numa_node` stays `-1`.
 
-### 11.3 Proposed solution
+### 12.3 Proposed solution
 
 #### 11.3.1 The fix
 
@@ -4248,7 +4559,7 @@ and costs throughput, but the OSD does not freeze.
   is also the base of the slow-ping warning: the threshold is
   `mon_warn_on_slow_ping_ratio` (0.05) × grace = the 1000 ms that
   `dump_osd_network` reports. Doubling the grace silently doubles that
-  threshold to 2 s, making the check §11.2.4 showed blind even blinder.
+  threshold to 2 s, making the check §12.2.4 showed blind even blinder.
   A non-zero `mon_warn_on_slow_ping_time` overrides the ratio and pins
   the threshold.
 - **Both settings go in `global`, not `osd`.** Upstream requires the
@@ -4290,7 +4601,7 @@ EC caveats:
 - EC costs CPU — the resource already suspected.
 
 **EC is a bet on the fabric hypothesis; cutting CRC and op shards is a
-bet on the host one.** They pull against each other, so run §11.2.5's
+bet on the host one.** They pull against each other, so run §12.2.5's
 localisation first.
 
 **A test pool that takes the fabric out of the path.** A CRUSH rule that
@@ -4324,7 +4635,7 @@ tc -s qdisc show dev <bond>
 
 | Host counters | Switch discards | Verdict |
 |---|---|---|
-| clean | high | the fabric — §11.3.3's ranking applies |
+| clean | high | the fabric — §12.3.3's ranking applies |
 | high | clean | drops never left the node — no switch work will help |
 
 Then confirm rather than assume:
@@ -4333,7 +4644,7 @@ Then confirm rather than assume:
   retransmit rate;
 - re-check `healthcheck history ls` for `SLOW_OPS`.
 
-The §11.3.1 lease change should stop the freezes while loss continues.
+The §12.3.1 lease change should stop the freezes while loss continues.
 So the two signals move independently: retransmits flat while
 `SLOW_OPS` goes quiet is the expected outcome, not a contradiction.
 
@@ -4361,7 +4672,7 @@ So the two signals move independently: retransmits flat while
   dropped it" from "we never got it out of the box", with no switch
   access at all.
 
-## 12. Tracker #80404 / PR #71663 — dead cluster sockets, parked ops, and the laggy latch that never lets go
+## 13. Tracker #80404 / PR #71663 — dead cluster sockets, parked ops, and the laggy latch that never lets go
 
 Found live in a `ceph_diagnostics` collection
 (`ceph-collect_20260909_140230`, captured mid-incident) and reported
@@ -4371,10 +4682,10 @@ upstream from an independent cluster:
 Ster · collection cluster: 48 OSDs, tentacle 20.2.2, 6 hosts × 8
 NVMe, 3× replication, 4 MiB RBD writes · component OSD
 (PeeringState / PrimaryLogPG) plus the fabric under the cluster
-network — the §11 disease with the §10 amplifier · fix: PR #71663
+network — the §12 disease with the §11 amplifier · fix: PR #71663
 upstream (reviewed below against main `5e757b85eaa`: correct),
 configuration and fabric work on the cluster · Status: PR under
-review; fabric localisation (§11.3.4) still to run on the hosts
+review; fabric localisation (§12.3.4) still to run on the hosts
 
 **The story in one view.** One issue, seen from two sides. The
 collection shows the wedge *while it happens*: replication sockets
@@ -4437,12 +4748,12 @@ OSD.
    inflating the client throttle.
 
 ```
-#1–#4  the live wedge        §12.1 report → §12.2.1–§12.2.3
-#5–#6  the latch             §12.2.4
-#7     the fix               §12.2.5 (PR review) → §12.3.1 upstream, §12.3.2 cluster
+#1–#4  the live wedge        §13.1 report → §13.2.1–§13.2.3
+#5–#6  the latch             §13.2.4
+#7     the fix               §13.2.5 (PR review) → §13.3.1 upstream, §13.3.2 cluster
 ```
 
-### 12.1 Report
+### 13.1 Report
 
 #### 12.1.1 The observation
 
@@ -4482,8 +4793,8 @@ From the collection, no live cluster needed:
 ```bash
 cds ceph -s ; cds ceph health detail            # the six OSDs
 cds ceph healthcheck history ls                 # 68 x SLOW_OPS, 32 x OSD_DOWN
-ops_in_flight summary                           # §12.2.1 - flag points per OSD
-./ceph-net-retrans.py <dir> --pairs --backoff   # §12.2.2 - the smoking gun
+ops_in_flight summary                           # §13.2.1 - flag points per OSD
+./ceph-net-retrans.py <dir> --pairs --backoff   # §13.2.2 - the smoking gun
 cds ceph config dump | grep -E 'grace|message_size_cap|objecter'
 ```
 
@@ -4494,7 +4805,7 @@ adds a standalone test, `qa/standalone/osd/osd-lease-laggy.sh`. A
 write issued after lease expiry blocks forever without the fix, and
 completes ~2 s after the latch with it.
 
-### 12.2 Analysis
+### 13.2 Analysis
 
 #### 12.2.1 What the parked ops are waiting for
 
@@ -4518,7 +4829,7 @@ object size                 = 4 MiB
 1 GiB / 4 MiB               = 256 message slots  -> 255 parked = throttle full
 ```
 
-This is the §10 amplifier. Parked ops never return their throttle
+This is the §11 amplifier. Parked ops never return their throttle
 bytes. The messenger then stops reading *every* client socket on the
 OSD, so one slow peer freezes all clients of the daemon. The tracker
 cluster counted the same number: 255 stuck ops at the same 1 GiB cap.
@@ -4555,7 +4866,7 @@ partner. Mutual waiting is what a dead *connection* looks like: the
 two peers share one cluster-network TCP path. When it stops
 delivering, A's sub-ops to B and B's sub-ops to A strand together.
 
-The `--tcp-info` messenger dumps prove it. The §11 collection did not
+The `--tcp-info` messenger dumps prove it. The §12 collection did not
 have them. Cluster-wide:
 
 ```
@@ -4584,11 +4895,11 @@ osd.46(ceph4) -> osd.35(ceph6)  backoff=8 rto=52.2s unacked=51  no ack for 67.2s
 delivered nothing for over a minute. That matches the oldest op age
 (76 s) within collection skew. Six sockets out of 1,902 explain all
 1,428 parked ops. All six end on ceph4, so that host's NIC, cabling
-and switch port are the first place to look (§12.3.2).
+and switch port are the first place to look (§13.3.2).
 
 #### 12.2.3 Why the cluster's safety nets were off
 
-No Ceph self-healing reacted. Part of the reason is the §11 story:
+No Ceph self-healing reacted. Part of the reason is the §12 story:
 heartbeats ride their own healthy sockets. The other part is one
 setting. The cluster runs `osd_heartbeat_grace = 600` (probably a past
 attempt to stop flapping), and that one value weakens three
@@ -4597,8 +4908,8 @@ protections:
 | Protection | Derived from grace | Default (grace 20) | Here (grace 600) | Effect here |
 |---|---|---|---|---|
 | Mark-down | grace | 20 s | 600 s = 10 min | Heartbeats flow anyway. But even a truly dead OSD would now stall its PGs 10 min before peering moves on. |
-| Read lease → `laggy` | 0.8 × grace | 16 s | 480 s = 8 min | A PG goes `laggy` only when `mnow > readable_until`. These wedges never live that long, so this collection has *zero* laggy PGs; §11's cluster (16 s lease) showed them. Same disease, different look. |
-| Slow-ping health check (§11.3.2 coupling) | `mon_warn_on_slow_ping_ratio` 0.05 × grace | 1 s | 30 s | All 48 `dump_osd_network` files say `"threshold": 30000, "entries": []`. `OSD_SLOW_PING_TIME_*` still fired 13 times through 09-04 — remarkable at this threshold. |
+| Read lease → `laggy` | 0.8 × grace | 16 s | 480 s = 8 min | A PG goes `laggy` only when `mnow > readable_until`. These wedges never live that long, so this collection has *zero* laggy PGs; §12's cluster (16 s lease) showed them. Same disease, different look. |
+| Slow-ping health check (§12.3.2 coupling) | `mon_warn_on_slow_ping_ratio` 0.05 × grace | 1 s | 30 s | All 48 `dump_osd_network` files say `"threshold": 30000, "entries": []`. `OSD_SLOW_PING_TIME_*` still fired 13 times through 09-04 — remarkable at this threshold. |
 
 The lease still expires *before* mark-down (ratio 0.8 < 1.0), so
 correctness holds. What is lost is every early warning on the way to a
@@ -4761,10 +5072,10 @@ Every claim in the PR text, checked against main `5e757b85eaa`:
 | Claim | Where verified |
 |---|---|
 | Once LAGGY, `check_laggy()` skips the time test | `PrimaryLogPG.cc:857` — the `else if (!state_test(PG_STATE_LAGGY))` shape above |
-| For acting > 1, only `proc_lease_ack()` clears it | all four `recheck_readable()` callers, table in §12.2.4 |
+| For acting > 1, only `proc_lease_ack()` clears it | all four `recheck_readable()` callers, table in §13.2.4 |
 | The renewal chain re-arms only itself | chain start is `all_activated_and_committed()`, once per interval; after that only `proc_renew_lease()` → `schedule_renew_lease()` |
 | Only an interval change clears the flag otherwise | `Started::exit()`, `PeeringState.cc:5482` |
-| The OSD is never marked down meanwhile | heartbeats use dedicated sockets, no PG lock — the §11 takeaway |
+| The OSD is never marked down meanwhile | heartbeats use dedicated sockets, no PG lock — the §12 takeaway |
 
 The watchdog itself is safe:
 
@@ -4778,7 +5089,7 @@ The watchdog itself is safe:
   `readable_until <= readable_until_ub_sent` always
   (`recalc_readable_until()` takes the min *including* the sent
   bound), and a live chain keeps the sent bound at least `interval/2`
-  ahead. When replicas simply stop acking — the §12.2.2 sockets — the
+  ahead. When replicas simply stop acking — the §13.2.2 sockets — the
   sent bound stays fresh. The watchdog then correctly does *not* spam
   renewals; it keeps re-checking until acks return.
 - **A restart is idempotent enough.** `proc_renew_lease()` moves
@@ -4796,7 +5107,7 @@ The watchdog itself is safe:
   latch → watchdog → restart repeatedly (the later `rados get` wedges
   and recovers a second time), not just once.
 
-### 12.3 Proposed solution
+### 13.3 Proposed solution
 
 #### 12.3.1 Upstream — the PR, plus four review comments
 
@@ -4842,26 +5153,26 @@ review comments:
 #### 12.3.2 On the cluster
 
 **First, localise on ceph4 while it is happening.** Every backoff
-socket has one end there. The §11 collection never gave such a strong
-lead. The §11.3.4 commands apply unchanged on ceph4: host counters vs
+socket has one end there. The §12 collection never gave such a strong
+lead. The §12.3.4 commands apply unchanged on ceph4: host counters vs
 switch discards decide fabric vs host. With switch access, the port
 counters of ceph4's cluster-VLAN uplink are the single most valuable
 read.
 
 **Second, undo the grace tuning.** `osd_heartbeat_grace = 600` is the
-§11.3.1 fix overshot by 15×, and §12.2.3 shows the cost. It does not
+§12.3.1 fix overshot by 15×, and §13.2.3 shows the cost. It does not
 prevent the wedge (the mechanism is TCP backoff, not heartbeats). It
-only hides the wedge and slows recovery. The §11.3.1 values — grace
+only hides the wedge and slows recovery. The §12.3.1 values — grace
 40–60 with `mon_warn_on_slow_ping_time 1000` pinned — keep the
 freeze-survival margin and restore mark-down, laggy visibility and
 ping warnings. With a sane lease these wedges *would* latch `laggy`.
-That makes the §12.2.5 watchdog directly relevant here: without it,
+That makes the §13.2.5 watchdog directly relevant here: without it,
 any lost renewal event turns a network event of a few minutes into a
 permanent wedge.
 
 **Third, stop feeding the amplifier.** The 1 GiB
 `osd_client_message_size_cap` (with `osd_client_message_cap = 0`, so
-bytes are the only limit) allows 256 parked messages per OSD — §10's
+bytes are the only limit) allows 256 parked messages per OSD — §11's
 arithmetic. The tracker cluster already showed that a bigger cap only
 means more stuck ops (124 → 255). The default (500 MiB) bounds the
 same wedge at about half the parked bytes. The client-side override
@@ -4877,7 +5188,7 @@ after the network heals.
 
 # Part IV — RGW
 
-## 13. PR #71209 — S3 over RDMA served directly from the OSDs
+## 14. PR #71209 — S3 over RDMA served directly from the OSDs
 
 [PR #71209](https://github.com/ceph/ceph/pull/71209) · RFC against `main`
 (Umbrella) · 30 commits, ~4,000 added lines across rgw/osdc/osd/common ·
@@ -4889,7 +5200,7 @@ librados/Objecter → OSD → RDMA NIC → client memory. Commits and source are
 used only to show how that architecture is built. It is written from the
 code at the branch tip (`wip-rgw-cuobj-osd`), not from the PR description.
 
-### 13.1 The story in one view
+### 14.1 The story in one view
 
 RGW stops carrying GET data. It forwards the client's RDMA token to the
 OSDs, and each OSD RDMA-writes its stripe straight into the client's memory.
@@ -4937,15 +5248,15 @@ Any OSD that cannot do this replies with a normal read, and RGW falls back.
    rewrites the window.
 
 ```text
-#1–#5  the path           §13.2 old vs new → §13.3 terms → §13.4 flow
-                          per layer: §13.5 RGW · §13.6 Objecter · §13.7 wire
-                          §13.8 OSD · §13.9 placement · §13.10–13.11 pools
-#6–#7  when it cannot     §13.12 lease/fence · §13.13 failures · §13.14 CRC
-                          §13.15 mixed versions · §13.16 fallback ladder
-       worked example     §13.17 · performance §13.18 · commits §13.19
+#1–#5  the path           §14.2 old vs new → §14.3 terms → §14.4 flow
+                          per layer: §14.5 RGW · §14.6 Objecter · §14.7 wire
+                          §14.8 OSD · §14.9 placement · §14.10–13.11 pools
+#6–#7  when it cannot     §14.12 lease/fence · §14.13 failures · §14.14 CRC
+                          §14.15 mixed versions · §14.16 fallback ladder
+       worked example     §14.17 · performance §14.18 · commits §14.19
 ```
 
-### 13.2 Old path vs new path
+### 14.2 Old path vs new path
 
 RGW is a proxy on the data path. For a GET, every object byte crosses the
 fabric twice and is staged in gateway memory in between.
@@ -5001,7 +5312,7 @@ bandwidth grows with the number of OSDs, and per-GET fabric traffic halves.
 This is the "gateway instructs data nodes, data nodes push via RDMA_WRITE"
 reference flow in NVIDIA's cuObject documentation (§1.3.3).
 
-### 13.3 Terms
+### 14.3 Terms
 
 ```text
 Term               What it is                             Why it is needed
@@ -5058,9 +5369,9 @@ inline fallback    Refusal == normal read reply.          One degradation path f
                                                           bytes the client asked for.
 ```
 
-### 13.4 End-to-end GET flow
+### 14.4 End-to-end GET flow
 
-The `#N` gutter matches §13.1.
+The `#N` gutter matches §14.1.
 
 ```text
     Client
@@ -5112,9 +5423,9 @@ The `#N` gutter matches §13.1.
 ```
 
 The push completes before the reply leaves the OSD. That is the completion
-interlock (§13.12, mechanism 1).
+interlock (§14.12, mechanism 1).
 
-### 13.5 RGW changes
+### 14.5 RGW changes
 
 `src/rgw/rgw_op.{h,cc}`, `src/rgw/rgw_rest_s3.cc`,
 `src/rgw/driver/rados/rgw_rados.{h,cc}`, `src/rgw/rgw_sal.h`.
@@ -5129,7 +5440,7 @@ std::optional<uint64_t> rdma_crc64;
 ```
 
 `RGWGetObj::select_rdma_mode(bool plain_chain)` picks the mode right before
-`iterate()`. The eligibility rules are in §13.16.
+`iterate()`. The eligibility rules are in §14.16.
 
 **SAL contract** (`rgw_sal.h`, `rgw::sal::Object::ReadOp::params`). When
 `params.rdma_token` is non-empty, `iterate()` must deliver all data out of
@@ -5174,7 +5485,7 @@ and `execute()` restarts the GET.
 RDMA bytes are accounted in the beast access log, ops log and usage log
 (`rgw_log.cc`, `s->rdma_bytes_transferred`).
 
-### 13.6 librados / Objecter changes
+### 14.6 librados / Objecter changes
 
 `src/include/rados/librados.hpp`, `src/librados/librados_cxx.cc`,
 `src/osdc/Objecter.{h,cc}`.
@@ -5199,16 +5510,16 @@ out-pointers). Two places use them:
 * `Objecter::_prepare_osd_op()` stamps the descriptors onto the `MOSDOp`,
   **only** when `osdmap->require_osd_release >= umbrella`. This check runs
   on *every* send, resends included. The OSD refuses to push a
-  retransmission (§13.12), so re-stamped descriptors do no harm.
+  retransmission (§14.12), so re-stamped descriptors do no harm.
 * `Objecter::handle_osd_op_reply()` copies `oob_results[i]` from the reply
   into each registered result slot. An inline reply (no vector) reads back
   as all-zero results.
 
 `IoCtx::pool_rdma_delivery_lease(double*)` reads the pool's lease from the
 client's own OSDMap. It is the same value the OSDs enforce — that is the
-point (§13.12).
+point (§14.12).
 
-### 13.7 MOSDOp protocol changes
+### 14.7 MOSDOp protocol changes
 
 `src/messages/MOSDOp.h` (v9 → **v10**), `src/messages/MOSDOpReply.h`
 (v8 → **v9**), `src/common/rdma_token.h` (the encoded types).
@@ -5249,13 +5560,13 @@ Why the descriptor is a field on `MOSDOp` and not an op:
 * Packing a token into per-op `indata` (the interim READ_RDMA design) had
   wire-format hazards; the commit message of `59a1146c2d0` names them.
 
-Version downgrade on the wire (v10 → v9, reply v9 → v8) is in §13.15.
+Version downgrade on the wire (v10 → v9, reply v9 → v8) is in §14.15.
 
 The lease is deliberately **not** on the wire. It is the pool option
 `rdma_delivery_lease`. The OSD that enforces it and the client that sizes
 its fence from it read the same OSDMap value, so they cannot disagree.
 
-### 13.8 The OSD delivery path
+### 14.8 The OSD delivery path
 
 `src/osd/PrimaryLogPG.{h,cc}`, `src/osd/osd_cuobj.{h,cc}`, `src/osd/OSD.cc`.
 
@@ -5283,18 +5594,18 @@ Refusals. Each one returns the data inline:
 ```text
 deliver_oob()                                    request level -> all ops inline
  +- descriptor vector doesn't mirror ops         malformed
- +- m->get_retry_attempt() > 0                   retransmit (§13.12, #2)
+ +- m->get_retry_attempt() > 0                   retransmit (§14.12, #2)
  +- osd->get_mnow() >                            PG read lease lapsed after
- |    recovery_state.get_readable_until()        dispatch (§13.12, #4;
+ |    recovery_state.get_readable_until()        dispatch (§14.12, #4;
  |                                               commit 4043ee33b7c)
- +- op age (now - recv_stamp) >                  delivery lease (§13.12, #3)
+ +- op age (now - recv_stamp) >                  delivery lease (§14.12, #3)
  |    pool rdma_delivery_lease
  +- per op: deliver_op_oob()                     op level -> this op inline
      +- unknown flag bits
      +- not READ / SYNC_READ / SPARSE_READ       descriptors on guards or
      |                                           stat ops are ignored
      +- failed or empty read
-     +- else: placement plan (§13.9)
+     +- else: placement plan (§14.9)
               -> OSDCuObj::execute_plan()
               ok: clear outdata, fill oob_results[i]
                   (sparse read keeps its extent map inline,
@@ -5331,7 +5642,7 @@ return total bytes only if every write completed, else negative errno
       -> caller delivers inline
 ```
 
-### 13.9 Placement planning
+### 14.9 Placement planning
 
 `src/osd/oob_placement.{h,cc}` holds pure functions with no OSD or RDMA
 dependencies, so the layout math is unit-tested standalone
@@ -5402,7 +5713,7 @@ The builders are tested against the client-side stripe walk
 (`ECStripeIterator`) as the oracle, across randomized geometries. The two
 independent implementations of the same layout math must agree.
 
-### 13.10 Replicated pools
+### 14.10 Replicated pools
 
 The common case is simple on purpose. RGW reads go to the primary. The
 whole stripe read gives one contiguous reply, and `linear_plan()` becomes a
@@ -5444,7 +5755,7 @@ slice size = floor division, rounded up to page size
 fix: ceiling division for the count
 ```
 
-### 13.11 EC pools
+### 14.11 EC pools
 
 There are two EC read paths. Which one runs depends on the pool and the
 read policy, not on this PR.
@@ -5488,7 +5799,7 @@ Unsupported EC cases degrade; they never break:
   (`rgw_obj_stripe_size == stripe_width`), each shard holds one contiguous
   range, and the "interleave" is a single write anyway.
 
-### 13.12 Correctness: lease, fencing, interlock
+### 14.12 Correctness: lease, fencing, interlock
 
 One-sided RDMA breaks an assumption the RADOS retry machinery relies on: a
 request the client gave up on can still have *side effects in client
@@ -5531,7 +5842,7 @@ peering. The resend carries `retry_attempt > 0`, and the OSD refuses to
 push it. So at most one attempt of an op ever writes the window. (The
 superseded attempt's write may still be in flight on another OSD; two
 writers to one range would race.) This also makes the Objecter's re-stamped
-descriptors (§13.6) harmless.
+descriptors (§14.6) harmless.
 
 **3. Lease + fence.** The pool's `rdma_delivery_lease` (default 5 s,
 `ceph osd pool set <pool> rdma_delivery_lease <s>`) bounds how long after
@@ -5562,14 +5873,14 @@ This is why the mechanism is called **advisory**: the OSD promises nothing.
 Every "no", and every crash, ends in an outcome the client always handles:
 inline data, or no reply and a fenced retry.
 
-### 13.13 Failure handling, case by case
+### 14.13 Failure handling, case by case
 
 ```text
 event                              what happens
 -----                              ------------
 one OSD lacks the feature          its stripe arrives inline -> flush_rdma() returns
                                    -EOPNOTSUPP -> RGW cancels/drains the other stripe
-                                   ops, fences (§13.12), restarts the GET staged or
+                                   ops, fences (§14.12), restarts the GET staged or
                                    plain-HTTP
 OSD crashes mid-request            Objecter resends after peering; resend refused
                                    (retry_attempt > 0), comes back inline -> same
@@ -5590,7 +5901,7 @@ passthrough that claimed success)
 In the first case, client ranges already RDMA-written are rewritten with
 the same bytes. No HTTP byte was committed, so the restart is invisible.
 
-### 13.14 Integrity: CRC64-NVME end to end
+### 14.14 Integrity: CRC64-NVME end to end
 
 The gateway never touches passthrough data, so verification moves to where
 the data is. With `rgw_cuobj_crc64nvme` (default on), each OSD checksums
@@ -5635,7 +5946,7 @@ verification". That text predates the final per-range CRC commit. The
 *Configuration* section correctly describes the range-fold, and the code
 implements the range-fold.
 
-### 13.15 Mixed-version compatibility
+### 14.15 Mixed-version compatibility
 
 ```text
 New RGW (umbrella librados)
@@ -5654,7 +5965,7 @@ older peer -> encode as v9      |
    |                            |
    +-------------+--------------+
                  |
-        any inline stripe -> RGW fallback ladder (§13.16)
+        any inline stripe -> RGW fallback ladder (§14.16)
 ```
 
 Two gates. Both are needed, because they guard different failure modes:
@@ -5678,7 +5989,7 @@ Old RGW / new OSD needs nothing: no token, no descriptor, no change.
 (`src/include/rados.h`, RD|DATA 34), so nothing ever reuses those bytes
 against a build of the interim series.
 
-### 13.16 RGW fallback ladder
+### 14.16 RGW fallback ladder
 
 ```text
 S3 GET
@@ -5726,7 +6037,7 @@ streamed stripes in one response; the restart rewrites everything. So the
 client contract is binary: either `x-amz-rdma-reply: 200` and all bytes are
 in the window, or the body has everything.
 
-### 13.17 Worked example: a 64 MiB GET, replicated pool
+### 14.17 Worked example: a 64 MiB GET, replicated pool
 
 The client registers a 64 MiB window and sends `GET /bucket/model.bin` +
 `x-amz-rdma-token`. RGW's manifest walk yields 16 stripe reads of 4 MiB
@@ -5768,7 +6079,7 @@ x-amz-rdma-reply: 200
 x-amz-rdma-bytes-transferred: 67108864
 ```
 
-By the interlock (§13.12), every byte was in the window before this
+By the interlock (§14.12), every byte was in the window before this
 response was formed.
 
 **Now OSD c cannot push** — built without `WITH_OSD_CUOBJ`,
@@ -5791,10 +6102,10 @@ stripe 2 returns as a normal inline read
 
 The client sees one slower GET, nothing else.
 
-### 13.18 Performance implications
+### 14.18 Performance implications
 
 The PR reports **no benchmark numbers**. Everything below is expected, not
-measured. The traffic picture is in §13.2.
+measured. The traffic picture is in §14.2.
 
 * Per-GET fabric traffic halves; the OSD→RGW hop disappears.
 * Gateway memory: no per-request full-object staging buffer. Staged mode
@@ -5830,10 +6141,10 @@ planned:  NVMe --DMA--> registered hugepage pool --NIC DMA--> client memory
   op against the token's range. But NVIDIA's docs never state this in one
   sentence, so the PR wants a 2-OSD hardware PoC before it leaves RFC.
 
-### 13.19 Commits and data structures
+### 14.19 Commits and data structures
 
 The 30 commits, grouped by architectural layer (not in order). The
-critical-path symbols and files are in the §13.4 flow.
+critical-path symbols and files are in the §14.4 flow.
 
 ```text
 Layer                     Commits          Files / what
@@ -5908,7 +6219,7 @@ rdma_delivery_result       librados       public mirror of oob_result_t
 get_obj_data.rdma_slots    RGW            per-stripe results, logical order
 ```
 
-### 13.20 Key takeaways
+### 14.20 Key takeaways
 
 1. **RGW leaves the GET data path.** It keeps the control plane (auth,
    manifest, HTTP, accounting). Bytes go OSD→client once; GET bandwidth
