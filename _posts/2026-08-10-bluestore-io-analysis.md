@@ -3898,6 +3898,48 @@ What one aio of that txc holds at each stage:
 | in `kv_committing`, before (3) | held | — |
 | after (3) | — | — |
 
+**When a shard thread blocks, and what lets it go.** The budget is
+drained one txc at a time as ops arrive and refilled in one lump per
+commit cycle:
+
+```
+ budget = bluestore_throttle_bytes (64 MiB);  count = cost outstanding
+
+ tp_osd_tp (one per op)                          bstore_kv_sync (one per cycle)
+ ──────────────────────                          ──────────────────────────────
+ queue_transactions()                 :16032
+   _txc_add_transaction()  plan done
+   throttle.try_start_transaction()   :19370
+     throttle_bytes.get(cost)         :19389
+       Throttle::get → _wait()        Throttle.cc:154, :94
+         _should_wait:                Throttle.h:47
+           count + cost > 64 MiB  ──► BLOCK (FIFO cond, PG lock held)
+           (a lone txc > 64 MiB       ▲
+            passes when count == 0)   │ ┌────────────── cycle N ──────────────┐
+                                      │ │ swap kv_queue → kv_committing        │
+                                      │ │ costs = Σ cost of the batch  :14716  │
+                                      │ │ bdev->flush()        barrier #1      │
+                                      │ │ release_kv_throttle(costs)  :15445   │
+                                      └─┼─   throttle_bytes.put(costs)         │
+     count += cost; proceed             │     Throttle::put → notify head      │
+   _txc_aio_submit() …                  │     waiter; it re-checks, takes its  │
+                                        │     cost, wakes the next             │
+                                        │ submit_transaction_sync()  barrier #2 │
+                                        └──────────────────────────────────────┘
+```
+
+A blocked shard thread therefore waits for the rest of the running
+cycle plus its place in the FIFO; under sustained load that is one
+commit cycle. The `false` return of `try_start_transaction` is about
+`throttle_deferred_bytes` only: `throttle_bytes.get()` has already
+blocked and returned by then, and the aggressive path
+([`:16032-16050`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L16032-L16050))
+kicks `deferred_try_submit` before blocking on the deferred budget. The
+limit itself is live: `handle_conf_change`
+([`:5974`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L5974))
+resets the throttle's max, so `bluestore_throttle_bytes` can be
+changed on a running OSD, unlike the aio ring depth.
+
 Two things follow.
 
 **The release is early on purpose.** (3) sits after the data flush
