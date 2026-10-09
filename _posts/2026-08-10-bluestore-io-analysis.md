@@ -3841,7 +3841,95 @@ On the SSD defaults of §1.1 (`prefer_deferred_size_ssd = 0`) this
 trade is switched off. Only `_do_write_small`'s read-modify-write
 still goes through `L` (§4.3.2).
 
-### 3.5.11 Code references
+### 3.5.11 The throttle — one budget, three touch points
+
+Every txc in §3.1 and §3.5 passed `bluestore_throttle_bytes` without
+the trace showing it, because the OSD was idle. Under load it is what
+decides how much of the pipeline exists at once, so here is where the
+budget is taken, counted and given back.
+
+A txc's cost is its data bytes plus
+[`bluestore_throttle_cost_per_io_ssd`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L5590)
+(4000) for each aio, and one more "io" for the kv commit
+(`_txc_calc_cost`, [`:14583`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L14583)).
+The budget,
+[`bluestore_throttle_bytes`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L5556),
+is 64 MiB per OSD. It touches the txc three times:
+
+```
+ shard thread (tp_osd_tp)               kv sync thread (bstore_kv_sync)
+ ────────────────────────               ───────────────────────────────
+
+ queue_transactions()
+   │
+   ├─ throttle.try_start_transaction()      ◄ (1) ACQUIRE          :16032
+   │     throttle_bytes.get(txc->cost)         blocks while        :19389
+   │     cost = bytes + 4000 × (aios + 1)      sum(cost) > 64 MiB
+   │
+   ├─ _txc_aio_submit()  → io_submit()  ─┐
+   │                                     │  aios at the device
+   │   STATE_AIO_WAIT                    │
+   ▼                                     ▼
+                       completion lands in the aio ring
+                                         │
+                       bstore_aio reaps it within µs
+                                         ▼
+                              _txc_aio_finish → _txc_state_proc
+                                kv_queue.push_back(txc)
+                                kv_throttle_costs += txc->cost   ◄ (2) COUNT   :14716
+                                         │
+                                  ── cycle start ──
+                                  swap kv_queue → kv_committing
+                                  costs = kv_throttle_costs
+                                  bdev->flush()                        barrier #1
+                                  throttle.release_kv_throttle(costs)  ◄ (3) RELEASE :15445
+                                  db->submit_transaction_sync()        barrier #2
+                                  hand off to kv_finalize
+                                  ── cycle end ──
+```
+
+What one aio of that txc holds at each stage:
+
+| stage | throttle bytes | aio ring slot |
+|---|---|---|
+| blocked in `throttle_bytes.get()` | — | — |
+| submitted, at the device | held | held |
+| completed, reaped, in `kv_queue` | held | — |
+| in `kv_committing`, before (3) | held | — |
+| after (3) | — | — |
+
+Two things follow.
+
+**The release is early on purpose.** (3) sits after the data flush
+and before the WAL sync, with the comment "this allows new ops to be
+prepared and enter pipeline while we are waiting on the kv commit
+sync/flush" (§4.3.7). The shard threads blocked in (1) wake while
+barrier #2 is still running, so the next cycle starts with work
+already queued.
+
+**The throttle, not the ring, is the pipeline's depth.** The aio ring
+([`bdev_aio_max_queue_depth`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L4074),
+1024) only holds aios the device has not completed yet, because
+`bstore_aio` frees the slot microseconds after completion while the
+throttle keeps counting until (3). So the ring is always lighter than
+the budget. For a large sequential write on the SSD defaults, each
+64 KiB blob
+([`bluestore_max_blob_size_ssd`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L4983))
+is one aio, and the budget admits
+
+```
+ 64 MiB / (64 KiB + 4000)  =  67108864 / 69536  ≈  965 aios
+```
+
+at once, of which only the device-resident part occupies the ring.
+That margin disappears when something else reaps the ring once per
+commit cycle instead of per completion: then every admitted aio sits
+in the ring until the next cycle starts, 965 of 1024 slots by
+construction, and `io_submit` returns `EAGAIN` whenever the rest is
+taken. That is the failure traced in
+[§9 of the tracker-notes post]({% post_url 2026-08-12-ceph-tracker-notes %}).
+
+### 3.5.12 Code references
 
 All links point at `v21.3.0`. `#N` is the §3.5.2 trace line.
 
