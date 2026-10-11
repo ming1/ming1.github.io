@@ -1459,6 +1459,26 @@ alone and fixes the task side instead: on a group exit the task cancels
 its own queued work through `io_wq_cancel_cb()` before the drain can see
 it.
 
+**Is it a regression of `c60eb049f4a1`?** No. That commit narrowed the
+hang; the drain is as old as io-wq, and the class test it added was right
+for every opcode that existed. The gap opened later:
+
+```
+ v5.5   771b53d033e8  ("io-wq: small threadpool implementation for io_uring")   workers run everything still queued at exit
+ v5.5   c5def4ab8494  ("io-wq: add support for bounded vs unbunded work")        bound = finite on its own, unbound = may never finish
+ v5.12  c60eb049f4a1  ("io-wq: cancel unbounded works on io-wq destroy")         exit cancels unbound, bound still runs   ← the proxy
+ v5.19  ee692a21e9bf  ("fs,io_uring: add infrastructure for uring-cmd")          bound by opcode, may wait for userspace  ← the gap opens
+ v6.2   fa8e442e832a  ("ublk: honor IO_URING_F_NONBLOCK for handling control command")   ublk's waits move onto io-wq   ← ublk steps in
+```
+
+Before `c60eb049f4a1` the same exit hung on unbound items too, so a
+bisect never lands on it. `Fixes:` goes to `fa8e442e832a` for the ublk
+patch, and would go to `ee692a21e9bf` for an io_uring-side one. The class
+test itself is still the right rule for the drain: a bound item that can
+block on userspace is a misclassified opcode or a driver sleeping where
+io-wq assumed it would not, and neither is fixable inside the drain
+without also canceling the file I/O the drain exists to finish.
+
 ## 4.8 Takeaways
 
 - A control command belongs to the task that issued it: its io-wq, its
