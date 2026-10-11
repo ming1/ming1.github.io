@@ -1,7 +1,7 @@
 ---
 title: "Linux Block Layer Issue Notes"
 category: linux kernel
-tags: [linux kernel, block, blk-mq, ublk, nvme, scsi, dm, loop, io-uring, debugging, regression, race, lore, hung-task, vfork, fd-lifetime, io-wq, scheduler, thread-handoff]
+tags: [linux kernel, block, blk-mq, ublk, nvme, scsi, dm, loop, io-uring, debugging, regression, race, lore, hung-task, vfork, fd-lifetime, io-wq, scheduler, thread-handoff, signals]
 ---
 
 * TOC
@@ -1174,3 +1174,244 @@ investigated.
 - **"Is the request started?" is only a check if nothing can start
   after it.** Quiesce and set `->canceling` first, or take the commands
   under the lock that starting the device needs.
+
+# 4. ublk: a control command queued on io-wq hangs the exit of the task that issued it
+
+| | |
+|---|---|
+| Report | [\[PATCH\] ublk: return from ublk_wait_dev_ready_and_lock() on group exit](https://lore.kernel.org/linux-block/20260930042335.16199-1-zcgao@amazon.com/), Nathan Gao, 2026-09-30, found by `test_generic_17.sh` hanging in a few percent of runs |
+| Affects | v6.2+, `fa8e442e832a` ("ublk: honor IO_URING_F_NONBLOCK for handling control command") |
+| Component | ublk ↔ io-wq ↔ signals: `drivers/block/ublk_drv.c`, `io_uring/io-wq.c`, `io_uring/cancel.c`, `kernel/signal.c` |
+| Fix | stable: fail the sleeping control commands with `-EINTR` once the issuing task's thread group is exiting (Nathan's check, extended to DEL_DEV, QUIESCE_DEV and exec). v7.4: `044e5f30b3e0` ("io_uring/cancel: cancel and wait for all requests on process exit") cancels the queued command before io-wq is drained |
+| Status | v1 posted; review reply drafted (DEL_DEV, exec, wording); v7.4 covered on the io_uring side; stable patch waits for v2 |
+| Code base | `3e11e07a196c` (v7.3-rc2+96: for-7.4/block + 12 ublk patches); all `file:line` refer to it, `ublk_drv.c` when no file is given |
+
+## 4.1 The story in one view
+
+A sleeping control command runs on an io-wq worker **of the task that
+issued it**. If that task exits while the command is still queued, the
+worker consumes its SIGKILL first and runs the command afterwards. The
+command waits for a server that never comes, and the exit waits for the
+worker. The task is left in D state, unkillable.
+
+```
+ issuing task (control)                     io-wq worker, idle                        ublk
+#1 START_DEV → -EAGAIN (NONBLOCK) → queued    woken, not running yet
+#2 raise(SIGKILL) → do_exit()
+     io_uring_files_cancel()
+       cancels io_uring-file requests only
+       io_wq_exit_start(): EXIT
+       io_wq_put_and_exit(): wait ────────┐
+                                          │   signal_pending → get_signal()
+#3                                        │     dequeues SIGKILL; PF_USER_WORKER: return
+                                          │   EXIT and queue not empty → drain
+#4                                        │     START_DEV is bound work: not canceled
+                                          │     ublk_wait_dev_ready_and_lock()
+                                          │       nothing pending → sleeps forever        waits for FETCH:
+    D state, forever ◄────────────────────┘                                              server gone, or is this task
+#5 stable: the wait checks SIGNAL_GROUP_EXIT → -EINTR
+   v7.4:   a group exit cancels every request of the task before the wait
+```
+
+1. **#1** ublk defers every sleeping control command to io-wq (`:5928`).
+2. **#2** `do_exit()` cancels only requests on io_uring files, then waits
+   for the workers (`cancel.c:603`, `io-wq.c:1403`).
+3. **#3** The worker dequeues the SIGKILL and returns instead of dying
+   (`signal.c:3033`), then drains the queue (`io-wq.c:751`).
+4. **#4** The drain cancels only unbound work (`io-wq.c:654`); uring_cmd
+   is bound. START_DEV runs with no signal pending and waits forever.
+5. **#5** End the wait from the group exit state, which outlives the
+   signal; or cancel the command before io-wq is drained.
+
+```
+#1–#4   4.2 report → 4.3 analysis      #5   4.4 fix → 4.5 validation
+side    4.6 can STOP_DEV from another task end the wait?
+```
+
+## 4.2 Report
+
+The warning is io-wq giving up on waiting, with the exiting task's own
+trace (`io-wq.c:1378`):
+
+```
+WARNING: io_uring/io-wq.c:1373 at io_wq_put_and_exit+0x10f/0x2d0, CPU#5: kublk/215924
+ io_uring_clean_tctx+0x85/0xb0
+ io_uring_cancel_generic+0x171/0x340
+ do_exit+0xb7/0x470
+ do_group_exit+0x2c/0x80
+ get_signal+0x8f8/0x940
+```
+
+`test_generic_17.sh` recovers a device with `--die_during_fetch`: kublk's
+daemon issues END_USER_RECOVERY from its main thread, and the fault_inject
+target calls `raise(SIGKILL)` from a queue thread at tag 1. So in that
+test the issuing task and the server are the same process, and both die
+at once. That is a kublk layout, not the model: the ublk tool and ublksrv
+issue control commands from a separate process.
+
+**Reproducer** [`ublk-ctrl-exit-hang.c`]({{ site.baseurl }}/code/block/ublk-ctrl-exit-hang.c)
+([runner]({{ site.baseurl }}/code/block/ublk-ctrl-exit-hang-run.sh)) needs
+no server. The control task pins itself and its io-wq worker to one CPU,
+runs SCHED_FIFO, queues START_DEV and dies at once. The worker cannot run
+before the task sleeps in `io_wq_put_and_exit()`, so the window is hit
+every time:
+
+```
+iter 0: pid 361 stuck in exit after SIGKILL
+  361 iowq_drain_hang   wchan=io_wq_put_and_exit     ← do_exit ← do_group_exit ← get_signal
+  362 iou-wrk-361       wchan=ublk_wait_dev_ready_and_lock
+      ublk_ctrl_start_dev ← ublk_ctrl_uring_cmd ← io_uring_cmd ← io_wq_submit_work
+      ← io_worker_handle_work ← io_wq_worker
+```
+
+Modes: `raise` (tgkill), `exit` (exit_group), `kill` (kill(pid)), `del`
+(DEL_DEV instead of START_DEV), `open` (START_DEV with `/dev/ublkcN` held
+open, like kublk). A hung run is followed by a STOP_DEV / DEL_DEV rescue
+attempt from another task (§4.6).
+
+## 4.3 Analysis
+
+From the symptom down to the cause:
+
+```
+exiting task stuck in io_wq_put_and_exit()                                  (io-wq.c:1403)
+ └─ why?   a worker never finishes: it sleeps in ublk_wait_dev_ready_and_lock()   (:4551)
+ └─ why doesn't the wait return?   signal_pending() is false
+      ├─ the worker's get_signal() dequeued SIGKILL and returned             (io-wq.c:740, signal.c:3033)
+      └─ TIF_NOTIFY_SIGNAL was cleared by io_run_task_work() before the work (io-wq.c:590)
+ └─ why does the worker run the command at all?
+      ├─ after the signal, EXIT + queued work → drain                        (io-wq.c:751)
+      ├─ the drain cancels only IO_WQ_WORK_UNBOUND                           (io-wq.c:654)
+      └─ URING_CMD has no unbound_nonreg_file → bound                        (opdef.c:417, io_uring.c:388)
+ └─ why didn't do_exit() cancel it first?
+      └─ io_uring_cancel_generic(false) stops at tctx_inflight(tracked)      (cancel.c:603)
+         tracked = REQ_F_INFLIGHT = requests on io_uring files only          (cancel.c:404)
+ └─ why can't the server end the wait?
+      └─ it is dead, or it is this process: its /dev/ublkcN closes in
+         exit_files(), after the io-wq wait                                  (exit.c:948, exit.c:1003)
+```
+
+**Which commands sleep.** `ublk_ctrl_uring_cmd_may_sleep()` (`:5903`)
+returns `-EAGAIN` under `IO_URING_F_NONBLOCK` for everything but the
+GET_* commands (`:5928`), so io_uring queues them to io-wq. Three of them
+wait for the server:
+
+| command | waits in | for |
+|---|---|---|
+| START_DEV, END_USER_RECOVERY | `ublk_wait_dev_ready_and_lock()` (`:4551`) | every queue fetched |
+| DEL_DEV | `wait_event_interruptible(ublk_idr_wq, …)` (`:5057`) | the device freed, i.e. `/dev/ublkcN` closed |
+| QUIESCE_DEV | `msleep()` loop (`:5385`) | idle io, bounded by a user timeout |
+
+**Why it usually works: which pending set the SIGKILL lands in.**
+
+```
+ how the task dies         where SIGKILL goes                                     after the worker's get_signal()
+ kill(pid, SIGKILL)        signal->shared_pending (process-directed)             still pending for every thread → wait returns -EINTR
+                                                                      (signal.c:1036)
+ tgkill / raise()          complete_signal(): one copy per thread, t->pending    dequeued once → nothing left
+                                                                      (signal.c:1002)
+ exit_group()              zap_other_threads(): same, per thread                 (signal.c:1343)
+ exec()                    de_thread() → zap_other_threads(), before
+                           io_uring_task_cancel()                                (exec.c:1152, :1160)
+```
+
+`kill -9` from a shell does not hang. A thread that calls `raise()`, a
+process that calls `exit()`, and an `exec()` do. The second condition is
+timing: the worker must be idle, so it takes the signal path instead of
+finishing a command with SIGKILL still pending, and it must run after the
+task has entered `io_wq_put_and_exit()`.
+
+## 4.4 Fix
+
+The group exit state outlives the signal: `SIGNAL_GROUP_EXIT` is set before
+SIGKILL is sent to each thread (`signal.c:997`, `exit.c:1145`) and never
+cleared, and `group_exec_task` is set while exec kills the other threads
+(`exec.c:944`). Check it before each wait:
+
+```c
+static bool ublk_ctrl_task_exiting(void)
+{
+	struct signal_struct *sig = current->signal;
+
+	return (READ_ONCE(sig->flags) & SIGNAL_GROUP_EXIT) ||
+		READ_ONCE(sig->group_exec_task);
+}
+
+static int ublk_wait_dev_ready_and_lock(struct ublk_device *ub)
+{
+	while (true) {
+		/* nobody is waiting for the result any more */
+		if (ublk_ctrl_task_exiting())
+			return -EINTR;
+		if (wait_var_event_interruptible(&ub->nr_queue_ready,
+						 ublk_dev_ready_or_stopping(ub)))
+			return -EINTR;
+		...
+```
+
+The same check guards the DEL_DEV wait and the QUIESCE_DEV loop. Nathan's
+v1 has the START_DEV site only, without `group_exec_task`.
+
+**Why it is safe.** A worker dequeues a signal only between two work items
+(`io-wq.c:740`), never inside one. If the group exit starts after the
+check, the worker has SIGKILL pending for the rest of the command, and
+every interruptible or killable wait in it returns as before. A plain
+`exit_group()` with START_DEV in flight now fails the command with
+`-EINTR` instead of hanging: nobody will read the result anyway.
+
+**Alternatives.**
+
+| alternative | why not |
+|---|---|
+| mark `IORING_OP_URING_CMD` `unbound_nonreg_file` so the drain cancels it | nvme passthrough on `/dev/ngXnY` is short, bound work by nature; unbound also lifts the per-CPU worker cap for it |
+| cancel bound work in the drain after a fatal signal | changes io-wq for every bound user (file reads at exit) |
+| re-arm `TIF_NOTIFY_SIGNAL` before the drain | `io_run_task_work()` clears it before each work item (`io-wq.c:590`) |
+| `044e5f30b3e0` ("io_uring/cancel: cancel and wait for all requests on process exit") | right layer: on `SIGNAL_GROUP_EXIT` the exit passes `IO_CANCEL_ALL`, `io_wq_cancel_cb()` cancels the queued command or notifies a running one, and the exit waits for inflight to drain. v7.4 behaviour, not a stable fix. Exec is still open: `de_thread()` runs before `io_uring_task_cancel()` |
+
+So for v7.4 the ublk check is belt and braces; for stable it is the fix.
+
+## 4.5 Validation
+
+All on `3e11e07a196c`, 3 runs per mode, 1 vCPU pinned; the ublk patch is
+`ublk-ctrl-group-exit`, the io_uring one is `block/for-7.4/io_uring` merged
+onto the base with no ublk change.
+
+| kernel | START_DEV raise | exit_group | kill(pid) | DEL_DEV raise | `test_generic_17.sh` × 40 |
+|---|---|---|---|---|---|
+| stock | 3/3 hung | 3/3 hung | clean | 3/3 hung | hung at run 25 |
+| + ublk check | clean | clean | clean | clean | clean; `run_generic` all pass |
+| + for-7.4/io_uring | clean | clean | clean | clean | clean |
+
+Nathan, on v7.3-rc5: unpatched hangs within 3–45 iterations, patched 150
+clean.
+
+## 4.6 Can STOP_DEV from another task end the wait?
+
+The 12 ublk patches on the base (§3) make `ublk_wait_dev_ready_and_lock()`
+also wake on `UB_STATE_STOPPING`. That is not a fix, but it changes what
+an operator can do with a stuck task:
+
+```
+ stuck task holds /dev/ublkcN (kublk layout)     stuck task holds only /dev/ublk-control
+ STOP_DEV from another task:                    STOP_DEV: "no server: nothing to cancel"   (:3082)
+   sets STOPPING, wake_up_var()       (:3076, :3087)     nobody is woken
+   START_DEV wakes → -EBUSY → exit continues    DEL_DEV from outside: blocks on the ref
+   3/3 hung, 3/3 rescued                          START_DEV holds → 3/3 hung, 0 rescued
+```
+
+`test_generic_17.sh` gets no help from it: the test waits for the
+foreground recover process to exit before it would issue DEL_DEV.
+
+## 4.7 Takeaways
+
+- A control command belongs to the task that issued it: its io-wq, its
+  signals, its exit. "The server dies" is the wrong frame unless the
+  server is that task.
+- io-wq runs bound work to completion at exit and cancels only unbound
+  work. A bound work item that can sleep until userspace acts needs its
+  own exit condition.
+- A thread-directed SIGKILL is dequeued once per thread. After the worker
+  took it, `fatal_signal_pending()` is false; the group exit flag is the
+  state that remains.
+- `kill -9` does not reproduce a hang that `raise()` or `exit()` does: the
+  pending set differs, not the signal.
