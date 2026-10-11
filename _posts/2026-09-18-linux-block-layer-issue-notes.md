@@ -1225,7 +1225,7 @@ worker. The task is left in D state, unkillable.
 
 ```
 #1–#4   4.2 report → 4.3 analysis      #5   4.4 fix → 4.5 validation
-side    4.6 can STOP_DEV from another task end the wait?
+side    4.6 can STOP_DEV from another task end the wait?   4.7 io-wq: bound vs unbound, why exit drains
 ```
 
 ## 4.2 Report
@@ -1402,7 +1402,64 @@ an operator can do with a stuck task:
 `test_generic_17.sh` gets no help from it: the test waits for the
 foreground recover process to exit before it would issue DEL_DEV.
 
-## 4.7 Takeaways
+## 4.7 io-wq: bound vs unbound, and why exit drains the queue
+
+Two questions the story raises: what "bound" means, and why SIGKILL does
+not make io-wq drop its queue.
+
+**Bound and unbound** are the two lifetimes io-wq knows, from
+`c5def4ab8494` ("io-wq: add support for bounded vs unbunded work"):
+
+```
+                  bound                                        unbound
+ meaning          completes in finite time on its own          may never complete on its own
+ typical          read/write on a regular file or bdev         socket send/recv, accept, connect, poll, pipe read
+ workers          IO_WQ_ACCT_BOUND, max min(sq_entries, 4×cpus)  IO_WQ_ACCT_UNBOUND, max RLIMIT_NPROC
+                  (tctx.c:41, io-wq.c:1279)                    (io-wq.c:1280)
+ queue            one list per account, so unbound work can't starve bound work      (f95dc207b93d)
+ at exit          runs to completion                           canceled, -ECANCELED            (io-wq.c:654)
+```
+
+The class is decided per request in `io_prep_async_work()`
+(`io_uring.c:361`), by the file first and the opcode second:
+
+```
+ regular file or block device                    → bound, always
+ anything else: char device, socket, pipe, none  → unbound only if the opcode has unbound_nonreg_file
+    with the flag     READ*, WRITE*, SEND*, RECV*, ACCEPT, CONNECT, POLL_ADD, SPLICE, TEE, EPOLL_CTL
+    without it        URING_CMD, FSYNC, OPENAT*, STATX, ...   → bound on every file     (opdef.c:417)
+```
+
+So a uring_cmd on `/dev/ublk-control` is bound. The flag belongs to the
+opcode, and uring_cmd was built for nvme passthrough, where bound is the
+right answer: the device completes it.
+
+**Why the queue is not dropped on SIGKILL.** Exit handles the two halves
+of the queue differently:
+
+```
+ work arriving after exit started   io_wq_enqueue(): EXIT set → io_run_cancel() → -ECANCELED    (io-wq.c:1048)
+ work already queued                the worker drains it: bound runs, unbound is canceled       (io-wq.c:751, :654)
+```
+
+The drain is deliberate. Until `c60eb049f4a1` ("io-wq: cancel unbounded
+works on io-wq destroy") every queued item ran at exit; that commit
+cancels the unbound half, because a pipe read had hung an exit exactly
+like this one. The bound half still runs, on the assumption from
+`c5def4ab8494` that it "will finish in a finite amount of time": the
+storage completes it, nobody in userspace has to act, and canceling it
+would throw away file I/O the application has already submitted. SIGKILL
+does not change that. The worker reads the signal as "exit", and exits
+after the drain.
+
+The assumption holds for every bound opcode but one: a `->uring_cmd()`
+that waits for userspace. Bound by opcode, unbounded by behaviour, and
+that is the gap ublk fell through. `044e5f30b3e0` leaves io-wq's rule
+alone and fixes the task side instead: on a group exit the task cancels
+its own queued work through `io_wq_cancel_cb()` before the drain can see
+it.
+
+## 4.8 Takeaways
 
 - A control command belongs to the task that issued it: its io-wq, its
   signals, its exit. "The server dies" is the wrong frame unless the
