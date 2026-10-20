@@ -460,7 +460,48 @@ Recovery is plain RocksDB on top of §3:
  db/CURRENT -> db/MANIFEST-* -> replay db.wal/*.log
 ```
 
-## 4.1 Column families
+## 4.1 The story in one view
+
+Every key is a byte string built so that RocksDB's sort order is PG
+order. So one PG's objects, shards and omap are each one contiguous key
+range. Listing, scrub, PG removal, split and merge become range
+operations, with no per-object index.
+
+Object `specimen`, pool 1, hash `0x5810483c`; `0x...3c & 0b111 = 4`, so
+it is in PG `1.4`:
+
+```
+ #1  C "1.4_head"   value: bits = 3            no object list stored
+                         |
+                         v  PG 1.4 = all hashes with low 3 bits == 4
+ #2  O  7f | 80..01 | 3c 12 08 1a | "specimen!=" | snap | gen | 'o'
+            pool+2^63  _reverse_bits(hash)
+            -> low hash bits come first, so PG 1.4 is one key range
+ #3  O  <same onode key> | BE u32 offset | 'x'   shards sort right after
+                                                 the onode
+ #4  p  00..01 | 3c 12 08 1a | nid | '.' | name   omap: same rev-hash,
+                                                 so one range per PG too
+ #5  CF hash over O[0,13) / p[0,12)  = shard+pool+hash / pool+hash
+            -> one object, one PG never spans column families
+ #6  list / scrub / remove PG  = scan [start, end)
+     split / merge PG          = rewrite C records only; no O/p key moves
+```
+
+1. A collection stores only its hash `bits`; membership is computed.
+2. The `O` key starts with shard, pool and *reversed* hash, so all
+   objects of a PG sort together.
+3. Shard keys extend the onode key and sort right after it.
+4. Per-PG omap keys reuse the reversed hash, so omap is PG-ordered too.
+5. Column-family sharding hashes only the leading bytes, so a range never
+   crosses CFs. Result: PG-level operations are range scans; split and
+   merge rewrite only `C` records.
+
+§4.2 covers column families, §4.3 lists all prefixes, §4.5–4.8 decode the
+`O`, `p` and `C` keys of steps #1–#4. The remaining prefixes (`S`, `T`,
+`L`, `B`/`b`, `X`) are small single-purpose tables: §4.4, §4.9, §8.2,
+§9.1, §5.5.
+
+## 4.2 Column families
 
 A column family (CF) is a separate keyspace inside one RocksDB:
 
@@ -504,8 +545,8 @@ Why:
 * **Sharding:** `O`, `m`, `p` are each split over 3 CFs by a hash of the
   leading key bytes. Smaller LSM trees flush and compact in parallel.
 * **Hash ranges keep neighbours together:** all keys of one object (`O`,
-  13 B = shard byte + pool + hash, §4.4) or one PG (`p`, 12 B = pool +
-  hash, §4.6) land in the same CF. Object listing and PG removal never
+  13 B = shard byte + pool + hash, §4.5) or one PG (`p`, 12 B = pool +
+  hash, §4.7) land in the same CF. Object listing and PG removal never
   cross CFs.
 
 Where the definition lives:
@@ -517,16 +558,16 @@ Where the definition lives:
   Changing `bluestore_rocksdb_cfs` later has no effect on an existing OSD;
 * shard CFs are named `O-0`, `O-1`, …; the RocksDB MANIFEST records which
   CF each SST belongs to;
-* merge operators (§4.8, §9.1) are registered on the CF that holds the
+* merge operators (§4.9, §9.1) are registered on the CF that holds the
   prefix;
 * offline tools: `ceph-bluestore-tool show-sharding` and `reshard`
   ([`src/os/bluestore/bluestore_tool.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_tool.cc));
   `reshard` moves keys between CFs.
 
-CFs change only where keys are stored. Key formats (§4.2–§4.8) are the
+CFs change only where keys are stored. Key formats (§4.3–§4.9) are the
 same.
 
-## 4.2 Prefix table
+## 4.3 Prefix table
 
 Source: [`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc) (top-of-file `PREFIX_*` constants).
 "Keys (ref OSD)" counts are from the captured OSD (1 pool, 8 PGs, 1 user
@@ -534,20 +575,20 @@ object).
 
 | Prefix | Name | Key format | Value | Keys (ref OSD) |
 |---|---|---|---|---|
-| `S` | PREFIX_SUPER | ASCII field name | per-field (§4.3) | 7 |
-| `T` | PREFIX_STAT | BE u64 pool id (or `bluestore_statfs`) | 5 × le64 (§4.8) | 3 |
-| `C` | PREFIX_COLL | ASCII coll name, e.g. `1.4_head` | `bluestore_cnode_t` (§4.7) | 10 |
-| `O` | PREFIX_OBJ | ghobject key (§4.4) | onode (§6) / extent shard (§6.4) | 32 |
-| `M` | PREFIX_OMAP | BE u64 nid + sep + name (§4.6) | omap value | 0 |
-| `P` | PREFIX_PGMETA_OMAP | BE u64 nid + sep + name (§4.6) | omap value (PG meta; opaque here) | 91 |
-| `m` | PREFIX_PERPOOL_OMAP | BE u64 pool + nid + sep + name (§4.6) | omap value | 0 |
-| `p` | PREFIX_PERPG_OMAP | BE u64 pool + BE u32 hash + nid + sep + name (§4.6) | omap value | 5 |
+| `S` | PREFIX_SUPER | ASCII field name | per-field (§4.4) | 7 |
+| `T` | PREFIX_STAT | BE u64 pool id (or `bluestore_statfs`) | 5 × le64 (§4.9) | 3 |
+| `C` | PREFIX_COLL | ASCII coll name, e.g. `1.4_head` | `bluestore_cnode_t` (§4.8) | 10 |
+| `O` | PREFIX_OBJ | ghobject key (§4.5) | onode (§6) / extent shard (§6.4) | 32 |
+| `M` | PREFIX_OMAP | BE u64 nid + sep + name (§4.7) | omap value | 0 |
+| `P` | PREFIX_PGMETA_OMAP | BE u64 nid + sep + name (§4.7) | omap value (PG meta; opaque here) | 91 |
+| `m` | PREFIX_PERPOOL_OMAP | BE u64 pool + nid + sep + name (§4.7) | omap value | 0 |
+| `p` | PREFIX_PERPG_OMAP | BE u64 pool + BE u32 hash + nid + sep + name (§4.7) | omap value | 5 |
 | `L` | PREFIX_DEFERRED | BE u64 seq | `bluestore_deferred_transaction_t` (§8.2) | 0 |
 | `B` | PREFIX_ALLOC | ASCII `size`, `blocks`, `bytes_per_block`, `blocks_per_key` | le64 (§9.1, geometry copy) | 4 |
 | `b` | PREFIX_ALLOC_BITMAP | BE u64 region offset | region bitmap (§9.1) | 802 |
 | `X` | PREFIX_SHARED_BLOB | BE u64 sbid | `bluestore_shared_blob_t` (§5.5) | 0 |
 
-## 4.3 `S` — superblock fields
+## 4.4 `S` — superblock fields
 
 Code path: `BlueStore::_open_super_meta()` and mkfs
 ([`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc)). Captured values:
@@ -568,7 +609,7 @@ Code path: `BlueStore::_open_super_meta()` and mkfs
 * Format numbers in code: latest 4, min compat 3, min readable 1.
 * A legacy key `min_min_alloc_size` is read and removed on upgrade.
 
-## 4.4 `O` — object key construction
+## 4.5 `O` — object key construction
 
 Source: [`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc) (`get_object_key()`,
 `_key_encode_prefix()`, `append_escaped()`; suffix constants
@@ -589,7 +630,7 @@ Source: [`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.
 | nspace, key, name | escaped strings, `!`-terminated | order-preserving |
 | snap | BE u64: `CEPH_NOSNAP` = 0xff..fe (head), `SNAPDIR` = 0xff..ff | |
 | generation | BE u64 (`NO_GEN` = 0xff..ff) | |
-| suffix | `'o'` (onode) or `'x'` (shard, §4.5) | |
+| suffix | `'o'` (onode) or `'x'` (shard, §4.6) | |
 
 String escaping (`append_escaped()`):
 
@@ -623,7 +664,7 @@ ff ff ff ff ff ff ff ff     generation = NO_GEN
 6f                          'o'
 ```
 
-## 4.5 `O` — extent-map shard keys
+## 4.6 `O` — extent-map shard keys
 
 Source: [`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc) (`get_extent_shard_key()`,
 `is_extent_shard_key()`).
@@ -636,7 +677,7 @@ Source: [`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.
 * An object's shards sort right after its onode.
 * Captured example: §7.2.
 
-## 4.6 `M`/`P`/`m`/`p` — omap keys
+## 4.7 `M`/`P`/`m`/`p` — omap keys
 
 Source: [`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc)
 (`BlueStore::Onode::calc_omap_key()`, `calc_omap_header()`,
@@ -671,7 +712,7 @@ The per-PG layout uses the same reversed hash as the `O` key. So an
 object's omap sorts inside its PG, and PG removal or export is one range
 scan.
 
-## 4.7 `C` — collections
+## 4.8 `C` — collections
 
 Source: [`src/os/bluestore/bluestore_types.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h) (`bluestore_cnode_t`).
 Code path: `get_coll_range()`, `_open_collections()`,
@@ -697,7 +738,7 @@ No object list is stored. Membership is computed:
                                   (and same pool and shard: pg_t::contains)
 ```
 
-`O` keys hold `_reverse_bits(hash)` (§4.4), so this is one key range
+`O` keys hold `_reverse_bits(hash)` (§4.5), so this is one key range
 (`get_coll_range()`):
 
 ```
@@ -732,7 +773,7 @@ range is reported as a stray object.
 * Collections load before any onode at mount (`_open_collections()`,
   §10): key ranges and membership checks need the cnode.
 
-## 4.8 `T` — statfs
+## 4.9 `T` — statfs
 
 Source: [`src/os/bluestore/BlueStore.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h) (`BlueStore::volatile_statfs`);
 merge operator `Int64ArrayMergeOperator`
@@ -904,7 +945,7 @@ Code path: `Collection::make_blob_shared()`, `_assign_blobid()`,
 
 After a clone, two objects use the same disk extents. Each onode keeps its
 own copy of the blob. Only the refcounts are shared, in one `X` record
-keyed by sbid (BE u64 in the key, §4.2).
+keyed by sbid (BE u64 in the key, §4.3).
 
 The **ref_map** is those refcounts: a sorted list of *disk* ranges.
 
@@ -962,7 +1003,7 @@ Life of an `X` record:
 clone          make_blob_shared(): set SHARED, clear HAS_UNUSED,
                take a ref on every non-hole pextent  -> record created
 ref change     whole ref_map re-encoded and set again
-               (no merge operator, unlike b §9.1 and T §4.8)
+               (no merge operator, unlike b §9.1 and T §4.9)
 range refs->0  that range goes to the transaction's released set (§8.2)
 ref_map empty  rmkey
 unshare        clone removed, head is the only user -> rmkey
@@ -984,7 +1025,7 @@ sbid allocation (one counter per OSD):
 
 ```
  0 ............. blobid_last ............. blobid_max
-                 last id given, RAM only    stored ceiling, S key (§4.3)
+                 last id given, RAM only    stored ceiling, S key (§4.4)
 
  _assign_blobid()    ++blobid_last, no disk I/O
  _kv_sync_thread()   if blobid_last + prealloc/2 > blobid_max:
@@ -1027,7 +1068,7 @@ An `O` value has three parts. The extent map is either inline (part 3) or
 split into shards, each shard in its own key:
 
 ```
- O value (key §4.4)
+ O value (key §4.5)
  +-----------------------+----------------------+-----------------------------+
  | bluestore_onode_t     | spanning blobs       | inline extent map           |
  | (§6.2)                | (§6.3)               | le32 len + payload (§6.4)   |
@@ -1036,7 +1077,7 @@ split into shards, each shard in its own key:
       |
       | onode field extent_map_shards not empty: part 3 is absent
       v
- shard values (key §4.5):  [ shard 0 ] [ shard 1 ] ...   each = one §6.4 payload
+ shard values (key §4.6):  [ shard 0 ] [ shard 1 ] ...   each = one §6.4 payload
 ```
 
 | Term | Meaning |
@@ -1074,7 +1115,7 @@ for it.
 2. When the encoded map passes `bluestore_extent_map_shard_max_size`
    (1200 B), reshard cuts it into shards near
    `bluestore_extent_map_shard_target_size` (500 B). Each shard is a key
-   (§4.5); the onode keeps only `(offset, bytes)` per shard.
+   (§4.6); the onode keeps only `(offset, bytes)` per shard.
 3. An I/O decodes only the shards that cover its range.
 4. Each shard must decode alone, so a blob that crosses a cut is split.
    A blob that cannot split becomes spanning.
@@ -1404,7 +1445,7 @@ O  <ghobject key>'o' 00 1f 00 00 'x'          shard 1: logical 0x1f0000, 500 B
 O  <ghobject key>'o' 00 3e 00 00 'x'          shard 2: logical 0x3e0000, 212 B
 ```
 
-* Shard key = onode key + BE u32 shard start + `'x'` (§4.5).
+* Shard key = onode key + BE u32 shard start + `'x'` (§4.6).
 * Shard value = bare §6.4 payload for [its start, next shard's start).
 * Here a cut (§6 glossary) shows up in three places with the same value
   (each shard's first extent starts exactly at the cut):
@@ -1448,7 +1489,7 @@ Inline vs sharded:
 | | inline (§7.1) | sharded (§7.2) |
 |---|---|---|
 | records per object | 1 | 4: onode + 3 shards |
-| extent map in | part 3 of the `O` value | separate `'x'` records (§4.5) |
+| extent map in | part 3 of the `O` value | separate `'x'` records (§4.6) |
 | map length | le32 before the payload | none; `shard_info.bytes`, checked against the KV value length |
 | `extent_map_shards` | empty | 3 entries |
 | spanning section | `02 00` | `02 00`: each blob is one 4 KiB extent, so none crosses a cut |
@@ -1620,7 +1661,7 @@ Every block is one extent record. Picture B — how each record names its blob:
 ### 7.3.3 The bytes
 
 The head object (`snap` = `CEPH_NOSNAP`; the clone sorts first, lower
-snap id, §4.4) has eight records: four under `O`, one `X` per shared blob:
+snap id, §4.5) has eight records: four under `O`, one `X` per shared blob:
 
 | Record | Key | Value |
 |---|---|---|
@@ -1872,7 +1913,7 @@ position; that is what the spanning id is for. Window 1's shared blob
 carries three names:
 
 ```
- sbid 61442       per OSD     key of its X record (§5.5); allocated below blobid_max (§4.3)
+ sbid 61442       per OSD     key of its X record (§5.5); allocated below blobid_max (§4.4)
  spanning id 0    per onode   used by shard records (0d ..)
  record index     none        not defined in any shard
 ```
@@ -1883,7 +1924,7 @@ One 4 KiB read at logical 0x1b000 of the §7.3 object. Every value is from
 the §7.3 capture.
 
 ```
-1. key        build the O key from the ghobject (§4.4), read the onode record
+1. key        build the O key from the ghobject (§4.5), read the onode record
 2. onode      decode bluestore_onode_t (§6.2)      -> shard_info[]
               decode the spanning section (§6.3)   -> id 0 = blob, 16 pextents,
                                                       csum order 12
@@ -1969,7 +2010,7 @@ Code path: `BlueStore::queue_transactions()`, `_txc_state_proc()`,
    -> one KV transaction (RocksDB WriteBatch):
         onode, shards, omap, X, C, [one L record],
         statfs T + freelist (§9.1 bitmap mode only)
-        (the KV thread may also add S nid_max / blobid_max, §4.3)
+        (the KV thread may also add S nid_max / blobid_max, §4.4)
 ```
 
 * **Atomic per txc:** the whole WriteBatch applies, or none of it.
@@ -2135,7 +2176,7 @@ The one exception is omap:
 
 # 9. Free Space Persistence
 
-BlueStore keeps free space in one of two ways. `S freelist_type` (§4.3)
+BlueStore keeps free space in one of two ways. `S freelist_type` (§4.4)
 says which:
 
 ```
@@ -2283,7 +2324,7 @@ cct->_conf->bluestore_allocation_from_file      (default: true)
 | RocksDB value(s) | would pay WAL double-write and compaction for a large blob, and put allocation state back into the path NCB removes |
 | reserved raw region | size is not known at mkfs: 16 B per free extent, grows with fragmentation |
 | BlueFS journal / superblock | the journal is replayed at every mount and rewritten at every compaction (§3.4); the superblock is one 4 KiB block (§3.1) |
-| **standalone BlueFS file** | growable, with atomic, journaled create and truncate — same pattern as `sharding/def` (§4.1) |
+| **standalone BlueFS file** | growable, with atomic, journaled create and truncate — same pattern as `sharding/def` (§4.2) |
 
 BlueFS guarantees the file's extents, not its content, so the file checks
 itself:
@@ -2341,7 +2382,7 @@ in NCB mode.
 [5] _open_super_meta                      S: ondisk_format gate,
         |                                 nid_max, blobid_max,
         |                                 min_alloc_size,
-        |                                 freelist_type, per_pool_omap(§4.3)
+        |                                 freelist_type, per_pool_omap(§4.4)
 [6] freelist/allocator init               b-bitmap scan (§9.1), or NCB
         |                                 file / full recovery scan   (§9.2)
 [7] _deferred_replay                      L records -> raw writes     (§8.2)
@@ -2397,7 +2438,7 @@ $ ceph-kvstore-tool bluestore-kv dev/osd0 get O '%7f%80...o' out /tmp/onode.bin
 
 `bluestore-kv` mode mounts BlueFS and opens the embedded RocksDB, so all
 §4 prefixes are visible. Keys are printed %xx-escaped and are accepted back
-in the same form by `get`. The §4.2 census was produced with
+in the same form by `get`. The §4.3 census was produced with
 `list | cut -f1 | sort | uniq -c`; the §7.1 hexdump is `hexdump -C` of the
 `get ... out` file.
 
