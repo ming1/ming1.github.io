@@ -212,21 +212,56 @@ because of the trailing crc32c and the `osd_uuid` match.
 BlueFS is a small filesystem that holds RocksDB's files. It has no inode
 table: all its metadata lives in one journal, replayed at every mount.
 
-```
- superblock @ 0x1000 (§3.1)
-     |  log_fnode = inode 1 = the journal
-     v
- journal (§3.3), replayed (§3.4)
-     |  builds in memory: dirs db/, db.wal/, db.slow/ -> files -> fnodes (extents)
-     v
- RocksDB files (SST, WAL, MANIFEST) read through their fnode extents
-```
-
 Types: [`src/os/bluestore/bluefs_types.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluefs_types.h); implementation:
 [`src/os/bluestore/BlueFS.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.cc); RocksDB glue:
 [`src/os/bluestore/BlueRocksEnv.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueRocksEnv.cc) (`BlueRocksEnv`).
 
-## 3.1 Superblock — `bluefs_super_t`
+## 3.1 The story in one view
+
+The superblock only points to the journal. Every directory and file
+change is a journal transaction, and mount rebuilds the whole namespace by
+replaying it. Each journal update costs a write, so v21 lets RocksDB WAL
+files skip most of them.
+
+```
+ #1 superblock @ 0x1000   uuid, seq, log_fnode = inode 1 = the journal
+                          rewritten at mkfs, compaction, device changes
+                               |
+                               v
+ #2 journal (inode 1)     [txn 1][txn 2] ... [txn N]     block-aligned
+                          each txn: uuid | seq | ops | crc   no commit record
+                          ops: dir_link, file_update(_inc), file_remove ...
+                               |
+ #3 mount: replay              v  stop at wrong uuid or seq gap; bad crc = -EIO
+                                  (torn multi-block txn: stop)
+                          in memory: db/, db.wal/, db.slow/ -> files -> fnodes
+                               |
+ #4 RocksDB open               v  SST, WAL, MANIFEST read through fnode extents
+
+ #5 cost                  journal only grows   -> compaction: write live state
+                                                  to a new journal, then the
+                                                  superblock
+                          PLAIN WAL file        -> one file_update_inc per
+                                                  size change
+ #6 v21 envelope mode     *.log content frames itself: [len|data|stamp] ...
+                          journal only on allocation; mount walks the stamps
+                          to find EOF
+```
+
+1. The superblock holds the journal's fnode (`log_fnode`) and little else.
+2. Every metadata change is a journal transaction. uuid + seq + crc decide
+   if a transaction is valid; there is no commit record.
+3. Mount replays the journal into memory. All fnodes, including RocksDB
+   file extents, exist only there.
+4. Cost: the journal grows until compaction rewrites it, and each size
+   change of a PLAIN WAL file costs a journal update.
+5. v21: envelope files describe their own content, so WAL appends skip
+   the journal; mount finds EOF by walking envelope stamps.
+
+§3.2 decodes the superblock, §3.3 the fnode and extent bytes, §3.4 the
+transaction and opcodes, §3.5 replay and compaction, §3.6 envelope mode.
+
+## 3.2 Superblock — `bluefs_super_t`
 
 Source: [`src/os/bluestore/bluefs_types.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluefs_types.h) (`bluefs_super_t`), encode in
 [`src/os/bluestore/bluefs_types.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluefs_types.cc).
@@ -238,7 +273,7 @@ Frame `ENCODE_START(_version, compat)`:
 ```
 _version   compat   meaning
 2          1        baseline
-3          3        envelope mode (§3.5); pre-envelope code refuses to mount
+3          3        envelope mode (§3.6); pre-envelope code refuses to mount
 ```
 
 | Field | Type | Meaning |
@@ -253,11 +288,11 @@ _version   compat   meaning
 
 * Written at mkfs, at the end of each journal compaction, on device
   add/migrate (`bluefs-bdev-new-db`, `-new-wal`, `-migrate`: this is where
-  `memorized_layout` changes), and on `revert-wal-to-plain` (§3.5).
+  `memorized_layout` changes), and on `revert-wal-to-plain` (§3.6).
   Normal journal growth does not touch it.
 * `seq` goes up on every write.
 
-## 3.2 File metadata — `bluefs_extent_t`, `bluefs_fnode_t`, `bluefs_fnode_delta_t`
+## 3.3 File metadata — `bluefs_extent_t`, `bluefs_fnode_t`, `bluefs_fnode_delta_t`
 
 Source: [`src/os/bluestore/bluefs_types.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluefs_types.h).
 
@@ -276,7 +311,7 @@ DENC_START(1,1) frame (6 B), then:
 | Field | Type | Since | Meaning |
 |---|---|---|---|
 | `ino` | varint | 1 | inode number; 1 = journal |
-| `size` | varint | 1 | logical file size (envelope files: §3.5) |
+| `size` | varint | 1 | logical file size (envelope files: §3.6) |
 | `mtime` | utime_t | 1 | |
 | `__unused__` | u8 | 1 | was `prefer_bdev` |
 | `extents` | le32 count + `bluefs_extent_t`[] | 1 | full physical map |
@@ -299,7 +334,7 @@ DENC_START(1,1) frame (6 B), then:
 `offset` = `allocated_commited` (`bluefs_fnode_t::make_delta()` /
 `reset_delta()`).
 
-## 3.3 Journal format — `bluefs_transaction_t`
+## 3.4 Journal format — `bluefs_transaction_t`
 
 Source: [`src/os/bluestore/bluefs_types.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluefs_types.h) (`bluefs_transaction_t`), encode
 in [`src/os/bluestore/bluefs_types.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluefs_types.cc).
@@ -340,7 +375,7 @@ transaction begins at the next block boundary.
 | 11 | `OP_JUMP_SEQ` | le64 next_seq | set seq only |
 | 12 | `OP_FILE_UPDATE_INC` | `bluefs_fnode_delta_t` | incremental inode update |
 
-## 3.4 Replay state machine
+## 3.5 Replay state machine
 
 Code path: `BlueFS::_replay()` ([`src/os/bluestore/BlueFS.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.cc)).
 
@@ -389,7 +424,7 @@ Compaction (`BlueFS::_compact_log_async_LD_LNF_D()`):
 With `bluefs_compact_log_sync` the sync variant
 `_compact_log_sync_LNF_LD()` is used instead.
 
-## 3.5 Envelope mode (v21 WAL fast path)
+## 3.6 Envelope mode (v21 WAL fast path)
 
 Source: [`src/os/bluestore/BlueFS.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueFS.h) (`BlueFS::File::envelope_t`).
 
@@ -405,7 +440,7 @@ How it is turned on:
   name ends in `.log`;
 * the journal is marked as using envelope mode; mount also marks it if
   any file already has envelope encoding. `_write_super()` then writes
-  `_version = 3`, compat 3 (§3.1), which locks out pre-envelope code;
+  `_version = 3`, compat 3 (§3.2), which locks out pre-envelope code;
 * going back needs `ceph-bluestore-tool revert-wal-to-plain --path <osd>`
   (the option help text still says `downgrade-wal-to-v1`, which does not
   exist).
@@ -1992,7 +2027,7 @@ A write finds its extents the same way; §8.3 shows what it rewrites.
 After a crash, a transaction survives through three nested logs:
 
 ```
- BlueFS journal (§3.3)  --finds-->  RocksDB WAL file
+ BlueFS journal (§3.4)  --finds-->  RocksDB WAL file
  RocksDB WAL            --holds-->  one WriteBatch per transaction (§8.1)
  WriteBatch             --holds-->  optional L record: block writes not yet
                                     done on the device (§8.2)
@@ -2323,7 +2358,7 @@ cct->_conf->bluestore_allocation_from_file      (default: true)
 |---|---|
 | RocksDB value(s) | would pay WAL double-write and compaction for a large blob, and put allocation state back into the path NCB removes |
 | reserved raw region | size is not known at mkfs: 16 B per free extent, grows with fragmentation |
-| BlueFS journal / superblock | the journal is replayed at every mount and rewritten at every compaction (§3.4); the superblock is one 4 KiB block (§3.1) |
+| BlueFS journal / superblock | the journal is replayed at every mount and rewritten at every compaction (§3.5); the superblock is one 4 KiB block (§3.2) |
 | **standalone BlueFS file** | growable, with atomic, journaled create and truncate — same pattern as `sharding/def` (§4.2) |
 
 BlueFS guarantees the file's extents, not its content, so the file checks
@@ -2373,10 +2408,10 @@ in NCB mode.
 ```
 [1] read bdev label(s) @0 (+replicas)     crc32c, osd_uuid match      (§2.3)
         |
-[2] read BlueFS super @0x1000             crc32c; get log_fnode       (§3.1)
+[2] read BlueFS super @0x1000             crc32c; get log_fnode       (§3.2)
         |
-[3] replay BlueFS journal (ino 1)         uuid/seq/crc chain          (§3.4)
-        |                                 then envelope walk          (§3.5)
+[3] replay BlueFS journal (ino 1)         uuid/seq/crc chain          (§3.5)
+        |                                 then envelope walk          (§3.6)
 [4] open RocksDB via BlueRocksEnv         MANIFEST + db.wal/*.log
         |                                 replay
 [5] _open_super_meta                      S: ondisk_format gate,
@@ -2424,8 +2459,8 @@ $ ceph-bluestore-tool bluefs-bdev-sizes --path dev/osd0
 2 : device size 0x1900000000(100 GiB): using 0x8b000(556 KiB) : bluefs used 0x0
 ```
 
-Slot numbers are §2.1 roles. `bluefs-log-dump` performs a §3.4 replay in
-noop mode and prints every transaction (excerpt in §3.5) — each line shows
+Slot numbers are §2.1 roles. `bluefs-log-dump` performs a §3.5 replay in
+noop mode and prints every transaction (excerpt in §3.6) — each line shows
 the journal offset, `txn(seq, len, crc)` and decoded ops, exposing
 fnode/extent evolution and envelope-mode flags.
 
