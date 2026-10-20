@@ -537,7 +537,7 @@ object).
 | `S` | PREFIX_SUPER | ASCII field name | per-field (§4.3) | 7 |
 | `T` | PREFIX_STAT | BE u64 pool id (or `bluestore_statfs`) | 5 × le64 (§4.8) | 3 |
 | `C` | PREFIX_COLL | ASCII coll name, e.g. `1.4_head` | `bluestore_cnode_t` (§4.7) | 10 |
-| `O` | PREFIX_OBJ | ghobject key (§4.4) | onode (§6) / extent shard (§6.3) | 32 |
+| `O` | PREFIX_OBJ | ghobject key (§4.4) | onode (§6) / extent shard (§6.4) | 32 |
 | `M` | PREFIX_OMAP | BE u64 nid + sep + name (§4.6) | omap value | 0 |
 | `P` | PREFIX_PGMETA_OMAP | BE u64 nid + sep + name (§4.6) | omap value (PG meta; opaque here) | 91 |
 | `m` | PREFIX_PERPOOL_OMAP | BE u64 pool + nid + sep + name (§4.6) | omap value | 0 |
@@ -642,7 +642,7 @@ Source: [`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.
 (`BlueStore::Onode::calc_omap_key()`, `calc_omap_header()`,
 `calc_omap_tail()`).
 
-The onode flags (§6.1), set at the first omap write, pick the prefix:
+The onode flags (§6.2), set at the first omap write, pick the prefix:
 
 | Onode flags | Prefix | Key layout |
 |---|---|---|
@@ -752,10 +752,14 @@ value   5 x signed le64: allocated, stored, compressed_original,
 
 # 5. Blob Structures
 
-A **blob** maps object data to disk space. It holds the disk extents, one
-checksum per chunk, and some flags. A blob has no RocksDB key. It is stored
-inside an object's extent map (§6). Only the refcounts of a cloned blob get
-their own key (`X`, §5.5). §6 cannot be decoded without this section.
+In one view: a blob maps object data to disk and has no key of its own.
+Only a cloned blob's refcounts get a key (`X`), counted per disk range so
+the head and the clone can free different parts.
+
+A **blob** holds the disk extents, one checksum per chunk, and some flags.
+It is stored inside an object's extent map (§6). Only the refcounts of a
+cloned blob get their own key (`X`, §5.5). §6 cannot be decoded without
+this section.
 
 ```
  O value or shard value (§6)                    X value, key = sbid (§5.5)
@@ -777,7 +781,7 @@ their own key (`X`, §5.5). §6 cannot be decoded without this section.
 |---|---|
 | pextent | one run of disk space: `(offset, length)` |
 | AU | use-tracker unit, normally `min_alloc_size` (4 KiB in §7) |
-| spanning blob | a blob used by more than one extent-map shard; stored once in the onode (§6.2) |
+| spanning blob | a blob used by more than one extent-map shard; stored once in the onode (§6.3) |
 | shared blob | a blob that a clone also uses; has `FLAG_SHARED` and an sbid |
 | sbid | shared-blob id; the key of the blob's `X` record |
 
@@ -799,7 +803,7 @@ PExtentVector         varint count | pextent x count
 ## 5.2 `bluestore_blob_t`
 
 Source: [`src/os/bluestore/bluestore_types.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h) (`bluestore_blob_t`), bare
-denc; struct_v (2) comes from the §6.2/§6.3 section that contains it.
+denc; struct_v (2) comes from the §6.3/§6.4 section that contains it.
 
 ```
 extents               PExtentVector (§5.1)
@@ -851,7 +855,7 @@ bluestore_blob_t        (§5.2)
 [ use tracker ]         only for spanning blobs: include_ref_map = true (§5.4)
 ```
 
-An extent-map shard (§6.3) and the spanning section (§6.2) store this
+An extent-map shard (§6.4) and the spanning section (§6.3) store this
 wrapper, not the bare `bluestore_blob_t`.
 
 The sbid:
@@ -1026,13 +1030,13 @@ split into shards, each shard in its own key:
  O value (key §4.4)
  +-----------------------+----------------------+-----------------------------+
  | bluestore_onode_t     | spanning blobs       | inline extent map           |
- | (§6.1)                | (§6.2)               | le32 len + payload (§6.3)   |
+ | (§6.2)                | (§6.3)               | le32 len + payload (§6.4)   |
  |                       |                      | only if there are no shards |
  +-----------------------+----------------------+-----------------------------+
       |
       | onode field extent_map_shards not empty: part 3 is absent
       v
- shard values (key §4.5):  [ shard 0 ] [ shard 1 ] ...   each = one §6.3 payload
+ shard values (key §4.5):  [ shard 0 ] [ shard 1 ] ...   each = one §6.4 payload
 ```
 
 | Term | Meaning |
@@ -1041,9 +1045,47 @@ split into shards, each shard in its own key:
 | extent map | all extents of the object, sorted by logical offset |
 | shard | one piece of the extent map, covering one logical range; loaded only when an I/O touches it |
 | cut | a shard boundary: the logical offset where one shard ends and the next starts |
-| spanning blob / promote | a blob moved out of the shards into the onode (§6.2); "promotion" is that move |
+| spanning blob / promote | a blob moved out of the shards into the onode (§6.3); "promotion" is that move |
 
-## 6.1 `bluestore_onode_t`
+## 6.1 The story in one view
+
+An extent map that grows too big is cut into shards, one key each, so an
+I/O loads only the shards it touches. A blob that crosses a cut and cannot
+split moves into the onode as a spanning blob, and every onode load pays
+for it.
+
+```
+ #1  small object      O = [ onode_t | spanning: 02 00 | inline map ]        §7.1
+                                                  |
+                       encoded map > shard_max_size (1200 B): reshard
+                                                  v
+ #2  sharded object    O = [ onode_t, shard_info[] | spanning blobs ]
+                       shard keys:  [ shard 0 ] [ shard 1 ] ...  (~500 B each)
+ #3  I/O at offset X   shard_info -> fault_range() -> load only shards over X
+ #4  blob crosses cut  can split?  yes -> one piece inline in each shard
+                                   no  -> spanning: defined once in O,
+                                          shards refer to it by id       §7.3
+ #5  cost              spanning section decoded on every onode load
+ #6  v21 answer        segment_size > 0: reshard cuts only at segment
+                       lines, so fewer blobs cross a cut
+```
+
+1. A new object keeps its whole extent map inline in the `O` value.
+2. When the encoded map passes `bluestore_extent_map_shard_max_size`
+   (1200 B), reshard cuts it into shards near
+   `bluestore_extent_map_shard_target_size` (500 B). Each shard is a key
+   (§4.5); the onode keeps only `(offset, bytes)` per shard.
+3. An I/O decodes only the shards that cover its range.
+4. Each shard must decode alone, so a blob that crosses a cut is split.
+   A blob that cannot split becomes spanning.
+5. Cost: spanning blobs live in the onode, decoded on every load. v21
+   segmentation makes them rarer.
+
+§6.2 decodes the fixed fields and `segment_size`, §6.3 the spanning
+section and the split-or-spanning rule, §6.4 the shard and inline map
+records. §7 shows the bytes.
+
+## 6.2 `bluestore_onode_t`
 
 Source: [`src/os/bluestore/bluestore_types.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/bluestore_types.h) (`bluestore_onode_t`,
 `_denc_friend`). Frame: `DENC_START`, struct_v 2 or 3, compat 1.
@@ -1086,7 +1128,7 @@ option value     struct_v written    segment_size in the onode
 * Old code reads a v3 onode, skips `segment_size` (compat frame), and
   writes it back as v2.
 * Users of `segment_size`:
-  * reshard (§6.2): where shards may be cut;
+  * reshard (§6.3): where shards may be cut;
   * legacy write, `_do_write_data()`: the aligned middle of a write goes
     to `_do_write_big()` once per segment. Head and tail (small writes)
     are not cut;
@@ -1096,7 +1138,7 @@ option value     struct_v written    segment_size in the onode
   and `L` records are the same with or without segments, and for both
   write paths.
 
-## 6.2 Spanning-blob section
+## 6.3 Spanning-blob section
 
 Code path: `BlueStore::ExtentMap::encode_spanning_blobs()` /
 `ExtentDecoder::decode_spanning_blobs()`; reshard request in
@@ -1129,7 +1171,7 @@ count x {
 ```
 
 * `Onode::decode_raw()` decodes this section before any shard. Shards
-  then find a spanning blob by id (§6.3, `BLOBID_FLAG_SPANNING`, id in
+  then find a spanning blob by id (§6.4, `BLOBID_FLAG_SPANNING`, id in
   bits 4+), whichever shards are loaded.
 * An unsharded onode has no cuts, so count is always 0: bytes `02 00`
   in §7.1.
@@ -1201,7 +1243,7 @@ stored use tracker and an id.
 * When a new spanning blob brings the onode to
   `bluestore_debug_too_many_blobs_threshold` (24576) or more, reshard
   dumps the onode for debugging (at most once per 5 minutes per onode).
-* v21 answer: segmentation (§6.1). With `segment_size > 0`, reshard cuts
+* v21 answer: segmentation (§6.2). With `segment_size > 0`, reshard cuts
   only at an extent whose blob starts at or after the next segment line.
   Writes that cut at segment lines keep their blobs inside one segment.
   This reduces spanning blobs; it does not forbid them:
@@ -1212,7 +1254,7 @@ stored use tracker and an id.
 
   The §7 specimens use option 0, so they show spanning blobs.
 
-## 6.3 Extent-map encoding
+## 6.4 Extent-map encoding
 
 Code path: `BlueStore::ExtentMap::encode_some()` /
 `ExtentDecoder::decode_some()` ([`src/os/bluestore/BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc),
@@ -1235,7 +1277,7 @@ n x extent record:
 bit 0    CONTIGUOUS    extent starts at prev extent's logical end
 bit 1    ZEROOFFSET    blob_offset == 0
 bit 2    SAMELENGTH    length == prev extent's length
-bit 3    SPANNING      id = spanning-blob id (§6.2)
+bit 3    SPANNING      id = spanning-blob id (§6.3)
 bits 4+  id            not SPANNING:
                          0     = blob defined inline right here
                          k > 0 = the blob defined inline at extent k-1
@@ -1279,7 +1321,7 @@ through the §7.3 object. All hexdumps are verbatim captures.
 O value, 414 B
 +-----------------------------+------------------+-----------------------------+
 | onode, 378 B                | spanning, 2 B    | inline map, 4 + 30 B        |
-| 6 B frame + 372 B payload   | 02 00 (empty)    | le32 len + §6.3 payload     |
+| 6 B frame + 372 B payload   | 02 00 (empty)    | le32 len + §6.4 payload     |
 +-----------------------------+------------------+-----------------------------+
 ```
 
@@ -1304,7 +1346,7 @@ data at end of buffer, offset 378").
 1e 00 00 00            inline extent map: 30 bytes
 ```
 
-The 30 inline bytes (§6.3 and §5.3 layouts; checked against
+The 30 inline bytes (§6.4 and §5.3 layouts; checked against
 `ceph-objectstore-tool ... dump`):
 
 ```
@@ -1363,7 +1405,7 @@ O  <ghobject key>'o' 00 3e 00 00 'x'          shard 2: logical 0x3e0000, 212 B
 ```
 
 * Shard key = onode key + BE u32 shard start + `'x'` (§4.5).
-* Shard value = bare §6.3 payload for [its start, next shard's start).
+* Shard value = bare §6.4 payload for [its start, next shard's start).
 * Here a cut (§6 glossary) shows up in three places with the same value
   (each shard's first extent starts exactly at the cut):
   `shard_info[n].offset` in the onode, the BE u32 in the shard key, and
@@ -1465,7 +1507,7 @@ each other on disk:
  physical  0x69b000    0x69c000     0x69d000        (4 KiB apart)
 ```
 
-Shard sizes: each shard starts at `pos` 0 (§6.3). Shard 0's first record
+Shard sizes: each shard starts at `pos` 0 (§6.4). Shard 0's first record
 is `03 07` (16 B). Shards 1 and 2 start with an 18-byte record: blobid
 `02`, a 2-byte absolute gap, and a length byte (SAMELENGTH cannot match
 `prev_len` 0):
@@ -1512,10 +1554,10 @@ Picture A — window 1 at the cut:
    the even blocks (H); the shared blobs keep the odd blocks (S). The map
    passes 1200 B and is sharded: cuts at blocks 21 and 48.
 4. The block-21 cut falls inside window 1. The head's blob there splits
-   into h1a and h1b. The shared blob 61442 fails `can_split()` (§6.2), so
+   into h1a and h1b. The shared blob 61442 fails `can_split()` (§6.3), so
    it becomes **spanning**.
 5. Cost: its 233 B definition now sits in the onode, decoded on every
-   onode load (§6.2).
+   onode load (§6.3).
 
 7.3.2 shows the layout, 7.3.3 the bytes, 7.3.4 the details.
 
@@ -1697,7 +1739,7 @@ shard 2, 423 B, 16 records, blocks 48-63
 * Shard 2 is the control case: one window, no cut inside, no spanning
   record.
 * Each shard's first record carries its absolute logical offset as the
-  gap (§6.3, as in §7.2): `57` = 0x15000 (shard 1), `c3 01` = 0x30000
+  gap (§6.4, as in §7.2): `57` = 0x15000 (shard 1), `c3 01` = 0x30000
   (shard 2).
 
 **`X` record for sbid 61442**, key `BE u64` 0x000000000000f002:
@@ -1756,7 +1798,7 @@ only `extent_avg` = 28 gives both cuts (27 → blocks 22, 48; 29 → 20, 40).
 
 ```
 233 B entry = 1 id + 1 count + 128 pextents + 1 flags + 67 csum + 8 sbid + 27 tracker
-              pextents + checksums = 84%  -> why a spanning blob is costly (§6.2)
+              pextents + checksums = 84%  -> why a spanning blob is costly (§6.3)
 ```
 
 **Spanning entry, pextents and checksums.**
@@ -1842,13 +1884,13 @@ the §7.3 capture.
 
 ```
 1. key        build the O key from the ghobject (§4.4), read the onode record
-2. onode      decode bluestore_onode_t (§6.1)      -> shard_info[]
-              decode the spanning section (§6.2)   -> id 0 = blob, 16 pextents,
+2. onode      decode bluestore_onode_t (§6.2)      -> shard_info[]
+              decode the spanning section (§6.3)   -> id 0 = blob, 16 pextents,
                                                       csum order 12
 3. select     shard_info {(0x0,494), (0x15000,583), (0x30000,423)}
               0x15000 <= 0x1b000 < 0x30000         -> shard 1 only
               read key <onode>'o' 00 01 50 00 'x'  -> 583 B
-4. decode     replay records from pos = 0, prev_len = 0 (§6.3) until one
+4. decode     replay records from pos = 0, prev_len = 0 (§6.4) until one
               covers the target                    -> record [6] = 0d 2f
 5. resolve    0x0d has SPANNING set, id 0x0d >> 4 = 0
               -> the blob from step 2, not an inline or back-referenced one
@@ -1859,7 +1901,7 @@ the §7.3 capture.
    => read 4 KiB at device offset 0x4ea000, check it against 0xcfae3298
 ```
 
-**Step 4 in detail.** A shard value is one §6.3 payload: `struct_v`,
+**Step 4 in detail.** A shard value is one §6.4 payload: `struct_v`,
 record count, then the records. It must be parsed from the first record:
 
 ```
@@ -2073,7 +2115,7 @@ shared or compressed            new space
 record          rewritten when                    note
 shard ('x')     its extents changed               only dirty shards (ExtentMap::update());
                                                   a 4 KiB write to the §7.3 object = 1 shard
-onode ('o')     every write                       with the whole spanning section (§6.2);
+onode ('o')     every write                       with the whole spanning section (§6.3);
                                                   an inline map is part of it
 shards          a shard passes the §7.2 limits    reshard: may split or promote blobs
 ```
