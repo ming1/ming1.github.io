@@ -3268,91 +3268,116 @@ serial-read cost of §10.4.4 or any rotational disk.
   aio. Check such guards when a synchronous path is added next to an
   asynchronous one.
 
-### 10.7 Recipe: running an OSD in 1 to 2 GiB
+### 10.7 Recipe: running small OSDs (1–2 GiB each)
 
-The PR exists because small OSDs lose their data cache. This recipe, from
-capped tests of small OSDs (6 OSDs, 256 PGs per OSD, a hard memory cap),
-shows what else has to change before an OSD fits in 1 GiB. At
-defaults a 1 GiB OSD was OOM-killed; with the settings below it peaked at
-about 600 MiB with no loss of throughput. The numbers are the test's, not
-mine. How the budget is spent is explained in
-[the memory-management post]({% post_url 2026-10-21-ceph-memory-management %}).
+Based on today's capped tests: 6 OSDs, 256 PGs per OSD, a hard memory cap.
+At defaults a 1 GiB OSD gets OOM-killed; with the settings below it peaked
+at about 600 MiB and lost no throughput.
 
-This flowchart shows which group of settings each budget needs.
+#### 2 GiB per OSD
 
-```mermaid
-flowchart TD
-    B{"Memory per OSD?"} -- "2 GiB" --> T2["osd_memory_target = 1.5 GiB<br/>(peaked at ~1.36 GiB)"]
-    B -- "1 GiB" --> T1["osd_memory_target = 1 GiB"]
-    T1 --> PG["PG log group:<br/>shorter logs, fewer dups<br/>(saves ~135 MiB)"]
-    T1 --> DB["RocksDB group:<br/>smaller memtables and WAL,<br/>client in-flight cap"]
-    PG --> R["restart the OSDs<br/>(RocksDB options apply at open)"]
-    DB --> R
-    R --> P["peak ~600 MiB"]
-    PG -. "PG group alone" .-> P1["peak ~1040 MiB"]
-    DB -. "RocksDB group alone" .-> P2["peak ~830 MiB"]
+Only the target needs changing. Don't leave the default 4 GiB target on a
+small box: in the test it grew past 2.3 GiB per OSD and was still growing.
+
+```sh
+ceph config set osd osd_memory_target 1610612736     # 1.5 GiB: leaves ~25% headroom under 2 GiB
 ```
 
-Takeaway: at 2 GiB only the target changes; at 1 GiB both groups are
-needed, because either one alone still overshoots.
+In the test this peaked at about 1.36 GiB.
 
-**Why the target alone is not enough.** The default 4 GiB target on a small
-host is the first problem: in the test an OSD with it grew past 2.3 GiB and
-was still growing. But at 1 GiB the caches are already pinned at the
-128 MiB floor (`osd_memory_cache_min`), so the tuner has nothing left to
-give back. The rest of the budget is memory the tuner does not manage: PG
-logs, RocksDB memtables and the write-ahead log, and client messages in
-flight. That explanation is mine, not the recipe's.
+#### 1 GiB per OSD
 
-The settings, all with `ceph config set osd ...` unless noted:
+```sh
+ceph config set osd osd_memory_target 1073741824
+# PG log and dups: saves ~135 MiB at 256 PGs/OSD
+ceph config set osd osd_target_pg_log_entries_per_osd 50000   # default 300000
+ceph config set osd osd_min_pg_log_entries 100                # default 250
+ceph config set osd osd_pg_log_dups_tracked 500               # default 3000
+# RocksDB memtables and WAL, plus the client in-flight cap: the biggest saving
+ceph config set osd bluestore_rocksdb_options_annex \
+  'max_write_buffer_number=16,write_buffer_size=8388608,max_total_wal_size=268435456'
+ceph config set osd osd_client_message_size_cap 134217728     # default 500 MiB
+```
 
-| Setting | Value | Default | Purpose |
-|---|---|---|---|
-| `osd_memory_target` | `1610612736` (1.5 GiB) for a 2 GiB box, `1073741824` for 1 GiB | 4 GiB | 1.5 GiB leaves about 25 % headroom under a 2 GiB cap. At 1 GiB the target equals the cap, and the two groups below make up the difference. |
-| `osd_target_pg_log_entries_per_osd` | `50000` | 300000 | PG log group: total log entries per OSD. |
-| `osd_min_pg_log_entries` | `100` | 250 | PG log group: floor per PG. |
-| `osd_pg_log_dups_tracked` | `500` | 3000 | PG log group: retried-request records per PG. |
-| `bluestore_rocksdb_options_annex` | `max_write_buffer_number=16,write_buffer_size=8388608,max_total_wal_size=268435456` | 16 MiB memtables, 64 of them, 1 GiB WAL (in `bluestore_rocksdb_options`) | RocksDB group: 8 MiB memtables, at most 16 of them, 256 MiB WAL cap. With the client cap, the biggest saving. Applies only when the DB is opened. |
-| `osd_client_message_size_cap` | `134217728` (128 MiB) | 500 MiB | RocksDB group: bytes of client requests held in flight. |
+Then **restart the OSDs**. The RocksDB options only apply when the DB is
+opened. I haven't checked which of the other settings take effect without a
+restart.
 
-Steps:
+You need both groups at 1 GiB. With only the PG log settings the peak was
+about 1,040 MiB, and with only the RocksDB settings about 830 MiB.
 
-1. Set `osd_memory_target` for the box size.
-2. For 1 GiB, set the PG log group and the RocksDB group.
-3. Restart the OSDs. The RocksDB options only take effect when the database
-   is opened; which of the others apply live was not checked in the test.
-4. Measure on your own workload. Omap-heavy RGW needs more onode and RocksDB
-   cache than this leaves.
+#### Also worth doing
 
-**Also worth doing:**
-
-- Fewer PGs per OSD, since PG log memory grows with the PG count. The recipe
-  suggests `ceph config set global mon_target_pg_per_osd 100` and calls 200
-  the default; at v21.3.0 the default is already 100, so check what your
-  cluster actually runs.
-- tcmalloc's thread cache. Packages and cephadm set
-  `TCMALLOC_MAX_TOTAL_THREAD_CACHE_BYTES` to 128 MiB; the test ran with
-  tcmalloc's 32 MiB default. Going back to 32 MiB can save up to about
-  96 MiB per OSD. On package installs edit `/etc/sysconfig/ceph` or `/etc/default/ceph`. With
-  cephadm the value is hard-coded in the container environment; overriding
+- **Fewer PGs per OSD.** PG log memory grows with the PG count.
+  `ceph config set global mon_target_pg_per_osd 100` (default 200) lowers
+  the autoscaler's target.
+- **tcmalloc thread cache.** cephadm and the packages set
+  `TCMALLOC_MAX_TOTAL_THREAD_CACHE_BYTES` to 128 MiB, while my tests ran
+  with tcmalloc's 32 MiB default. Going back to 32 MiB can save up to about
+  96 MiB per OSD. On package installs, edit `/etc/sysconfig/ceph` or
+  `/etc/default/ceph`. With cephadm the variable is hard-coded; overriding
   it through `extra_container_args` in the service spec is untested.
-- No swap. It turns memory pressure into stalls.
+- **No swap.** It turns memory pressure into stalls.
 
-**Optional, only on the PR branch:** `bluestore_page_cache_read = true`
-together with `bluestore_cache_meta_ratio 0.5`, `bluestore_cache_kv_ratio
-0.45` and `bluestore_cache_kv_onode_ratio 0.04`, which hands the data cache
-to the kernel and keeps BlueStore's budget for onodes and RocksDB (§10.4.3).
-In the test this gave 5 to 10 % faster 4K random reads under a hard cap with
-no growth in OSD RSS. The recipe says to leave it off in production until
-the intermittent 80 MiB `bluestore_writing` leftover (§10.4.6) is explained.
+#### Optional: page-cache reads (only on the #72884 branch, not in any release)
 
-**Trade-offs:**
+```sh
+ceph config set osd bluestore_page_cache_read true
+# hand the data cache to the kernel: BlueStore keeps onodes and RocksDB
+ceph config set osd bluestore_cache_meta_ratio 0.5
+ceph config set osd bluestore_cache_kv_ratio 0.45
+ceph config set osd bluestore_cache_kv_onode_ratio 0.04
+```
 
-| Change | Cost |
-|---|---|
-| Shorter PG logs | An OSD that was down even briefly recovers by backfill, which copies whole objects, instead of by log replay. |
-| Fewer dups tracked | A retried client request is recognised only within the last ~500 operations per PG. |
-| Cache at the 128 MiB floor | 4K writes were about 8 % slower in the test. |
+This gave 5–10% faster 4K random reads under a hard cap, with no growth in
+OSD RSS. The page cache uses whatever host memory is free and gives it back
+under pressure. Leave it off in production until the intermittent 80 MiB
+`bluestore_writing` leftover is explained; the three debug runs going now
+are aimed at that.
+
+#### Trade-offs
+
+- **Shorter PG logs:** an OSD that was down for even a short time recovers
+  by backfill, which copies whole objects, rather than by log replay.
+- **Fewer dups tracked:** retried client requests are only recognised within
+  the last ~500 operations per PG.
+- **Small cache:** at 1 GiB the cache is pinned at the 128 MiB minimum
+  (`osd_memory_cache_min`), which made 4K writes about 8% slower in testing.
+- **Testing:** check on your own workload, especially omap-heavy RGW, which
+  needs more onode and RocksDB cache.
+
+#### What the script changes
+
+The 1 GiB script attacks the memory the cache tuner does not manage. At
+1 GiB the BlueStore caches are already at the 128 MiB floor, so the tuner
+has nothing left to give back; the rest of the budget is spent elsewhere
+(see [the memory-management post]({% post_url 2026-10-21-ceph-memory-management %})).
+
+```
+osd_memory_target            the budget the tuner sizes the caches against
+                             1.5 GiB on a 2 GiB box, 1 GiB on a 1 GiB box
+
+PG log group                 per-PG in-memory log + dup records
+  osd_target_pg_log_entries_per_osd   total entries across the OSD, 300k → 50k
+  osd_min_pg_log_entries              floor per PG, 250 → 100
+  osd_pg_log_dups_tracked             retried-request records per PG, 3000 → 500
+
+RocksDB group                memtables + write-ahead log
+  write_buffer_size          one memtable, 16 MiB → 8 MiB
+  max_write_buffer_number    memtables kept per column family, 64 → 16
+  max_total_wal_size         WAL cap before a flush is forced, 1 GiB → 256 MiB
+  (set through bluestore_rocksdb_options_annex: appended to the stock
+   bluestore_rocksdb_options, so only these three are overridden)
+
+osd_client_message_size_cap  bytes of client requests held in flight, 500 MiB → 128 MiB
+```
+
+Each group removes a different pool. The PG logs scale with the PG count, so
+their ~135 MiB saving is for 256 PGs per OSD. The RocksDB options bound how
+much unflushed write data sits in memory, and the client cap bounds how much
+request payload is queued ahead of it. Either group alone leaves the OSD
+over 1 GiB at peak; together they bring it to ~600 MiB. RocksDB reads its
+options once at open, which is why the restart is required.
 
 #### Code references
 
