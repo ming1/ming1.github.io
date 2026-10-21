@@ -2773,58 +2773,34 @@ main `d42b95216c4`) · affects: the BlueStore read path and
 are my review notes, not yet posted. Ceph references are permalinks at the PR
 tip; kernel references are `/home/ming/git/linux` at `v7.3-rc4-70-gfe2ec837`.
 
-**Summary.** The PR lets BlueStore read object data through the Linux page
-cache instead of always bypassing it, so an OSD with a small memory budget
-can still have a large read cache, paid for with memory the host is not
-using. It is safe because the kernel clears the page cache before every
-direct write and because BlueStore never reads from disk where a write is
-still in flight; the checksum is a backstop, not the main defence. Review
-found no correctness bug, but five things worth fixing: an error path that
-behaves differently from the existing one, recovery reads that are not
-excluded although the PR says they are, a latency counter that stops
-recording, two options that must be tuned together, and a serial-read cost
-that was not measured.
+### 10.1 The story in one view
 
-### 10.1 Why the change exists
+A small OSD has a small `osd_memory_target`, so BlueStore's data cache
+shrinks to its floor and every miss is a disk read. The PR lets cacheable
+reads go through the kernel page cache, which is sized by free host memory
+and reclaimed under pressure, so the read cache no longer has to fit inside
+the OSD's budget.
 
-BlueStore opens its block device with `O_DIRECT`, a flag that tells the
-kernel to move data straight between the disk and the program's memory
-without keeping a copy in the kernel's page cache. So the only cache for
-object data is BlueStore's own, and that cache must fit inside
-`osd_memory_target`, the memory budget of one OSD.
+1. `O_DIRECT` bypasses the page cache, so object data has one cache,
+   inside `osd_memory_target`. FileStore on XFS had the page cache for free.
+2. With the option on, a cacheable read is a synchronous `pread()` on
+   a second, non-`O_DIRECT` descriptor of the same device, as
+   `bluefs_buffered_io` already does for RocksDB files.
+3. The kernel invalidates before every `O_DIRECT` write; BlueStore
+   never lets a reader go to disk under an in-flight write.
+4. A stale page fails the per-blob checksum and is re-read `O_DIRECT`.
 
-This hurts small OSDs:
+§10.2 shows step 2, §10.3 argues steps 3 and 4, §10.4 lists what review
+found, §10.5 what the tests cover, §10.7 how to run an OSD small enough to
+need it.
 
-- An OSD that must stay small gets a small `osd_memory_target`.
-- The data cache shrinks with it.
-- On a rotational disk, every cache miss is a disk seek.
-- The older FileStore backend ran on XFS and got the kernel page cache for
-  free. BlueStore gave that up when it moved to `O_DIRECT`.
-
-The kernel page cache has two properties BlueStore's own cache cannot have:
-it is sized by whatever memory the host has free, and the kernel takes it
-back under memory pressure. BlueStore already uses it for one thing: the
-option `bluefs_buffered_io` (on by default) reads RocksDB files through it.
-The PR extends the same idea to object data.
-
-### 10.2 What the change does
-
-The PR adds one option, `bluestore_page_cache_read`, off by default. When it
-is on, a read that BlueStore would cache anyway goes through the "buffered
-descriptor", a second open file handle on the same device that was opened
-without `O_DIRECT`. Reads through that handle fill and hit the page cache.
-
-#### 10.2.1 The three commits
+### 10.2 What the PR changes
 
 | Commit | Change |
 |---|---|
-| `blk: let aio_read go through the buffered descriptor` | `aio_read()` gets a new argument `bool buffered = false`. When true, the read is a plain synchronous `read()` on the buffered descriptor instead of an asynchronous libaio request on the `O_DIRECT` one. The SPDK device ignores the flag because SPDK bypasses the kernel entirely. |
-| `os/bluestore: add bluestore_page_cache_read` | `_do_read()` and `_do_readv()` decide per read whether the page cache may be used. `_prepare_read_ioc()` applies the decision per blob, but only for blobs that carry a checksum. A checksum failure calls the new `_drop_page_cache()` before the retry. Two new perf counters: `page_cache_read_bytes` and `page_cache_csum_retries`. |
-| `test/objectstore: cover buffered aio_read and page cache reads` | Five device-level unit tests and two store-level tests (§10.5). |
-
-#### 10.2.2 How one read is routed
-
-This flowchart shows every decision a read goes through with the option on.
+| `blk: let aio_read go through the buffered descriptor` | `aio_read(..., bool buffered = false)`. When true: a synchronous `read()` on the buffered descriptor instead of a libaio request on the `O_DIRECT` one. SPDK ignores the flag. |
+| `os/bluestore: add bluestore_page_cache_read` | `_do_read()` / `_do_readv()` decide per read; `_prepare_read_ioc()` applies it per blob, only for blobs with a checksum. A checksum failure calls `_drop_page_cache()` before the retry. Counters `page_cache_read_bytes`, `page_cache_csum_retries`. |
+| `test/objectstore: cover buffered aio_read and page cache reads` | Five device-level and two store-level tests (§10.5). |
 
 ```mermaid
 flowchart TD
@@ -2842,431 +2818,126 @@ flowchart TD
     I --> J["Retry the whole read O_DIRECT<br/>(up to bluestore_retry_disk_reads, then EIO)"]
 ```
 
-Take away: the page cache is used only on a first attempt, only when the
-client did not ask BlueStore to skip caching, and only for blobs whose
-checksum can catch a wrong page.
+Three facts the diagram leans on:
 
-The decision point in the code, in
-[`_do_read()`](https://github.com/ceph/ceph/blob/37bcb733bc45b32e48e862ee91807c867ab4a0ae/src/os/bluestore/BlueStore.cc#L13522):
-
-```cpp
-  // Retries after a checksum failure always go O_DIRECT.
-  const bool page_cache = buffered && retry_count == 0 &&
-                          cct->_conf->bluestore_page_cache_read;
-  r = _prepare_read_ioc(blobs2read, &compressed_blob_bls, &ioc, page_cache);
-```
-
-`buffered` is a flag BlueStore already had. It is true when the client sends
-the `FADVISE_WILLNEED` hint, or by default (option
-`bluestore_default_buffered_read`) unless the client sends `DONTNEED` or
-`NOCACHE`. Two facts about who sends those hints:
-
-- Deep scrub sends `DONTNEED` (`scrub_fadvise_flags` in
-  `ReplicatedBackend.h:518`), so scrub reads stay `O_DIRECT`.
-- Recovery push reads do not. `build_push_op()` adds `DONTNEED` only when
-  `RecoveryHandle::cache_dont_need` is set, and nothing sets it (§10.4.5).
-
-The same `buffered` flag also decides whether the result is inserted into
-BlueStore's own cache. That is why the same bytes can end up in both caches
-(§10.4.3).
-
-#### 10.2.3 What happens inside the device layer
-
-This sequence shows one read that touches two blobs, one with a checksum
-and one without, and why the two take different routes.
-
-```mermaid
-sequenceDiagram
-    participant T as OSD op thread (_prepare_read_ioc)
-    participant K as KernelDevice
-    participant P as Page cache
-    participant D as Disk
-    T->>K: aio_read(blob with checksum, buffered=true)
-    K->>P: pread() on buffered descriptor (blocks)
-    alt page cached
-        P-->>K: copy from memory
-    else miss
-        P->>D: read
-        D-->>P: data (kept in page cache)
-        P-->>K: data
-    end
-    K-->>T: returns at once, nothing queued
-    T->>K: aio_read(blob without checksum, buffered=false)
-    K-->>T: queued on the IOContext
-    T->>K: aio_submit(), then aio_wait()
-    K->>D: libaio O_DIRECT read
-    D-->>K: data
-    K-->>T: wait returns
-    T->>T: verify checksums
-```
-
-Take away: a buffered read completes inside the call, so it blocks the op
-thread for one disk round trip on a miss, while direct reads of other blobs
-are still queued and go to the disk together afterwards.
-
-The device-side code, in
-[`KernelDevice::aio_read()`](https://github.com/ceph/ceph/blob/37bcb733bc45b32e48e862ee91807c867ab4a0ae/src/blk/kernel/KernelDevice.cc#L1493):
-
-```cpp
-  if (aio && dio && !buffered) {
-    ... queue aio_t on fd_directs[WRITE_LIFE_NOT_SET] ...
-  } else {
-    r = read(off, len, pbl, ioc, buffered);   // sync pread on fd_buffereds[]
-  }
-```
-
-Why the buffered read is synchronous: libaio's `io_submit()` blocks the
-caller when the descriptor is not `O_DIRECT`, and it would block every other
-request in the same batch with it. The PR accepts a cost (the extents of one
-read are no longer read in parallel) for a gain (a page cache hit returns
-without a context switch). §10.4.4 weighs that trade. io_uring could do
-buffered reads asynchronously, but BlueStore's io_uring path is not used in
-the field and the PR leaves it alone.
-
-Readahead is disabled on the buffered descriptor with `POSIX_FADV_RANDOM`
-at open
-([`KernelDevice.cc:233`](https://github.com/ceph/ceph/blob/37bcb733bc45b32e48e862ee91807c867ab4a0ae/src/blk/kernel/KernelDevice.cc#L233)),
-so a page cache read caches exactly what was asked for and prefetches
-nothing.
+- **Who sends the hints.** Deep scrub sends `DONTNEED`
+  (`ReplicatedBackend.h:518`), so scrub stays `O_DIRECT`. Recovery push
+  reads do not (§10.4.5). The same `buffered` flag also decides whether the
+  result enters BlueStore's own cache (§10.4.3).
+- **Why the buffered read is synchronous.** libaio's `io_submit()` blocks on
+  a non-`O_DIRECT` descriptor and would block the whole batch. So a buffered
+  blob completes inside
+  [`aio_read()`](https://github.com/ceph/ceph/blob/37bcb733bc45b32e48e862ee91807c867ab4a0ae/src/blk/kernel/KernelDevice.cc#L1493)
+  in the op thread; direct blobs of the same read are queued and submitted
+  together afterwards (cost: §10.4.4). io_uring could do this
+  asynchronously; the PR leaves it alone.
+- **No readahead.** The buffered descriptor is opened with
+  `POSIX_FADV_RANDOM`
+  ([`KernelDevice.cc:233`](https://github.com/ceph/ceph/blob/37bcb733bc45b32e48e862ee91807c867ab4a0ae/src/blk/kernel/KernelDevice.cc#L233)),
+  so a read caches exactly what was asked for.
 
 ### 10.3 Why a stale page cannot reach a client
 
-The whole feature rests on one rule: *a page served from the page cache
-holds what is on disk.* Two layers enforce it.
+The rule the feature rests on: *a page served from the page cache holds
+what is on disk.* Two layers enforce it, and the checksum is the net under
+both.
 
-#### 10.3.1 What the kernel guarantees
-
-An `O_DIRECT` write must not leave an old copy of the same bytes in the page
-cache. The kernel handles this by invalidating (throwing away) the cached
-pages over the written range. When it does so depends on how the write was
-issued.
-
-This sequence shows the two cases in the kernel's block-device write path
-(`block/fops.c`, `blkdev_direct_write()` at line 686 and
-`blkdev_bio_end_io()` at line 131).
-
-```mermaid
-sequenceDiagram
-    participant W as Writer (BlueStore via libaio)
-    participant K as blkdev_direct_write()
-    participant P as Page cache
-    participant D as Disk
-    W->>K: O_DIRECT write of a range
-    K->>P: kiocb_invalidate_pages() — drop pages over the range (:692)
-    K->>D: blkdev_direct_IO() — start the DMA (:699)
-    alt synchronous caller
-        D-->>K: done
-        K->>P: kiocb_invalidate_post_direct_write() (:701)
-    else libaio caller (what BlueStore uses)
-        K-->>W: -EIOCBQUEUED, returns before the DMA lands
-        D-->>K: blkdev_bio_end_io() → ki_complete() (:157), no invalidation
-    end
+```
+  writer (txc)                      o->bc (buffer cache)         reader               kernel / disk
+  ─────────────                     ────────────────────         ──────               ─────────────
+  coll lock X  (:16608)
+  insert WRITING buffer for the
+  full on-disk range  (:17086/:17179/:17444)  ──►  [WRITING]
+  release lock, commit to RocksDB
+                                                                 coll lock shared (:13060)
+                                                                 bc.read()  (:13141, :1886)
+                                                   [WRITING] ──► served from memory,
+                                                                 no pread, no aio          #A
+  deferred aio_write O_DIRECT (:16129) ───────────────────────────────────────────►  invalidate pages
+                                                                                     over the range (:692)
+                                                                                     then DMA
+  _txc_finish → finish_writing (:15365)  ──►  [CLEAN] or erased
+                                                                 from here a reader may
+                                                                 pread() the range          #B
 ```
 
-Take away: for the write BlueStore actually issues, the page cache is cleaned
-once, *before* the data reaches the disk, and never after.
-
-That leaves a window. If a buffered read of the same range starts after the
-invalidation and reaches the disk before the DMA lands, it brings the old
-bytes back into the page cache, and nothing on the kernel side removes them
-later. On a regular file the picture differs: the file-system direct-IO code
-(`fs/iomap/direct-io.c:141`, `fs/direct-io.c:300`) invalidates again after
-the write. The PR's device-level coherence test runs on a file, so it cannot
-see this window (§10.5).
-
-This is from reading the kernel source, not from a trace. It is also exactly
-the window the PR's checksum-and-retry is for; the PR description names "a
-racing O_DIRECT write" as the case.
-
-#### 10.3.2 What BlueStore guarantees
-
-The window above needs a reader going to disk while a writer is in flight on
-the same range. BlueStore does not let that happen for object data. The
-mechanism is the "writing buffer": before any in-place write is queued, the
-new data is placed in the object's in-memory buffer cache, marked as
-writing, and readers are served from there.
-
-This sequence shows a writer and a reader on the same object.
-
-```mermaid
-sequenceDiagram
-    participant Wr as Writer (transaction)
-    participant BC as Object buffer cache (o->bc)
-    participant Rd as Reader
-    participant Dev as Device
-    Wr->>Wr: take collection lock exclusive (:16608)
-    Wr->>BC: insert writing buffer for the full range (:17086 / :17179 / :17444)
-    Wr->>Wr: release lock, commit to RocksDB
-    Rd->>Rd: take collection lock shared (:13060)
-    Rd->>BC: _read_cache → bc.read() (:13141, :1886)
-    BC-->>Rd: writing buffer found → range served from memory
-    Note over Rd,Dev: no pread, no aio for that range
-    Wr->>Dev: deferred aio_write O_DIRECT (:16129) — kernel invalidates first
-    Dev-->>Wr: complete
-    Wr->>BC: _txc_finish → finish_writing (:15365): buffer becomes clean or is erased
-    Note over Rd,Dev: only from here may a reader go to disk for the range
-```
-
-Take away: a reader can only reach the disk for a range after the write to
-it has fully landed, and by then the kernel's pre-write invalidation has
-already run.
-
-The lifecycle of one buffer, from the same facts:
-
-```mermaid
-stateDiagram-v2
-    [*] --> WRITING: _buffer_cache_write() before the IO is queued
-    WRITING --> CLEAN: _finish_write(), cacheable (moves to bluestore_cache_data)
-    WRITING --> erased: _finish_write(), FLAG_NOCACHE
-    CLEAN --> evicted: cache trim
-    [*] --> CLEAN: did_read() after a successful read
-```
-
-Take away: a read can only create a clean buffer, never a writing one. That
-matters for the PR's open question (§10.4.6).
-
-Supporting facts, each with its code:
-
-- A reader holds the collection lock in shared mode for the whole read
-  ([`BlueStore::read()`](https://github.com/ceph/ceph/blob/37bcb733bc45b32e48e862ee91807c867ab4a0ae/src/os/bluestore/BlueStore.cc#L13060)),
-  so it sees the object's extent map either from before a transaction or
-  from after it, never half-built.
-- Every path that overwrites allocated disk space in place inserts a
-  writing buffer covering the full on-disk range before the IO is queued:
-  the [direct write into unused blob space](https://github.com/ceph/ceph/blob/37bcb733bc45b32e48e862ee91807c867ab4a0ae/src/os/bluestore/BlueStore.cc#L17086),
-  the [deferred small overwrite](https://github.com/ceph/ceph/blob/37bcb733bc45b32e48e862ee91807c867ab4a0ae/src/os/bluestore/BlueStore.cc#L17179)
-  (its head and tail pre-read makes the write chunk-aligned, so the buffer
-  covers every sector the write touches), and the
-  [deferred big write](https://github.com/ceph/ceph/blob/37bcb733bc45b32e48e862ee91807c867ab4a0ae/src/os/bluestore/BlueStore.cc#L17444).
-  `_do_alloc_write()` writes only freshly allocated extents that no reader
-  references yet.
-- [`BufferSpace::read()`](https://github.com/ceph/ceph/blob/37bcb733bc45b32e48e862ee91807c867ab4a0ae/src/os/bluestore/BlueStore.cc#L1886)
-  hands writing buffers to readers even in `BYPASS_CLEAN_CACHE` mode (used
-  by deep scrub), so a scrub does not go to disk under a deferred write
-  either.
-- The buffer leaves the writing state only in `_txc_finish()`
-  ([`finish_writing()`](https://github.com/ceph/ceph/blob/37bcb733bc45b32e48e862ee91807c867ab4a0ae/src/os/bluestore/BlueStore.cc#L15365)),
-  after the deferred aio has completed.
-- A freed extent is reused only by a later transaction, whose `O_DIRECT`
-  write invalidates whatever the page cache still holds for it. BlueFS, on a
-  shared device, writes its own space either `O_DIRECT` or buffered followed
-  by `fdatasync`, so by the time an extent changes hands its pages are
-  clean and the same invalidation drops them.
-
-So BlueStore's own reads and writes never enter the kernel window of
-§10.3.1. The checksum retry remains the net under it, and under the all-zero
-page bug the existing retry was written for (tracker #22464). A stale page
-that does slip through is caught, dropped and re-read. It costs one extra
-`O_DIRECT` read and one tick of `page_cache_csum_retries`. The PR's runs show
-zero such ticks over about 125 GiB.
+- **#A BlueStore.** Every in-place overwrite (direct write into unused blob
+  space, deferred small overwrite, deferred big write) inserts a writing
+  buffer covering the whole on-disk range before the IO is queued.
+  [`BufferSpace::read()`](https://github.com/ceph/ceph/blob/37bcb733bc45b32e48e862ee91807c867ab4a0ae/src/os/bluestore/BlueStore.cc#L1886)
+  serves it to every reader, deep scrub included. The buffer leaves
+  `WRITING` only in `_txc_finish()`, after the aio completed.
+  `_do_alloc_write()` touches only fresh extents nobody references yet, and
+  a freed extent is reused by a later `O_DIRECT` write, which invalidates
+  its pages first.
+- **#B Kernel.** `blkdev_direct_write()` (`block/fops.c:686`, v7.3-rc4)
+  drops cached pages before the DMA. For a synchronous write it also drops
+  them after; for the libaio write BlueStore uses, `blkdev_bio_end_io()`
+  does not. So a buffered read that reaches the disk between the
+  invalidation and the DMA would cache stale bytes for good. #A keeps
+  BlueStore out of that window. (A regular file is different: the
+  file-system direct-IO code invalidates after the write too.)
+- **Net.** The checksum retry of §10.2 catches whatever slips through, as it
+  already did for the all-zero page bug (tracker #22464). The PR's runs show
+  zero `page_cache_csum_retries` over about 125 GiB.
 
 ### 10.4 Review findings
 
-#### 10.4.1 The error path of a page-cache read is not the libaio path's
+No correctness bug. Five things worth fixing before merge:
 
-**What happens.** A device error from the buffered `pread()` leaves
-`_prepare_read_ioc()` at once, as a return value. A device error from libaio
-is reported through the `IOContext` (the per-read bookkeeping object) after
-`aio_wait()`, under a policy set by the option `bluestore_fail_eio`.
+| # | Finding | Suggested fix |
+|---|---|---|
+| 10.4.1 | The buffered error path is not the libaio one: `read()` returns at once, `_aio_thread()` applies a policy (edge table below). | Apply `allow_eio` / `is_expected_ioerr()` as `_aio_thread()` does, report through the `IOContext`, optionally retry the range `O_DIRECT`. |
+| 10.4.2 | `buffer_miss_lat` is recorded only under `has_pending_aios()`; a read served wholly from the page cache records nothing. | Time the `_prepare_read_ioc()` + wait pair, or count the synchronous part separately. |
+| 10.4.3 | Page-cache reads and BlueStore's own caching hang off the same `buffered` flag: on by default the bytes are cached twice; `bluestore_default_buffered_read = false` silently turns the page cache off too. | Insert nothing into BlueStore's cache for a blob served from the page cache, or at least document that the options are linked. |
+| 10.4.4 | A cold N-blob read is N serial `pread()`s in the op thread. Fine on HDD (the target); on NVMe a 4 MiB object in 64 KiB blobs is 64 round trips. Not measured. | One cold large-object sequential read on NVMe, off and on. A size cap on the buffered path would bound it. `RWF_NOWAIT` does not help: `O_DIRECT` misses never warm the cache. |
+| 10.4.5 | The PR says recovery reads stay `O_DIRECT`. `build_push_op()` adds `DONTNEED` only when `RecoveryHandle::cache_dont_need` is set, and nothing sets it ([`ReplicatedBackend.cc:2367`](https://github.com/ceph/ceph/blob/37bcb733bc45b32e48e862ee91807c867ab4a0ae/src/osd/ReplicatedBackend.cc#L2367)). One backfill streams the working set out of the page cache. | Set the hint recovery already has a flag for, or exclude `FADVISE_SEQUENTIAL` reads; fix the description either way. |
 
-This flowchart compares the two paths for the same device error.
-
-```mermaid
-flowchart TD
-    E["Device returns an error"] --> W{"Which read path?"}
-    W -- "libaio (_aio_thread, :726)" --> A1{"allow_eio and<br/>is_expected_ioerr?"}
-    A1 -- yes --> A2["-EIO set on IOContext<br/>_do_read sees it after aio_wait"]
-    A1 -- "expected, but fail_eio set" --> A3["note_io_error_event()<br/>abort the OSD"]
-    A1 -- "unexpected errno" --> A3
-    W -- "buffered pread (read(), :1472)" --> B1{"allow_eio and<br/>is_expected_ioerr?"}
-    B1 -- yes --> B2["return -EIO"]
-    B1 -- no --> B3["return -errno"]
-    B2 --> B4["_prepare_read_ioc returns at once (:13234)<br/>direct aios already queued are never submitted"]
-    B3 --> B4
-```
-
-Take away: the new path never aborts and never reports through the
-`IOContext`, so the two paths agree only in the default case.
-
-`allow_eio` is `!bluestore_fail_eio`, and `bluestore_fail_eio` defaults to
-`false`. So by default both paths hand `-EIO` to the client and the
-`read_eio` counter is incremented. The differences are at the edges:
+The error-path edges of 10.4.1, since the default case hides them:
 
 | Case | libaio read | buffered `pread()` |
 |---|---|---|
 | expected error, `bluestore_fail_eio = false` (default) | `-EIO` to client | `-EIO` to client |
 | expected error, `bluestore_fail_eio = true` | `note_io_error_event()`, abort | `-EIO` to client, no event |
-| unexpected errno (not in `is_expected_ioerr()`) | abort | `-errno` to client, past the comment "errors other than EIO are not allowed" |
-| mixed read, error on one blob | all aios complete, one error | direct aios queued for other blobs are never submitted |
+| unexpected errno | abort | `-errno` to client |
+| mixed read, error on one blob | all aios complete, one error | direct aios queued for other blobs are never submitted (trips `bdev_debug_aio`) |
 
-The last row is harmless in production, because the `IOContext` is destroyed
-together with the queued requests. Under the debug option `bdev_debug_aio`
-it is not: the `_aio_log_start()` entries of the unsubmitted requests are
-never finished, and the next overlapping read trips the debug assert.
-`KernelDevice::read()` has only ever been called by BlueFS and by fsck,
-which assert or return on their own terms. This PR is the first to put it
-under a client read.
+Smaller points: drop the repeated `bool buffered = false` default from the
+virtual overrides; comment that `_drop_page_cache()` drops every checksummed
+blob of the read on purpose; one line in `bluestore-config-ref.rst` that
+this cache lives outside `osd_memory_target`. The PR's open question, 80 MiB
+left in `bluestore_writing` after a recovery, is not this option's doing:
+reads create only `CLEAN` buffers, and only `_buffer_cache_write()` creates
+writing ones.
 
-**Suggested fix, step by step:**
-
-1. In the buffered branch of `aio_read()`, apply `allow_eio` and
-   `is_expected_ioerr()` exactly as `_aio_thread()` does.
-2. When `bluestore_fail_eio` is set and the error is expected, call
-   `note_io_error_event()` and abort, as the libaio path does.
-3. Report the error on the `IOContext` instead of the return value, so
-   `_do_read()` sees it after `aio_wait()`, where it already handles `-EIO`
-   and where the other queued requests have been submitted.
-4. Optionally, before failing, retry the failed range `O_DIRECT`. This path
-   is the optional one.
-
-#### 10.4.2 The buffer-miss latency counter stops recording
-
-`l_bluestore_buffer_miss_lat` is recorded only inside
-`if (ioc.has_pending_aios())`
-([`_do_read()`](https://github.com/ceph/ceph/blob/37bcb733bc45b32e48e862ee91807c867ab4a0ae/src/os/bluestore/BlueStore.cc#L13530)).
-A read whose blobs all went through the page cache has no pending aios, so
-with the option on the counter stops recording exactly the misses the option
-is meant to speed up. The counter `read_wait_aio_lat` still covers them,
-because its start time is taken before `_prepare_read_ioc()`. Suggested fix:
-measure the miss latency around the `_prepare_read_ioc()` and wait pair, or
-count the synchronous part separately.
-
-#### 10.4.3 Double caching is tied to a second option
-
-A page-cache read happens only when `buffered` is true, and `buffered` is
-also what makes `_generate_read_result_bl()` insert the data into BlueStore's
-own cache. The result for an operator:
-
-| Operator sets | Page cache | BlueStore data cache |
-|---|---|---|
-| option on, defaults | fills | fills (same bytes twice) |
-| option on, `bluestore_default_buffered_read = false` | off, except `WILLNEED` | off |
-| option on, data ratio near 0 (the PR's advice) | fills | trimmed at once |
-
-The third row works. With `bluestore_cache_autotune` on, the ratios are
-still handed to the caches before every `pcm->balance()`
-([`MempoolThread`](https://github.com/ceph/ceph/blob/37bcb733bc45b32e48e862ee91807c867ab4a0ae/src/os/bluestore/BlueStore.cc#L5651))
-and shape how it splits memory between them, so the advice holds under the
-default tuner. But it takes three knobs to get one behaviour, and the second
-row is a trap: turning off BlueStore's own caching also turns off the page
-cache reads.
-
-A smaller change would make the option mean what its name says: when a blob
-was served through the page cache, insert nothing into BlueStore's cache for
-it (pass `buffered = false` into `did_read()`), so the data lives in one
-cache. The cost: reads that BlueStore serves from its own cache today would
-become a `pread()` system call per hit. Either way, the option's `long_desc`
-should say in one sentence that the two options are linked.
-
-#### 10.4.4 One `pread()` per extent, in series
-
-A cold read of an object with N blobs becomes N synchronous `pread()` calls
-in the op thread, where before it was N requests in flight together. On a
-rotational OSD, the stated target, the disk serves them in order anyway and
-the loss is small. On flash with a cold page cache, a 4 MiB object stored in
-64 KiB blobs is 64 serial device round trips instead of one.
-
-The PR's numbers are 4K random reads on NVMe with
-`bluestore_debug_enforce_settings=hdd`, which does not exercise this case.
-One cold large-object sequential read on NVMe, option off and on, would
-bound the cost. A size cap on the buffered path would cap it.
-
-`preadv2(RWF_NOWAIT)`, a read that returns at once if the data is not in the
-page cache, looks like the obvious hybrid: serve hits synchronously, let
-misses go `O_DIRECT` in parallel. It does not work here, because an
-`O_DIRECT` read does not fill the page cache, so the cache would never warm
-up. The real alternatives are a thread pool for buffered reads or io_uring.
-Both are out of scope, and the PR says so.
-
-#### 10.4.5 Recovery reads are not excluded
-
-The PR says that reads hinted `NOCACHE` or `DONTNEED` stay `O_DIRECT`. That
-is true. The commit message implies recovery is among them. It is not:
-
-1. `build_push_op()` reads the object with `DONTNEED` only if its
-   `cache_dont_need` argument is set
-   ([`ReplicatedBackend.cc:2367`](https://github.com/ceph/ceph/blob/37bcb733bc45b32e48e862ee91807c867ab4a0ae/src/osd/ReplicatedBackend.cc#L2367)).
-2. That argument comes from `RecoveryHandle::cache_dont_need`.
-3. That field is initialised `false` and is never set anywhere in `src/osd`.
-
-This is from reading the code, not from a run. So on a primary pushing a
-backfill, every object read goes through the page cache with the option on,
-and through BlueStore's own cache as it already does today. Readahead is
-off, so the damage is limited to the bytes actually read, and the kernel's
-LRU will evict them in time. But one full backfill streams the OSD's working
-set out of the page cache. Either the option should exclude bulk reads such
-as those hinted `FADVISE_SEQUENTIAL`, or recovery should set the hint it
-already has a flag for. The PR should state this either way, because the
-description promises the opposite.
-
-#### 10.4.6 Smaller points
-
-- `BlockDevice::aio_read()` and both overrides repeat `bool buffered =
-  false`. Default arguments on virtual functions are bound at compile time
-  from the static type; drop them from the overrides so the base class is
-  the only place that defines the default.
-- `_drop_page_cache()` drops the pages of every checksummed blob in the
-  read, not only the one that failed. That is harmless (the retry reads
-  `O_DIRECT` anyway) and simpler than tracking which blob failed. A comment
-  would stop the next reader from "fixing" it.
-- The PR checklist ticks "updates relevant documentation", but the change
-  touches only the option's `long_desc`. That is where the generated
-  reference comes from, so it is fine. The "Automatic Cache Sizing" section
-  of `doc/rados/configuration/bluestore-config-ref.rst` could say in one
-  line that this cache lives outside `osd_memory_target`.
-- The PR's open question is about 80 MiB left in the `bluestore_writing`
-  memory pool after a recovery with the low cache ratios. The read path
-  cannot put anything there. `did_read()` creates clean buffers directly in
-  `bluestore_cache_data`; only `_buffer_cache_write()` creates writing
-  buffers, and only `_finish_write()` moves them out (§10.3.2, state
-  diagram). So the leak, if it is one, is a write-side buffer that
-  `txc->writings` did not cover, and this option is a bystander.
-
-### 10.5 What the tests prove, and what they cannot
+### 10.5 What the tests and numbers cover
 
 | Test | Proves | Does not prove |
 |---|---|---|
 | `KernelDevice.BufferedAioReadIsSynchronous`, `...InOneIOContext` | A buffered read queues nothing on the `IOContext`; mixed reads work. | — |
-| `KernelDevice.BufferedAioReadCoherentWithDirectWrite` ([test_bdev.cc:189](https://github.com/ceph/ceph/blob/37bcb733bc45b32e48e862ee91807c867ab4a0ae/src/test/objectstore/test_bdev.cc#L189)) | After a *completed and flushed* `O_DIRECT` write, a buffered read sees the new bytes. | The race of §10.3.1. The write is waited for before the read is issued, and the test device is a file on a file system, which also invalidates after the write. It would pass even on a kernel that only invalidated afterwards. |
-| `StoreTest.PageCacheReadTest` ([store_test.cc:1215](https://github.com/ceph/ceph/blob/37bcb733bc45b32e48e862ee91807c867ab4a0ae/src/test/objectstore/store_test.cc#L1215)) | Write, remount, read; overwrite, remount, read; a subrange of a cached range. | Same: no concurrency. |
-| `StoreTest.PageCacheReadCsumRetryTest` ([store_test.cc:11666](https://github.com/ceph/ceph/blob/37bcb733bc45b32e48e862ee91807c867ab4a0ae/src/test/objectstore/store_test.cc#L11666)) | With every checksum failing, `page_cache_csum_retries` is exactly 1 and the read ends in `-EIO`; with injection off it reads back. | That a real stale page is dropped and re-read correctly. The failure is injected; the page cache holds correct data throughout. |
+| `KernelDevice.BufferedAioReadCoherentWithDirectWrite` ([test_bdev.cc:189](https://github.com/ceph/ceph/blob/37bcb733bc45b32e48e862ee91807c867ab4a0ae/src/test/objectstore/test_bdev.cc#L189)) | After a completed, flushed `O_DIRECT` write, a buffered read sees the new bytes. | The §10.3 window: the write is waited for before the read, and a file invalidates after the write anyway. |
+| `StoreTest.PageCacheReadTest` ([store_test.cc:1215](https://github.com/ceph/ceph/blob/37bcb733bc45b32e48e862ee91807c867ab4a0ae/src/test/objectstore/store_test.cc#L1215)) | Write, remount, read; overwrite, remount, read; subrange hits. | No concurrency. |
+| `StoreTest.PageCacheReadCsumRetryTest` ([store_test.cc:11666](https://github.com/ceph/ceph/blob/37bcb733bc45b32e48e862ee91807c867ab4a0ae/src/test/objectstore/store_test.cc#L11666)) | With every checksum failing: exactly one retry, then `-EIO`. | A real stale page being dropped and re-read; the failure is injected. |
 
-Nothing tests §10.4.1. No existing hook injects a device error on the
-buffered descriptor (`bluestore_debug_inject_read_err` works per object
-inside BlueStore, above the device), so a `unittest_bdev` case would need a
-device whose `pread()` fails, for example a file truncated under the
-descriptor. A deterministic test of the §10.3.1 window is hard from user
-space. The §10.3.2 argument is what has to be reviewed instead, and it
-should be written into the commit message, which today says only "relies on
-an O_DIRECT write invalidating the page cache".
+Nothing tests 10.4.1; it needs a device whose `pread()` fails. The §10.3
+window is hard to test from user space, so the writing-buffer argument
+should go into the commit message, which today says only "relies on an
+O_DIRECT write invalidating the page cache".
 
-The measurements in the PR: 4K random reads under a cgroup `memory.max`
-limit, option off and on, +7 to +11 % at 1 to 1.5 GiB `osd_memory_target`,
-resident memory unchanged, zero checksum retries. They show the page cache
-being used and reclaimed under a hard limit. They do not cover the
-serial-read cost of §10.4.4 or any rotational disk.
+Measurements in the PR: 4K random reads under cgroup `memory.max`, +7 to
++11 % at 1 to 1.5 GiB `osd_memory_target`, RSS unchanged, zero checksum
+retries. Nothing on the serial-read cost or on a rotational disk.
 
 ### 10.6 Takeaways
 
-- A new read path inherits the device's error policy only if it goes through
-  the same completion code. `KernelDevice::read()` and `_aio_thread()` agree
-  on the default case and disagree on `bluestore_fail_eio`, on unexpected
-  errnos, and on what happens to the rest of the batch. Check the edges, not
-  only the common case.
-- A hint that a subsystem "already sets" is worth one grep. Recovery has had
-  a `cache_dont_need` flag for years and nothing sets it.
-- "O_DIRECT invalidates the page cache" is true before the write, always.
-  After the write it is true for a synchronous write and for files, and not
-  for a libaio write on a block device. Say which one the design relies on.
-- The checksum is a net, not a guarantee. The guarantee for this feature is
-  BlueStore's own: a writing buffer exists before the IO, and readers see
-  it. That argument belongs in the commit message, where the next person to
-  touch `_buffer_cache_write()` or `finish_write()` will find it.
-- A test that waits for the write before reading cannot test a race with
-  the write. Name that limit in the test instead of calling it coherence.
-- A perf counter guarded by `has_pending_aios()` assumes every read is an
-  aio. Check such guards when a synchronous path is added next to an
-  asynchronous one.
+- A new read path inherits the device's error policy only if it shares the
+  completion code. Check the edges, not the default case.
+- "O_DIRECT invalidates the page cache" needs a qualifier: before the write
+  always, after it only for synchronous writes and files. Write down which
+  one the design relies on, and the invariant that keeps you out of the gap.
+- A hint a subsystem "already sets" is worth one grep.
+- A test that waits for the write cannot test a race with it. A counter
+  guarded by `has_pending_aios()` assumes every read is an aio.
 
 ### 10.7 Recipe: running small OSDs (1–2 GiB each)
 
@@ -3348,36 +3019,27 @@ are aimed at that.
 
 #### What the script changes
 
-The 1 GiB script attacks the memory the cache tuner does not manage. At
-1 GiB the BlueStore caches are already at the 128 MiB floor, so the tuner
-has nothing left to give back; the rest of the budget is spent elsewhere
-(see [the memory-management post]({% post_url 2026-10-21-ceph-memory-management %})).
+With the caches already at their floor, the 1 GiB script cuts memory the
+cache tuner does not manage. Where the rest of the budget goes:
+[the memory-management post]({% post_url 2026-10-21-ceph-memory-management %}).
 
 ```
-osd_memory_target            the budget the tuner sizes the caches against
-                             1.5 GiB on a 2 GiB box, 1 GiB on a 1 GiB box
+osd_memory_target                   the budget the tuner sizes the caches against
 
-PG log group                 per-PG in-memory log + dup records
-  osd_target_pg_log_entries_per_osd   total entries across the OSD, 300k → 50k
-  osd_min_pg_log_entries              floor per PG, 250 → 100
-  osd_pg_log_dups_tracked             retried-request records per PG, 3000 → 500
+PG log group                        per-PG in-memory log + dup records
+  osd_target_pg_log_entries_per_osd   total entries across the OSD
+  osd_min_pg_log_entries              floor per PG
+  osd_pg_log_dups_tracked             retried-request records per PG
 
-RocksDB group                memtables + write-ahead log
-  write_buffer_size          one memtable, 16 MiB → 8 MiB
-  max_write_buffer_number    memtables kept per column family, 64 → 16
-  max_total_wal_size         WAL cap before a flush is forced, 1 GiB → 256 MiB
-  (set through bluestore_rocksdb_options_annex: appended to the stock
+RocksDB group                       unflushed write data in memory
+  write_buffer_size                   one memtable            (stock 16 MiB)
+  max_write_buffer_number             memtables kept per CF   (stock 64)
+  max_total_wal_size                  WAL cap before a forced flush (stock 1 GiB)
+  (bluestore_rocksdb_options_annex is appended to the stock
    bluestore_rocksdb_options, so only these three are overridden)
 
-osd_client_message_size_cap  bytes of client requests held in flight, 500 MiB → 128 MiB
+osd_client_message_size_cap         client request payload held in flight
 ```
-
-Each group removes a different pool. The PG logs scale with the PG count, so
-their ~135 MiB saving is for 256 PGs per OSD. The RocksDB options bound how
-much unflushed write data sits in memory, and the client cap bounds how much
-request payload is queued ahead of it. Either group alone leaves the OSD
-over 1 GiB at peak; together they bring it to ~600 MiB. RocksDB reads its
-options once at open, which is why the restart is required.
 
 #### Code references
 
@@ -3401,24 +3063,18 @@ options once at open, which is why the restart is required.
 |---|---|
 | `O_DIRECT` | An open flag. Reads and writes go straight between disk and program memory; the kernel keeps no copy in its page cache. |
 | page cache | The kernel's in-memory cache of file and device blocks. Sized by free memory, reclaimed under pressure. |
-| buffered descriptor | BlueStore's second file handle on the block device, opened without `O_DIRECT`. Reads through it use the page cache. |
 | libaio | The Linux asynchronous IO interface. BlueStore queues many reads, submits them together with `io_submit()`, and waits for completion. |
 | `IOContext` | BlueStore's bookkeeping object for one batch of device requests: the queued requests, their return value, and the `allow_eio` policy. |
 | blob | BlueStore's unit of on-disk allocation for part of an object. A blob may carry a checksum per chunk. |
 | checksum (csum) | A per-chunk value stored with a blob and verified on every read; catches data that does not match what was written. |
-| writing buffer | Data of an in-flight write kept in the object's in-memory buffer cache in state `WRITING`; readers are served from it until the write is finished. |
 | deferred write | A small overwrite that BlueStore first commits to its RocksDB write-ahead log and then applies to the data device later. |
 | collection lock | A reader-writer lock per placement-group collection. Readers hold it shared; a transaction holds it exclusive while it changes metadata. |
-| `osd_memory_target` | The memory budget of one OSD daemon; BlueStore's caches are sized to fit inside it. |
-| `bluefs_buffered_io` | Existing option (default on) that reads RocksDB files through the page cache. The PR applies the same idea to object data. |
 | `fadvise` / `DONTNEED` / `NOCACHE` / `WILLNEED` | Hints a client sends with a read. `DONTNEED` and `NOCACHE` tell BlueStore not to cache the data; `WILLNEED` tells it to cache. `posix_fadvise(DONTNEED)` on a descriptor drops cached pages. |
 | perf counter | A named statistic the OSD exposes; the PR adds `page_cache_read_bytes` and `page_cache_csum_retries`. |
 | backfill / recovery push | Copying objects from a primary OSD to another OSD after a failure or a change in placement. |
 | deep scrub | A background check that reads all object data and compares it across copies. |
 | `EIO` / `errno` | `EIO` is the Unix error code for an IO failure; `errno` is whichever error code a system call returned. |
-| `bluestore_fail_eio` | Option (default false). When true, the OSD aborts on an IO error instead of returning it to the client. |
 | cgroup `memory.max` | A Linux limit on the memory of a group of processes; the page cache counts against it, and the kernel reclaims it at the limit. |
-| FileStore | BlueStore's predecessor, which stored objects as files on XFS and therefore had the kernel page cache. |
 
 # Part II — OSD
 
