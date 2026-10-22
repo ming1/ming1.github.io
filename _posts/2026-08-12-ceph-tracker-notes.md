@@ -2769,9 +2769,11 @@ All links point at the PR head `a2518aac732`.
 colleague's series, 3 commits at `37bcb733bc4` on `wip-lowmem-osd` (base
 main `d42b95216c4`) · affects: the BlueStore read path and
 `KernelDevice::aio_read()`, Linux with libaio only · adds one option,
-`bluestore_page_cache_read` (default off) · Status: open; the findings below
-are my review notes, not yet posted. Ceph references are permalinks at the PR
-tip; kernel references are `/home/ming/git/linux` at `v7.3-rc4-70-gfe2ec837`.
+`bluestore_page_cache_read` (default off) · Status: open; review posted as
+[this comment](https://github.com/ceph/ceph/pull/72884#issuecomment-6316087346)
+(2026-10-21), asking for the problem to be solved inside the existing cache
+framework instead. Ceph references are permalinks at the PR tip; kernel
+references are `/home/ming/git/linux` at `v7.3-rc4-70-gfe2ec837`.
 
 ### 10.1 The story in one view
 
@@ -2792,7 +2794,7 @@ the OSD's budget.
 
 §10.2 shows step 2, §10.3 argues steps 3 and 4, §10.4 lists what review
 found, §10.5 what the tests cover, §10.7 how to run an OSD small enough to
-need it.
+need it, §10.8 the run that shows a 1 GiB OSD dying at default limits.
 
 ### 10.2 What the PR changes
 
@@ -2891,7 +2893,7 @@ No correctness bug. Five things worth fixing before merge:
 | 10.4.2 | `buffer_miss_lat` is recorded only under `has_pending_aios()`; a read served wholly from the page cache records nothing. | Time the `_prepare_read_ioc()` + wait pair, or count the synchronous part separately. |
 | 10.4.3 | Page-cache reads and BlueStore's own caching hang off the same `buffered` flag: on by default the bytes are cached twice; `bluestore_default_buffered_read = false` silently turns the page cache off too. | Insert nothing into BlueStore's cache for a blob served from the page cache, or at least document that the options are linked. |
 | 10.4.4 | A cold N-blob read is N serial `pread()`s in the op thread. Fine on HDD (the target); on NVMe a 4 MiB object in 64 KiB blobs is 64 round trips. Not measured. | One cold large-object sequential read on NVMe, off and on. A size cap on the buffered path would bound it. `RWF_NOWAIT` does not help: `O_DIRECT` misses never warm the cache. |
-| 10.4.5 | The PR says recovery reads stay `O_DIRECT`. `build_push_op()` adds `DONTNEED` only when `RecoveryHandle::cache_dont_need` is set, and nothing sets it ([`ReplicatedBackend.cc:2367`](https://github.com/ceph/ceph/blob/37bcb733bc45b32e48e862ee91807c867ab4a0ae/src/osd/ReplicatedBackend.cc#L2367)). One backfill streams the working set out of the page cache. | Set the hint recovery already has a flag for, or exclude `FADVISE_SEQUENTIAL` reads; fix the description either way. |
+| 10.4.5 | The PR says recovery reads stay `O_DIRECT`. Replicated: `build_push_op()` adds `DONTNEED` only when `RecoveryHandle::cache_dont_need` is set, and nothing sets it ([`ReplicatedBackend.cc:2367`](https://github.com/ceph/ceph/blob/37bcb733bc45b32e48e862ee91807c867ab4a0ae/src/osd/ReplicatedBackend.cc#L2367)); only pull replies via `handle_pull()` take the default `true`. EC: every shard read is built with `read_request_t::flags = 0` ([`ECCommon.h:123`](https://github.com/ceph/ceph/blob/37bcb733bc45b32e48e862ee91807c867ab4a0ae/src/osd/ECCommon.h#L123)) and `handle_sub_read()` passes those flags to `store->read()` ([`ECBackend.cc:529`](https://github.com/ceph/ceph/blob/37bcb733bc45b32e48e862ee91807c867ab4a0ae/src/osd/ECBackend.cc#L529)), so EC recovery reads are not excluded either. One backfill streams the working set out of the page cache. | Set the hint recovery already has a flag for, or exclude `FADVISE_SEQUENTIAL` reads; fix the description either way. |
 
 The error-path edges of 10.4.1, since the default case hides them:
 
@@ -3040,6 +3042,88 @@ RocksDB group                       unflushed write data in memory
 
 osd_client_message_size_cap         client request payload held in flight
 ```
+
+### 10.8 Reproducer: a 1 GiB OSD at default limits is OOM-killed
+
+The claim at the top of 10.7 came from the PR author's runs. This is an
+independent run on c28 (2026-10-21) with a build that carries neither #72884
+nor the limit-scaling PR [#72964](https://github.com/ceph/ceph/pull/72964),
+so the kill is what stock code does at a 1 GiB target.
+
+#### Setup
+
+| | |
+|---|---|
+| Host | c28 VM, 8 vCPU, 31 GiB, Fedora 42, kernel 6.19.14 |
+| Build | `wip-kvsync-v6` at `ba165903a5a` (main plus the kv-sync series, 21.3.0-2868), RelWithDebInfo, tcmalloc |
+| Cluster | vstart: 1 mon, 1 mgr, 4 OSDs on raw devices, `bluestore_debug_enforce_settings = hdd`; pool `rbd`, 512 PGs, size 2 |
+| PGs per OSD | uneven, the devices differ in size: osd.0 45, osd.1 254, osd.2 362, osd.3 365 |
+| Memory cap | one cgroup v2 per OSD: `memory.max` 1 GiB, `memory.swap.max` 0, `memory.oom.group` 1; host swap off |
+| Config | `osd_memory_target` 1 GiB (1073741824); every other option at its default |
+| Load | 900 s of `rados bench -p rbd 900 write -b 4096 -t 128 --no-cleanup`, then 120 s of fio 4 KiB random reads on an 8 GiB rbd image, then `ceph osd out 0` / `in 0` |
+
+#### What happened
+
+| Phase | Outcome |
+|---|---|
+| idle, 30 s after start | 150 to 185 MiB mapped per OSD; PG log 31 to 45 MiB |
+| 4 KiB writes, 900 s (435 IOPS, 392k objects) | osd.3 killed after 12 min; osd.2 peaked at 949 MiB, osd.0 and osd.1 at 690 MiB |
+| 4 KiB random reads | osd.2, osd.0 and osd.3 killed, one after another, while the harness kept restarting them |
+| recovery (osd.0 out, in) | osd.3, osd.2 and osd.0 killed again |
+
+The kernel line for the first kill:
+
+```
+[Wed Oct 21 13:38:39 2026] oom-kill:constraint=CONSTRAINT_MEMCG,... oom_memcg=/osdtest/osd3,task=ceph-osd
+Memory cgroup out of memory: Killed process 312920 (ceph-osd) anon-rss:1048676kB
+```
+
+Seven kills in all across the run (`memory.events` per cgroup: osd.0 one,
+osd.2 two, osd.3 three; osd.1 with 254 PGs never died).
+
+#### Where osd.2's memory was at the end of the write phase
+
+Snapshot at 949 MiB peak, just under the cap. The tuner had been at its
+128 MiB floor since start, so nothing it manages could give anything back.
+
+| | MiB |
+|---|---|
+| tcmalloc, bytes in use by the application | 871 |
+| all mempools | 270 |
+| of which `osd_pglog` (517k entries and dups) | 182 |
+| of which onode + meta cache | 52 |
+| not in any mempool | ~600 |
+
+The untracked 600 MiB is most likely RocksDB memtables: the default
+`max_total_wal_size` lets up to 1 GiB of unflushed writes accumulate. That is
+inferred from the defaults, not measured; the snapshot has no memtable
+counter.
+
+#### What is still open
+
+The same heavy load with the 10.7 settings (arm `m6`) was queued but not
+run. The lighter pair that did run (fio 4 KiB random writes at about 350
+IOPS for 180 s) killed nothing in either configuration: defaults peaked at
+754 MiB, the 10.7 settings at 573 MiB. So this run proves the kill at
+defaults; the A/B for the recipe under the same load is not done.
+
+#### How to run it
+
+The harness is
+[`osd-memcap-test.sh`]({{ site.baseurl }}/code/ceph/osd-memcap-test.sh).
+Edit `DEVS` first; vstart wipes those devices.
+
+```sh
+./osd-memcap-test.sh setup      # vstart, 4 OSDs, per-OSD cgroups, 8 GiB rbd image mapped
+./osd-memcap-test.sh arm m5     # 1 GiB cap, default limits: writes, reads, recovery, scrub
+./osd-memcap-test.sh arm m6     # same load with the 10.7 settings
+./osd-memcap-test.sh teardown
+```
+
+Results land in `~/pc-mem/results/<arm>/`: `samples.txt` (one line per
+OSD every 5 s: cgroup current, anon, file, RSS, oom_kill), `phases.txt`
+(peak per phase and a perf-dump, mempool and heap snapshot), `events.txt`
+(OSDs the harness restarted after a kill).
 
 #### Code references
 
