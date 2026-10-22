@@ -3,7 +3,6 @@
 # ceph tracker notes §10.8: arm m5 (1 GiB target, default limits) is OOM-killed.
 # Edit DEVS for the host; the devices are wiped by vstart.
 # Usage: osd-memcap-test.sh setup | arm <name> | all | teardown
-set -eu
 B=$HOME/git/ceph/ceph/build
 RES=$HOME/pc-mem/results
 DEVS=(/dev/nvme0n1 /dev/vdb /dev/sda /dev/sdb)
@@ -34,7 +33,7 @@ start_cluster() {
     rm -rf dev out
     MON=1 MGR=1 OSD=$NOSD MDS=0 RGW=0 ../src/vstart.sh -n -X --without-dashboard --nolockdep \
         --bluestore-devs $(IFS=,; echo "${DEVS[*]}") \
-        -o "osd_pool_default_size = 2" -o "osd_pool_default_min_size = 1" \
+        -o "osd_pool_default_size = ${POOL_SIZE:-2}" -o "osd_pool_default_min_size = 1" \
         -o "osd_pool_default_pg_autoscale_mode = off" \
         -o "bluestore_debug_enforce_settings = hdd" > "$RES/vstart.log" 2>&1
     ceph osd set noscrub; ceph osd set nodeep-scrub
@@ -42,9 +41,11 @@ start_cluster() {
     ceph osd pool set rbd pg_autoscale_mode off
     rbd pool init rbd
     wait_clean
+    if [ "${NO_RBD:-0}" != 1 ]; then
     rbd create --size $IMG_SIZE $IMG
     rbd map $IMG > "$RES/rbddev"
     log "mapped $(cat $RES/rbddev)"
+    fi
 }
 
 wait_clean() {
@@ -92,7 +93,7 @@ apply_arm() {
         m1) cap=$((2<<30)); ceph config set osd osd_memory_target 4294967296 ;;
         m2) cap=$((2<<30)); ceph config set osd osd_memory_target 1610612736 ;;
         m3) cap=$((1<<30)); ceph config set osd osd_memory_target 1073741824 ;;
-        m5) cap=$((1<<30)); ceph config set osd osd_memory_target 1073741824 ;;
+        m5|m5f) cap=$((1<<30)); ceph config set osd osd_memory_target 1073741824 ;;
         m6|m4) cap=$((1<<30)); ceph config set osd osd_memory_target 1073741824
             ceph config set osd osd_target_pg_log_entries_per_osd 50000
             ceph config set osd osd_min_pg_log_entries 100
@@ -178,7 +179,7 @@ phase() {   # phase <out> <name> <command...>
 fio_run() { local dev; dev=$(cat "$RES/rbddev"); fio --name=$1 --filename=$dev --direct=1 --ioengine=libaio --group_reporting --output-format=terse --terse-version=3 "${@:2}" | awk -F';' -v n=$1 '{printf "  fio %s: read iops=%s MB/s=%s | write iops=%s MB/s=%s\n", n, $8, $7/1024, $49, $48/1024}'; }
 do_seqwrite() { fio_run seqwrite --rw=write --bs=1M --iodepth=16 --size=4G; }
 do_randwrite() { fio_run randwrite --rw=randwrite --bs=4k --iodepth=32 --numjobs=2 --runtime=180 --time_based --randrepeat=0; }
-do_benchwrite() { "$B/bin/rados" -c "$B/ceph.conf" bench -p rbd 900 write -b 4096 -t 128 --no-cleanup 2>/dev/null | grep -E "^Total time|^Total writes|^Bandwidth|^Average IOPS|^Average Latency" | sed "s/^/  /"; }
+do_benchwrite() { "$B/bin/rados" -c "$B/ceph.conf" bench -p rbd ${BENCH_SECS:-900} write -b ${BENCH_BS:-4096} -t 128 --no-cleanup 2>/dev/null | grep -E "^Total time|^Total writes|^Bandwidth|^Average IOPS|^Average Latency" | sed "s/^/  /"; }
 do_randread() { fio_run randread --rw=randread --bs=4k --iodepth=32 --numjobs=2 --runtime=120 --time_based --randrepeat=0; }
 do_recovery() {
     ceph osd out 0; sleep 10
@@ -204,8 +205,9 @@ arm() {
     sampler "$out/samples.txt" & local sp=$!
     sleep 30
     phase "$out" idle true
-    if [ "$name" = m5 ] || [ "$name" = m6 ]; then
+    if [ "$name" = m5 ] || [ "$name" = m5f ] || [ "$name" = m6 ]; then
         phase "$out" benchwrite do_benchwrite
+        if [ "${WRITE_ONLY:-0}" = 1 ]; then kill $sp 2>/dev/null || true; log "=== arm $name done (write only); events: $(cat "$out/events.txt" 2>/dev/null | wc -l) OOM restarts"; return; fi
     else
         phase "$out" seqwrite do_seqwrite
         phase "$out" randwrite do_randwrite
@@ -220,6 +222,7 @@ arm() {
 case ${1:-} in
     setup) mkdir -p "$RES"; setup_cg; start_cluster; set_caps $((4<<30)); for n in $(seq 0 $((NOSD-1))); do :; done ;;
     arm) arm $2 ;;
+    prep) mkdir -p "$RES/$2"; apply_arm $2 | tee "$RES/$2/config.txt"; restart_osds ;;
     all) for a in m1 m2 m3 m4; do arm $a; done ;;
     teardown) cd "$B"; rbd unmap $(cat "$RES/rbddev") 2>/dev/null || true; ../src/stop.sh; pkill -9 -f "ceph-osd -i" || true ;;
     *) echo "usage: $0 setup|arm <name>|all|teardown"; exit 1 ;;

@@ -3045,46 +3045,99 @@ osd_client_message_size_cap         client request payload held in flight
 
 ### 10.8 Reproducer: a 1 GiB OSD at default limits is OOM-killed
 
-The claim at the top of 10.7 came from the PR author's runs. This is an
-independent run on c28 (2026-10-21) with a build that carries neither #72884
-nor the limit-scaling PR [#72964](https://github.com/ceph/ceph/pull/72964),
-so the kill is what stock code does at a 1 GiB target.
+The claim at the top of 10.7 came from the PR author's runs. These are
+independent runs on c28 (2026-10-21/22) with a build that carries neither
+#72884 nor the limit-scaling PR
+[#72964](https://github.com/ceph/ceph/pull/72964), so the kill is what
+stock code does at a 1 GiB target. Two ways to get there:
 
-#### Setup
+| | Load | Time to first kill | What fills the budget |
+|---|---|---|---|
+| fast | four 4 MiB writers at 256 deep, clients allowed 1 GiB in flight | 6 to 12 s, 5 of 5 fresh runs | in-flight client messages, 500 MiB per OSD, plus unthrottled replica ops |
+| slow | one 4 KiB writer at 128 deep | 12 min, 2 of 2 fresh runs | RocksDB memtables up to the 1 GiB WAL cap, plus 180 MiB of PG log |
+
+Both are the limits #72964 scales. Neither one is touched by the cache
+tuner, which sat at its 128 MiB floor the whole time.
+
+#### Setup, shared by both
 
 | | |
 |---|---|
 | Host | c28 VM, 8 vCPU, 31 GiB, Fedora 42, kernel 6.19.14 |
 | Build | `wip-kvsync-v6` at `ba165903a5a` (main plus the kv-sync series, 21.3.0-2868), RelWithDebInfo, tcmalloc |
-| Cluster | vstart: 1 mon, 1 mgr, 4 OSDs on raw devices, `bluestore_debug_enforce_settings = hdd`; pool `rbd`, 512 PGs, size 2 |
-| PGs per OSD | uneven, the devices differ in size: osd.0 45, osd.1 254, osd.2 362, osd.3 365 |
+| Cluster | vstart: 1 mon, 1 mgr, 4 OSDs on raw QEMU disks of 8 to 12 GiB, `bluestore_debug_enforce_settings = hdd`; pool `rbd`, 512 PGs, size 2 |
+| PGs per OSD | uneven, the disks differ in size: osd.0 45, osd.1 254, osd.2 362, osd.3 365 |
 | Memory cap | one cgroup v2 per OSD: `memory.max` 1 GiB, `memory.swap.max` 0, `memory.oom.group` 1; host swap off |
-| Config | `osd_memory_target` 1 GiB (1073741824); every other option at its default |
-| Load | 900 s of `rados bench -p rbd 900 write -b 4096 -t 128 --no-cleanup`, then 120 s of fio 4 KiB random reads on an 8 GiB rbd image, then `ceph osd out 0` / `in 0` |
+| OSD config | `osd_memory_target` 1 GiB (1073741824); every other option at its default |
 
-#### What happened
+osd.3 sits on the one disk the VM flags as rotational and is the slowest
+OSD. It died first in every run.
 
-| Phase | Outcome |
-|---|---|
-| idle, 30 s after start | 150 to 185 MiB mapped per OSD; PG log 31 to 45 MiB |
-| 4 KiB writes, 900 s (435 IOPS, 392k objects) | osd.3 killed after 12 min; osd.2 peaked at 949 MiB, osd.0 and osd.1 at 690 MiB |
-| 4 KiB random reads | osd.2, osd.0 and osd.3 killed, one after another, while the harness kept restarting them |
-| recovery (osd.0 out, in) | osd.3, osd.2 and osd.0 killed again |
+#### Fast: 6 to 12 seconds
 
-The kernel line for the first kill:
+Four `rados bench` writers at once with 4 MiB objects at 256 in flight,
+started with `--objecter_inflight_op_bytes 1073741824 --objecter_inflight_ops 4096`.
+That is a client-side setting: a stock client caps itself at 100 MiB in
+flight, and the point is to offer the OSD as much as several clients would.
+The OSDs stay at defaults.
+
+| Fresh run | Kill | After |
+|---|---|---|
+| 1 | osd.3 | 6 s |
+| 2 | osd.3 | 8 s |
+| 3 | osd.3 | 6 s |
+| 4 | osd.3 | 12 s |
+| 5, 4 MiB writers only | osd.3 | 6 s |
+
+Runs 1 to 4 also had a 60 KiB writer at 128 deep alongside; run 5 dropped
+it and died just as fast, so in-flight client bytes alone are enough.
+
+The kernel line for run 1:
 
 ```
-[Wed Oct 21 13:38:39 2026] oom-kill:constraint=CONSTRAINT_MEMCG,... oom_memcg=/osdtest/osd3,task=ceph-osd
-Memory cgroup out of memory: Killed process 312920 (ceph-osd) anon-rss:1048676kB
+[Thu Oct 22 12:41:09 2026] Memory cgroup out of memory: Killed process 110313 (ceph-osd) anon-rss:1002420kB
 ```
 
-Seven kills in all across the run (`memory.events` per cgroup: osd.0 one,
-osd.2 two, osd.3 three; osd.1 with 254 PGs never died).
+The three survivors at that moment, from their own perf counters
+(`throttle-osd_client_bytes` and `bluestore-pricache`):
 
-#### Where osd.2's memory was at the end of the write phase
+| OSD | mapped | client bytes in flight | throttle max | `buffer_anon` mempool |
+|---|---|---|---|---|
+| osd.0 | 836 MiB | 498 MiB | 500 MiB | 488 MiB |
+| osd.1 | 560 MiB | 493 MiB | 500 MiB | 2 MiB |
+| osd.2 | 538 MiB | 497 MiB | 500 MiB | 3 MiB |
 
-Snapshot at 949 MiB peak, just under the cap. The tuner had been at its
-128 MiB floor since start, so nothing it manages could give anything back.
+Every OSD is at its 500 MiB client-message throttle a few seconds after
+the writers start: half of a 1 GiB budget is gone before a single write is
+processed. osd.3 holds the same 500 MiB as a primary and, on top, the
+replica ops the other three primaries forward to it. Replica ops go over
+the cluster messenger, which has no byte throttle, and the slowest OSD is
+where they queue. That is the extra 500 MiB.
+
+#### Slow: 12 minutes of 4 KiB writes
+
+One writer: `rados bench -p rbd 900 write -b 4096 -t 128 --no-cleanup`
+(435 IOPS, 392k objects over 900 s).
+
+| Fresh run | Kill | After |
+|---|---|---|
+| Oct 21 | osd.3 | 12 min 06 s; in the read and recovery phases that followed, osd.2, osd.0 and osd.3 again |
+| Oct 22 | osd.3 | 11 min 51 s; osd.2 1 min 48 s later |
+
+One second before the Oct 22 kill, osd.3's log shows RocksDB hitting the
+WAL cap:
+
+```
+11:41:33.822 rocksdb: Flushing all column families with data in WAL number 51.
+             Total log size is 1073744350 while max_total_wal_size is 1073741824
+11:41:34     oom-kill ... oom_memcg=/osdtest/osd3
+```
+
+On HDD settings every write of 64 KiB or less is deferred: the data goes
+into RocksDB first and sits in a memtable until flushed. On a disk where
+flushing cannot keep up with the deferred applies, memtables accumulate
+until `max_total_wal_size` forces a flush, and that cap is 1 GiB.
+Where osd.2's 949 MiB was at the end of the write phase on Oct 21:
 
 | | MiB |
 |---|---|
@@ -3092,38 +3145,50 @@ Snapshot at 949 MiB peak, just under the cap. The tuner had been at its
 | all mempools | 270 |
 | of which `osd_pglog` (517k entries and dups) | 182 |
 | of which onode + meta cache | 52 |
-| not in any mempool | ~600 |
+| not in any mempool, most likely memtables (inferred) | ~600 |
 
-The untracked 600 MiB is most likely RocksDB memtables: the default
-`max_total_wal_size` lets up to 1 GiB of unflushed writes accumulate. That is
-inferred from the defaults, not measured; the snapshot has no memtable
-counter.
+#### What did not kill, and why
+
+| Load | osd.3 peak | Why it stopped short |
+|---|---|---|
+| 60 KiB writes, 305 s | 819 MiB | WAL cap reached at 92 s, forced flushes, plateau; too few ops to grow the PG log |
+| two 4 MiB writers, default client budget | 314 MiB | each client capped at 100 MiB in flight |
+| the two above together | 469 MiB | the big writers starved the small one down to 1 MiB/s |
+
+The lesson: memtables alone top out below the cap, so the fast path needs
+the one consumer that fills in seconds, in-flight client bytes.
 
 #### What is still open
 
-The same heavy load with the 10.7 settings (arm `m6`) was queued but not
-run. The lighter pair that did run (fio 4 KiB random writes at about 350
-IOPS for 180 s) killed nothing in either configuration: defaults peaked at
-754 MiB, the 10.7 settings at 573 MiB. So this run proves the kill at
-defaults; the A/B for the recipe under the same load is not done.
+- The 10.7 settings under either load (arm `m6`) were queued but not run,
+  so the A/B for the recipe is not done. Under a lighter 4 KiB load that
+  killed nothing in either configuration, defaults peaked at 754 MiB and
+  the 10.7 settings at 573 MiB.
 
 #### How to run it
 
-The harness is
-[`osd-memcap-test.sh`]({{ site.baseurl }}/code/ceph/osd-memcap-test.sh).
-Edit `DEVS` first; vstart wipes those devices.
+Two scripts, kept in the same directory. Edit `DEVS` in the harness first;
+vstart wipes those devices.
+
+- [`osd-memcap-test.sh`]({{ site.baseurl }}/code/ceph/osd-memcap-test.sh):
+  cluster, cgroups, arms and the phased slow run.
+- [`osd-oom-fast-repro.sh`]({{ site.baseurl }}/code/ceph/osd-oom-fast-repro.sh):
+  fresh cluster, concurrent writers, stop at the first kill.
 
 ```sh
-./osd-memcap-test.sh setup      # vstart, 4 OSDs, per-OSD cgroups, 8 GiB rbd image mapped
-./osd-memcap-test.sh arm m5     # 1 GiB cap, default limits: writes, reads, recovery, scrub
-./osd-memcap-test.sh arm m6     # same load with the 10.7 settings
-./osd-memcap-test.sh teardown
+# fast: 6 to 12 s
+BENCH_EXTRA="--objecter_inflight_op_bytes 1073741824 --objecter_inflight_ops 4096" \
+  ./osd-oom-fast-repro.sh fast 120 4194304:256 4194304:256 4194304:256 4194304:256
+
+# slow: 12 min, write phase only
+./osd-memcap-test.sh setup
+NO_RBD=1 WRITE_ONLY=1 ./osd-memcap-test.sh arm m5
 ```
 
-Results land in `~/pc-mem/results/<arm>/`: `samples.txt` (one line per
-OSD every 5 s: cgroup current, anon, file, RSS, oom_kill), `phases.txt`
-(peak per phase and a perf-dump, mempool and heap snapshot), `events.txt`
-(OSDs the harness restarted after a kill).
+The fast runner prints time to kill, the kernel OOM line, and for each
+surviving OSD its mapped bytes, in-flight client bytes against the throttle
+max, PG log and mempool totals. The harness writes `samples.txt`,
+`phases.txt` and `events.txt` under `~/pc-mem/results/<arm>/`.
 
 #### Code references
 
