@@ -476,6 +476,27 @@ The per-shard details:
 
 ## 8. Inside the caches
 
+Each cache below ends with the call stacks that allocate and free its
+entries, recorded on a live OSD: ceph `21.3.0-2868-gba165903a5a`
+(RelWithDebInfo, vstart, four OSDs, `osd_memory_target` = 1 GiB, so the
+caches share the 128 MiB floor and trim all the time). The probes are perf
+uprobes on the OSD binary with DWARF unwinding, taken during recovery pushes,
+client reads, and cold reads after a `compact`; the script is
+[`cachestacks.sh`]({{ site.baseurl }}/code/ceph/cachestacks.sh) and the
+folding is [`cachefold.py`]({{ site.baseurl }}/code/ceph/cachefold.py).
+A stack reads top-down from the probed function, `*` marks an inlined frame,
+the number is how often that exact stack fired in one window, and `std::`
+and thread-pool frames are dropped.
+
+Two things the binary taught about probing it. The constructors of `Onode`
+and `Buffer` are inlined into every caller, so the class's `operator new`
+and `operator delete` are probed instead; they are out-of-line mempool
+allocators and fire for every object. And `BinnedLRUCacheShard::Insert()`
+has an out-of-line copy for the vtable that is never executed, because its
+only caller, `rocksdb_cache::ShardedCache::Insert()`, inlined it: a probe on
+it attaches cleanly and counts zero. bpftrace cannot do this job on this
+build: without frame pointers its `ustack()` stops after two frames.
+
 ### 8.1 The onode cache: an LRU with pinning
 
 `bluestore_cache_type` names two cache kinds, `2q` (default) and `lru`, but
@@ -506,6 +527,72 @@ Onode memory is not fixed. An onode's extent map is stored on disk in
 pieces ("shards" of the map, unrelated to cache shards) and loaded on demand
 by `fault_range()`. Nothing unloads a loaded piece; the memory is released
 only when the whole onode is evicted.
+
+**Call stacks.** Allocation and insertion are one step:
+[`get_onode()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L5388) misses the onode space,
+[`create_decode()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L4953) builds the onode from
+its RocksDB value, and
+[`add_onode()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L2064) links it into the shard
+and trims the shard on the spot.
+
+```
+alloc + insert, client read              3496x  tp_osd_tp
+  BlueStore::Onode::operator new
+  BlueStore::Onode::create_decode
+  BlueStore::Collection::get_onode          -> OnodeSpace::add_onode -> _trim_some*
+  BlueStore::getattr
+  PGBackend::objects_get_attr
+  PrimaryLogPG::get_object_context
+  PrimaryLogPG::find_object_context
+  PrimaryLogPG::do_op_impl
+  PrimaryLogPG::do_op
+  OSD::dequeue_op
+
+alloc + insert, write (recovery push)     193x  tp_osd_tp
+  BlueStore::Onode::operator new
+  BlueStore::Onode::create_decode
+  BlueStore::Collection::get_onode
+  BlueStore::_txc_add_transaction
+  BlueStore::queue_transactions
+  PrimaryLogPG::queue_transaction
+  ReplicatedBackend::_do_push
+  PGBackend::handle_message
+  PrimaryLogPG::do_request
+  OSD::dequeue_op
+```
+
+```
+free, inline on insert                   1124x  tp_osd_tp   (same op as above)
+  BlueStore::Onode::operator delete         <- OnodeSpace::_remove drops the last ref, Onode::put
+  std::_Hashtable::_M_erase
+  LruOnodeCacheShard::_trim_to
+  BlueStore::CacheShard::_trim_some*
+  BlueStore::OnodeSpace::add_onode
+  BlueStore::Collection::get_onode
+  BlueStore::getattr
+  ...
+
+free, background                         2300x  bstore_mempool
+  BlueStore::Onode::operator delete
+  std::_Hashtable::_M_erase
+  LruOnodeCacheShard::_trim_to
+  BlueStore::CacheShard::_trim_some*
+  BlueStore::CacheShard::set_max*
+  BlueStore::MempoolThread::_resize_shards
+  BlueStore::MempoolThread::entry
+
+free, collection removed                   14x  bstore_kv_final
+  BlueStore::Onode::operator delete
+  BlueStore::OnodeSpace::clear
+  BlueStore::_reap_collections
+  BlueStore::_kv_finalize_thread
+```
+
+Take away: the op thread that inserts an onode is also the thread that
+evicts one, because `add_onode()` calls `_trim_some()`; the mempool thread
+only catches up. In the read window the split was about 1,700 inline to
+2,300 background, in the recovery window 330 to 58. An eviction frees the
+onode, its loaded extent-map shards, and its cached buffers (§8.2).
 
 ### 8.2 The data cache: 2Q
 
@@ -542,7 +629,8 @@ state diagram shows the lifecycle.
 ```mermaid
 stateDiagram-v2
     [*] --> WRITING: write path (_add_buffer), data tagged bluestore_writing then re-tagged bluestore_cache_data at once
-    WRITING --> CLEAN: write finished (_finish_write)
+    WRITING --> CLEAN: write finished (_finish_write), FLAG_NOCACHE clear
+    WRITING --> [*]: write finished, FLAG_NOCACHE set (the default, bluestore_default_buffered_write = false)
     [*] --> CLEAN: read filled it (did_read)
     CLEAN --> EMPTY: trimmed out of warm_in, data dropped
     EMPTY --> CLEAN: read again (promoted to hot)
@@ -560,6 +648,82 @@ The tagging is in
 at L1721 and L1742. The re-tag in
 [`_finish_write`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1933)
 at L1957 changes nothing by then.
+
+**Call stacks.** A buffer is allocated by the reader or writer that needs
+it. [`did_read()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L514) and `write()` do the
+same three things: `_discard()` whatever overlaps, `_add_buffer()`, then
+`cache->_trim()`.
+
+```
+alloc, read fill                         4167x  tp_osd_tp
+  BlueStore::BufferSpace::_add_buffer
+  BlueStore::BufferSpace::did_read*         -> _discard* before, cache->_trim() after
+  BlueStore::_generate_read_result_bl
+  BlueStore::_do_read
+  BlueStore::read
+  ReplicatedBackend::objects_read_sync
+  PrimaryLogPG::do_read
+  PrimaryLogPG::do_osd_ops
+  PrimaryLogPG::execute_ctx
+  PrimaryLogPG::do_op
+
+alloc, write                              221x  tp_osd_tp
+  BlueStore::BufferSpace::_add_buffer
+  BlueStore::BufferSpace::write*
+  BlueStore::_buffer_cache_write*
+  BlueStore::_do_alloc_write
+  BlueStore::_do_write
+  BlueStore::_write
+  BlueStore::_txc_add_transaction
+  BlueStore::queue_transactions
+```
+
+Recovery reads take the first path through `readv()` from
+`build_push_op()`, with the same frames below `_generate_read_result_bl`.
+
+```
+free, write finished                      244x  bstore_kv_final
+  BlueStore::Buffer::operator delete        FLAG_NOCACHE: the default write is not cached
+  BlueStore::BufferSpace::_finish_write
+  BlueStore::Onode::finish_write
+  BlueStore::TransContext::finish_writing
+  BlueStore::_txc_finish
+  BlueStore::_kv_finalize_thread
+
+free, trim inline on a read fill         2418x  tp_osd_tp
+  BlueStore::Buffer::operator delete
+  BlueStore::BufferSpace::_rm_buffer*
+  TwoQBufferCacheShard::_trim_to
+  BlueStore::CacheShard::_trim*
+  BlueStore::BufferSpace::did_read*
+  BlueStore::_generate_read_result_bl
+  BlueStore::_do_read
+  ...
+
+free, overlapped by the new buffer        169x  tp_osd_tp
+  BlueStore::Buffer::operator delete
+  BlueStore::BufferSpace::_discard
+  BlueStore::BufferSpace::did_read*
+  BlueStore::_generate_read_result_bl
+  ...
+
+free, onode evicted                       282x  bstore_mempool
+  BlueStore::Buffer::operator delete
+  BlueStore::BufferSpace::_clear
+  BlueStore::Onode::~Onode
+  BlueStore::Onode::put
+  std::_Hashtable::_M_erase
+  LruOnodeCacheShard::_trim_to
+  BlueStore::CacheShard::_trim_some*
+  BlueStore::CacheShard::set_max*
+  BlueStore::MempoolThread::_resize_shards
+```
+
+Take away: in these windows no buffer was freed by the mempool thread's own
+buffer-shard `set_max()`. A buffer leaves with the reader that inserts the
+next one, with the write that finishes, or with its onode. The writing
+buffer of a default write is not cache at all: it serves readers while the
+write is in flight and is erased in `_txc_finish()`.
 
 ### 8.3 The RocksDB block caches
 
@@ -585,6 +749,91 @@ and the per-column-family cache in
 A separate cache for a column family is only created when its option string
 gives a type, size or high ratio; otherwise the family shares the default
 cache.
+
+**Call stacks.** A block enters through RocksDB's table reader, which calls
+[`ShardedCache::Insert()`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/ShardedCache.cc#L46) after a
+cache miss. BlueStore reaches it with point gets and with iterators.
+
+```
+alloc, onode point get (kv_onode cache)   519x  tp_osd_tp
+  rocksdb_cache::ShardedCache::Insert       -> BinnedLRUCacheShard::Insert* -> EvictFromLRU* -> FreeDeleted
+  rocksdb::BlockBasedTable::PutDataBlockToCache
+  rocksdb::BlockBasedTable::MaybeReadBlockAndLoadToCache
+  rocksdb::BlockBasedTable::RetrieveBlock
+  rocksdb::BlockBasedTable::NewDataBlockIterator
+  rocksdb::BlockBasedTable::Get
+  rocksdb::TableCache::Get
+  rocksdb::Version::Get
+  rocksdb::DBImpl::Get
+  RocksDBStore::get
+  BlueStore::Collection::get_onode
+  BlueStore::getattr
+  PGBackend::objects_get_attr
+  PrimaryLogPG::get_object_context
+  PrimaryLogPG::do_op_impl
+
+alloc, collection listing (backfill scan) 624x  tp_osd_tp
+  rocksdb_cache::ShardedCache::Insert
+  rocksdb::BlockBasedTable::PutDataBlockToCache
+  rocksdb::BlockBasedTable::MaybeReadBlockAndLoadToCache
+  rocksdb::BlockBasedTable::RetrieveBlock
+  rocksdb::BlockBasedTable::NewDataBlockIterator
+  rocksdb::BlockBasedTableIterator::InitDataBlock
+  rocksdb::BlockBasedTableIterator::FindBlockForward
+  rocksdb::BlockBasedTableIterator::Next
+  rocksdb::MergingIterator::Next
+  rocksdb::DBIter::Next
+  ShardMergeIteratorImpl::next
+  SortedCollectionListIterator::get_next_chunk
+  BlueStore::_collection_list
+
+alloc, extent-map shard load               18x  tp_osd_tp
+  rocksdb_cache::ShardedCache::Insert
+  ... rocksdb::BlockBasedTable::Get ... RocksDBStore::get
+  BlueStore::ExtentMap::maybe_load_shard
+  BlueStore::_fiemap
+  ReplicatedBackend::build_push_op
+
+compaction, placeholder entry           19168x  RocksDB background thread
+  rocksdb_cache::ShardedCache::Insert
+  rocksdb::PlaceholderCacheInterface::Insert*
+  rocksdb::BlockBasedTable::NewDataBlockIterator
+  rocksdb::BlockBasedTableIterator::InitDataBlock
+  rocksdb::BlockBasedTableIterator::Next
+  rocksdb::MergingIterator::Next
+  rocksdb::CompactionIterator::Next
+  rocksdb::CompactionJob::ProcessKeyValueCompaction
+  rocksdb::CompactionJob::Run
+  rocksdb::DBImpl::BackgroundCompaction
+```
+
+The last one is not a cached block. A compaction reads with the cache fill
+off, and RocksDB inserts a value-less placeholder that charges the block's
+size to the cache while the iterator holds it; the block is freed when the
+iterator moves on (36,000 `Block::~Block` in that window). It is why
+`inserts` in the `rocksdb-cache-O` perf counters runs far ahead of `elems`.
+
+```
+free, tuner resize                         30x  bstore_mempool   (every balance round)
+  rocksdb_cache::BinnedLRUCache::commit_cache_size   -> SetCapacity -> EvictFromLRU -> FreeDeleted -> Block::~Block
+  PriorityCache::Manager::balance
+  BlueStore::MempoolThread::entry
+
+free, insert into a full shard                        (inlined into ShardedCache::Insert, see above)
+  rocksdb_cache::ShardedCache::Insert
+  rocksdb_cache::BinnedLRUCacheShard::Insert*
+  rocksdb_cache::BinnedLRUCacheShard::EvictFromLRU*
+  rocksdb_cache::BinnedLRUCacheShard::FreeDeleted    -> Block::~Block
+```
+
+Take away: both free paths exist, neither freed a block in this run. At
+the floor each RocksDB cache is handed its 64 MiB minimum chunk and never
+shrinks, and the kv_onode cache's usage stayed under it (`rocksdb-cache-O` in
+`perf dump`: capacity 64 MiB, usage 48 MiB, 10,743 blocks after 32,750
+inserts over the OSD's life). So on a small OSD the RocksDB caches only
+grow to the chunk; the `hits`, `misses` and `inserts` counters there are
+the way to see them work, since `dump_objectstore_kv_stats` needs
+`rocksdb_perf` on.
 
 ## 9. Mempools: how BlueStore knows what it uses
 
@@ -768,6 +1017,7 @@ defaults:
 | chunk | The rounding unit for a committed cache size: the total rounded to a power of two over 256, clamped to 4 to 64 MiB. |
 | cephadm | Ceph's orchestrator for container deployments; it can set `osd_memory_target` per host. |
 | perf counter | A named statistic a daemon exposes through `perf dump`. |
+| uprobe | A kernel breakpoint on a user-space function. perf and bpftrace use it to record each call, and perf can unwind the call stack from DWARF when the binary has no frame pointers. |
 
 ## Code references
 
@@ -793,5 +1043,14 @@ All links point at tag `v21.3.0` of `ceph/ceph`.
 | [`md_config_t::parse_env()`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/config.cc#L475) | Container memory limit to target |
 | [`MemoryAutotuner.tune()`](https://github.com/ceph/ceph/blob/v21.3.0/src/pybind/mgr/cephadm/autotune.py#L32) | cephadm per-host target |
 | [`DEFINE_MEMORY_POOLS_HELPER`](https://github.com/ceph/ceph/blob/v21.3.0/src/include/mempool.h#L154) | The mempool list |
+| [`Collection::get_onode()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L5388) | Onode miss: `create_decode()` (L4953), then `add_onode()` |
+| [`OnodeSpace::add_onode()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L2064) | Insert into the shard, then `_trim_some()` inline |
+| [`Onode::put()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L4917) | Last reference drops: `delete`, with the onode's buffers |
+| [`_reap_collections()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L12537) | `OnodeSpace::clear()` when a collection is removed |
+| [`BufferSpace::did_read()` / `write()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L514) | `_discard()`, `_add_buffer()`, `cache->_trim()` |
+| [`BufferSpace::_discard()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1781) / [`__rm_buffer()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1752) | Buffer freed by overlap or by trim |
+| [`BlueStore::_collection_list()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L13897) | RocksDB iterator over the onode column family (backfill scans) |
+| [`ShardedCache::Insert()`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/ShardedCache.cc#L46) | The RocksDB cache entry point BlueStore's reads reach |
+| [`BinnedLRUCacheShard::Insert()`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/BinnedLRUCache.cc#L422) / [`EvictFromLRU()`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/BinnedLRUCache.cc#L277) / [`FreeDeleted()`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/BinnedLRUCache.cc#L296) / [`SetCapacity()`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/BinnedLRUCache.cc#L307) | Insert with eviction; the tuner's resize |
 
 {% include mermaid.html %}
