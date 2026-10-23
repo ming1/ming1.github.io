@@ -1133,7 +1133,8 @@ holding exactly its even share is a fixed point, so when every shard wants
 more than its share the split stays even, as today. The onode shards keep
 the even split for now, because their count includes pinned onodes that
 cannot be evicted. The change is confined to `_resize_shards()`:
-[`shard-demand.patch`]({{ site.baseurl }}/code/ceph/shard-demand.patch).
+[`shard-demand.patch`]({{ site.baseurl }}/code/ceph/shard-demand.patch),
+filed as [tracker #82021](https://tracker.ceph.com/issues/82021).
 
 Same fw settings, same test, with the patch:
 
