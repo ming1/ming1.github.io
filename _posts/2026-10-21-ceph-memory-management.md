@@ -897,6 +897,22 @@ data they point to, so it belongs to meta. The data itself is in
    which needs tcmalloc.
 4. The tuner's decisions, at debug level 5 of the `prioritycache` subsystem,
    as lines `prioritycache tune_memory target: … mapped: … unmapped: … heap: … old mem: … new mem: …`.
+5. The kernel's view next to the tuner's view, sampled over time:
+   [`osd-rss-watch.sh`]({{ site.baseurl }}/code/ceph/osd-rss-watch.sh)
+   prints one line per OSD per interval with `VmRSS` split into anon and
+   file from `/proc/PID/status`, the charge of the cgroup the OSD runs in,
+   and `heap`, `mapped`, `unmapped`, `target` and `tuned` from the perf
+   counters above, plus the mempool total.
+   ```
+   osd-rss-watch.sh -i 10                                    # packaged OSDs
+   CEPH=build/bin/ceph osd-rss-watch.sh -c build/ceph.conf   # vstart
+   ```
+   Read it as `rss = anon + file`, and `anon ≈ mapped` plus what tcmalloc
+   does not manage (thread stacks, RocksDB's own mmaps). `unmapped` is
+   released to the kernel and not resident. An `anon` that keeps growing
+   while `mapped` stays flat is memory the tuner does not see; `tuned`
+   dropping while `anon` does not is the tuner shrinking caches that are
+   not what fills the OSD.
 
 ## 10. What changes at runtime, and what does not
 
