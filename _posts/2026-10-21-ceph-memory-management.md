@@ -1126,10 +1126,13 @@ Keep a small floor per shard and split the rest by what each shard holds:
 max_i = floor + (committed - 8 * floor) * held_i / sum(held)      floor = committed / 64
 ```
 
-The limits still add up to the committed size. A shard at its limit gains
-budget as long as another shard holds less than its share, so the split
-follows the data in a few rounds of the mempool thread. The same rule
-applies to the onode shards. It is a 29-line change in `_resize_shards()`:
+The limits still add up to at most the committed size. A shard at its
+limit gains budget as long as another shard holds less than its share, so
+the split follows the data in a few rounds of the mempool thread. A shard
+holding exactly its even share is a fixed point, so when every shard wants
+more than its share the split stays even, as today. The onode shards keep
+the even split for now, because their count includes pinned onodes that
+cannot be evicted. The change is confined to `_resize_shards()`:
 [`shard-demand.patch`]({{ site.baseurl }}/code/ceph/shard-demand.patch).
 
 Same fw settings, same test, with the patch:
@@ -1141,8 +1144,12 @@ Same fw settings, same test, with the patch:
 | pc | 98,032 | page cache | 1.04 ms | 0.071 ms | 37 to 48 µs | 3.7 GiB |
 
 With a 2 GiB hot region the patched fw arm gives 107,543 IOPS against
-98,020 for the page cache, at 2.4 against 2.7 GiB. BlueStore's own cache
-beats the page cache on every column once it is allowed to hold the data.
+98,020 for the page cache, at 2.4 against 2.7 GiB. A later A/B on the same
+cluster with the reviewed patch, the stock and patched binaries built from
+one tree, and disk reads per OSD recorded as cache-independent evidence
+gave the same picture: 5,643 IOPS with 77 to 253 MiB read from disk per
+OSD, against 106,712 with none. BlueStore's own cache beats the page cache
+on every column once it is allowed to hold the data.
 
 ### 13.5 Three more things the tuner does to a small OSD
 
