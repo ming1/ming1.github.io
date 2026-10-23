@@ -1134,7 +1134,8 @@ more than its share the split stays even, as today. The onode shards keep
 the even split for now, because their count includes pinned onodes that
 cannot be evicted. The change is confined to `_resize_shards()`:
 [`shard-demand.patch`]({{ site.baseurl }}/code/ceph/shard-demand.patch),
-filed as [tracker #82021](https://tracker.ceph.com/issues/82021).
+filed as [tracker #82021](https://tracker.ceph.com/issues/82021), fix in
+[PR #73018](https://github.com/ceph/ceph/pull/73018).
 
 Same fw settings, same test, with the patch:
 
