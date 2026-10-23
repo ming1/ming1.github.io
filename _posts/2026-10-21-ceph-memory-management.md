@@ -1055,6 +1055,27 @@ Two things it was *not*:
 
 ### 13.3 Why the cache stops at 70 % of its budget
 
+First, what a shard is. BlueStore does not keep one data cache and one
+onode cache; it cuts each into N independent pieces, so that the OSD's op
+threads do not all wait for one lock. N is the OSD's op-queue shard count
+(`osd_op_num_shards`, 8 on flash), set at start by
+[`set_cache_shards()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L9405).
+Each piece has its own lock, its own 2Q lists and its own byte limit. Every
+collection, that is every PG on the OSD, belongs to exactly one piece, and
+all of that PG's data is cached there. Budget cannot move between pieces.
+
+```
+        data cache budget, committed by the tuner: 816 MiB
+                         │  split 8 ways
+   ┌──────────┬──────────┼──────────┬─────────────┐
+ shard 0    shard 1    shard 2    shard 3   ...  shard 7      own lock, own lists,
+ 102 MiB    102 MiB    102 MiB    102 MiB        102 MiB      own limit
+   ▲          ▲          ▲          ▲              ▲
+ PG 2.0     PG 2.1     PG 2.2     PG 2.3         PG 2.7       PG n -> shard n mod 8
+ PG 2.8     PG 2.9     PG 2.a     PG 2.b         PG 2.f
+  ...        ...        ...        ...            ...
+```
+
 [`_resize_shards()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L5699) gives every
 buffer shard the same limit, the committed bytes divided by the shard
 count (L5756). A collection goes to a shard by its PG number modulo the
