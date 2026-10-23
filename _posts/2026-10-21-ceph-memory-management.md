@@ -1,7 +1,7 @@
 ---
 title: "Explaining Ceph's memory management"
 category: storage
-tags: [ceph, bluestore, osd, memory, cache, rocksdb, tcmalloc, mempool, prioritycache, cephadm]
+tags: [ceph, bluestore, osd, memory, cache, rocksdb, tcmalloc, mempool, prioritycache, cephadm, page-cache, perf]
 ---
 
 * TOC
@@ -991,6 +991,145 @@ defaults:
 7. If mapped memory climbs past 4 GiB, step 3 shrinks `tuned_mem`, step 4
    hands out less, and step 6 evicts more, until mapped memory falls back
    under the target.
+
+## 13. A case: the page cache "beat" BlueStore's cache
+
+[PR #72884](https://github.com/ceph/ceph/pull/72884) lets BlueStore read
+object data through the kernel's page cache. Its author measured hot 4K
+random reads and found 1 GiB OSDs plus the page cache 21 % faster than
+OSDs with a 4 GiB target. Two explanations are possible: the kernel caches
+data better than BlueStore, or BlueStore's cache was not using the memory
+it had. I repeated the test on a 4-OSD vstart cluster and found the second.
+
+### 13.1 The test
+
+```mermaid
+flowchart LR
+    F["fio: 4K random reads<br/>3 GiB hot region of the image<br/>4 jobs x queue depth 8, 120 s"] --> R["/dev/rbd1<br/>6 GiB image, pool size 2"]
+    R --> O0["osd.0<br/>nvme"]
+    R --> O1["osd.1<br/>vdb"]
+    R --> O2["osd.2<br/>sda, slow"]
+    R --> O3["osd.3<br/>sdb, slow"]
+    subgraph CG["one cgroup of 8 GiB: the OSDs and their page cache"]
+      O0
+      O1
+      O2
+      O3
+    end
+```
+
+Three settings, called arms. Each arm restarts the OSDs, warms up with two
+sequential reads of the hot region, then runs the measured pass.
+
+| arm | `osd_memory_target` | tuner settings | page cache reads |
+|---|---|---|---|
+| base | 2 GiB | defaults | off |
+| fw | 2 GiB | `osd_memory_base` 256 MiB, meta and kv ratios 0.30 | off |
+| pc | 1 GiB | the PR's advice: meta 0.50, kv 0.45 | on |
+
+Per OSD the harness records `buffer_hit_bytes` and `buffer_miss_bytes`,
+`read_lat`, CPU time per read, and a perf profile of the threads:
+[`hotpass.sh`]({{ site.baseurl }}/code/ceph/hotpass.sh).
+
+### 13.2 What came out
+
+| arm | IOPS | buffer hit rate | p99 latency | data cache held per OSD |
+|---|---|---|---|---|
+| base | 3,179 | 55 % | 80 ms | 330 to 490 MiB |
+| fw | 5,824 | 85 % | 52 ms | 490 to 680 MiB |
+| pc | 98,032 | page cache, all hits | 1.0 ms | 60 MiB, plus 3.2 GiB of page cache |
+
+Each OSD's share of the hot region is 0.6 to 1.0 GiB. The page cache held
+all of it after one pass. BlueStore's cache never did, although the tuner
+had committed 760 to 880 MiB per OSD to it. On this machine a miss goes to a
+slow disk, so the hit rate decides the result.
+
+Two things it was *not*:
+
+- **Not the hit path.** With a 3 GiB target and ratios of 0.10 the cache
+  finally held the data (98 to 100 % hits). A hit then cost 4 µs of
+  `read_lat`, against 20 µs for a page-cache hit, at the same CPU per read.
+  Once BlueStore's cache has the data, it serves it faster than the kernel.
+- **Not the growth ramp of §6.3.** Six warm passes instead of two changed
+  nothing. The cache reached the same size within a minute and stayed there.
+
+### 13.3 Why the cache stops at 70 % of its budget
+
+[`_resize_shards()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L5699) gives every
+buffer shard the same limit, the committed bytes divided by the shard
+count (L5756). A collection goes to a shard by its PG number modulo the
+count ([`hash_to_shard()`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.h#L634)), and the PGs an OSD
+is primary for do not spread evenly: on these four OSDs the busiest shard
+carried 1.3 to 1.6 times the average.
+
+```
+example: tuner commits 816 MiB to the data cache; 8 shards, each allowed 816 / 8 = 102 MiB
+
+shard        0     1     2     3     4     5     6     7
+hot data   140   140    70    70    90   140   120   170  MiB  what the shard needs (940)
+allowed    102   102   102   102   102   102   102   102  MiB  equal split
+held       102   102    70    70    90   102   102   102  MiB  = 740 of 816
+
+             ^ full: trims on every insert   ^ never fills: 32 + 32 + 12 = 76 MiB stranded
+```
+
+The loaded shards sit at their limit and
+[`_trim_some()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1557) evicts on every
+insert; the light shards never reach theirs. The budget that is stranded in
+the light shards is lost, and inside a loaded shard the 2Q split between
+`warm_in` and `hot` (§8.2) loses a little more. Measured: 574 MiB held of
+816 committed, which is where the 85 % hit rate comes from. More budget
+only helps by accident, when even the busiest shard fits.
+
+### 13.4 The fix
+
+Keep a small floor per shard and split the rest by what each shard holds:
+
+```
+max_i = floor + (committed - 8 * floor) * held_i / sum(held)      floor = committed / 64
+```
+
+The limits still add up to the committed size. A shard at its limit gains
+budget as long as another shard holds less than its share, so the split
+follows the data in a few rounds of the mempool thread. The same rule
+applies to the onode shards. It is a 29-line change in `_resize_shards()`:
+[`shard-demand.patch`]({{ site.baseurl }}/code/ceph/shard-demand.patch).
+
+Same fw settings, same test, with the patch:
+
+| arm | IOPS | buffer hit rate | p99 | `op_r_latency` | OSD CPU per read | cgroup memory |
+|---|---|---|---|---|---|---|
+| fw, stock | 5,824 | 85 % | 52 ms | 0.2 to 15 ms | 130 to 150 µs | 2.8 GiB |
+| fw + patch | 105,585 | 100 % | 0.95 ms | 0.046 ms | 33 to 43 µs | 3.4 GiB |
+| pc | 98,032 | page cache | 1.04 ms | 0.071 ms | 37 to 48 µs | 3.7 GiB |
+
+With a 2 GiB hot region the patched fw arm gives 107,543 IOPS against
+98,020 for the page cache, at 2.4 against 2.7 GiB. BlueStore's own cache
+beats the page cache on every column once it is allowed to hold the data.
+
+### 13.5 Three more things the tuner does to a small OSD
+
+- It only lets a cache grow by 64 MiB plus one chunk per 5-second round,
+  because [`request_cache_bytes()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2618)
+  asks for what the cache already holds (§6.3).
+- At the `LAST` priority the defaults give the data cache 6 % (§6.2), and
+  `osd_memory_base` takes 768 MiB before any cache is sized (§2). On a
+  1.5 GiB OSD that is half the target.
+- `bluestore_cache_type = lru` aborts the OSD at start on current main, an
+  assert in `LruBufferCacheShard::_rm()` on the age-bin accounting. The
+  2Q cache is the only one that runs.
+
+### 13.6 Takeaways
+
+- Measure the hit rate before judging the mechanism. `buffer_hit_bytes`,
+  `buffer_miss_bytes` and `read_lat` in `perf dump` tell in one minute
+  whether a cache holds its working set.
+- An equal split over shards plus an uneven mapping onto them strands
+  budget. Any sharded cache with fixed per-shard caps has this problem;
+  let the caps follow demand.
+- A page-cache hit costs a system call, a copy and a checksum. A BlueStore
+  cache hit costs a reference count. When both hold the data, BlueStore's
+  is the faster one, and it is the one the tuner can see.
 
 ## Glossary
 

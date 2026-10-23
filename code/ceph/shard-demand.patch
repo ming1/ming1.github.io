@@ -1,0 +1,52 @@
+diff --git a/src/os/bluestore/BlueStore.cc b/src/os/bluestore/BlueStore.cc
+index 64f89b9da60..b7f3c8ae000 100644
+--- a/src/os/bluestore/BlueStore.cc
++++ b/src/os/bluestore/BlueStore.cc
+@@ -5751,18 +5751,39 @@ void BlueStore::MempoolThread::_resize_shards(bool interval_stats)
+                    << " data_used: " << data_used << dendl;
+   }
+ 
+-  uint64_t max_shard_onodes = static_cast<uint64_t>(
+-      (meta_alloc / (double) onode_shards) / meta_cache->get_bytes_per_onode());
+-  uint64_t max_shard_buffer = static_cast<uint64_t>(data_alloc / buffer_shards);
+-
+-  dout(30) << __func__ << " max_shard_onodes: " << max_shard_onodes
+-                 << " max_shard_buffer: " << max_shard_buffer << dendl;
++  // Demand-weighted per-shard limits.  A collection maps to a shard by
++  // pg number modulo the shard count, so the primaries of one OSD spread
++  // unevenly over the shards (1.3x to 1.6x the average on the busiest shard
++  // in a 4-OSD vstart).  With an equal split the loaded shards cap and trim
++  // while the light shards never fill, and the caches stall at ~70% of the
++  // committed size.  Give each shard an eighth of its even share as a floor and
++  // split the rest by the bytes (onodes) it currently holds; the sum
++  // still equals the committed size, and a capped shard gains budget as
++  // long as some other shard holds less than its share.
++  uint64_t total_onodes = 0, total_buffer = 0;
++  for (auto i : store->onode_cache_shards) total_onodes += i->_get_num();
++  for (auto i : store->buffer_cache_shards) total_buffer += i->_get_bytes();
++  uint64_t alloc_onodes = static_cast<uint64_t>(
++      meta_alloc / meta_cache->get_bytes_per_onode());
++  uint64_t onode_floor = alloc_onodes / (8 * onode_shards);
++  uint64_t buffer_floor = data_alloc / (8 * buffer_shards);
++
++  dout(30) << __func__ << " alloc_onodes: " << alloc_onodes
++           << " onode_floor: " << onode_floor
++           << " data_alloc: " << data_alloc
++           << " buffer_floor: " << buffer_floor << dendl;
+ 
+   for (auto i : store->onode_cache_shards) {
+-    i->set_max(max_shard_onodes);
++    uint64_t share = total_onodes
++      ? (alloc_onodes - onode_floor * onode_shards) * i->_get_num() / total_onodes
++      : onode_floor;
++    i->set_max(onode_floor + share);
+   }
+   for (auto i : store->buffer_cache_shards) {
+-    i->set_max(max_shard_buffer);
++    uint64_t share = total_buffer
++      ? (data_alloc - buffer_floor * buffer_shards) * i->_get_bytes() / total_buffer
++      : buffer_floor;
++    i->set_max(buffer_floor + share);
+   }
+ }
+ 
