@@ -2772,7 +2772,8 @@ main `d42b95216c4`) · affects: the BlueStore read path and
 `bluestore_page_cache_read` (default off) · Status: open; review posted as
 [this comment](https://github.com/ceph/ceph/pull/72884#issuecomment-6316087346)
 (2026-10-21), asking for the problem to be solved inside the existing cache
-framework instead. Ceph references are permalinks at the PR tip; kernel
+framework instead; the follow-up that did so is §10.8 (tracker #82021,
+PR #73018). Ceph references are permalinks at the PR tip; kernel
 references are `/home/ming/git/linux` at `v7.3-rc4-70-gfe2ec837`.
 
 ### 10.1 The story in one view
@@ -3189,6 +3190,43 @@ The fast runner prints time to kill, the kernel OOM line, and for each
 surviving OSD its mapped bytes, in-flight client bytes against the throttle
 max, PG log and mempool totals. The harness writes `samples.txt`,
 `phases.txt` and `events.txt` under `~/pc-mem/results/<arm>/`.
+
+### 10.8 Follow-up: the gap was the cache tuner, not the cache
+
+I reproduced the PR's hot-read comparison on a 4-OSD vstart and traced the
+difference to one line of the tuner, not to the page cache. The full story,
+with the harness and pictures, is §13 of
+[the memory-management post]({% post_url 2026-10-21-ceph-memory-management %});
+this is the short version.
+
+```
+why the page cache won                      what BlueStore's cache does once the cap follows demand
+──────────────────────                      ─────────────────────────────────────────────────────
+data cache = 8 shards, equal limits         limit_i = 1/8 even share + rest * held_i / sum(held)
+PG -> shard by pg seed % 8, uneven 1.3-1.6x
+loaded shards evict on every insert         4K randread, 3 GiB hot set, 2 GiB target:
+light shards never fill                       stock    5,643 IOPS   76% hit   77-253 MiB/OSD from disk
+cache stops at ~70% of committed              patched  106,712      100%      0
+hot set that fits still reads from disk       page cache (PR #72884)  96,196, hit 18 µs vs 4 µs
+```
+
+- Hit path: a BlueStore cache hit costs 4 µs of `read_lat` against 18 µs
+  through the page cache, at the same OSD CPU per read. The PR's gain was
+  hit rate, and the hit rate was capped by `_resize_shards()` splitting the
+  committed budget equally over shards that are loaded unevenly.
+- Writes do not change with the fix: a write inserts a `NOCACHE` writing
+  buffer that is erased at `_txc_finish()`, so no write keeps or needs
+  cache; on c28 the writes were disk-bound anyway (190 IOPS random,
+  17 MiB/s sequential, ±12 % between passes).
+- Onode shards keep the even split in the fix: their `num` includes onodes
+  pinned by in-flight ops, which `_trim_to()` cannot evict, so weighting by
+  it would credit demand a shard cannot give back. Weighting by the
+  evictable count is the follow-up.
+- Filed as [tracker #82021](https://tracker.ceph.com/issues/82021); fix in
+  [PR #73018](https://github.com/ceph/ceph/pull/73018), buffer shards only,
+  share computed in `double` and from one snapshot of the counters after
+  review. Found on the way: `bluestore_cache_type = lru` aborts the OSD at
+  start on main.
 
 #### Code references
 
