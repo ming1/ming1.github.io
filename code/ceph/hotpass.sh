@@ -175,6 +175,7 @@ snap() {   # snap <dir>
         echo "$n $bdev $(awk -v d="$bdev" '$3==d{print $6}' /proc/diskstats) $(awk '/^file /{print $2}' $CG/osd$n/memory.stat) $(osd_pid $n || true)"
     done > "$1/dev"
     awk '$3=="rbd0"{print $4, $6}' /proc/diskstats > "$1/rbd"   # reads and sectors on the fio target
+    for n in $(seq 0 $((NOSD-1))); do bdev=$(basename "$(readlink -f "$B/dev/osd$n/block")"); echo "$n $(awk -v d="$bdev" '$3==d{print $6, $10}' /proc/diskstats)"; done > "$1/devrw"
     for n in $(seq 0 $((NOSD-1))); do p=$(osd_pid $n); [ -n "$p" ] && echo "$n $(awk '{print $14+$15}' /proc/$p/stat)"; done > "$1/cpu"   # utime+stime, ticks
 }
 
@@ -211,6 +212,46 @@ for osd in range(4):
     c = collections.Counter(int(p["pgid"].split(".")[1], 16) % n for p in pgs if p["acting_primary"] == osd and not p["pgid"].startswith("1."))
     v = [c[i] for i in range(n)]
     print("osd.%d primaries=%3d per shard=%s  busiest/avg=%.2f" % (osd, sum(v), v, max(v) / (sum(v) / n)))' "$n"
+}
+
+bench() {   # bench <name> <rw> <bs> <seconds> [numjobs] [iodepth]: generic fio pass with per-OSD op counters, for regression checks
+    local name=$1 rw=$2 bs=$3 secs=$4 nj=${5:-4} qd=${6:-8}; local out="$RES/$name"; mkdir -p "$out"
+    local dev; dev=$(cat "$RES/dev"); [ -b "$dev" ] || { echo "bench: $dev is not a block device"; exit 1; }
+    snap "$out/s0"
+    fio --name=$name --filename=$dev --rw=$rw --bs=$bs --direct=1 --ioengine=libaio --numjobs=$nj --iodepth=$qd \
+        --size=$HOT --group_reporting --runtime=$secs --time_based --randrepeat=0 \
+        --output-format=json --output="$out/fio.json" >/dev/null
+    snap "$out/s1"
+    python3 - "$out" "$rw" <<'EOF'
+import json, sys
+out, rw = sys.argv[1], sys.argv[2]
+j = json.load(open(out + "/fio.json"))["jobs"][0]; r = j["read"] if "read" in rw else j["write"]
+pct = r["clat_ns"]["percentile"]
+print("fio %-9s iops=%7.0f  MiB/s=%7.1f  clat_ms mean=%.3f p50=%.3f p99=%.3f" % (rw, r["iops"], r["bw_bytes"] / 2**20,
+      r["clat_ns"]["mean"]/1e6, pct["50.000000"]/1e6, pct["99.000000"]/1e6))
+def P(s, n): return json.load(open(out + "/%s/perf.%d.json" % (s, n)))
+def cpu(n):
+    c = {}
+    for s in ("s0", "s1"):
+        for l in open(out + "/%s/cpu" % s):
+            k, v = l.split(); c.setdefault(k, []).append(int(v))
+    v = c.get(str(n), [0, 0]); return (v[-1] - v[0]) * 10.0
+def devrw(n):
+    r = {}
+    for s in ("s0", "s1"):
+        for l in open(out + "/%s/devrw" % s):
+            f = l.split()
+            if f[0] == str(n): r[s] = (int(f[1]), int(f[2]))
+    return ((r["s1"][0] - r["s0"][0]) * 512 >> 20, (r["s1"][1] - r["s0"][1]) * 512 >> 20)
+print("osd    ops  op_lat_ms  cpu_us/op  buffers_MiB  rss_MiB  disk_rd_MiB  disk_wr_MiB")
+for n in range(4):
+    a, b = P("s0", n), P("s1", n)
+    ops = b["osd"]["op"] - a["osd"]["op"]
+    lat = (b["osd"]["op_latency"]["sum"] - a["osd"]["op_latency"]["sum"]) / max(1, ops) * 1e3
+    rss = [int(l.split()[1]) for l in open(out + "/s1/rss") if " -i %d" % n in l]
+    rd, wr = devrw(n)
+    print("%d  %7d %10.3f %10.0f %12d %8d %12d %12d" % (n, ops, lat, cpu(n) * 1e3 / max(1, ops), b["bluestore"]["buffer_bytes"] >> 20, (rss[0] >> 10) if rss else 0, rd, wr))
+EOF
 }
 
 report() {
@@ -270,5 +311,6 @@ EOF
 
 case ${1:-} in
     prep) prep ;; arm) arm "$2" ;; warm) warm "${2:-2}" ;; hot) hot "$2" ;; report) report "$2" ;; shards) shards ;;
-    *) echo "usage: $0 prep | arm <base|fw|fw2|fw-big|fw-lru|fw-kin|pc> | warm [passes] | hot <name> | report <name> | shards"; exit 1 ;;
+    bench) bench "$2" "$3" "$4" "$5" "${6:-4}" "${7:-8}" ;;
+    *) echo "usage: $0 prep | arm <base|fw|fw2|fw-big|fw-lru|fw-kin|pc> | warm [passes] | hot <name> | report <name> | shards | bench <name> <rw> <bs> <secs> [jobs] [qd]"; exit 1 ;;
 esac
