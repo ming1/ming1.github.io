@@ -1,7 +1,7 @@
 ---
 title: "Explaining Ceph's memory management"
 category: storage
-tags: [ceph, bluestore, osd, memory, cache, rocksdb, tcmalloc, mempool, prioritycache, cephadm, page-cache, perf]
+tags: [ceph, bluestore, osd, memory, cache, rocksdb, tcmalloc, mempool, prioritycache, cephadm, page-cache, perf, memtable, cgroup]
 ---
 
 * TOC
@@ -1177,6 +1177,205 @@ on every column once it is allowed to hold the data.
   cache hit costs a reference count. When both hold the data, BlueStore's
   is the faster one, and it is the one the tuner can see.
 
+## 14. Can the default target be 2 GiB?
+
+### 14.1 The answer in one view
+
+The target sizes the caches and nothing else. Everything else the OSD
+allocates has its own bound, set by other options, and `osd_memory_base`
+is a fixed guess for the sum of those bounds. At 4 GiB the guess is a third
+of the target; at 2 GiB it is more than half. Measured on four capped OSDs,
+a 2 GiB target never came close to its cgroup limit, so 2 GiB works for a
+normal read/write/recovery mix. It is not a safe *default* until the parts
+outside the target are tied to it.
+
+```
+osd_memory_target = 2048 MiB
+ ├─ 15 % fragmentation reserve    307 MiB   fixed share
+ ├─ osd_memory_base               768 MiB   fixed guess for "everything else"
+ └─ cache ceiling (max)           973 MiB   the only part the tuner moves (§2)
+                                             kv | kv_onode | meta | data
+
+"everything else" is bounded per part, not by the target:
+  RocksDB memtables   ≤ max_total_wal_size              1024 MiB   #1
+  client messages     ≤ osd_client_message_size_cap      500 MiB   #2
+  pg log              ≈ 300000 entries/OSD × ~500 B    ~150 MiB   #3
+  tcmalloc free lists   seen 15–140 MiB per OSD, released each round
+  maps, threads, in-flight data, BlueFS                   tens of MiB
+                                                         ----------
+  sum of the bounds                                     ~1.7 GiB  >  1075 MiB reserve
+```
+
+1. In every phase of the test the "everything else" part stayed between
+   0.1 and 0.46 GiB per OSD (§14.2). The reserve of 1075 MiB is 2.3× that.
+2. The caches, not the reserve, set the OSD's size: the peak RSS was the
+   cache ceiling plus about 60 MiB (§14.2).
+3. The default stays 4 GiB because #1 to #3 are not sized by the target. A
+   write burst can put 1 GiB of memtables and 0.5 GiB of client messages
+   next to the caches, and the tuner only reacts after `mapped` has grown
+   (§14.3).
+4. Tie #1 and #2 to the target, then `osd_memory_base` can drop and a 2 GiB
+   OSD keeps about 1.4 GiB of cache instead of 0.95 (§14.4).
+
+### 14.2 What was measured
+
+[`memtarget.sh`]({{ site.baseurl }}/code/ceph/memtarget.sh) runs the vstart
+cluster of §13 (4 OSDs, 512 PGs, pool size 2, 6 GiB RBD image) with each
+OSD in its own cgroup capped at 2 GiB (`memory.oom.group = 1`, so a kill is
+visible) and `osd_memory_target` 2 GiB. The phases are: idle, 4 GiB
+sequential write, 4K random write (180 s), 4K random read (120 s), recovery
+(osd.0 out, then in) and a deep scrub. A sampler reads the cgroup and RSS
+every 5 s; at the end of each phase it stores `perf dump`,
+`dump_mempools` and `heap stats` of every OSD.
+
+| Arm | Options on top of the defaults | Binary |
+|---|---|---|
+| d2 | none | stock |
+| d2b | `osd_memory_base` 256 MiB | stock |
+| r2 | pg log 50000/100/500, `max_write_buffer_number=4, write_buffer_size=64 MiB, max_total_wal_size=256 MiB`, `osd_client_message_size_cap` 128 MiB | stock |
+| r2p | r2 + `osd_memory_base` 256 MiB | shard-limit patch (§13.4) |
+
+Peak RSS (MiB, the largest of the four OSDs) per phase, and the range of
+"everything else" (`mapped` minus the bytes the four caches hold; it
+includes tcmalloc's free lists):
+
+| Arm | cache ceiling | seq write | rand write | rand read | recovery | scrub | everything else | OOM kills |
+|---|---|---|---|---|---|---|---|---|
+| d2 | 972 | 515 | 431 | 650 | 1036 | 1019 | 131–460 | 0 |
+| d2b | 1484 | 257 | 428 | 663 | 1098 | 1093 | 103–489 | 0 |
+| r2 | 972 | 284 | 420 | 626 | 980 | 975 | 123–438 | 0 |
+| r2p | 1484 | 250 | 382 | 611 | 1499 | 1494 | 100–464 | 0 |
+
+What the numbers say:
+
+- The peak is the recovery phase, and it is the cache ceiling plus tcmalloc
+  overhead: d2's busiest OSD reached `mapped` 975 MiB against a ceiling of
+  972 (data cache 467 MiB of recovered objects); r2p reached 1441 against
+  1484 (data cache 939 MiB). A smaller `osd_memory_base` raises the
+  ceiling and nothing else moves.
+- Whether the OSD uses the higher ceiling depends on the cache code, not
+  on the tuner: d2b (stock binary, same 256 MiB base as r2p) stopped at
+  `mapped` 1047 with a data cache of 514 MiB, because the equal per-shard
+  limits of §13.3 cap each shard and the cache then asks for less. The
+  patched r2p filled the same ceiling to 1441.
+- The tuner granted the full ceiling in every snapshot (`cache_bytes` =
+  `max`), because `mapped` never reached the target. Below the ceiling the
+  caches are sized by the working set, not by the tuner: 0 to 300 MiB of
+  data cache in the read phase, up to 986 MiB after recovery.
+- "Everything else" is 100–460 MiB and peaks in recovery, where 50–140 MiB
+  of it is tcmalloc free lists after the data cache churned. The pg log is
+  the next item: 130 000 entries of about 500 B, 44–66 MiB per OSD with
+  the defaults, 27–40 MiB with `osd_target_pg_log_entries_per_osd` 50000.
+- The RocksDB bounds of r2 changed nothing measurable, and that is a limit
+  of this VM, not a result: its disks take 15 MiB/s of sequential and 250
+  IOPS of random writes, so a 16 MiB memtable fills in minutes and is
+  flushed long before the WAL cap matters. The memtable bound in §14.3 is
+  read from the options, not measured.
+
+Unit of all the memory numbers: MiB. All four arms ran on
+21.3.0-2872-gfe630588daf; r2p used the §13.4 patch. One OSD of d2b failed
+to start on the first try (device still busy after the previous arm) and
+was restarted by the harness before the idle phase; no OSD was killed in
+any phase.
+
+### 14.3 Why the default is still 4 GiB
+
+The tuner measures `mapped` once per round and moves the caches toward
+`target − mapped`
+([`tune_memory()`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/PriorityCache.cc#L119)).
+It sees a memtable or a message buffer only after it was allocated. The
+caches can give back at most `ceiling − osd_memory_cache_min` (845 MiB at
+2 GiB), and the shrink is one step per `bluestore_cache_autotune_interval`
+(5 s). Anything outside the caches that grows faster or larger than that
+makes RSS pass the target; whether the OSD dies is then decided by the
+cgroup, not by Ceph.
+
+```
+            what can grow outside the caches at 2 GiB, worst case
+            ───────────────────────────────────────────────────────
+ #1 memtables   16 MiB × up to 64 per column family, 12 families;
+                L and P merge 32 memtables before a flush;
+                the only global bound is max_total_wal_size = 1 GiB:
+                RocksDB flushes the family holding the oldest WAL
+                when the WALs pass it, so ≈ 1 GiB can sit in memory.
+                No WriteBufferManager: nothing ties this to the target.
+ #2 messages    osd_client_message_size_cap = 500 MiB of client data
+                waiting in the messenger before the throttle blocks.
+ #3 pg log      osd_target_pg_log_entries_per_osd = 300000 entries
+                plus osd_pg_log_dups_tracked = 3000 per PG.
+            ───────────────────────────────────────────────────────
+                #1 + #2 + #3 ≈ 1.7 GiB   vs   reserve 1075 MiB
+```
+
+On the VM none of this happened: writes are too slow to fill a memtable,
+and one fio client never had 500 MiB in flight. On an NVMe OSD doing
+50 000 4K writes per second a 16 MiB memtable fills in well under a second
+and the WAL cap is reached in tens of seconds; that is the case the 768 MiB
+base and the 4 GiB default were sized for.
+
+Two details of how the target is set, for completeness. The option has a
+floor of 896 MiB, which is `osd_memory_base` + `osd_memory_cache_min`
+(`global.yaml.in`). Under Kubernetes the default becomes
+`osd_memory_target_cgroup_limit_ratio` (0.8) × `POD_MEMORY_LIMIT`
+([`config.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/config.cc#L553));
+the cgroup file it reads is the v1 path
+([`get_cgroup_memory_limit()`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/util.cc#L173)),
+so on a cgroup v2 host only the environment variable works.
+
+### 14.4 What would make 2 GiB a safe default
+
+In order of effect:
+
+1. **Bound memtables by the target.** Give RocksDB a `WriteBufferManager`
+   shared by all column families, sized from the target (for example
+   target / 8 = 256 MiB at 2 GiB), and scale `max_total_wal_size` with it.
+   RocksDB then flushes the largest memtable when the budget is full
+   instead of waiting for the WAL cap. Cost: more and smaller flushes on a
+   write-heavy OSD, so more L0 files and compaction. Until this is in the
+   code the r2 annex gives the same bound by configuration.
+2. **Scale the message cap.** `osd_client_message_size_cap` 500 MiB is a
+   quarter of a 2 GiB target. A cap tied to the target (target / 16 =
+   128 MiB) only moves the point where the messenger stops reading from
+   clients; it is back-pressure, not an error.
+3. **Lower `osd_memory_base` once 1 and 2 hold.** The measured
+   "everything else" peaked at 460 MiB including 140 MiB of free lists.
+   With bounded memtables and messages, a base of 256–384 MiB gives the
+   caches 1357–1484 MiB at 2 GiB instead of 973. r2p ran at that ceiling
+   (1441 of 1484 MiB) with no kill.
+4. **Let the shard limits follow demand** (§13.4, PR #73018). With the
+   same 256 MiB base the stock OSD ended recovery with 514 MiB of data
+   cache, the patched one with 939; at 2 GiB every stranded shard limit is
+   a larger share of what is left.
+5. **Keep the pg log where it is.** 300000 entries per OSD is at most
+   about 150 MiB at the 500 B per entry measured here.
+   Lowering it (r2: 50000) saves about 30 MiB and shortens the window in
+   which a returning OSD can log-recover instead of backfill; not worth
+   it for memory alone.
+
+With 1 to 3 in place a 2 GiB OSD looks like this:
+
+```
+ today, 2 GiB target                   with bounded memtables and messages
+ ┌──────────────────────────────┐      ┌──────────────────────────────┐
+ │ caches            973 MiB    │      │ caches          ~1400 MiB    │
+ │ base (guess)      768 MiB    │      │ memtables  ≤ 256, msgs ≤ 128 │
+ │ fragmentation     307 MiB    │      │ pg log + rest   ~250 MiB     │
+ │ unbounded: memtables ≤ 1 GiB,│      │ fragmentation     307 MiB    │
+ │   messages ≤ 500 MiB on top  │      │ nothing on top               │
+ └──────────────────────────────┘      └──────────────────────────────┘
+```
+
+### 14.5 Takeaways
+
+- Judge the target by what it does not control. On this cluster the OSD's
+  size was the cache ceiling plus 60 MiB; the 768 MiB base was a 2.3×
+  guess for a 100–460 MiB reality.
+- 2 GiB is fine today for an OSD whose writes are modest and whose host
+  has the headroom; the price is cache, 973 MiB instead of 2714.
+- A 2 GiB *default* needs RocksDB's memtables and the client message cap
+  tied to the target first. After that, `osd_memory_base` can drop and the
+  caches get the difference.
+
 ## Glossary
 
 | Term | Meaning here |
@@ -1237,5 +1436,7 @@ All links point at tag `v21.3.0` of `ceph/ceph`.
 | [`BlueStore::_collection_list()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L13897) | RocksDB iterator over the onode column family (backfill scans) |
 | [`ShardedCache::Insert()`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/ShardedCache.cc#L46) | The RocksDB cache entry point BlueStore's reads reach |
 | [`BinnedLRUCacheShard::Insert()`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/BinnedLRUCache.cc#L422) / [`EvictFromLRU()`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/BinnedLRUCache.cc#L277) / [`FreeDeleted()`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/BinnedLRUCache.cc#L296) / [`SetCapacity()`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/BinnedLRUCache.cc#L307) | Insert with eviction; the tuner's resize |
+| [`Manager::tune_memory()`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/PriorityCache.cc#L119) | Moves the cache budget toward `target − mapped`, between `min` and `max` (§5, §14.3) |
+| [`get_cgroup_memory_limit()`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/util.cc#L173) / [`POD_MEMORY_LIMIT` in `config.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/config.cc#L553) | Where a container limit becomes the default target (§14.3) |
 
 {% include mermaid.html %}
