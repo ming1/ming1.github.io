@@ -107,9 +107,15 @@ changes of the whole cluster. The interval is derived from it, per PG.
 
 Every change to an object gets a version,
 [`eversion_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.h#L890), printed as `epoch'number`,
-for example `71'3`. The PG keeps its recent changes, in order, in the
-**PG log**. An entry names the object and the operation. It does not
-hold the data.
+for example `71'3`. The version is minted by the PG's primary
+([`get_next_version`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PG.h#L1343)):
+the epoch is the OSDMap epoch the primary is serving, the number is a
+per-PG counter, one per log entry. Replicas never mint one; they copy the
+version that arrives with the replicated op. So the same change carries
+the same version on every OSD of the PG, and a jump in the epoch part,
+`71'12` then `74'13`, marks a map change between two writes. The PG keeps
+its recent changes, in order, in the **PG log**. An entry names the
+object and the operation. It does not hold the data.
 
 An example: a replica that was down while three writes happened. It is
 back, and peering (§3.6) has just given it the newer log entries from the
@@ -129,6 +135,22 @@ primary. The objects themselves are not copied yet.
  74'13 … 74'16: the log names the changed objects, the new data is not here yet
                 ─► these objects are this OSD's "missing" set (an older copy may exist on disk)
 ```
+
+Both are fields of
+[`pg_info_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.h#L3107).
+**last_update** is the head of the log: the newest change this OSD has
+*heard of*. It says nothing about the data; peering bumps it to the
+primary's head while the objects are still elsewhere. **last_complete**
+is the newest version through which every change is *applied on this
+disk*: the entry just before the oldest `need` in the missing set. So the
+missing set and last_complete are two views of the same gap, and
+`has_missing()` is literally `last_complete != last_update`. A normal
+write raises both together, but only while they are already equal; once
+a gap opens, last_complete freezes and recovery raises it again, in log
+order, as objects arrive
+([`recover_got`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PGLog.h#L970)).
+If last_complete falls below log_tail, the log no longer covers the gap
+and the OSD must backfill instead (§1.4).
 
 In normal operation this state never appears: a write and its log entry
 are committed together on each OSD (§4.2.2). Real, from the healthy lab PG
