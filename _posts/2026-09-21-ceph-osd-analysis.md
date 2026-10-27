@@ -2943,6 +2943,36 @@ comparison: `iocost` keys on cgroups, which are tenants; mClock keys on
 four fixed kinds of work. And the kernel does its QoS below the
 scheduler, in a separate layer; the OSD does both in one object.
 
+### 6.3.5 Block-layer view: the kernel's per-IO priority
+
+The kernel has the mirror image of this design. Every bio carries an
+I/O priority (`bi_ioprio`: a class RT, BE, IDLE or DL, and a level 0–7,
+the `ionice` encoding). It can be set **per I/O**: io_uring takes it
+from the SQE, libaio from `aio_reqprio`, and direct I/O copies it onto
+the bio. A bio with no class gets the submitting task's priority in
+`submit_bio`, then the `io.prio.class` cgroup policy may change it.
+What honours it is the limited part (Linux 6b4b543fa187):
+
+| Layer | What it does with the priority |
+|---|---|
+| mq-deadline | three class queues, RT before BE before IDLE, with a 10 s aging timer against starvation (`block/mq-deadline.c:36`) |
+| BFQ | RT first, IDLE last, level → weight. The unit is the per-task queue, so a change on one bio re-tags that task's queue (`bfq_check_ioprio_change`, `block/bfq-iosched.c:5561`) |
+| kyber, none | ignore it |
+| libata, CDL | RT sets the NCQ high-priority bit; the DL class picks a command duration limit (`drivers/ata/libata-core.c:778`) |
+| NVMe | nothing |
+
+Two gaps: buffered writes lose the priority, because the writeback
+kworker submits them; and below the scheduler it is a hint, so a `none`
+queue on NVMe drops it.
+
+The OSD takes the opposite route. It classifies each item itself
+(§6.2.3) and schedules before the kernel sees anything. BlueStore never
+sets a per-IO priority on its reads or writes (no `aio_reqprio` or
+io_uring `ioprio` anywhere in `src/blk` or `src/os/bluestore`), so the
+kernel sees one OSD's I/O as one stream at the default BE level. The two
+schemes do not compose: a class the OSD chose is gone by the time the
+request reaches the device queue.
+
 ## 6.4 Takeaways
 
 - The scheduler exists because only the OSD knows the class of a
@@ -2959,6 +2989,8 @@ scheduler, in a separate layer; the OSD does both in one object.
   back jumps the mClock queue once.
 - Recovery is throttled twice: by the reservers and
   `osd_recovery_max_active` before it is queued, and by mClock after.
+- The kernel can take a priority per I/O, but the OSD never sets one.
+  Its scheduling decision ends at `queue_transactions`.
 
 ## 6.5 Glossary
 
