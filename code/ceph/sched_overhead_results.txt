@@ -1,0 +1,43 @@
+# sched_overhead_bench 1000000, taskset -c 5, c28 (KVM guest, 8 vCPU, Core Ultra 9 285H, kernel 6.19.14)
+# ceph tree b6c6b62037e2 (wip-kvsync-v6, merge-base with main d78578929f9d 2026-09-03), RelWithDebInfo
+# ns per enqueue()+dequeue() pair, 5 reps per cell; futures = mclock "not yet" answers
+cell                               scheduler              min_ns  median_ns    futures
+depth1_1owner_client               none                       53         55          0
+depth1_1owner_client               wpq                        84         85          0
+depth1_1owner_client               mclock_scheduler          326        328          0
+depth1_16owner_client              none                       52         56          0
+depth1_16owner_client              wpq                        83         88          0
+depth1_16owner_client              mclock_scheduler          322        330          0
+depth64_1owner_client              none                       60         61          0
+depth64_1owner_client              wpq                        67         71          0
+depth64_1owner_client              mclock_scheduler          320        324          0
+depth64_16owner_client             none                       56         59          0
+depth64_16owner_client             wpq                        65         70          0
+depth64_16owner_client             mclock_scheduler          318        326          0
+depth64_16owner_20pct_recovery     none                       55         57          0
+depth64_16owner_20pct_recovery     wpq                       435        443          0
+depth64_16owner_20pct_recovery     mclock_scheduler          333        345          0
+depth512_16owner_20pct_recovery    none                       57         61          0
+depth512_16owner_20pct_recovery    wpq                       442        455          0
+depth512_16owner_20pct_recovery    mclock_scheduler          321        335          0
+
+# first run, 300000 pairs per cell, taskset -c 3, same host and tree
+cell                               scheduler              min_ns  median_ns    futures
+depth1_1owner_client               none                       50         58          0
+depth1_1owner_client               wpq                        86         89          0
+depth1_1owner_client               mclock_scheduler          321        330          0
+depth1_16owner_client              none                       50         60          0
+depth1_16owner_client              wpq                        88         91          0
+depth1_16owner_client              mclock_scheduler          322        331          0
+depth64_1owner_client              none                       55         56          0
+depth64_1owner_client              wpq                        67         69          0
+depth64_1owner_client              mclock_scheduler          309        324          0
+depth64_16owner_client             none                       56         61          0
+depth64_16owner_client             wpq                        71         76          0
+depth64_16owner_client             mclock_scheduler          319        324          0
+depth64_16owner_20pct_recovery     none                       54         58          0
+depth64_16owner_20pct_recovery     wpq                       418        447          0
+depth64_16owner_20pct_recovery     mclock_scheduler          362        372          0
+depth512_16owner_20pct_recovery    none                       60         61          0
+depth512_16owner_20pct_recovery    wpq                       437        447          0
+depth512_16owner_20pct_recovery    mclock_scheduler          331        343          0
