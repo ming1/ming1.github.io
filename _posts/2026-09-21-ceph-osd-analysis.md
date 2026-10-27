@@ -2676,74 +2676,65 @@ exist for it (§6.3.3). The two options passed to it,
 
 ### 6.3.1 Who puts work in
 
-Every producer builds an `OpSchedulerItem` and calls the shard queue
-([`ShardedOpWQ::_enqueue`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L11451)).
-The item's cost depends on which scheduler is active: under mClock the
-producers give a cost in bytes, under `wpq` a fixed per-type cost.
+Every producer builds an `OpSchedulerItem` and hands it to the shard
+queue ([`ShardedOpWQ::_enqueue`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L11451)).
+Under mClock the cost is a number of bytes that the producer works out.
+Under `wpq` most background items use one fixed cost per type instead.
 
 | Producer | Item | Priority | Cost under mClock | Cost under wpq |
 |---|---|---|---|---|
-| [`OSD::enqueue_op`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L9920) (every fast-dispatched message, §3.1 #2) | `PGOpItem`, or `PGRecoveryMsg` for push/pull/scan/backfill messages | from the message (client ops 63, replies 196) | the message's data length | same |
-| [`OSD::enqueue_peering_evt`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L9962) (new map, §3.5; peer messages) | `PGPeeringItem` | `osd_peering_op_priority` = 255 | 10 | 10 |
-| [`_queue_for_recovery`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L2084), after the throttle [`_maybe_queue_recovery`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L9704) | `PGRecovery` | `osd_recovery_priority` = 5; the class comes from the PG's recovery priority | average object size × reserved pushes | `osd_recovery_cost` = 20 MiB |
+| [`enqueue_op`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L9920): every fast-dispatched message (§3.1 #2) | `PGOpItem`; `PGRecoveryMsg` for push, pull, scan and backfill messages | the message's own: client op 63, reply 196 | the message's data length | same |
+| [`enqueue_peering_evt`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L9962): new map (§3.5), peer messages | `PGPeeringItem` | 255 | 10 | 10 |
+| [`_queue_for_recovery`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L2084) | `PGRecovery` | 5; the class comes from the PG's recovery priority | average object size × reserved pushes | `osd_recovery_cost`, 20 MiB |
 | [`queue_recovery_context`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L1723) | `PGRecoveryContext` | 5 | the caller's cost | 20 MiB |
-| [`queue_for_snap_trim`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L1755) | `PGSnapTrim` | `osd_snap_trim_priority` = 5 | average object size × `osd_pg_max_concurrent_snap_trims` | `osd_snap_trim_cost` = 1 MiB |
-| [`queue_scrub_event_msg`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L1789) and its callers: scrub events | `PGScrub` and the scrub event items | the PG's scrub priority (`osd_scrub_priority` = 5 or the pool's). A high-priority event, such as an operator-requested scrub, is raised to at least 63 ([`scrub_requeue_priority`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scrubber/pg_scrubber.cc#L384)) | `osd_scrub_event_cost` = 4 KiB | 4 KiB |
-| the same, for a scrub chunk | `PGScrubChunkIsFree`, `PGRepScrub` | same | [`get_scrub_cost`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scrubber/pg_scrubber.cc#L1086): 4 KiB + objects × cost_per_io, plus the average object size per object for a deep scrub | `osd_scrub_cost` = 50 MiB |
-| [`queue_for_pg_delete`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L1924) | `PGDelete` | `osd_pg_delete_priority` = 5 | objects × `osd_pg_delete_cost` | `osd_pg_delete_cost` = 1 MiB |
+| [`queue_for_snap_trim`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L1755) | `PGSnapTrim` | 5 | average object size × `osd_pg_max_concurrent_snap_trims` | `osd_snap_trim_cost`, 1 MiB |
+| [`queue_scrub_event_msg`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L1789): scrub state events | `PGScrub` and the other scrub event items | 5, or the pool's scrub priority; an operator-requested scrub gets at least 63 ([`scrub_requeue_priority`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scrubber/pg_scrubber.cc#L384)) | `osd_scrub_event_cost`, 4 KiB | 4 KiB |
+| the same, for one scrub chunk | `PGScrubChunkIsFree`, `PGRepScrub` | same | [`get_scrub_cost`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scrubber/pg_scrubber.cc#L1086): 4 KiB + objects × cost_per_io, plus the average object size per object for a deep scrub | `osd_scrub_cost`, 50 MiB |
+| [`queue_for_pg_delete`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L1924) | `PGDelete` | 5 | objects × `osd_pg_delete_cost` | `osd_pg_delete_cost`, 1 MiB |
 
-Three things to notice:
+Two things to notice:
 
-- Only messages carry a real `owner`: the sender's number, so a replica
-  op from osd.1 has owner 1. Work the OSD creates itself uses 0. Since
-  mClock does not use the owner (§6.2.5), this only matters for `wpq`.
-- The recovery throttle is **outside** the scheduler. A PG that wants to
-  recover first waits in [`awaiting_throttle`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L662)
+- Only messages carry a real `owner`: the sender's number. Work the OSD
+  creates itself uses 0. mClock ignores the owner (§6.2.5), so it
+  matters only for `wpq`.
+- The recovery throttle sits **outside** the scheduler. A PG waits in
+  [`awaiting_throttle`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L662)
   until the active plus reserved recovery ops are below
-  `osd_recovery_max_active`. Then one `PGRecovery` item is queued, and
-  it carries the pushes it reserved (`osd_recovery_max_single_start`,
-  default 1). mClock then decides when that item runs. The two limits
-  stack.
-- The decision "which scheduler is active" is repeated in several
-  places, sometimes by asking the shard
-  ([`osd_op_queue_type`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L10548))
-  and sometimes by comparing the option string
-  ([snap trim](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L1759),
-  [recovery priority](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.h#L1660)).
-  The two agree unless `osd_op_queue` is `debug_random` or the store is
-  filestore.
+  `osd_recovery_max_active`
+  ([`_maybe_queue_recovery`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L9704)).
+  Then one `PGRecovery` item is queued with the pushes it reserved
+  (`osd_recovery_max_single_start`, default 1), and mClock decides when
+  that item runs. The two limits stack.
 
-This diagram shows the path of one client write through the producer,
-the scheduler and the consumer, as the trace of §4.2 recorded it.
+This diagram shows one client write going from the messenger thread
+through the scheduler to a worker, as the trace of §4.2 recorded it.
 
 ```mermaid
 sequenceDiagram
     participant M as msgr-worker
-    participant Q as OSDShard scheduler
+    participant Q as shard scheduler
     participant W as tp_osd_tp worker
     participant PG as PG
-    M->>M: ms_fast_dispatch, enqueue_op: build PGOpItem (cost = data length, priority 63, owner = client id)
-    M->>Q: _enqueue under shard_lock: mClockScheduler::enqueue
-    M-->>W: _enqueue notifies sdata_cond
+    M->>M: enqueue_op builds a PGOpItem
+    M->>Q: _enqueue under shard_lock
+    M-->>W: notify sdata_cond
     W->>Q: _process: dequeue under shard_lock
-    Q-->>W: OpSchedulerItem (or a time to wait until)
-    W->>W: put the item in the PG slot's to_process
-    W->>PG: pg->lock()
-    W->>PG: PGOpItem::run → OSD::dequeue_op → PG::do_request
+    Q-->>W: an item, or a time to wait until
+    W->>W: push on the PG slot's to_process list
+    W->>PG: pg->lock(), item.run → do_request
     PG-->>W: unlock
 ```
 
-Take away: the messenger thread does the enqueue and a worker does the
-dequeue, so the scheduler is the hand-off point between the two thread
-groups of §3.2.2, and the shard lock is what makes that hand-off safe.
+The scheduler is the hand-off point between the two thread groups of
+§3.2.2, and the shard lock is what makes the hand-off safe.
 
 ### 6.3.2 Who takes work out: the worker and the PG slot
 
 The consumer is
-[`ShardedOpWQ::_process`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L11114).
-It runs on every `tp_osd_tp` thread of the shard. The scheduler gives it
-the order between items; the **PG slot** gives it the order inside one
-PG and handles the cases where the item cannot run yet.
+[`ShardedOpWQ::_process`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L11114),
+which runs on every `tp_osd_tp` thread of the shard. The scheduler
+gives the order between items. The **PG slot** gives the order inside
+one PG, and holds items that cannot run yet.
 
 This diagram shows the states an item passes through after it leaves
 the scheduler.
@@ -2762,65 +2753,62 @@ stateDiagram-v2
     Running --> [*]: done
 ```
 
-Take away: "dequeued" does not mean "running". Between the scheduler and
-the PG lock there is a per-PG list, and an item can go back to the
-scheduler from there. When it goes back it uses `enqueue_front`, which in
-mClock means the strict lane (§6.2.4).
+"Dequeued" does not mean "running": an item can go back to the
+scheduler from the slot, and every way back uses `enqueue_front`, which
+in mClock means the strict lane (§6.2.4).
 
 The steps of `_process`, in order:
 
 1. Take `shard_lock`. If the scheduler is empty, wait on `sdata_cond`
    with the lock dropped ([line 11137](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L11137)).
-   `_enqueue` signals this condition when the queue was empty before the
-   insert, or when a thread is in a timed wait.
-2. Call [`scheduler->dequeue()`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L11177).
-   If the result is a time, drop the lock, clear the heartbeat timeout
+   `_enqueue` signals it when the queue was empty before the insert or
+   a thread is in a timed wait.
+2. Call [`dequeue()`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L11177).
+   If the answer is a time, drop the lock, clear the heartbeat timeout
    so the wait is not reported as a stuck thread, and
    [`wait_until`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L11202)
-   that time on `sdata_cond`. A new enqueue wakes the thread early. Then
-   go to step 2 again.
-3. Find or create the PG's slot
-   ([`OSDShardPGSlot`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L960))
-   and push the item on its
+   that time. A new enqueue wakes the thread early. Go to step 2 again.
+3. Push the item on the PG slot's
    [`to_process`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L11240)
-   list.
+   list ([`OSDShardPGSlot`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L960)).
 4. If the slot has a PG: drop `shard_lock`, take
    [`pg->lock()`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L11255),
-   take `shard_lock` again, and check that the slot did not change in
-   between (another thread may have run `_wake_pg_slot` or
-   `consume_map`). If the list is empty or the slot was requeued, give
-   up this pass: the item is already back in the scheduler. If only the
-   PG object changed, retry with the new one.
-5. If the slot has no PG: a peering event that
-   [needs no PG runs here](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L11331),
-   under `shard_lock`. A peering event that creates the PG creates it.
-   Any other item whose PG does not exist yet, or whose
-   `map_epoch` is newer than the shard's map, goes to the slot's
-   `waiting` or `waiting_peering` list
+   take `shard_lock` again. If the slot changed in between, because
+   another thread ran `_wake_pg_slot` or `consume_map`, stop: the item
+   is already back in the scheduler.
+5. If the slot has no PG: a peering event
+   [runs here](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L11331)
+   under `shard_lock`, and may create the PG. Any other item, and any
+   item whose `map_epoch` is newer than the shard's map, waits in the
+   slot's `waiting` or `waiting_peering` list
    ([`_add_slot_waiter`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L11091)).
-   An item for a PG that should not be on this OSD is dropped, a
-   peering event included. A peering event for an existing PG whose
-   epoch is newer than the shard's map waits too.
+   An item for a PG that should not be on this OSD is dropped.
 6. Drop `shard_lock` and call
    [`item.run(osd, shard, pg, handle)`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L11435)
    with the PG locked. `run` unlocks the PG when it returns.
 
-[`_wake_pg_slot`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L10824)
-is the way back. It is called when a PG is created, when a new map
-arrives ([`consume_map`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L10736))
-and when a PG splits. It walks `to_process`, then `waiting`, then
-every `waiting_peering` epoch in reverse order and calls
-`enqueue_front` for each item, so that the original order is kept.
-`consume_map` also drops waiting items whose PG no longer maps to this
-OSD.
+There are two ways back into the scheduler:
+
+- [`_wake_pg_slot`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L10824),
+  called when a PG is created, when a new map arrives
+  ([`consume_map`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L10736))
+  and when a PG splits. It walks `to_process`, then `waiting`, then
+  every `waiting_peering` epoch, each in reverse order, so the original
+  order is kept. `consume_map` first drops waiting items whose PG no
+  longer maps to this OSD.
+- The PG itself. An op that had to wait inside the PG, in one of the
+  `waiting_for_*` lists of §5.2 #16, is put back with
+  [`enqueue_front`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PG.cc#L1206)
+  and keeps its original cost, priority and owner.
+
 [`_enqueue_front`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L11482)
-has one more trick. If the slot's `to_process` list is not empty, another
-thread is racing: it took a newer item and now waits for the PG lock. So
-`_enqueue_front` puts the requeued item at the head of that list, and
-moves the newest item, the tail, back to the scheduler front. The old
-item never runs after a newer one. The whole chain is written down in a
-comment in
-[`OSD.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L1715):
+guards the order. If the slot's `to_process` list is not empty, another
+thread holds a newer item and is waiting for the PG lock. The requeued
+item goes to the head of that list, and the newest item, the tail, goes
+back to the scheduler front. So an old item never runs after a newer
+one. A comment in
+[`OSD.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L1715)
+draws the whole chain:
 
 ```
 fast dispatch -> scheduler back
@@ -2829,62 +2817,50 @@ fast dispatch -> scheduler back
                                                       <- queue_front()
 ```
 
-A PG itself also puts ops back. When an op must wait for something
-inside the PG (a missing object, a degraded write, a scrub on the same
-range), `do_request` parks it in one of the PG's `waiting_for_*` lists
-(§5.2 #16). When the wait ends, the PG calls
-[`enqueue_front`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PG.cc#L1206)
-with the op's original cost, priority and owner.
-
 ### 6.3.3 Boot: the benchmark, and the options mClock takes over
 
-mClock needs the disk's capacity to turn fractions into rates. The OSD
-measures the IOPS part once at boot (the bandwidth is an option, §6.2.6),
-and at the same time it switches off the older
-throttles that would fight with mClock.
+mClock needs the disk's capacity to turn fractions into rates. At boot
+the OSD measures the IOPS part (the bandwidth is an option, §6.2.6) and
+switches off the older throttles that would fight with mClock.
 [`OSD::init`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L4069)
 calls three functions, in this order:
 
 1. [`maybe_override_sleep_options_for_qos`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L10473).
-   Under mClock, set every sleep option to 0: `osd_recovery_sleep`,
+   Under mClock every sleep option becomes 0: `osd_recovery_sleep`,
    `osd_recovery_sleep_degraded`, `osd_delete_sleep`,
    `osd_snap_trim_sleep`, each with its `_hdd`, `_ssd` and `_hybrid`
-   variants, and `osd_scrub_sleep`. The code that sleeps still exists
+   variants, and `osd_scrub_sleep`. The sleep code still exists
    ([`do_recovery`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L9784),
    [`do_delete_work`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PG.cc#L2265)),
-   but with a 0 it does nothing. mClock paces instead.
+   but a 0 does nothing. mClock paces instead.
 2. [`maybe_override_options_for_qos`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L10383).
-   Under mClock, pin `osd_max_backfills`, `osd_recovery_max_active` and
-   its `_hdd` and `_ssd` variants to their stock defaults (1, 0, 3 and
-   10), and apply the backfill limit to the two reservers (§3.7.2). The
-   values do not change; what changes is that the OSD now defends them.
-   If an operator
-   changes one of these without setting
-   [`osd_mclock_override_recovery_settings`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/osd.yaml.in#L1339),
-   the OSD removes the change from the mon's config store again and logs
-   a warning that says to set that option first.
-3. [`maybe_override_max_osd_capacity_for_qos`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L10286).
-   The benchmark:
+   Under mClock `osd_max_backfills`, `osd_recovery_max_active` and its
+   `_hdd` and `_ssd` variants are pinned to their stock defaults (1, 0,
+   3 and 10). An operator change is removed from the mon's config store
+   again, with a warning, unless
+   [`osd_mclock_override_recovery_settings`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/osd.yaml.in#L1339)
+   is set.
+3. [`maybe_override_max_osd_capacity_for_qos`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L10286),
+   the benchmark:
    1. Skip it if the scheduler is not mClock, if
       `osd_mclock_skip_benchmark` is set, if the store is memstore, or
-      if `osd_mclock_max_capacity_iops_*` already differs from its
-      default (someone set it) and
+      if `osd_mclock_max_capacity_iops_*` is already non-default and
       `osd_mclock_force_run_benchmark_on_init` is not set.
-   2. Run an `OSDBenchTest` on the store's meta collection: 12,288,000
-      bytes, that is 3000 writes of 4 KiB, over 100 objects of 4 MiB
+   2. Run an `OSDBenchTest` on the store's meta collection: 3000 writes
+      of 4 KiB, 12,288,000 bytes in all, over 100 objects of 4 MiB
       ([line 10332](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L10332)).
    3. If the measured IOPS is outside
       `[osd_mclock_iops_capacity_low_threshold_*, osd_mclock_iops_capacity_threshold_*]`
-      (50–500 for rotational, 1000–80000 for flash), log a warning and
-      keep the old value.
+      (50–500 for rotational, 1000–80000 for flash), warn and keep the
+      old value.
    4. Otherwise send `config set osd.N osd_mclock_max_capacity_iops_*`
       to the mon ([`mon_cmd_set_config`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L10533)),
       so the value survives a restart, and apply it locally when the
       mon answers.
 
 This diagram shows how a measured or operator-set value reaches the
-scheduler. Nothing in the OSD calls the scheduler directly; the
-scheduler watches the configuration itself.
+scheduler: nothing in the OSD calls the scheduler, the scheduler
+watches the configuration itself.
 
 ```mermaid
 sequenceDiagram
@@ -2901,19 +2877,16 @@ sequenceDiagram
     Note over CR: dmclock reads ClientInfo dynamically (U1 flag)
 ```
 
-Take away: `osd_mclock_profile`, the capacity options and the nine
-custom res/wgt/lim options can all change at runtime, and the next tag
-calculation uses the new numbers.
-
 [`MclockConfig`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/mclock_common.h#L193)
 is a config observer that
 [tracks](https://github.com/ceph/ceph/blob/v21.3.0/src/common/mclock_common.h#L231)
-the profile, the two capacity options per media type and the nine custom
-options. The OSD's own
+the profile, the capacity options and the nine custom res/wgt/lim
+options; all of them can change at runtime, and the next tag uses the
+new numbers. The OSD's own
 [`handle_conf_change`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L10139)
-re-runs the two override functions of steps 1 and 2 when a sleep or a
-recovery limit changes. `osd_op_queue` and `osd_op_queue_cut_off` are not
-tracked by anyone; they need a restart.
+re-runs steps 1 and 2 when a sleep or a recovery limit changes.
+`osd_op_queue` and `osd_op_queue_cut_off` are tracked by nobody; they
+need a restart.
 
 ### 6.3.4 What you can see from outside
 
@@ -2923,33 +2896,32 @@ tracked by anyone; they need a restart.
   calls [`scheduler->dump`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.h#L1802)
   on every shard. For mClock
   ([`dump`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/scheduler/mClockScheduler.cc#L46))
-  that prints the number of strict-lane priority levels and the length
-  of each, the dmclock request count, and the dmclock queues with their
-  tags.
+  that prints the strict-lane priority levels and their lengths, the
+  dmclock request count, and the dmclock queues with their tags.
 - Perf counters: each shard has a logger named
   `mclock-shard-queue-<shard>` with the queue length per class
   ([`init_logger`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/mclock_common.cc#L240)).
-- The scheduler type is in the OSD log at start ("using op scheduler")
-  and in the `print` output: `mclock_scheduler, cutoff=196`.
-- Per-op: `dump_historic_ops` shows `queued_for_pg` and
-  `reached_pg` events (§4.1.4). The time between them is the scheduler
-  wait plus the PG lock wait.
+- The OSD log says "using op scheduler" at start, and the scheduler's
+  `print` output reads `mclock_scheduler, cutoff=196`.
+- Per op, `dump_historic_ops` shows `queued_for_pg` and `reached_pg`
+  (§4.1.4). The time between them is the scheduler wait plus the PG
+  lock wait.
 
-**Block-layer view:** the strict lane is `blk_mq_insert_request` with
-`at_head`, a bypass of the elevator. The mClock lane is closest to the
-kernel's `iocost`, which also measures the device once and charges each
-request a cost against a per-second budget. The limits of the
-comparison: `iocost` keys on cgroups, which are tenants; mClock keys on
-four fixed kinds of work. And the kernel does its QoS below the
-scheduler, in a separate layer; the OSD does both in one object.
+### 6.3.5 Block-layer view
 
-### 6.3.5 Block-layer view: the kernel's per-IO priority
+The strict lane is `blk_mq_insert_request` with `at_head`: a bypass of
+the elevator. The mClock lane is closest to the kernel's `iocost`,
+which also measures the device once and charges each request a cost
+against a per-second budget. The limits of the comparison: `iocost`
+keys on cgroups, which are tenants, while mClock keys on four fixed
+kinds of work; and the kernel does its QoS below the scheduler, in a
+separate layer, while the OSD does both in one object.
 
-The kernel has the mirror image of this design. Every bio carries an
-I/O priority (`bi_ioprio`: a class RT, BE, IDLE or DL, and a level 0–7,
-the `ionice` encoding). It can be set **per I/O**: io_uring takes it
-from the SQE, libaio from `aio_reqprio`, and direct I/O copies it onto
-the bio. A bio with no class gets the submitting task's priority in
+The kernel also has the mirror image of the OSD's class: a priority
+**per I/O**. Every bio carries one (`bi_ioprio`: a class RT, BE, IDLE
+or DL and a level 0–7, the `ionice` encoding). io_uring takes it from
+the SQE, libaio from `aio_reqprio`, and direct I/O copies it onto the
+bio. A bio with no class gets the submitting task's priority in
 `submit_bio`, then the `io.prio.class` cgroup policy may change it.
 What honours it is the limited part (Linux 6b4b543fa187):
 
