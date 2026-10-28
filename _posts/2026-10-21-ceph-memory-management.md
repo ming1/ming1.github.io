@@ -1,7 +1,7 @@
 ---
 title: "Explaining Ceph's memory management"
 category: storage
-tags: [ceph, bluestore, osd, memory, cache, rocksdb, tcmalloc, mempool, prioritycache, cephadm, page-cache, perf, memtable, cgroup]
+tags: [ceph, bluestore, osd, memory, cache, rocksdb, tcmalloc, mempool, prioritycache, cephadm, page-cache, perf, memtable, cgroup, recovery, pg-log]
 ---
 
 * TOC
@@ -1270,7 +1270,7 @@ What the numbers say:
   of this VM, not a result: its disks take 15 MiB/s of sequential and 250
   IOPS of random writes, so a 16 MiB memtable fills in minutes and is
   flushed long before the WAL cap matters. The memtable bound in §14.3 is
-  read from the options, not measured.
+  read from the options, not measured; §15.3 measures it.
 
 Unit of all the memory numbers: MiB. All four arms ran on
 21.3.0-2872-gfe630588daf; r2p used the §13.4 patch. One OSD of d2b failed
@@ -1326,13 +1326,12 @@ so on a cgroup v2 host only the environment variable works.
 
 In order of effect:
 
-1. **Bound memtables by the target.** Give RocksDB a `WriteBufferManager`
-   shared by all column families, sized from the target (for example
-   target / 8 = 256 MiB at 2 GiB), and scale `max_total_wal_size` with it.
-   RocksDB then flushes the largest memtable when the budget is full
-   instead of waiting for the WAL cap. Cost: more and smaller flushes on a
-   write-heavy OSD, so more L0 files and compaction. Until this is in the
-   code the r2 annex gives the same bound by configuration.
+1. **Bound memtables by the target.** Scale `max_total_wal_size` with the
+   target: §15.3 measured the memtable peak at about 1.1 times the cap. A
+   `WriteBufferManager` sized from the target does not help with Ceph's
+   merge counts (§15.3.5). Cost: more and smaller flushes on a
+   write-heavy OSD, so more SST writes. Until this is in the code the r2
+   annex gives the same bound by configuration.
 2. **Scale the message cap.** `osd_client_message_size_cap` 500 MiB is a
    quarter of a 2 GiB target. A cap tied to the target (target / 16 =
    128 MiB) only moves the point where the messenger stops reading from
@@ -1376,6 +1375,751 @@ With 1 to 3 in place a 2 GiB OSD looks like this:
   tied to the target first. After that, `osd_memory_base` can drop and the
   caches get the difference.
 
+## 15. Memory outside the caches: what to cut next
+
+**Summary.** With the shard fix of §13.4 the caches fill their budget, so
+whether a small `osd_memory_target` holds now depends on the memory outside
+them. On four OSDs on c28's four disks, at a 2 GiB target, three consumers
+stand out. RocksDB memtables are bounded only by the WAL size cap (up to
+470 MiB per OSD, 720 MiB on an HDD OSD). Recovery reads stay in the data
+cache although nothing reads them again (+160 to +290 MiB per source OSD).
+The pg log costs 40–70 % more than its mempool reports. §15.7 ranks the
+fixes.
+
+### 15.1 The findings in one view
+
+This graph shows where an OSD's memory goes and which part each finding is
+about.
+
+```mermaid
+graph TD
+    T["osd_memory_target = 2 GiB"] --> C["the four caches<br/>sized by the tuner, ceiling 973 MiB"]
+    T --> O["everything outside the caches<br/>not sized by the target"]
+    C --> R["#2 recovery reads<br/>cached once, never read again"]
+    O --> M["#1 RocksDB memtables<br/>bounded by the WAL cap and merge counts"]
+    O --> L["#3 pg log<br/>bounded by entry counts, not bytes"]
+    O --> F["tcmalloc free lists<br/>freed, still mapped"]
+```
+
+Take away: #1 and #3 grow where the tuner cannot reach; #2 sits inside the
+cache budget but spends it on data nobody wants.
+
+| # | Consumer | Measured per OSD, 2 GiB target | Why | Fix | Cost |
+|---|---|---|---|---|---|
+| 1 | RocksDB memtables | peak 456–469 MiB (SSD-class), 719 MiB (HDD mode) | full memtables wait for a merge count of 6 (`O`) or 32 (`P`, `L`); only the WAL cap forces them out | lower the merge counts (2 held the peak to 83–114 MiB), or tie the WAL cap to the target | about 2× the bytes flushed to SST |
+| 2 | Recovery reads | +157 to +294 MiB of once-read data in each source OSD's data cache | push reads never set DONTNEED | set `cache_dont_need` in background recovery; DONTNEED on EC recovery reads | none found |
+| 3 | PG log | 782–789 B per entry, 175–181 B per dup: 42 % and 70 % above the mempool | strings, tree nodes and hash indexes sit outside the mempool; freed memory stays on tcmalloc's free lists | count them; move rarely used fields out of the entry; a dup budget per OSD | code change |
+
+### 15.2 How it was measured
+
+The test is a 4-OSD vstart cluster on the c28 VM (8 vCPUs, 32 GiB), one OSD
+per disk, driven by fio through the kernel RBD client.
+[`memopt.sh`]({{ site.baseurl }}/code/ceph/memopt.sh) does every step; each
+experiment below is one of its subcommands.
+
+This graph shows the test setup.
+
+```mermaid
+graph TD
+    F["fio: 4K random writes or reads"] --> K["/dev/rbd0<br/>krbd, 3 GiB image"]
+    K --> P["pool rbd<br/>256 PGs, 2 copies"]
+    P --> O0["osd.0 on vdb"]
+    P --> O1["osd.1 on nvme0n1"]
+    P --> O2["osd.2 on sda"]
+    P --> O3["osd.3 on sdb<br/>rotational: BlueStore HDD mode"]
+    S["snapshots per OSD:<br/>perf dump, dump_mempools,<br/>heap stats, RSS"] -.-> O0
+    S -.-> O3
+```
+
+Take away: four OSDs, one per disk; osd.3 runs with BlueStore's HDD
+settings because sdb reports itself as rotational.
+
+The disks, measured with fio on the raw devices before the cluster was
+created:
+
+| OSD | Disk | Kind in the VM | Size | 4K random writes, queue depth 32 | 1 MiB sequential writes |
+|---|---|---|---|---|---|
+| osd.0 | vdb | virtio | 8 GiB | 21800/s | 314 MB/s |
+| osd.1 | nvme0n1 | QEMU NVMe | 8 GiB | 10500/s | 419 MB/s |
+| osd.2 | sda | QEMU SCSI | 12 GiB | 23800/s | 245 MB/s |
+| osd.3 | sdb | QEMU SCSI, rotational | 11 GiB | 822/s | 54 MB/s |
+
+The build is `21.3.0-2873-g3410de9c419`: `main` at d78578929f9 plus 15
+local commits. Two of them matter here: the shard-limit fix of PR #73018,
+and a port of [PR #72964](https://github.com/ceph/ceph/pull/72964), which
+lowers three limits by `osd_memory_target / 4 GiB` and the WAL cap by the
+square root of that ratio. The others are an opt-in page-cache read option
+(off here) and work in progress on BlueStore's aio completion path. At
+2 GiB the OSD log shows what #72964 gives:
+
+| Limit | Default (4 GiB) | At 2 GiB |
+|---|---|---|
+| `osd_client_message_size_cap` | 500 MiB | 250 MiB |
+| `osd_target_pg_log_entries_per_osd` | 300000 | 150000 |
+| `osd_pg_log_dups_tracked` | 3000 | 1500 |
+| `max_total_wal_size` (in `bluestore_rocksdb_options`) | 1 GiB | 724 MiB |
+
+Everything else is at its default. Scrubs are off so that they do not mix
+into the numbers. Each OSD runs in its own cgroup with a 3 GiB limit, which
+guards the host and was never reached.
+
+What one sample records, per OSD: `perf dump`, `dump_mempools`,
+`heap stats` (tcmalloc), RSS and the cgroup peak. Two derived numbers carry
+the results:
+
+- **Outside the caches** = `mapped` − (data cache + onode cache + RocksDB
+  block caches). §14 called this "everything else". It includes tcmalloc's
+  free lists.
+- **Memtables** ≈ outside the caches during the run − outside the caches
+  right after `ceph daemon osd.N compact`, which flushes every memtable.
+  This is an estimate: it assumes nothing else changes while the compaction
+  runs.
+
+To reproduce it:
+
+1. Build Ceph for vstart from `main` with PR #73018 and PR #72964 applied,
+   on a host with four unused disks, and copy `memopt.sh` there. `B`,
+   `VS`, `RES` and `DEVS` at the top of the script name the build, the
+   cluster directory, the results directory and the disks.
+2. `memopt.sh up`. This clears old BlueStore labels on the disks, reports
+   their write cache as write-through (see below), creates the cluster
+   without cephx (the kernel client rejects this build's 32-byte keys),
+   creates the pool and the image, maps it with krbd and fills it.
+3. Memtables: `memopt.sh memtable 1800`, then
+   `memopt.sh memtable 1200 wal256 max_total_wal_size=268435456`,
+   `memopt.sh memtable 1200 wal128 max_total_wal_size=134217728` and
+   `memopt.sh memtable 1200 wbm256 db_write_buffer_size=268435456`.
+   Each restarts the OSDs with the given RocksDB options, runs 4K random
+   writes, samples every 60 s, then compacts. The merge-count arm and its
+   control need new clusters; §15.3.6 lists their steps.
+4. Pg log: `memopt.sh pglog`.
+5. Recovery: `memopt.sh recovery cache`, then `memopt.sh recovery nocache`.
+6. tcmalloc: `memopt.sh tcmalloc 32`, then `memopt.sh tcmalloc 128`.
+7. Read the results in `$RES/<experiment>/`. `memopt.sh show <dir> [<dir0>]`
+   prints one line per OSD; `memopt.sh flushes <dir>` lists the RocksDB
+   flushes of a memtable run by column family.
+8. `memopt.sh down`.
+
+Three things about the setup matter for the results:
+
+- c28's virtual disks pass every cache flush on to slow host storage: sdb
+  manages 68 4K writes per second with a flush after each. `up` therefore
+  sets `/sys/block/<disk>/queue/write_cache` to `write through`. The guest
+  kernel then sends no flushes, as with a datacenter SSD that has
+  power-loss protection.
+- sdb is slow even without flushes: during the write tests it was 97 %
+  busy at about 535 writes/s, and osd.3's commit latency was about 250 ms.
+  It caps the cluster at 700–780 4K writes/s, so memtables fill slowly
+  and each write run lasts 20–30 minutes.
+- The VM froze for 17 minutes during the first run of the uncached recovery
+  arm. Two OSDs then aborted on their op-thread timeout, and the hot-set
+  re-read was lost. Both recovery arms were run again; §15.4 uses the
+  second pair.
+
+### 15.3 Finding 1: RocksDB memtables
+
+#### 15.3.1 How a write reaches RocksDB's memory
+
+BlueStore commits each transaction as one RocksDB write batch
+([`RocksDBStore::submit_common()`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/RocksDBStore.cc#L1607)).
+RocksDB appends the batch to its write-ahead log (WAL), a file on disk that
+makes the write durable. Then it inserts each key into a *memtable*, an
+in-memory sorted table, one per column family. A memtable is never edited in
+place: a key written ten times is in it ten times. A *flush* writes a
+memtable out as an SST file, the sorted on-disk format, and keeps only the
+newest version of each key. Until then every version takes memory.
+
+BlueStore spreads its keys over column families by key prefix
+([prefixes](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L134),
+[`bluestore_rocksdb_cfs`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L5407)).
+These are the ones that matter here:
+
+| Column family | Holds | A 4K RBD write adds | Memtables merged per flush |
+|---|---|---|---|
+| `O` (3 shards) | onodes: object metadata and extent maps | a new copy of the object's onode | 6 |
+| `P` | the omap of each PG's meta object: pg log entries, dups, PG info | a log entry and new PG info; trimming deletes old entries and adds dups | 32 |
+| `L` | deferred writes: small writes staged in RocksDB before BlueStore copies them to the data disk | on an HDD OSD: the 4K of data | 32 |
+| `m` (3), `p` (3), `default` | object omap, statistics and the rest | little or nothing | 6 |
+
+The defaults in
+[`bluestore_rocksdb_options`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L5370)
+are 16 MiB per memtable (`write_buffer_size`), up to 64 per column family
+(`max_write_buffer_number`), 6 merged per flush
+(`min_write_buffer_number_to_merge`, 32 for `L` and `P`) and a WAL cap
+(`max_total_wal_size`) of 1 GiB.
+
+#### 15.3.2 When RocksDB frees a memtable
+
+This state diagram shows the life of one memtable in RocksDB 7.9.2, the
+version in v21.3.0, and the three ways out of memory that apply to Ceph.
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> Active: first write to the column family
+    Active --> Immutable: reaches write_buffer_size (16 MiB)
+    Immutable --> Immutable: waits while the count is below min_write_buffer_number_to_merge
+    Immutable --> Flushing: count reached ("Write Buffer Full")
+    Active --> Flushing: WAL total above max_total_wal_size ("WAL Full")
+    Immutable --> Flushing: WAL total above max_total_wal_size ("WAL Full")
+    Active --> Flushing: manual compaction
+    Flushing --> [*]: SST written, memory freed
+```
+
+Take away: no exit looks at time or at the OSD's memory, so a memtable
+stays until its column family has enough of them, the WAL is full, or
+someone compacts.
+
+The two automatic exits, from the code:
+
+- **Write Buffer Full.** A column family flushes once it has
+  `min_write_buffer_number_to_merge` immutable memtables
+  ([`MemTableList::IsFlushPending()`](https://github.com/ceph/rocksdb/blob/24ea35870fe9b3ba15285ec8746ba97ed5d67ff3/db/memtable_list.cc#L370)).
+  For `O` that is 6 × 16 MiB; for `P` and `L` it is 32 × 16 = 512 MiB.
+- **WAL Full.** A WAL file can only be deleted when every column family has
+  flushed the keys it holds. When the live WAL files pass
+  `max_total_wal_size`, RocksDB flushes every column family that still has
+  keys in the oldest one
+  ([`PreprocessWrite()`](https://github.com/ceph/rocksdb/blob/24ea35870fe9b3ba15285ec8746ba97ed5d67ff3/db/db_impl/db_impl_write.cc#L1147),
+  [`SwitchWAL()`](https://github.com/ceph/rocksdb/blob/24ea35870fe9b3ba15285ec8746ba97ed5d67ff3/db/db_impl/db_impl_write.cc#L1559)).
+
+Every key in a memtable is also in a live WAL file, so the WAL cap bounds
+the memtables' content. For `P`, which needs 512 MiB before it flushes on
+its own, the WAL cap is the bound that acts. Nothing flushes a memtable
+because time passed: after the writes stop, the memtables stay in memory.
+
+#### 15.3.3 What was measured
+
+`memopt.sh memtable` runs 4K random writes (4 jobs × queue depth 32),
+samples every minute and compacts at the end. The memory outside the caches
+minus its value after the compaction gives the memtables. This estimate
+reads low in the first minutes, while the pg log is still growing toward its
+limit; the maxima below all come later.
+
+Each arm changes one RocksDB option through `bluestore_rocksdb_options_annex`:
+
+| Arm | Option | Run | 4K write IOPS | Memtables, SSD OSDs: mean / max | osd.3: mean / max | Flushed to SST, bytes per transaction: SSD OSDs / osd.3 | All SST writes, same unit |
+|---|---|---|---|---|---|---|---|
+| default | WAL cap 724 MiB | 30 min | 699 | 220–229 / 456–469 MiB | 365 / 719 MiB | 45–78 / 117 | 69–122 / 186 |
+| wal256 | `max_total_wal_size=268435456` | 20 min | 746 | 141–146 / 268–294 MiB | 143 / 287 MiB | 87–147 / 197 | 158–278 / 570 |
+| wal128 | `max_total_wal_size=134217728` | 20 min | 780 | 62–79 / 135–148 MiB | 66 / 135 MiB | 153–197 / 282 | 323–457 / 1040 |
+| wbm256 | `db_write_buffer_size=268435456` | 20 min | 730 | 265–290 / 449–482 MiB | 411 / 800 MiB | 9–66 / 108 | 9–100 / 211 |
+
+A *transaction* is one BlueStore commit (`txc_count`): one client write on
+the primary or one replicated write on a replica. "Flushed to SST" counts
+the SST files the flushes wrote; "all SST writes" adds the compactions that
+merge them later (BlueFS `bytes_written_sst`).
+
+What the table says:
+
+- **The WAL cap sets the memtables.** 724 → 256 → 128 MiB of WAL gave
+  peaks of about 460 → 290 → 145 MiB on the SSD OSDs. A RAM-disk run of the
+  same arms at 18000 IOPS gave the same peaks (460–520, 280–290, 120–140 MiB):
+  the bound does not depend on the disk's speed, only the time to reach it
+  does.
+- **The cost is SST writes.** With a smaller cap a memtable has less time
+  to absorb rewrites before its flush, so more versions survive. Flushes
+  wrote 1.7–2.0× the bytes per transaction at 256 MiB and 2.4–3.5× at
+  128 MiB; compaction multiplies that, to 2.3–3.1× and 3.7–5.6× of all SST
+  writes. Against what each transaction already writes (4 KiB of data and
+  3.5–6.2 KiB of WAL), 128 MiB adds 3–4 % to an SSD OSD's device writes and
+  8 % to the HDD OSD's.
+- **Throughput did not drop.** IOPS went 699 → 746 → 780, within the noise
+  of these disks.
+- **Latency is open.** Write latency here is set by sdb: p50 152–169 ms,
+  p99 0.7–0.8 s and p99.9 4–8 s in all arms, without a trend. PR #72964
+  scales the WAL by the square root of the target because, in its code
+  comment, a WAL at a quarter of its size cost 25 % at p99.9. This setup
+  cannot confirm or rule that out.
+
+#### 15.3.4 Where the peak comes from
+
+Every flush leaves a line in the OSD log: the column family, how many
+memtables it merged, their memory and data size, the reason, and the SST
+file it wrote. `memopt.sh flushes` sums them per column family. For the
+30-minute default run:
+
+| OSD | Column family | Flushes | Memtables per flush | Data in | Kept in the SST | Reason |
+|---|---|---|---|---|---|---|
+| osd.0 | `O` (3 shards) | 7 | 6 | 648 MiB | 1.1 % | Write Buffer Full |
+| osd.0 | `P` | 1 | 15 | 213 MiB | 29 % | WAL Full |
+| osd.3 | `L` | 5 | 32 | 2489 MiB | 0.2 % | Write Buffer Full 3, WAL Full 2 |
+| osd.3 | `O` (3 shards) | 15 | 3–4 | 725 MiB | 1.7 % | WAL Full |
+| osd.3 | `P` | 5 | 5–7 | 410 MiB | 58 % | WAL Full |
+
+"Kept" is the raw key and value bytes the flush wrote out, as a share of the
+raw bytes that came in. The other column families flushed only empty or
+near-empty memtables. Each flush freed 1.01–1.10 times its data in memory.
+
+The flush times explain the sawtooth of the memory:
+
+- **SSD-class OSD (osd.0).** The three `O` shards fill at the same rate and
+  flush within two minutes of each other, 6 memtables (94 MiB) each, every
+  9–10 minutes. `P` flushed once, at minute 20, when the WAL passed its cap;
+  it held 15 memtables (235 MiB) by then. `P` (up to 235 MiB) sits on top
+  of `O` (up to 3 × 110 MiB); they flush at different times, and the
+  measured peak was 456–469 MiB.
+- **HDD-mode OSD (osd.3).** `L` reaches its 32 memtables (504 MiB) every
+  5.2 minutes and flushes; the WAL cap then flushes `O` and `P` within
+  12 seconds. Just before that, `L` holds 504 MiB, `O` about 150 MiB and
+  `P` up to 100 MiB; the measured peak was 719 MiB.
+
+What the kept column says:
+
+- **`O` is almost all dead data.** Each write rewrites the object's onode;
+  the memtable keeps every copy, and the flush keeps one. Of 648 MiB,
+  7 MiB reached disk.
+- **`P` keeps more.** Pg log entries live longer than one flush interval,
+  and trimming writes delete markers, which the flush must keep.
+- **`L` is the HDD case.** BlueStore deletes a deferred write's data from
+  RocksDB once it has copied it to the data disk, so 99.8 % of `L` dies in
+  the memtables. Until the flush it all sits in memory: 2.5 GiB went
+  through `L` on osd.3 in 30 minutes.
+
+#### 15.3.5 Why a WriteBufferManager does not help
+
+A WriteBufferManager is RocksDB's memory budget for memtables
+(`db_write_buffer_size`). It looks like the natural way to tie memtables to
+the target, but it does not work with Ceph's column-family settings. This
+flowchart shows the test RocksDB 7.9.2 runs before each write
+([`WriteBufferManager::ShouldFlush()`](https://github.com/ceph/rocksdb/blob/24ea35870fe9b3ba15285ec8746ba97ed5d67ff3/include/rocksdb/write_buffer_manager.h#L94)).
+
+```mermaid
+flowchart TD
+    A["a write batch arrives"] --> B{"active memtables<br/>above 7/8 of the budget?"}
+    B -->|yes| F["flush one column family:<br/>the one with the oldest active memtable"]
+    B -->|no| C{"all memtables at or above the budget,<br/>and active ones at least half of it?"}
+    C -->|yes| F
+    C -->|no| N["no flush"]
+```
+
+Take away: both triggers need the *active* memtables to be large; full
+memtables waiting for their merge count do not count as active.
+
+A memtable leaves the "active" count as soon as it is full and becomes
+immutable
+([`MemTable::MarkImmutable()`](https://github.com/ceph/rocksdb/blob/24ea35870fe9b3ba15285ec8746ba97ed5d67ff3/db/memtable.h#L442)).
+In the flush log of §15.3.4 only `O`'s three shards and `P` carry real data,
+plus `L` on an HDD OSD. So the active memtables hold about 4 × 16 = 64 MiB
+at most (80 MiB on an HDD OSD). With a 256 MiB budget the triggers need 224
+MiB, or 128 MiB, of active memtables. Neither can happen. Meanwhile the
+immutable memtables, up to 32 in `P` and in `L`, hold hundreds of MiB.
+
+The wbm256 arm of §15.3.3 tests it. The OSD log confirms the budget
+(`Options.db_write_buffer_size: 268435456`), and the memtables still reached
+449–482 MiB on the SSD OSDs and 800 MiB on osd.3, as without it. Of the 32
+flushes on the four OSDs in that run, none had the reason "Write Buffer
+Manager"; all were "WAL Full" or "Write Buffer Full".
+
+A budget would work only with lower merge counts, so that full memtables
+flush instead of waiting. §15.3.6 tests that.
+
+#### 15.3.6 Bounding the memtables by merge count instead
+
+The other way to bound memtables is to flush full ones sooner: lower
+`min_write_buffer_number_to_merge`. For `L` and `P` that value is part of
+the column-family definition, which BlueStore stores in RocksDB at mkfs and
+reads back when it opens the database
+([`RocksDBStore::verify_sharding()`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/RocksDBStore.cc#L1034)).
+Changing `bluestore_rocksdb_cfs` later does nothing to an existing OSD;
+`ceph-bluestore-tool reshard` rewrites the definition. The tool in this
+build tree was older than its libraries and crashed, so the arm builds a
+new cluster instead:
+
+1. `memopt.sh down`
+2. `CFS="m(3) p(3,0-12) O(3,0-13)=block_cache={type=binned_lru} L=min_write_buffer_number_to_merge=2 P=min_write_buffer_number_to_merge=2" memopt.sh up`
+3. `memopt.sh memtable 1200 merge2 min_write_buffer_number_to_merge=2`
+   (the annex sets 2 for `O`, `m`, `p` and `default`)
+4. As a control, the same three steps with the default definition:
+   `memopt.sh down`, `memopt.sh up`, `memopt.sh memtable 1200 fresh`.
+
+The OSD log shows 2 for all 12 column families. A new cluster starts with an
+empty pg log, which grows during the run, so the memtable numbers below
+subtract that growth (at the 785 bytes per entry of §15.5).
+
+| Arm | 4K write IOPS | Memtables peak, SSD OSDs / osd.3 | Flushed to SST, bytes per transaction: SSD OSDs / osd.3 | Memtables per flush |
+|---|---|---|---|---|
+| control: default definition | 341 | 362–378 / 768 MiB, still growing at 20 min | 0–16 / 55: few flushes yet | 6 (`O`), 32 (`L`) |
+| merge2 | 315 | 83–96 / 114 MiB | 95–134 / 253 | 2 |
+
+What this says:
+
+- **Merge count 2 bounds the memtables lower than any WAL cap tried.** Each
+  column family flushes at 2 full memtables (32 MiB), so the peak stayed at
+  83–114 MiB, below the 135–148 MiB of a 128 MiB WAL cap. The control,
+  same day and same steps, grew to 362–378 MiB (768 MiB on osd.3) and was
+  still growing.
+- **It flushes about as much as a 256 MiB cap.** Its flushes wrote
+  95–134 bytes per transaction on the SSD OSDs and 253 on osd.3,
+  against 45–78 and 117 for the 30-minute default run (§15.3.3), 87–147 and
+  197 at a 256 MiB cap, and 153–197 and 282 at 128 MiB. The control had
+  flushed too little in 20 minutes to compare with directly. Neither new
+  database had compacted much yet, so their "all SST writes" are not
+  comparable either.
+- **Throughput did not move.** 315 against 341 IOPS for the control. Both
+  are half of the morning's arms because the host's disks were slower in
+  the afternoon: the fill of the first cluster ran at 35 MB/s, those of
+  the two new ones at 16 and 19 MB/s.
+- **It helps HDD OSDs most.** `L` dropped from 32 memtables (504 MiB) per
+  flush to 2. Its data is still mostly dead by the flush: 3.3 % reached an
+  SST, against 0.2 % at 32.
+
+The catch is deployment: a new default for `bluestore_rocksdb_cfs` reaches
+only new OSDs; existing ones need `ceph-bluestore-tool reshard`.
+
+### 15.4 Finding 2: recovery reads fill the data cache
+
+*Recovery* brings a PG copy that missed writes up to date; *backfill*
+copies a whole PG to an OSD that did not have it. On a replicated pool the
+primary reads each object and *pushes* it to the target OSD. Each object is
+read once, so caching it on the primary only pushes hot data out of the data
+cache.
+
+This sequence diagram shows how a background push reads the object on the
+primary.
+
+```mermaid
+sequenceDiagram
+    participant PG as PrimaryLogPG
+    participant RB as ReplicatedBackend
+    participant BS as BlueStore
+    participant DC as data cache
+    PG->>RB: open_recovery_op(): cache_dont_need = false
+    PG->>RB: start_pushes(object)
+    RB->>RB: build_push_op(cache_dont_need = false)
+    RB->>BS: readv(object, flags = 0)
+    BS->>BS: _do_readv(): buffered, since bluestore_default_buffered_read<br/>is true and no DONTNEED flag is set
+    BS->>DC: keep the read data as buffers
+    RB-->>PG: PushOp, sent to the target OSD
+```
+
+Take away: the flag that would keep recovery reads out of the cache exists,
+but nothing sets it, so every push read is a cached read.
+
+The code path, in order:
+
+1. [`recover_replicas()`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L13984)
+   and [`recover_backfill()`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L14152)
+   open a `RecoveryHandle`, whose constructor sets `cache_dont_need` to
+   false ([`PGBackend.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PGBackend.h#L353)).
+   Neither sets it.
+2. [`start_pushes()`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L2611)
+   passes the flag on when the object goes to one peer (L2636).
+3. [`build_push_op()`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L2238)
+   reads with `CEPH_OSD_OP_FLAG_FADVISE_DONTNEED` only if the flag is set
+   (L2364).
+4. [`BlueStore::_do_readv()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L13562)
+   caches a read when
+   [`bluestore_default_buffered_read`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L5655)
+   is true (the default) and the read carries neither DONTNEED nor NOCACHE
+   (L13584).
+
+The other paths differ:
+
+- **Pulls.** When the primary itself is missing an object, it pulls it from
+  a replica. The replica builds its reply in
+  [`handle_pull()`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L2502)
+  with `build_push_op()`'s default, `cache_dont_need = true`, so that read is
+  not cached.
+- **Erasure-coded pools.** A recovery read is a `read_request_t` built in
+  [`ECCommon.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ECCommon.cc#L1571)
+  without flags; `flags` defaults to 0
+  ([`ECCommon.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ECCommon.h#L120)).
+  Each shard OSD reads with those flags in
+  [`handle_sub_read()`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ECBackend.cc#L517),
+  so EC recovery reads are cached too.
+
+The flag came with commit fabd6357e42 (2015, "ReplicatedPG: Don't cache
+recovery and scrub data"). It set the flag to false where a client op waits
+for the object, since the client reads it next. The background paths were
+left at the constructor's default, which is also false. A 2016 cleanup
+(3a28d01c4ba) removed one of the explicit assignments as redundant. Since
+then no recovery read has used DONTNEED.
+
+`memopt.sh recovery` measures the effect:
+
+1. Read a 1 GiB hot set twice, so it is in the data caches, and read it at
+   random for 60 s.
+2. Mark osd.0 out, wait until the cluster is clean, mark it in, wait again.
+   osd.1–3 read and push osd.0's objects, then osd.0 gets them back.
+3. Read the hot set at random for 60 s again and count the misses.
+
+The `nocache` arm sets `bluestore_default_buffered_read` to false for step 2
+only. No client I/O runs during step 2, so this changes only how recovery
+reads are cached: what DONTNEED on them would do.
+
+On the three source OSDs (osd.1–3), from the second of two runs:
+
+| | Stock | Recovery reads not cached |
+|---|---|---|
+| Data cache before recovery | 280–311 MiB | 228–292 MiB |
+| Data cache after recovery | 464–574 MiB (+157 to +294) | 253–288 MiB (−4 to +25) |
+| RSS after recovery | 672–818 MiB | 451–519 MiB |
+| Hot-set misses in the next 60 s | 59–170 MiB | 0–55 MiB |
+| Hot-set hit ratio | 96.5–98.5 % | 99.3–100 % |
+
+The first stock run gave the same picture: +191 to +251 MiB of data cache
+and 67–164 MiB of misses. osd.0 itself loses its cache in both arms, because
+its PGs leave while it is out.
+
+Two things follow:
+
+- **Recovery fills the cache with data nobody reads again.** Each source OSD
+  kept 160–290 MiB of recovered objects, 16–30 % of the 973 MiB that all
+  four caches may hold at 2 GiB.
+- **It pushes hot data out.** The hot set took 59–170 MiB of misses after a
+  stock recovery against 0–55 MiB without the cached recovery reads. The
+  two arms differ only in how recovery reads are cached.
+
+The fix for replicated pools is one line in each background path:
+
+```cpp
+// PrimaryLogPG::recover_replicas() and PrimaryLogPG::recover_backfill()
+PGBackend::RecoveryHandle *h = pgbackend->open_recovery_op();
+h->cache_dont_need = true;   // read once to push: keep it out of the data cache
+```
+
+`start_pushes()` already keeps caching an object that goes to more than one
+peer, since it is read once per peer. Recovery that a waiting client op
+triggers (the paths of fabd6357e42) keeps the default. For EC, the recovery
+`read_request_t` needs to carry `CEPH_OSD_OP_FLAG_FADVISE_DONTNEED`.
+
+### 15.5 Finding 3: the pg log costs more than its mempool says
+
+Every write adds one entry to its PG's log: the object, the version, the
+client request id and what changed. The log lets a returning OSD catch up by
+replaying entries instead of copying the whole PG. When the log is trimmed,
+an old entry becomes a *dup*: just the request id, version and return code,
+kept so that a resent client request is recognised and not applied twice.
+
+How many of each an OSD keeps:
+
+- Entries per PG = `osd_target_pg_log_entries_per_osd` / PGs on the OSD,
+  clamped to 250…10000
+  ([`get_target_pg_log_entries()`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L9750)).
+  Here 106–153 PGs per OSD, so about 1000–1400 entries per PG.
+- Dups: a trimmed entry becomes a dup if it is among the PG's last
+  `osd_pg_log_dups_tracked` versions, and the dup list is cut back to
+  `osd_pg_log_dups_tracked` entries
+  ([`IndexedLog::trim()`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PGLog.cc#L56)).
+  Older dups are not dropped by age, so a written PG holds the full count
+  (1500 here, 3000 by default) however long its log is. The limit is per
+  PG: an OSD with more PGs keeps more dups.
+
+This diagram shows what one PG's log holds in memory and which parts the
+`osd_pglog` mempool counts.
+
+```mermaid
+erDiagram
+    IndexedLog ||--o{ pg_log_entry_t : "log: mempool list"
+    IndexedLog ||--o{ pg_log_dup_t : "dups: mempool list"
+    IndexedLog ||--o{ hash_index_node : "4 indexes: std::unordered_map, not counted"
+    pg_log_entry_t ||--|| object_name : "soid: std::string, heap when over 15 chars"
+    pg_log_entry_t ||--o{ clean_regions_node : "interval_set: std::map nodes, not counted"
+    pg_log_entry_t {
+        bytes struct "536"
+        bytes list_node "16"
+    }
+    pg_log_dup_t {
+        bytes struct "88"
+        bytes list_node "16"
+    }
+```
+
+Take away: the mempool sees the list nodes; the strings, the
+`clean_regions` tree nodes and the hash indexes are plain heap allocations
+it does not see.
+
+The parts, from the code and from `gdb` on the test build:
+
+- The lists `log` and `dups` use the `osd_pglog` mempool allocator
+  ([`pg_log_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.h#L4733)).
+  A `pg_log_entry_t` is 536 bytes, a `pg_log_dup_t` 88; a list node adds 16.
+- The object name is a `std::string` inside `hobject_t`. An RBD data object
+  name (`rbd_data.<image id>.<16 hex digits>`) is longer than the 15
+  characters a string keeps inline, so it is a separate heap allocation.
+- `clean_regions` is an `interval_set` on a `std::map`
+  ([`ObjectCleanRegions`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.h#L4318)):
+  each interval is a tree node on the heap. One write in the middle of an
+  object leaves two clean intervals, so two nodes.
+- The PG keeps four hash indexes into the log: by object, by request id, by
+  extra request id and for dups
+  ([`PGLog.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PGLog.h#L172)).
+  They are `std::unordered_map`s, each built the first time something
+  looks it up. The primary looks up every client write's request id to
+  catch resent ops
+  ([`get_request()`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PGLog.h#L404)),
+  which builds the request-id and dup indexes.
+
+About 250 of the 536 bytes of an entry are fields a plain write to a
+replicated pool leaves empty
+([`pg_log_entry_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.h#L4525)):
+
+| Field | Bytes | Used for |
+|---|---|---|
+| `mod_desc` | 40 | rollback information, EC pools |
+| `snaps` | 32 | clone entries only |
+| `extra_reqids` | 40 | ops that carry more than one client request |
+| `extra_reqid_return_codes` | 64 | the same |
+| `reverting_to` | 16 | `LOST_REVERT` entries |
+| `op_returns` | 24 | ops that return data |
+| `written_shards` | 32 | EC partial writes |
+| total | 248 | |
+
+`memopt.sh pglog` measures the real cost by removing the log in two steps
+and charging the heap that comes back to what was removed:
+
+1. Flush the memtables, take snapshot `a`.
+2. Set `osd_pg_log_dups_tracked` to 10, write for 30 s, flush, take `b`.
+   The dups go.
+3. Set `osd_target_pg_log_entries_per_osd` to 2000 and
+   `osd_min_pg_log_entries` to 10, write for 30 s, flush, take `c`. The
+   entries go.
+4. The `osd_pglog` mempool reports items and bytes. With a node of 552 bytes
+   per entry and 104 per dup, the two numbers say how many entries and dups
+   each step removed. The drop in tcmalloc's in-use bytes, minus the change
+   in the caches and the other mempools, is the real heap freed. Two steps
+   give two equations for two unknowns: the real bytes per entry and per
+   dup.
+
+The entry counts this gives match the PGs' `log_size` statistics exactly.
+
+| OSD | PGs | Entries at `a` | Per entry: mempool / real | Per dup: mempool / real |
+|---|---|---|---|---|
+| osd.0 | 108 | 127725 | 552 / 782 B | 104 / 179 B |
+| osd.1 | 106 | 126654 | 552 / 789 B | 104 / 175 B |
+| osd.2 | 153 | 163847 | 552 / 782 B | 104 / 178 B |
+| osd.3 | 147 | 154820 | 552 / 787 B | 104 / 181 B |
+
+An entry costs 42 % more than the mempool reports, a dup 70 % more. The
+RAM-disk run gave the same 783–788 bytes per entry.
+
+What the pg log costs per OSD at the default target (4 GiB), estimated from
+these per-item costs. Entries are 300000 per OSD; a PG makes dups only when
+its share of entries is below `osd_pg_log_dups_tracked` (3000):
+
+| PGs per OSD | Entries per PG | Dups | Mempool says | Real |
+|---|---|---|---|---|
+| 100 | 3000 | none | 158 MiB | 225 MiB |
+| 128 | 2343 | 384000 | 196 MiB | 290 MiB |
+| 200 | 1500 | 600000 | 217 MiB | 326 MiB |
+| 300 | 1000 | 900000 | 247 MiB | 377 MiB |
+
+The pg log also behaves as a high-water mark. Trimming the whole log freed
+126–171 MiB of in-use heap, but `mapped` fell only 30–50 MiB; tcmalloc's
+central free list grew by 95–119 MiB.
+
+This flowchart shows why freed pg log memory stays mapped.
+
+```mermaid
+flowchart TD
+    A["trim frees an entry,<br/>its name string and its tree nodes"] --> B["tcmalloc puts each object<br/>on the free list of its size"]
+    B --> C{"is every object on that<br/>page run free now?"}
+    C -->|yes| D["page run to the page heap;<br/>the tuner's release returns it to the OS"]
+    C -->|no| E["stays on the central free list:<br/>mapped, but not in use"]
+```
+
+Take away: the entries were allocated one by one during the writes, between
+other objects, so most page runs still hold something live and the freed
+bytes stay mapped.
+
+The tuner calls `ceph_heap_release_free_memory()` every round
+([`tune_memory()`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/PriorityCache.cc#L125)),
+but that only returns free page runs. The OSD reuses free-list memory for
+new objects of the same size, so it is not lost; it just does not go back
+to the OS, and the peak pg log stays in `mapped`.
+
+One loose end: by the mempool's item count, osd.0 held about 220000 dups at
+`a`, while its 100 written PGs report 1500 each (150000) in their
+statistics. The statistics come from the primary only, so the difference
+would sit in replica PGs. I did not track it down.
+
+### 15.6 What was ruled out
+
+These were checked and are not worth a change:
+
+| Suspect | Check | Result |
+|---|---|---|
+| tcmalloc's per-thread caches | `TCMALLOC_MAX_TOTAL_THREAD_CACHE_BYTES=134217728`, which the packages ([`etc/sysconfig/ceph`](https://github.com/ceph/ceph/blob/v21.3.0/etc/sysconfig/ceph#L7)) and cephadm set, against the library default; 8 jobs of 4K writes, then reads (`memopt.sh tcmalloc`) | at most 5–9 MiB per OSD with it, 5–14 MiB without: the OSD's 58–76 threads never fill even the default |
+| BlueFS reads in the page cache | `file` in each OSD cgroup's `memory.stat` (`bluefs_buffered_io` is true by default) | 23–26 MiB per OSD |
+| Object contexts holding onode buffers | code: onode attributes are decoded with `begin_deep()` ([`BlueStore.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L4928)), so they are copies | nothing pinned |
+| Pg log growth while PGs are degraded | code: with the `pglog_hardlimit` OSD map flag the log is trimmed to its target even when degraded ([`PeeringState.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PeeringState.h#L2025)) | bounded |
+
+
+### 15.7 Next steps
+
+This graph shows the order I suggest.
+
+```mermaid
+graph TD
+    A["1. DONTNEED on background recovery reads<br/>two lines, plus a flag for EC"] --> D["4. lower osd_memory_base<br/>caches get what 1-3 free"]
+    B["2. memtables tied to the target<br/>WAL cap, or merge counts"] --> D
+    C["3. pg log: count what it costs,<br/>then shrink entries and dups"] --> D
+```
+
+Take away: 1 is ready now; 2 needs a latency test on fast disks; 3 is code
+work; only after them can the fixed reserve shrink.
+
+1. **Mark background recovery reads DONTNEED.** Set `cache_dont_need` in
+   `recover_replicas()` and `recover_backfill()`, and pass
+   `CEPH_OSD_OP_FLAG_FADVISE_DONTNEED` in the EC recovery `read_request_t`.
+   Effect measured here: 160–290 MiB less cold data on each source OSD
+   after a recovery, and 0–55 instead of 59–170 MiB of misses when the hot
+   set is read again. No cost was found; pulls already read this way.
+   Before posting the patch: an A/B with the patch itself instead of the
+   config switch, and the same on an EC pool.
+2. **Tie the memtables to the target.** The measurements give two knobs:
+   - `max_total_wal_size`: the memtable peak follows it (§15.3.3). Scaling
+     it linearly with the target instead of by the square root, as #72964
+     does, gives 512 MiB of WAL at 2 GiB. It costs SST writes, and the open
+     question is write tail latency: measure p99.9 on NVMe at 256–512 MiB.
+   - `min_write_buffer_number_to_merge`: at 2 for every column family the
+     peak was 83–114 MiB, lower than any WAL cap tried, at about the flush
+     cost of a 256 MiB cap (§15.3.6). It needs a reshard on existing OSDs,
+     and a longer run that includes compaction.
+
+   A WriteBufferManager is not a knob with Ceph's merge counts (§15.3.5).
+   RocksDB also never flushes on time, so memtables stay at their peak
+   after a write burst; an OSD could flush them once its writes go quiet.
+   That is an idea, not measured here.
+3. **Make the pg log's cost visible, then smaller.** In order:
+   - Count the object-name strings, the `clean_regions` tree nodes and the
+     four hash indexes in the `osd_pglog` mempool, so `dump_mempools`
+     stops reporting 42–70 % less than the real cost.
+   - Move the 248 bytes of rarely used fields (§15.5) out of
+     `pg_log_entry_t` into an allocation made only when one is set, and
+     keep up to two `clean_regions` intervals inline, which covers one
+     write. By arithmetic, not measurement, that takes an entry from about
+     785 to about 500 bytes.
+   - Bound dups per OSD rather than per PG. Today 3000 per PG means 384000
+     dups at 128 PGs and 900000 at 300 (§15.5).
+4. **Then lower `osd_memory_base`.** After a compaction the memory outside
+   the caches was 206–267 MiB per OSD here, including the pg log and the
+   free lists. With 1–3 in place, §14.4's base of 256–384 MiB at a 2 GiB
+   target becomes safe to test.
+
+Not measured, and worth a look: BlueStore's write throttles
+(`bluestore_throttle_bytes` 64 MiB plus `bluestore_throttle_deferred_bytes`
+128 MiB) are not scaled by #72964.
+
+### 15.8 Takeaways
+
+- At a 2 GiB target the memtables are the largest thing outside the
+  caches: 0.45–0.8 GiB after a write burst, bounded only by the WAL cap,
+  and still there when the writes stop. The tuner can only answer by
+  shrinking the caches.
+- Two knobs bound them: the WAL cap (the peak is about 1.1 times a 128–256
+  MiB cap) and the merge count (2 held the peak to 83–114 MiB, for less
+  flushing than a 128 MiB cap). A WriteBufferManager does nothing with
+  Ceph's merge counts.
+- Recovery reads have been meant to skip the cache since 2015. Two lines
+  finish the job and keep 160–290 MiB of each source OSD's cache for data
+  that is read again.
+- `dump_mempools` under-reports the pg log: budget 785 bytes per entry and
+  178 per dup, not 552 and 104. Freed pg log memory stays mapped.
+- HDD OSDs need their own look: deferred writes put up to 512 MiB of data
+  that is already on its way to the disk into the `L` memtables.
+
 ## Glossary
 
 | Term | Meaning here |
@@ -1402,10 +2146,27 @@ With 1 to 3 in place a 2 GiB OSD looks like this:
 | cephadm | Ceph's orchestrator for container deployments; it can set `osd_memory_target` per host. |
 | perf counter | A named statistic a daemon exposes through `perf dump`. |
 | uprobe | A kernel breakpoint on a user-space function. perf and bpftrace use it to record each call, and perf can unwind the call stack from DWARF when the binary has no frame pointers. |
+| memtable | RocksDB's in-memory sorted table of recent writes, one active per column family. It keeps every version of a key until a flush. |
+| WAL | RocksDB's write-ahead log: each write batch is appended to it on disk first. A WAL file is deleted once every column family has flushed the keys in it. |
+| SST file | RocksDB's sorted, read-only table file on disk. |
+| flush | Writing memtables out as one SST file, keeping only the newest version of each key, and freeing their memory. |
+| compaction | RocksDB merging SST files into fewer, larger ones; a manual compaction flushes the memtables first. |
+| WriteBufferManager | RocksDB's optional memory budget for the memtables of all column families (`db_write_buffer_size`). |
+| deferred write | A small write that BlueStore first stores in RocksDB (column family `L`) and copies to the data disk later. On an HDD OSD this applies to writes below 64 KiB. |
+| pg log | Each PG's list of recent writes. It lets a PG copy catch up by replaying entries, and it detects resent client requests. |
+| dup | A trimmed pg log entry reduced to request id, version and return code, kept to detect resent requests. |
+| recovery, backfill | Bringing a PG copy up to date from the log (recovery) or by copying every object (backfill). |
+| push, pull | The primary sends an object to another OSD (push), or fetches one it is missing (pull). |
+| DONTNEED | `CEPH_OSD_OP_FLAG_FADVISE_DONTNEED`, a read or write flag that tells BlueStore not to keep the data in its cache. |
+| central free list | tcmalloc's per-size pool of freed small objects. Memory goes back to the OS only when every object on a page run is free. |
+| krbd | The Linux kernel's RBD client; it shows an RBD image as a block device. |
+| vstart | Ceph's script that starts a development cluster from a build tree. |
+| cgroup | A Linux control group; here each OSD runs in one with a memory limit. |
 
 ## Code references
 
-All links point at tag `v21.3.0` of `ceph/ceph`.
+All links point at tag `v21.3.0` of `ceph/ceph`; RocksDB links point at the
+`ceph/rocksdb` commit that v21.3.0 pins (24ea358, RocksDB 7.9.2).
 
 | Symbol | Role |
 |---|---|
@@ -1438,5 +2199,16 @@ All links point at tag `v21.3.0` of `ceph/ceph`.
 | [`BinnedLRUCacheShard::Insert()`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/BinnedLRUCache.cc#L422) / [`EvictFromLRU()`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/BinnedLRUCache.cc#L277) / [`FreeDeleted()`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/BinnedLRUCache.cc#L296) / [`SetCapacity()`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/BinnedLRUCache.cc#L307) | Insert with eviction; the tuner's resize |
 | [`Manager::tune_memory()`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/PriorityCache.cc#L119) | Moves the cache budget toward `target − mapped`, between `min` and `max` (§5, §14.3) |
 | [`get_cgroup_memory_limit()`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/util.cc#L173) / [`POD_MEMORY_LIMIT` in `config.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/config.cc#L553) | Where a container limit becomes the default target (§14.3) |
+| [`RocksDBStore::submit_common()`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/RocksDBStore.cc#L1607) | One BlueStore transaction, one RocksDB write batch (§15.3) |
+| [`RocksDBStore::verify_sharding()`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/RocksDBStore.cc#L1034) | Column-family options come from the definition stored at mkfs (§15.3) |
+| [`WriteBufferManager::ShouldFlush()`](https://github.com/ceph/rocksdb/blob/24ea35870fe9b3ba15285ec8746ba97ed5d67ff3/include/rocksdb/write_buffer_manager.h#L94) | Memtable budget test: active memtables only (§15.3.5) |
+| [`DBImpl::SwitchWAL()`](https://github.com/ceph/rocksdb/blob/24ea35870fe9b3ba15285ec8746ba97ed5d67ff3/db/db_impl/db_impl_write.cc#L1559) / [`MemTableList::IsFlushPending()`](https://github.com/ceph/rocksdb/blob/24ea35870fe9b3ba15285ec8746ba97ed5d67ff3/db/memtable_list.cc#L370) | The two automatic flush triggers (§15.3.2) |
+| [`PrimaryLogPG::recover_replicas()`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L13984) / [`recover_backfill()`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L14152) | Background recovery; never sets `cache_dont_need` (§15.4) |
+| [`ReplicatedBackend::start_pushes()`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L2611) / [`build_push_op()`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L2238) | Push read with or without DONTNEED (§15.4) |
+| [`BlueStore::_do_readv()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L13562) | Buffered unless DONTNEED or NOCACHE (§15.4) |
+| [`ECBackend::handle_sub_read()`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ECBackend.cc#L517) | EC shard read with the request's flags (§15.4) |
+| [`pg_log_entry_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.h#L4525) / [`pg_log_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.h#L4733) | Log entry and the mempool lists (§15.5) |
+| [`PGLog::IndexedLog`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PGLog.h#L172) / [`get_request()`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PGLog.h#L404) | Hash indexes outside the mempool, built on lookup (§15.5) |
+| [`OSDService::get_target_pg_log_entries()`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L9750) / [`IndexedLog::trim()`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PGLog.cc#L56) | Entries per PG; entries to dups (§15.5) |
 
 {% include mermaid.html %}
