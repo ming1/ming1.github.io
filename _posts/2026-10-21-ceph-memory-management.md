@@ -2050,7 +2050,7 @@ sequenceDiagram
     C->>PL: issue_repop(): add(entry)
     Note over C: the write commits
     C->>PL: log_operation(): trim(entry.version)
-    Note over PL: IndexedLog::trim(): the trimmed entry becomes a dup;<br/>the list is cut back at osd_pg_log_dups_tracked
+    Note over PL: IndexedLog::trim(): the trimmed entry becomes a dup,<br/>the list is cut back at osd_pg_log_dups_tracked
     C->>L: log_operation(): append_log(entry, trim_to)
 ```
 
