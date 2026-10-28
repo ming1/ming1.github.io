@@ -1,0 +1,71 @@
+// mClock scheduler trace for one ceph-osd. Symbols substituted by run-trace.sh.
+// Counters are per scheduler object (one per shard, arg0 = this).
+uprobe:BIN:SYM_ENQ   {
+  // mclock lane empty before this enqueue: remember when work appeared
+  if (@enq[arg0] - @enqh[arg0] + @enqf[arg0] - @pulled[arg0] == 0) { @t_empty_enq[arg0] = nsecs; }
+  @enq[arg0]++; @t_enq[tid] = nsecs; }
+uretprobe:BIN:SYM_ENQ /@t_enq[tid]/ {
+  @enqueue_ns = hist(nsecs - @t_enq[tid]); delete(@t_enq[tid]);
+}
+uprobe:BIN:SYM_ENQH  { @enqh[arg0]++;
+  if (arg1 == 0xffffffff) { @high_immediate++; } else { @high_prio[arg1]++; } }
+uprobe:BIN:SYM_ENQF  { @enqf[arg0]++; }
+
+uprobe:BIN:SYM_DEQ {
+  // WorkItem is returned via a hidden pointer in the first argument, so this is arg1
+  $s = arg1;
+  @t_deq[tid] = nsecs; @sched[tid] = $s; @pull_flag[tid] = 0;
+  // items waiting in the mclock-managed lane of this shard right now
+  @mclock_depth = hist(@enq[$s] - @enqh[$s] + @enqf[$s] - @pulled[$s]);
+  // items waiting in the strict high_priority lane of this shard
+  @high_depth = hist(@enqh[$s] - @hpop[$s]);
+  // starvation guard condition at this dequeue (stock code): strict lane
+  // non-empty, mclock lane non-empty, >= 50 ms since the last mclock pull
+  if (@enqh[$s] - @hpop[$s] > 0 && @enq[$s] - @enqh[$s] + @enqf[$s] - @pulled[$s] > 0 &&
+      @last_pull[$s] > 0 && nsecs - @last_pull[$s] >= 50000000) {
+    @guard_fires++;
+    // ... although the mclock lane became non-empty less than 50 ms ago (bug 1)
+    if (@t_empty_enq[$s] > 0 && nsecs - @t_empty_enq[$s] < 50000000) { @guard_wrong_fires++; }
+  }
+}
+uretprobe:BIN:SYM_PULL /@sched[tid]/ {
+  // PullReq: NextReqType at offset 0 (0 returning, 1 future, 2 none)
+  $t = *(uint32 *)retval;
+  @pull_type[$t]++;
+  if ($t == 0) { @pulled[@sched[tid]]++; @pull_flag[tid] = 1; @last_pull[@sched[tid]] = nsecs; }
+}
+uretprobe:BIN:SYM_DEQ /@t_deq[tid]/ {
+  @dequeue_ns = hist(nsecs - @t_deq[tid]);
+  // WorkItem = variant<monostate, OpSchedulerItem(40 B), double>; index byte at +40
+  $idx = *(uint8 *)(retval + 40);
+  if ($idx == 1) {
+    if (@pull_flag[tid] == 1) { @ret["item from mclock lane"]++;
+      if (@t_empty_enq[@sched[tid]]) {
+        // first item pulled after the lane was empty: enqueue -> dequeue-return latency
+        @wake_us = hist((nsecs - @t_empty_enq[@sched[tid]]) / 1000);
+        @wake_total_us += (nsecs - @t_empty_enq[@sched[tid]]) / 1000; @wake_n++;
+        delete(@t_empty_enq[@sched[tid]]); } }
+    else { @ret["item from high_priority lane"]++; @hpop[@sched[tid]]++; }
+  } else if ($idx == 2) { @ret["future time (shard thread will sleep)"]++; }
+  else { @ret["monostate"]++; }
+  delete(@t_deq[tid]); delete(@sched[tid]); delete(@pull_flag[tid]);
+}
+
+// shard worker sleeps: timed (future tag) vs untimed (idle)
+uprobe:/lib64/libc.so.6:pthread_cond_timedwait /pid == PID && comm == "tp_osd_tp"/ { @t_tw[tid] = nsecs; }
+uretprobe:/lib64/libc.so.6:pthread_cond_timedwait /@t_tw[tid]/ {
+  @timedwait_us = hist((nsecs - @t_tw[tid]) / 1000); @timedwait_total_us += (nsecs - @t_tw[tid]) / 1000;
+  delete(@t_tw[tid]); }
+uprobe:/lib64/libc.so.6:pthread_cond_clockwait /pid == PID && comm == "tp_osd_tp"/ { @t_tw[tid] = nsecs; }
+uretprobe:/lib64/libc.so.6:pthread_cond_clockwait /@t_tw[tid]/ {
+  @timedwait_us = hist((nsecs - @t_tw[tid]) / 1000); @timedwait_total_us += (nsecs - @t_tw[tid]) / 1000;
+  delete(@t_tw[tid]); }
+uprobe:/lib64/libc.so.6:pthread_cond_wait /pid == PID && comm == "tp_osd_tp"/ { @t_w[tid] = nsecs; }
+uretprobe:/lib64/libc.so.6:pthread_cond_wait /@t_w[tid]/ {
+  @idlewait_us = hist((nsecs - @t_w[tid]) / 1000); @idlewait_total_us += (nsecs - @t_w[tid]) / 1000;
+  delete(@t_w[tid]); }
+
+END {
+  clear(@t_enq); clear(@t_deq); clear(@sched); clear(@pull_flag); clear(@t_tw); clear(@t_w);
+  clear(@t_empty_enq); clear(@last_pull); clear(@enq); clear(@enqh); clear(@enqf); clear(@pulled); clear(@hpop);
+}

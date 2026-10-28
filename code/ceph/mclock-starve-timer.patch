@@ -1,0 +1,180 @@
+diff --git a/src/osd/scheduler/mClockScheduler.cc b/src/osd/scheduler/mClockScheduler.cc
+index 323da61b737..9a740d1f50f 100644
+--- a/src/osd/scheduler/mClockScheduler.cc
++++ b/src/osd/scheduler/mClockScheduler.cc
+@@ -133,6 +133,16 @@ void mClockScheduler::enqueue(OpSchedulerItem&& item)
+     // trigger perf counter calculations first
+     mclock_conf.get_mclock_counter(id, sch_op_type, item_cost);
+ 
++    // The starvation-bound forced yield in dequeue() measures how long
++    // pending mclock-queue work has waited since the queue was last
++    // served. An item arriving into an empty queue has not waited yet,
++    // so restart the clock here; otherwise a queue that has been idle
++    // (or never served: TimeZero) for longer than the threshold would
++    // get its very next item pulled ahead of high_priority at once.
++    if (scheduler.empty()) {
++      last_mclock_service_time = crimson::dmclock::get_time();
++    }
++
+     // Add item to scheduler queue
+     scheduler.add_request(
+       std::move(item),
+@@ -256,8 +266,13 @@ WorkItem mClockScheduler::dequeue()
+       return std::move(*retn.request);
+     }
+     // Nothing was actually ready as per mclock's own reservation/limit tags
+-    // -- fall through and serve high_priority as usual; the starvation check
+-    // will retry on the next call.
++    // -- fall through and serve high_priority as usual. The queue was not
++    // held back by high_priority but by its own tags, so count this as its
++    // turn: otherwise every following dequeue would retry the pull, and an
++    // item that becomes ready later (or a new item arriving into the
++    // non-empty queue) would be pulled ahead of high_priority with no wait
++    // of its own.
++    last_mclock_service_time = crimson::dmclock::get_time();
+   }
+ 
+   if (!high_priority.empty()) {
+diff --git a/src/osd/scheduler/mClockScheduler.h b/src/osd/scheduler/mClockScheduler.h
+index c3d3012c7ba..39f93589acc 100644
+--- a/src/osd/scheduler/mClockScheduler.h
++++ b/src/osd/scheduler/mClockScheduler.h
+@@ -88,9 +88,12 @@ class mClockScheduler : public OpScheduler {
+   /**
+    * last_mclock_service_time
+    *
+-   * Time (per crimson::dmclock::get_time()) at which an item was last
+-   * successfully pulled from the mclock-managed queue (scheduler).
+-   * TimeZero means "never" and is treated as already-expired.
++   * Time (per crimson::dmclock::get_time()) since which the mclock-managed
++   * queue (scheduler) has had pending work that was not served: set when
++   * an item is pulled from it, and when an item is added to it while it
++   * is empty. now - last_mclock_service_time is therefore how long the
++   * oldest pending item has waited, which is what mclock_queue_is_starved()
++   * compares against the starve time.
+    */
+   crimson::dmclock::Time last_mclock_service_time = crimson::dmclock::TimeZero;
+ 
+diff --git a/src/test/osd/TestMClockScheduler.cc b/src/test/osd/TestMClockScheduler.cc
+index 55ea357801b..d9fb54112dc 100644
+--- a/src/test/osd/TestMClockScheduler.cc
++++ b/src/test/osd/TestMClockScheduler.cc
+@@ -572,3 +572,118 @@ TEST_F(mClockSchedulerTest, TestNonClientRequeueDoesNotBlockForcedYield) {
+ 
+   ASSERT_TRUE(q.empty());
+ }
++
++// Regression tests for the starvation-bound forced yield's timer: the
++// yield must measure how long pending mclock-queue work has waited since
++// the queue was last served, not how long ago the queue was last served
++// while it may have been empty. Without the enqueue-side reset, an item
++// arriving into a queue that has been empty for longer than the threshold
++// (or never served at all: last_mclock_service_time starts at TimeZero)
++// is force-pulled ahead of high_priority on the very next dequeue().
++TEST_F(mClockSchedulerTest, TestFreshItemAfterIdleDoesNotForceYield) {
++  ASSERT_TRUE(q.empty());
++
++  // Set up last_mclock_service_time, then let the (empty) mclock queue sit
++  // idle for longer than the 50ms SSD/NVMe threshold. Nothing is pending,
++  // so nothing can be starving.
++  q.enqueue(create_item(0, client1, SchedulerClass::client));
++  get_item(q.dequeue());
++  ASSERT_TRUE(q.empty());
++  std::this_thread::sleep_for(60ms);
++
++  // A background item arrives together with an immediate-class item.
++  q.enqueue(create_item(1, client1, SchedulerClass::background_best_effort));
++  q.enqueue(create_high_prio_item(200, 200, client2, SchedulerClass::immediate));
++
++  // The background item has waited ~0ms: ordinary priority order applies.
++  auto r = get_item(q.dequeue());
++  ASSERT_EQ(200u, r.get_map_epoch());
++  r = get_item(q.dequeue());
++  ASSERT_EQ(1u, r.get_map_epoch());
++  ASSERT_TRUE(q.empty());
++}
++
++TEST_F(mClockSchedulerTest, TestFirstEverItemDoesNotForceYield) {
++  ASSERT_TRUE(q.empty());
++
++  // No priming: last_mclock_service_time is still TimeZero. The first
++  // mclock-queue item of this scheduler's life must not count as starved.
++  q.enqueue(create_item(1, client1, SchedulerClass::background_best_effort));
++  q.enqueue(create_high_prio_item(200, 200, client2, SchedulerClass::immediate));
++
++  auto r = get_item(q.dequeue());
++  ASSERT_EQ(200u, r.get_map_epoch());
++  r = get_item(q.dequeue());
++  ASSERT_EQ(1u, r.get_map_epoch());
++  ASSERT_TRUE(q.empty());
++}
++
++TEST_F(mClockSchedulerTest, TestStarvationStillForcesYieldAfterIdle) {
++  ASSERT_TRUE(q.empty());
++
++  // Idle for a while first, as above...
++  q.enqueue(create_item(0, client1, SchedulerClass::client));
++  get_item(q.dequeue());
++  std::this_thread::sleep_for(60ms);
++
++  // ...then a background item arrives and genuinely waits behind a
++  // continuously refilled high_priority for longer than the threshold.
++  q.enqueue(create_item(1, client1, SchedulerClass::background_best_effort));
++  for (unsigned i = 0; i < 60; ++i) {
++    q.enqueue(create_high_prio_item(100 + i, 100 + i, client2,
++                                    SchedulerClass::immediate));
++  }
++  std::this_thread::sleep_for(60ms);
++
++  auto r = get_item(q.dequeue());
++  ASSERT_EQ(1u, r.get_map_epoch());
++  ASSERT_FALSE(q.empty());
++}
++
++// The mclock queue can be non-empty but have nothing ready (its only item
++// is held back by its own limit tag). That is not starvation by
++// high_priority: once the forced yield has tried and found nothing ready,
++// the timer must restart so that a ready item arriving into the still
++// non-empty queue does not jump ahead of high_priority at once.
++TEST_F(mClockSchedulerTest, TestNotReadyQueueDoesNotStayStarved) {
++  ASSERT_TRUE(q.empty());
++
++  // Custom profile: best_effort limited to a tiny fraction of capacity so
++  // the second best_effort item's limit tag lands far in the future.
++  g_ceph_context->_conf.set_val("osd_mclock_profile", "custom");
++  g_ceph_context->_conf.set_val(
++    "osd_mclock_scheduler_background_best_effort_lim", "0.000001");
++  g_ceph_context->_conf.apply_changes(nullptr);
++
++  q.enqueue(create_item(1, client1, SchedulerClass::background_best_effort));
++  q.enqueue(create_item(2, client1, SchedulerClass::background_best_effort));
++  auto r = get_item(q.dequeue());
++  ASSERT_EQ(1u, r.get_map_epoch());
++  // Item 2 stays queued but is not ready for a long time.
++  ASSERT_FALSE(q.empty());
++
++  for (unsigned i = 0; i < 60; ++i) {
++    q.enqueue(create_high_prio_item(100 + i, 100 + i, client2,
++                                    SchedulerClass::immediate));
++  }
++  std::this_thread::sleep_for(60ms);
++
++  // Forced yield fires, finds nothing ready, serves high_priority.
++  r = get_item(q.dequeue());
++  ASSERT_GE(r.get_map_epoch(), 100u);
++
++  // A ready recovery item arrives into the non-empty queue. It has waited
++  // nothing and the queue was just offered its turn: high_priority first.
++  q.enqueue(create_item(3, client1, SchedulerClass::background_recovery));
++  r = get_item(q.dequeue());
++  ASSERT_GE(r.get_map_epoch(), 100u);
++
++  // After a full starve interval it does get its forced turn.
++  std::this_thread::sleep_for(60ms);
++  r = get_item(q.dequeue());
++  ASSERT_EQ(3u, r.get_map_epoch());
++
++  g_ceph_context->_conf.rm_val("osd_mclock_scheduler_background_best_effort_lim");
++  g_ceph_context->_conf.rm_val("osd_mclock_profile");
++  g_ceph_context->_conf.apply_changes(nullptr);
++}
