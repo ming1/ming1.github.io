@@ -133,9 +133,9 @@ goes stale although nothing is starved. A ready item arriving into that
 queue is pulled ahead of the strict lane at once, and until it arrives
 every `dequeue` retries the pull.
 
-**Fix.** Two resets, nine lines
+**Fix.** Two resets, four lines of code
 ([patch]({{ site.baseurl }}/code/ceph/mclock-starve-timer.patch), with
-three regression tests). In `enqueue`, if the dmclock queue is empty
+four regression tests). In `enqueue`, if the dmclock queue is empty
 before `add_request`, set `last_mclock_service_time` to now: work that
 has just arrived has waited nothing. In the guard branch of `dequeue`,
 if `pull_request` returns nothing ready, set it too: the queue had its
@@ -145,12 +145,14 @@ but dmclock has no peek API, so that is a larger change. One edge
 remains: a not-ready item, an idle gap and a simultaneous burst still
 let one item jump, with the same one-item cost.
 
-**Verification.** On stock main the two new tests fail (the background
-item comes out where the immediate item is expected); with the patch all
-sixteen tests pass in three runs (§4.1). The traces in §4.1 also show
+**Verification.** On stock main three of the four new tests fail (the
+background item comes out where the immediate item is expected); the
+fourth, which checks that the yield still fires after an idle gap,
+passes on both. With the patch all sixteen tests pass in three runs
+(§4.1). The traces in §4.1 also show
 how rare the precondition is on a replicated pool under client load: the
 guard condition never occurred in over a million dequeues. Hence Medium,
-not Important.
+not High.
 
 ### 2.2 Config changes race with the shard threads
 
@@ -257,7 +259,7 @@ that can reach the limit is the deep-scrub chunk:
 [`get_scrub_cost`](https://github.com/ceph/ceph/blob/dc7b747c37c466b46bfd90bd7b940b8cdf3c8478/src/osd/scrubber/pg_scrubber.cc#L1087)
 charges the average object size per object. With `osd_scrub_chunk_max`
 15 and objects at the 128 MiB maximum the sum is just under `INT_MAX`;
-one more object wraps negative, and above 2^32 it wraps to a small
+an operator who raises the chunk size to 16 wraps it negative, and above 2^32 it wraps to a small
 positive value. Either way the largest item in the system is charged
 as the smallest. Rare in practice, trivial to harden: clamp to
 `INT_MAX` in the producer or make the field unsigned.
@@ -377,7 +379,7 @@ BlueStore throttles (`bluestore_throttle_bytes` 64 MiB and
 `bluestore_throttle_deferred_bytes` 128 MiB), PG locks and synchronous
 reads. The docs say as much by telling operators to tune those
 throttles with `osd bench`. §4.2 measures it: under a 4 KiB write load
-the queue holds zero or one item at 99 % of dequeues and never returns
+the queue holds zero or one item at 98 % of dequeues and never returns
 a wait time. A device
 feedback signal would close the loop: in-flight bytes or completion
 latency from the ObjectStore, used to hold dequeue when the device is
@@ -460,7 +462,7 @@ counters: `op_before_dequeue_op_lat` minus `op_before_queue_op_lat`.
 
 ### 4.1 Bug 1 reproduced and fixed
 
-The three tests from the patch, built against stock main and against
+The four tests from the patch, built against stock main and against
 the patched tree:
 
 | Test | Stock | Patched |
@@ -468,7 +470,8 @@ the patched tree:
 | fresh item after a 60 ms idle gap: strict item first | fails, background item returned | passes |
 | first item ever (timer at zero): strict item first | fails | passes |
 | not-ready item, then a ready item into the non-empty queue: strict first, forced turn after 50 ms | fails, ready item returned | passes |
-| the thirteen existing tests | pass | pass (three runs) |
+| item arriving after an idle gap, then a real 60 ms wait behind the strict lane: forced turn | passes | passes |
+| the twelve existing tests | pass | pass (three runs) |
 
 How often the stock guard condition occurs on this cluster (strict lane
 non-empty, mClock lane non-empty, 50 ms since the last pull):
@@ -479,9 +482,11 @@ non-empty, mClock lane non-empty, 50 ms since the last pull):
 | 4 KiB writes, 4 threads, 25 s | 61k | 0 | 0 |
 | 50 single puts 200 ms apart, then the 64-thread burst | 543k | 0 | 0 |
 
-With a primary PG on every shard the timer never goes stale. The
-precondition is a shard that sees no mClock pull for 50 ms, which this
-lab cannot produce; an EC or replica-heavy OSD can.
+The spaced-puts run did make the timer stale, but every item was
+dequeued within tens of microseconds of arriving (§4.2), so no dequeue
+ever saw both lanes non-empty with a stale timer. That needs a standing
+strict backlog on a shard with no mClock pull for 50 ms: an EC or
+replica-heavy OSD.
 
 ### 4.2 Under client load, mClock is a FIFO
 
@@ -498,8 +503,9 @@ lab cannot produce; an EC or replica-heavy OSD can.
 For writes, 69 % of the items on the primary's shards bypass mClock,
 the lane almost never holds two items, and no item is ever delayed by a
 tag. The scheduler adds nothing but its own 8 µs. For reads the queue
-time is 43 % of the op latency while the threads are 82 % idle. The
-trace explains it: 82 % of reads arrive into an empty lane, and the
+time is 43 % of the op latency while the threads are 82 % idle. A
+second read run with the wake-up probe explains it: 82 % of reads
+arrive into an empty lane, and the
 time from that enqueue to the item coming out of `dequeue` is 16 to
 32 µs for most of them, 30 µs on average. That is a futex wake-up of a
 sleeping shard thread. A short spin before sleeping in `_process`, or
@@ -515,13 +521,13 @@ Deep scrub of all 64 PGs started six seconds into a 30 s write run.
 |---|---|---|---|---|---|
 | no scrub, mClock balanced | 14.9k | 4.3 ms | 43 µs | 0 % | 0 % |
 | no scrub, wpq | 15.4k | 4.1 ms | | | |
-| scrub, mClock balanced | 7.3k | 8.8 ms | 1.0 ms | 44 % | 22 to 27 % |
+| scrub, mClock balanced (two runs) | 7.2k to 7.3k | 8.7 to 8.9 ms | 1.0 ms | 44 % | 22 % |
 | scrub, mClock high_client_ops | 7.3k | 8.8 ms | 1.0 ms | 46 % | 26 % |
 | scrub, mClock balanced, capacity set to 15000 IOPS | 9.2k | 7.0 ms | 0.5 ms | 61 % | 42 % |
 | scrub, wpq | 7.7k | 8.3 ms | 0.8 ms | | |
 
-mClock does pace the scrub: the shard threads spend a quarter of their
-time asleep on best-effort limit tags, and the profile makes no
+mClock does pace the scrub: the shard threads spend about a quarter of
+their time asleep on best-effort limit tags, and the profile makes no
 difference. The client still loses half of its throughput, and wpq,
 which paces nothing, gives it slightly more. Of the 4.5 ms the client
 lost, 1 ms is queue time and 3.5 ms is below the queue: scrub reads,
@@ -530,7 +536,7 @@ mClock cannot see any of it.
 
 The reason is the model. The boot benchmark reported 44k IOPS on a
 device that does about 320k; bandwidth stays at the 1200 MiB/s default
-and is never measured; so `cost_per_io` is 28.5 KiB and the model
+and is never measured; so `cost_per_io` is 27.9 KiB and the model
 believes the OSD can do 44k such ops per second. The OSD delivers 15k
 client writes per second through mClock, a third of that, so the model
 never sees contention and never holds anything back for the client.
@@ -592,6 +598,10 @@ each call takes dmclock's mutex; `dequeue` is 0.1 %. Under uprobes
   (`osd_op_queue = wpq`); strict priorities, no tags, no pacing.
 - **Queue time**: `op_before_dequeue_op_lat` minus
   `op_before_queue_op_lat` from the OSD perf counters: receipt to
-  dequeue minus receipt to enqueue.
+  dequeue minus receipt to enqueue. Shares of thread time (idle, asleep
+on tags) use the 40 s trace window over the 16 shard threads, which
+starts 4 s before the bench and ends after it, so the in-bench shares
+are somewhat higher for sleep under scrub and lower for idle. A count
+that the trace never incremented is reported as 0.
 
 {% include mermaid.html %}
