@@ -3,6 +3,9 @@
 # block device in DEVS (default: the four data disks of c28; DEVS=brd uses RAM block devices).
 # CFS=<bluestore_rocksdb_cfs> at "up" sets the column families: their options are stored at mkfs.
 # The cluster lives in its own VSTART_DEST and port range; another vstart in $B is left alone.
+# DISCARD=false at "up" leaves bdev_enable_discard off: on by default here to keep thin VM disks small, but with
+# bdev_async_discard_threads 0 every freed extent is a synchronous BLKDISCARD on the kv_finalize thread (1-3 ms each
+# on c28's virtual disks), which caps an OSD at 370-500 transactions/s.
 #
 #   memopt.sh up                     # wipe DEVS, vstart, rbd pool + image, krbd map, fill
 #   memopt.sh memtable [secs] [tag annex]  # 4K random writes; heap and BlueFS WAL/SST every 60 s; then compact.
@@ -20,6 +23,7 @@ CONF=$VS/ceph.conf
 CG=/sys/fs/cgroup/memopt
 NOSD=4 IMG=rbd/mo IMG_SIZE=3G HOT=${HOT:-1G}
 DEVS=${DEVS:-/dev/vdb,/dev/nvme0n1,/dev/sda,/dev/sdb}
+DISCARD=${DISCARD:-true}
 CAP=${CAP:-3072}                       # MiB per OSD cgroup: a guard for the host, not a test limit
 TARGET=${TARGET:-$((2 << 30))}
 export LD_LIBRARY_PATH=$B/lib
@@ -44,8 +48,9 @@ start_osd() {   # start_osd <n> [tcmalloc thread cache bytes]
     echo $! > $CG/osd$1/cgroup.procs
 }
 wait_clean() {
+    local r
     for i in $(seq 1 300); do
-        set -- $(ceph pg stat -f json | python3 -c 'import sys,json; d=json.load(sys.stdin)["pg_summary"]; print(d["num_pgs"], sum(s["num"] for s in d["num_pg_by_state"] if s["name"]=="active+clean"))' 2>/dev/null) || { sleep 2; continue; }
+        r=$(ceph pg stat -f json | python3 -c 'import sys,json; d=json.load(sys.stdin)["pg_summary"]; print(d["num_pgs"], sum(s["num"] for s in d["num_pg_by_state"] if s["name"]=="active+clean"))' 2>/dev/null) || { sleep 2; continue; }; set -- $r 0 0
         up=$(ceph osd stat -f json | python3 -c 'import sys,json; print(json.load(sys.stdin)["num_up_osds"])' 2>/dev/null)
         [ "$up" = "$NOSD" ] && [ "$1" = "$2" ] && [ "$1" != "0" ] && { log "clean: $up up, $2/$1 pgs"; return 0; }
         sleep 2
@@ -65,7 +70,7 @@ restart_osds() {   # restart_osds [tcmalloc thread cache bytes]
     for n in $(seq 0 $((NOSD-1))); do echo 0 > $CG/osd$n/memory.peak 2>/dev/null || true; done
 }
 defaults() {   # the arm's config: defaults except the 2 GiB target, no scrub during the tests
-    for k in bluestore_default_buffered_read osd_target_pg_log_entries_per_osd osd_pg_log_dups_tracked osd_min_pg_log_entries; do ceph config rm osd $k; done
+    for k in bluestore_default_buffered_read bluestore_rocksdb_options_annex osd_target_pg_log_entries_per_osd osd_pg_log_dups_tracked osd_min_pg_log_entries; do ceph config rm osd $k; done
     ceph config set osd osd_memory_target $TARGET
     ceph osd set noscrub; ceph osd set nodeep-scrub
 }
@@ -87,7 +92,7 @@ d = sys.argv[1]; d0 = sys.argv[2] if len(sys.argv) > 2 else None
 M = 1 << 20
 def heap(dd, n):
     h = open("%s/heap.%d.txt" % (dd, n)).read()
-    g = lambda s: int(re.search(r"(\d+) \(\s*[\d.]+ MiB\) " + s, h).group(1))
+    g = lambda s: (lambda m: int(m.group(1)) if m else 0)(re.search(r"(\d+) \(\s*[\d.]+ MiB\) " + s, h))   # 0 if the sample missed the heap stats
     return dict(app=g("Bytes in use by application"), thread=g("Bytes in thread cache freelists"),
                 central=g("Bytes in central cache freelist") + g("Bytes in transfer cache freelist"),
                 pageheap=g("Bytes in page heap freelist"), unmapped=g("Bytes released to OS"))
@@ -143,7 +148,7 @@ up() {
     done
     echo $devs > "$RES/devs"
     cd "$B" && VSTART_DEST=$VS CEPH_PORT=46100 MON=1 MGR=1 OSD=$NOSD MDS=0 RGW=0 NFS=0 ../src/vstart.sh -n -X --without-dashboard \
-        --bluestore --bluestore-devs $devs -o "bluestore_fsck_on_mount = false" -o "bdev_enable_discard = true" \
+        --bluestore --bluestore-devs $devs -o "bluestore_fsck_on_mount = false" -o "bdev_enable_discard = $DISCARD" \
         -o "osd_pool_default_size = 2" -o "osd_pool_default_min_size = 1" -o "mon_allow_pool_size_one = true" "${cfs[@]}" > "$VS/vstart.log" 2>&1 \
         || { tail -20 "$VS/vstart.log"; exit 1; }
     defaults
@@ -171,7 +176,7 @@ down() {
 memtable() {   # memtable [secs] [tag annex]: annex is a RocksDB options string for this arm,
                # e.g. "db_write_buffer_size=268435456" or "max_total_wal_size=268435456"
     local secs=${1:-600} tag=${2:-} annex=${3:-} out="$RES/memtable${2:+-$2}"; rm -rf "$out"; mkdir -p "$out"
-    defaults; ceph config rm osd bluestore_rocksdb_options_annex
+    defaults
     [ -n "$annex" ] && ceph config set osd bluestore_rocksdb_options_annex "$annex"
     restart_osds; sleep 20; snap "$out/t0"
     for n in $(seq 0 $((NOSD-1))); do stat -c %s "$VS/out/osd.$n.log"; done > "$out/logoff"
@@ -199,6 +204,7 @@ ts = sorted((int(os.path.basename(d)[1:]), d) for d in glob.glob(out + "/t*") if
 print("summary  osd  non-cache MiB: max mean flushed | memtables max mean | SST MiB written | WAL MiB | txc  WAL B/txc SST B/txc")
 for n in range(4):
     v = [nc(d, n)[0] for t, d in ts if t > 0]; base, bf = nc(out + "/compacted", n); b0 = nc(out + "/t0", n)[1]; be = nc(out + "/end", n)[1]
+    if not v: print("summary  %d    no samples: run shorter than 60 s" % n); continue
     sst = be["bytes_written_sst"] - b0["bytes_written_sst"]; wal = be["bytes_written_wal"] - b0["bytes_written_wal"]; txc = max(1, be["txc"] - b0["txc"])
     print("summary  %d    %5d %5d %5d | %5d %5d | %5d | %6d | %8d %5d %5d" % (n, max(v) // M, sum(v) // len(v) // M, base // M, (max(v) - base) // M,
           (sum(v) // len(v) - base) // M, sst // M, wal // M, txc, wal // txc, sst // txc))

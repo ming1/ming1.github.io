@@ -1477,12 +1477,14 @@ the results:
 
 To reproduce it:
 
-1. Build Ceph for vstart from `main` with PR #73018 and PR #72964 applied,
+1. Build Ceph for vstart from `main` with PR #73018 and PR #72964 applied
+   (or plain `main`: §15.9 has those numbers),
    on a host with four unused disks, and copy `memopt.sh` there. `B`,
    `VS`, `RES` and `DEVS` at the top of the script name the build, the
    cluster directory, the results directory and the disks.
 2. `memopt.sh up`. This clears old BlueStore labels on the disks, reports
-   their write cache as write-through (see below), creates the cluster
+   their write cache as write-through (see below), turns on
+   `bdev_enable_discard` (§15.9 shows what that costs), creates the cluster
    without cephx (the kernel client rejects this build's 32-byte keys),
    creates the pool and the image, maps it with krbd and fills it.
 3. Memtables: `memopt.sh memtable 1800`, then
@@ -1687,7 +1689,7 @@ flowchart shows the test RocksDB 7.9.2 runs before each write
 ```mermaid
 flowchart TD
     A["a write batch arrives"] --> B{"active memtables<br/>above 7/8 of the budget?"}
-    B -->|yes| F["flush one column family:<br/>the one with the oldest active memtable"]
+    B -->|yes| F["flush one column family: the one whose<br/>active memtable is oldest and not already flushing"]
     B -->|no| C{"all memtables at or above the budget,<br/>and active ones at least half of it?"}
     C -->|yes| F
     C -->|no| N["no flush"]
@@ -1695,6 +1697,9 @@ flowchart TD
 
 Take away: both triggers need the *active* memtables to be large; full
 memtables waiting for their merge count do not count as active.
+When a trigger fires, RocksDB flushes one column family: the one whose
+active memtable is the oldest, skipping families that are already flushing
+([`HandleWriteBufferManagerFlush()`](https://github.com/ceph/rocksdb/blob/24ea35870fe9b3ba15285ec8746ba97ed5d67ff3/db/db_impl/db_impl_write.cc#L1661)).
 
 A memtable leaves the "active" count as soon as it is full and becomes
 immutable
@@ -1718,8 +1723,8 @@ flush instead of waiting. §15.3.6 tests that.
 
 The other way to bound memtables is to flush full ones sooner: lower
 `min_write_buffer_number_to_merge`. For `L` and `P` that value is part of
-the column-family definition, which BlueStore stores in RocksDB at mkfs and
-reads back when it opens the database
+the column-family definition, which BlueStore writes to the `sharding/def`
+file beside the database at mkfs and reads back when it opens the database
 ([`RocksDBStore::verify_sharding()`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/RocksDBStore.cc#L1034)).
 Changing `bluestore_rocksdb_cfs` later does nothing to an existing OSD;
 `ceph-bluestore-tool reshard` rewrites the definition. The tool in this
@@ -1834,7 +1839,7 @@ recovery and scrub data"). It set the flag to false where a client op waits
 for the object, since the client reads it next. The background paths were
 left at the constructor's default, which is also false. A 2016 cleanup
 (3a28d01c4ba) removed one of the explicit assignments as redundant. Since
-then no recovery read has used DONTNEED.
+then no push read has used DONTNEED; only the pull reply does.
 
 `memopt.sh recovery` measures the effect:
 
@@ -1895,7 +1900,7 @@ kept so that a resent client request is recognised and not applied twice.
 How many of each an OSD keeps:
 
 - Entries per PG = `osd_target_pg_log_entries_per_osd` / PGs on the OSD,
-  clamped to 250…10000
+  clamped to `osd_min_pg_log_entries`…`osd_max_pg_log_entries` (250…10000)
   ([`get_target_pg_log_entries()`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L9750)).
   Here 106–153 PGs per OSD, so about 1000–1400 entries per PG.
 - Dups: a trimmed entry becomes a dup if it is among the PG's last
@@ -1904,13 +1909,15 @@ How many of each an OSD keeps:
   ([`IndexedLog::trim()`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PGLog.cc#L56)).
   Older dups are not dropped by age, so a written PG holds the full count
   (1500 here, 3000 by default) however long its log is. The limit is per
-  PG: an OSD with more PGs keeps more dups.
+  PG: an OSD with more PGs keeps more dups. On a primary the projected log
+  holds a second list of up to the same count (below).
 
 This diagram shows what one PG's log holds in memory and which parts the
 `osd_pglog` mempool counts.
 
 ```mermaid
 erDiagram
+    PrimaryLogPG ||--|| IndexedLog : "projected_log: a second IndexedLog on the primary, with its own dups"
     IndexedLog ||--o{ pg_log_entry_t : "log: mempool list"
     IndexedLog ||--o{ pg_log_dup_t : "dups: mempool list"
     IndexedLog ||--o{ hash_index_node : "4 indexes: std::unordered_map, not counted"
@@ -1949,7 +1956,7 @@ The parts, from the code and from `gdb` on the test build:
   looks it up. The primary looks up every client write's request id to
   catch resent ops
   ([`get_request()`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PGLog.h#L404)),
-  which builds the request-id and dup indexes.
+  which builds the request-id, extra-request-id and dup indexes.
 
 About 250 of the 536 bytes of an entry are fields a plain write to a
 replicated pool leaves empty
@@ -2029,10 +2036,74 @@ but that only returns free page runs. The OSD reuses free-list memory for
 new objects of the same size, so it is not lost; it just does not go back
 to the OS, and the peak pg log stays in `mapped`.
 
-One loose end: by the mempool's item count, osd.0 held about 220000 dups at
-`a`, while its 100 written PGs report 1500 each (150000) in their
-statistics. The statistics come from the primary only, so the difference
-would sit in replica PGs. I did not track it down.
+The mempool counts more dups than the PGs report: by its item count osd.0
+held about 220000 at `a`, while the `log_dups_size` statistics of its 100
+written PGs add up to 150000. The rest is a second copy on the primary.
+
+This sequence diagram shows where it comes from.
+
+```mermaid
+sequenceDiagram
+    participant C as client write
+    participant PL as projected_log (primary only)
+    participant L as pg log
+    C->>PL: issue_repop(): add(entry)
+    Note over C: the write commits
+    C->>PL: log_operation(): trim(entry.version)
+    Note over PL: IndexedLog::trim(): the trimmed entry becomes a dup;<br/>the list is cut back at osd_pg_log_dups_tracked
+    C->>L: log_operation(): append_log(entry, trim_to)
+```
+
+Take away: the primary's projected log is trimmed by the same function as
+the pg log, so it keeps its own dup list, up to `osd_pg_log_dups_tracked`
+per primary PG, until the OSD stops being primary.
+
+The pieces:
+
+- `projected_log` is an `IndexedLog` in every PG
+  ([`PG.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PG.h#L1335)).
+  The primary uses it to recognise a resent request whose entry has not
+  committed yet: each client write adds its entry
+  ([`issue_repop()`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L11721)),
+  and [`check_in_progress_op()`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PG.cc#L791)
+  looks there first, then in the pg log.
+- When the write commits,
+  [`log_operation()`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.h#L537)
+  trims `projected_log` to that version with
+  [`IndexedLog::trim()`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PGLog.cc#L56),
+  the same function the pg log uses: each trimmed entry becomes a dup (L84)
+  and the list is only cut back at `osd_pg_log_dups_tracked` (L142). The
+  window test, within `osd_pg_log_dups_tracked` versions of the head, always
+  passes here, since the projected log holds only in-flight entries.
+- The list goes away in
+  [`clear_primary_state()`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PG.cc#L357)
+  and at restart. A PG that stays primary keeps it.
+- Every request in it is also in the pg log, which `check_in_progress_op()`
+  checks next, so the copy answers nothing the pg log would not.
+
+The numbers fit: osd.0 was primary for 52 of its 108 PGs, 48 of them at
+the 1500 cap, so about 72000 extra dups; 150000 + 72000 is the 220000
+counted. On `main` with the default 3000 (§15.9) the mempool's dups per PG
+climbed to 3600–4100 and fell by 1200–1500 at every OSD restart, when the
+projected logs start empty. A direct check there: after 15 minutes of
+writes on a new cluster each OSD's mempool held 77000–130000 more dups
+than the logs of its PG instances, within 0.5 % of Σ min(writes, 3000)
+over its primary PGs; with the flag below the difference is zero on every
+OSD.
+
+The cost is up to `osd_pg_log_dups_tracked` × 178 bytes per primary PG,
+0.5 MiB at 3000: 20–50 MiB per OSD at 43–100 primary PGs. The fix is a flag
+on `IndexedLog::trim()`, so that the projected log drops trimmed entries
+instead of keeping dups:
+
+```cpp
+// PrimaryLogPG::log_operation(): the trimmed entries go into the pg log
+// below, which keeps their dups
+projected_log.trim(cct, last->version, nullptr, nullptr, nullptr, /*keep_dups=*/false);
+```
+
+The projected log dates from 2016 (ccbc90dd736) and dups from 2017
+(2c856473990); nothing kept the one out of the other.
 
 ### 15.6 What was ruled out
 
@@ -2066,8 +2137,8 @@ work; only after them can the fixed reserve shrink.
    Effect measured here: 160–290 MiB less cold data on each source OSD
    after a recovery, and 0–55 instead of 59–170 MiB of misses when the hot
    set is read again. No cost was found; pulls already read this way.
-   Before posting the patch: an A/B with the patch itself instead of the
-   config switch, and the same on an EC pool.
+   The A/B with the patch itself is in §15.9; before posting it, the same
+   on an EC pool.
 2. **Tie the memtables to the target.** The measurements give two knobs:
    - `max_total_wal_size`: the memtable peak follows it (§15.3.3). Scaling
      it linearly with the target instead of by the square root, as #72964
@@ -2091,6 +2162,9 @@ work; only after them can the fixed reserve shrink.
      keep up to two `clean_regions` intervals inline, which covers one
      write. By arithmetic, not measurement, that takes an entry from about
      785 to about 500 bytes.
+   - Stop the projected log from keeping dups: one flag (§15.5, A/B in
+     §15.9). Up to 0.5 MiB per primary PG, in effect at once, nothing to
+     deploy.
    - Bound dups per OSD rather than per PG. Today 3000 per PG means 384000
      dups at 128 PGs and 900000 at 300 (§15.5).
 4. **Then lower `osd_memory_base`.** After a compaction the memory outside
@@ -2117,8 +2191,127 @@ Not measured, and worth a look: BlueStore's write throttles
   that is read again.
 - `dump_mempools` under-reports the pg log: budget 785 bytes per entry and
   178 per dup, not 552 and 104. Freed pg log memory stays mapped.
+- The primary keeps a second, unused copy of up to `osd_pg_log_dups_tracked`
+  dups per PG in its projected log: 0.5 MiB per primary PG, gone with one
+  flag.
+- `bdev_enable_discard` without `bdev_async_discard_threads` is a
+  synchronous `BLKDISCARD` per transaction on the thread that finishes
+  every transaction: at 1–3 ms per discard an OSD tops out at 370–500
+  transactions/s. The default is off; if on, set the threads.
 - HDD OSDs need their own look: deferred writes put up to 512 MiB of data
   that is already on its way to the disk into the `L` memtables.
+
+### 15.9 The same on upstream `main`
+
+The build above carries two open PRs. To see what in §15 depends on them,
+every experiment was run again on plain `main` (dc7b747c37c, 2026-10-28)
+with the same VM and script. Two things differ. Without #72964 the
+defaults apply: a 1 GiB WAL cap, 300000 log entries per OSD and 3000 dups
+per PG. And osd.3 runs on vdc instead of sdb: virtio, rotational, so still
+BlueStore's HDD mode, but 9300 raw 4K writes/s against sdb's 822, so sdb
+no longer bounds the cluster (what does: the write-rate note at the end;
+`main` also lacks #73018, which only matters for the recovery arm, below).
+
+**Memtables** (§15.3.3, §15.3.6). Mean / max in MiB for the SSD OSDs and for
+osd.3; "flushed" is bytes per transaction written by the flushes.
+
+| Arm | §15, WAL cap 724 MiB: IOPS, SSD OSDs, osd.3, flushed | `main`, WAL cap 1 GiB: IOPS, SSD OSDs, osd.3, flushed |
+|---|---|---|
+| default | 699; 220–229 / 456–469; 365 / 719; 45–78 / 117 | 630; 180–194 / 495–564; 353 / 893; 99–113 / 86 |
+| wal256 | 746; 141–146 / 268–294; 143 / 287; 87–147 / 197 | 917; 107–135 / 263–289; 101 / 240; 274–471 / 599 |
+| wal128 | 780; 62–79 / 135–148; 66 / 135; 153–197 / 282 | 942; 41–65 / 120–145; 43 / 136; 566–758 / 1429 |
+| wbm256 | 730; 265–290 / 449–482; 411 / 800; 9–66 / 108 | 1135; 333–398 / 686–758; 446 / 868; 109–122 / 290 |
+| merge2, new cluster | 315; peak 83–96; 114; 95–134 / 253 | 601; peak 83–108; 131; 180–196 / 174 |
+| control, new cluster | 341; peak 362–378; 768, still growing at 20 min | 686; peak 533–610; 785 at 20 min |
+
+The peaks of the two new clusters add the pg log's growth back, as in
+§15.3.6. What holds: the peak follows the WAL cap (about 0.5× at 1 GiB on
+the SSD OSDs, 1.1× at 256 and 128 MiB), osd.3's `L` family takes it to
+0.9× of the cap, the WriteBufferManager never fires (686–868 MiB against
+its 256 MiB), and merge count 2 holds the memtables under 135 MiB. What
+differs: the 1 GiB cap costs 40–110 MiB more per SSD OSD and 170 MiB more
+on osd.3 than the 724 MiB of #72964; and at the same cap of 256 or 128 MiB
+the flushes wrote 3–5× more per transaction. The one input to RocksDB that
+changed is the pg log: twice the entries and dups in the `P` family, which
+keeps 29–58 % of what it flushes. I did not take that apart.
+
+Order matters at the 1 GiB cap. Four 20-minute passes on one cluster and
+image, at 1 GiB, 1 GiB, 256 MiB and 1 GiB, peaked at 447–653, 584–736,
+270–279 and 707–888 MiB (596, 1190, 1116 and 1133 IOPS; peaks corrected
+for the pg log as in §15.3.6). A 256 MiB cap holds whatever came before;
+at 1 GiB the peak depends on what the pass writes, and the `default` row
+above, a first pass, is its low end: without the discards of the write-rate
+note below, a first pass at 1 GiB ran at 1226–1318 IOPS and peaked at
+500–634 / 732–786 MiB.
+
+**Pg log** (§15.5). 779–786 bytes per entry and 175–178 per dup on `main`,
+against 782–789 and 175–181. At the default target each OSD held
+248000–317000 entries. An offline dump of osd.0 after a 20-minute write run
+on a new cluster (`ceph-objectstore-tool --op log` on its 109 PGs) shows no
+PG above 3000 dups on disk, primary or replica: primaries, whose logs sit at
+the 2770-entry target, hold a median of 400 dups; replicas of the OSDs with
+more PGs, and so shorter logs, hold a median of 1100. In memory, by the
+mempool's count, the dups per PG instance climbed to 3600–4100 during the
+write arms and fell by 1200–1500 at every OSD restart: the primaries'
+projected logs of §15.5, which start empty. The A/B of §15.5's flag, 15
+minutes of writes on a new cluster each: stock, the mempool's dups
+exceeded the PG instances' logs by 77000–130000 per OSD (14–22 MiB at
+178 bytes), within 0.5 % of Σ min(writes, 3000) over the OSD's primaries;
+patched, by zero on all four OSDs.
+
+**Recovery** (§15.4). Without #73018 the data cache holds less, so the
+1 GiB hot set never fit: 38–68 % hits before recovery against 96–98 % in
+§15. The cache-side numbers are the same picture, and a third arm runs the
+two-line patch of §15.4 itself instead of the config switch. Source OSDs
+1–3:
+
+| | Stock | Recovery reads not cached (config) | `cache_dont_need` patch |
+|---|---|---|---|
+| Data cache before recovery | 111–215 MiB | 107–232 MiB | 130–240 MiB |
+| Data cache after recovery | 174–301 MiB (+63 to +86) | 107–226 MiB (−6 to 0) | 128–207 MiB (−33 to 0) |
+| RSS after recovery | 325–579 MiB | 244–429 MiB | 259–379 MiB |
+| Hot-set hit ratio, before → after | 55–68 % → 54–61 % | 54–68 % → 53–68 % | 38–64 % → 39–71 % |
+
+The patch behaves as the config switch did: no recovered data stays in the
+source caches, and the hot set is read as well after the recovery as
+before.
+
+**tcmalloc** (§15.6). The thread caches peaked at 6–10 MiB per OSD at the
+library default and 9–16 MiB at 128 MiB, against 5–14 and 5–9 in §15.
+Still nothing to gain.
+
+**Write rate.** Every new cluster wrote its first pass after the fill at
+596–686 IOPS; later passes over the same image ran at 917–1190, on both
+builds far below the SSDs. mclock is not it: osd.3's startup bench
+(5500–9150 IOPS) falls outside the 50–500 IOPS window for a rotational
+disk, so its capacity stays at the 315 fallback, but the balanced profile
+does not cap client ops, and a cluster with that capacity set to 5000
+wrote its first pass at 650. RocksDB is not it: `kv_sync_lat` stayed at
+1–5 ms. The counters point at the kv_finalize thread, which finishes every
+transaction: on one OSD per run its batch latency (`kv_final_lat`) ran at
+70–800 ms, and every transaction's `state_kv_commiting_lat` with it. It
+was discarding. `memopt.sh` sets `bdev_enable_discard = true` to keep the
+VM's thin disks small, and with the default `bdev_async_discard_threads =
+0`,
+[`_txc_release_alloc`](https://github.com/ceph/ceph/blob/dc7b747c37c/src/os/bluestore/BlueStore.cc#L11523)
+→ [`KernelDevice::try_discard`](https://github.com/ceph/ceph/blob/dc7b747c37c/src/blk/kernel/KernelDevice.cc#L934)
+issues one synchronous `BLKDISCARD` per transaction (each 4K overwrite
+frees the 4K it replaces) from that thread. On c28's virtual disks a
+discard takes 1–2.7 ms, so the OSD with the slowest one tops out at
+370–500 transactions/s: sda at 2.7 ms on the first pass after a fill (96 %
+busy at 357 txc/s, the cluster at 600 IOPS), 1.0 ms afterwards; nvme0n1 at
+2 ms throughout, the limit once sda is cheap (92 % busy at 484 txc/s, the
+cluster at 1100–1190). Why sda's discards get cheaper after the first pass
+I did not pursue. On the §15 build the same discards cost 0.4–1.1 ms and
+sdb capped the cluster first: osd.3's finalize batches of 290–720 ms there
+were `deferred_try_submit` waiting on the disk. The A/B, a new cluster
+and a first pass each: discard off, 1226 IOPS; discard on with one async
+thread, 1318; finalize batches of 0.1–0.5 ms on every OSD, and the thread
+kept up (646000 discards on osd.0 in 20 minutes, used space unchanged).
+The upstream default is off; with it on, set the threads (a pool since
+[PR #55469](https://github.com/ceph/ceph/pull/55469), 2024, after
+ceph-users reports of exactly this cost), and know that freed space
+reaches the allocator only when its discard completes.
 
 ## Glossary
 
