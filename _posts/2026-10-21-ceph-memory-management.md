@@ -1,7 +1,7 @@
 ---
 title: "Explaining Ceph's memory management"
 category: storage
-tags: [ceph, bluestore, osd, memory, cache, rocksdb, tcmalloc, mempool, prioritycache, cephadm, page-cache, perf, memtable, cgroup, recovery, pg-log]
+tags: [ceph, bluestore, osd, memory, cache, rocksdb, tcmalloc, mempool, prioritycache, cephadm, page-cache, perf, memtable, cgroup, recovery, pg-log, uprobe, rgw, scrub]
 ---
 
 * TOC
@@ -62,7 +62,7 @@ comes from and what BlueStore does with it.
 
 All seven are defined in
 [`src/common/options/global.yaml.in`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L3913)
-(L3913–L4017):
+(L3913–L4016):
 
 | Group | Option | Default | Level | Takes effect | Role |
 |---|---|---|---|---|---|
@@ -81,7 +81,9 @@ routine tuning. The loop has three preconditions, all defaults:
   With either off, no PriorityCache manager is created
   ([L5569](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L5569)):
   the caches get the fixed `bluestore_cache_size` (or `_hdd` 1 GiB / `_ssd`
-  3 GiB) split by the ratios, and none of the seven options sizes a cache.
+  3 GiB) split by the `kv`, `meta` and `data` ratios, the `kv_onode` block
+  cache keeps its own `rocksdb_cache_size` (512 MiB), and none of the seven
+  options sizes a cache.
 - **tcmalloc.** Without it the loop never runs `tune_memory()`: the caches'
   total is fixed at the mount-time ceiling (§5), and the "at runtime"
   changes in the table do not move it. Their setters only store the new
@@ -121,7 +123,7 @@ routine tuning. The loop has three preconditions, all defaults:
   yaml: it does not follow when either option changes. `ceph config set`
   rejects a smaller value; through `POD_MEMORY_LIMIT` the OSD asserts at
   start instead (a limit below 1120 MiB at ratio 0.8,
-  [config.cc:276]({GH}src/common/config.cc#L276)), and a
+  [config.cc:276](https://github.com/ceph/ceph/blob/v21.3.0/src/common/config.cc#L276)), and a
   too-small `POD_MEMORY_REQUEST` is dropped silently. Up to about 1054 MiB the caches get no tuning range at all
   (§1.3).
 - **Other readers.** fsck sizes its shared-blob tracker from it
@@ -361,7 +363,7 @@ Two sizing options exist only for the static case, when autotuning is off:
 | Option | Default | Used when |
 |---|---|---|
 | `bluestore_cache_size` | 0 (= pick by media) | `bluestore_cache_autotune = false` |
-| `bluestore_cache_size_hdd` / `_ssd` | 1 GiB / 3 GiB | Same; chosen by whether the device is rotational ([L6185](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L6185)) |
+| `bluestore_cache_size_hdd` / `_ssd` | 1 GiB / 3 GiB | Same; chosen by whether the device is rotational ([L6189](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L6189)) |
 
 With `bluestore_cache_autotune = true` (the default), these sizes are
 replaced by the tuner's result, but the ratios still matter: they become the
@@ -424,7 +426,8 @@ flowchart TD
 ```
 
 Take away: the thread wakes twenty times a second, but the expensive steps
-run on their own timers; only `_resize_shards()` runs every pass.
+run on their own timers; only `_resize_shards()` and a perf-counter refresh
+run every pass.
 
 The steps in order, with their code:
 
@@ -588,12 +591,14 @@ The rounds at one priority, from
    drops out of the round. A cache that wants more gets its fair share and
    stays in for the next round.
 5. Repeat while there are caches still asking and memory left.
-6. For `LAST` only, each cache's share is overwritten with
+6. For `LAST` the rounds run as usual and what they assign is subtracted
+   from `mem_avail` ([L390](https://github.com/ceph/ceph/blob/v21.3.0/src/common/PriorityCache.cc#L390));
+   then each cache's `LAST` share is overwritten with the remaining
    `mem_avail × ratio`
-   ([L398](https://github.com/ceph/ceph/blob/v21.3.0/src/common/PriorityCache.cc#L398)),
-   so whatever remains after the aged priorities is handed out by ratio.
-   The bytes the rounds assigned at `LAST` are discarded by this overwrite,
-   and if the ratios sum to less than 1 the remainder stays unassigned.
+   ([L398](https://github.com/ceph/ceph/blob/v21.3.0/src/common/PriorityCache.cc#L398)).
+   The bytes the rounds assigned at `LAST` are lost, gone from `mem_avail`
+   and kept by no cache, and if the ratios sum to less than 1 the remainder
+   stays unassigned.
 
 ### 6.3 Commit rounds up
 
@@ -641,7 +646,7 @@ each shard enforces.
 - The onode limit is a *count*, because the onode cache evicts whole onodes.
   `get_bytes_per_onode()` is the metadata mempool bytes divided by the number
   of onodes
-  ([BlueStore.h:2756](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2756)).
+  ([BlueStore.h:2761](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2761)).
 - The buffer limit is in bytes.
 
 This flowchart shows how a limit becomes an eviction.
@@ -673,7 +678,7 @@ The per-shard details:
 - Adding or renaming an onode calls `_trim_some()` on its shard
   ([`OnodeSpace::add_onode`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L2064)),
   so onode shards trim gradually even with
-  `bluestore_cache_meta_evict_in_autotune` off. Any buffer read, write,
+  `bluestore_cache_meta_evict_in_autotune` off. Any buffer fill after a read miss (`did_read`), write,
   discard or write completion calls `_trim()` on its buffer shard right away.
 
 ### 7.1 Shards and how a collection finds its shard
@@ -689,8 +694,11 @@ The per-shard details:
 - A collection (one placement group's objects) is assigned a shard by the
   placement group's hash: `onode_cache_shards[cid.hash_to_shard(n)]`
   ([L8459](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L8459)),
-  where `hash_to_shard` is the PG number modulo the shard count
-  ([osd_types.h:634](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.h#L634)).
+  where `coll_t::hash_to_shard`
+  ([osd_types.h:800](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.h#L800)) is the PG's
+  placement seed modulo the shard count (`spg_t::hash_to_shard`,
+  [L634](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.h#L634)); non-PG collections go to
+  shard 0.
 - When a PG splits, `Collection::split_cache` moves the affected onodes and
   buffers to the new collection's shards.
 
@@ -699,7 +707,8 @@ The per-shard details:
 Each cache below ends with the call stacks that allocate and free its
 entries, recorded on a live OSD: ceph `21.3.0-2868-gba165903a5a`
 (RelWithDebInfo, vstart, four OSDs, `osd_memory_target` = 1 GiB, so the
-caches share the 128 MiB floor and trim all the time). The probes are perf
+tuner sits at the 128 MiB floor, `balance()` assigns nothing, every cache
+gets the 64 MiB minimum chunk, and the shards trim all the time). The probes are perf
 uprobes on the OSD binary with DWARF unwinding, taken during recovery pushes,
 client reads, and cold reads after a `compact`; the script is
 [`cachestacks.sh`]({{ site.baseurl }}/code/ceph/cachestacks.sh) and the
@@ -752,7 +761,8 @@ only when the whole onode is evicted.
 [`get_onode()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L5388) misses the onode space,
 [`create_decode()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L4953) builds the onode from
 its RocksDB value, and
-[`add_onode()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L2064) links it into the shard
+[`add_onode()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L2064) registers it with the
+shard (counted, but not yet on the LRU list: the operation still holds it)
 and trims the shard on the spot.
 
 ```
@@ -853,7 +863,8 @@ stateDiagram-v2
     WRITING --> [*]: write finished, FLAG_NOCACHE set (the default, bluestore_default_buffered_write = false)
     [*] --> CLEAN: read filled it (did_read)
     CLEAN --> EMPTY: trimmed out of warm_in, data dropped
-    EMPTY --> CLEAN: read again (promoted to hot)
+    EMPTY --> [*]: read again, the ghost is dropped by _discard
+    [*] --> CLEAN: read again, a new buffer goes straight into hot
     CLEAN --> [*]: evicted from hot
     EMPTY --> [*]: evicted from warm_out
 ```
@@ -949,9 +960,9 @@ write is in flight and is erased in `_txc_finish()`.
 
 BlueStore stores all metadata in RocksDB, a key-value database. RocksDB
 reads its files in blocks and keeps them in a block cache. Ceph replaces
-RocksDB's own cache with `BinnedLRUCache`, an LRU with two additions: a
-high-priority pool and age bins, so that the tuner can see how old each
-block is.
+RocksDB's own cache with `BinnedLRUCache`, a copy of RocksDB's LRU cache
+(high-priority pool included) extended with age bins and the tuner's
+`PriCache` interface, so that the tuner can see how old each block is.
 
 | Option | Default | Effect |
 |---|---|---|
@@ -1182,10 +1193,12 @@ The procedure:
    off.
 4. Divide what is left equally among the OSDs that have autotune on.
 5. If the result differs from an OSD's own setting, remove the per-OSD value
-   and set `osd_memory_target` for the mask `osd/host:<hostname>`.
+   and set `osd_memory_target` for the mask `osd/host:<short hostname>`
+   (the first DNS label).
 6. If there is nothing to tune, because no OSD is autotuned or the remainder
-   is not positive, and autotune is on globally, remove the host mask's
-   `osd_memory_target` instead.
+   is negative, and autotune is on globally, remove the host mask's
+   `osd_memory_target` instead (a remainder of exactly 0 is handed to
+   `config set` and rejected by the option's 896 MiB minimum).
 
 This flowchart shows the computation.
 
@@ -1209,8 +1222,10 @@ without the `_no_autotune_memory` label.
 Putting §2 to §7 together, this is what one OSD does after start, with the
 defaults:
 
-1. At mount, `_set_cache_sizes()` reads the options: ceiling 2713 MiB, floor
-   128 MiB, ratios 0.45 / 0.45 / 0.04 / 0.06.
+1. At mount, `_set_cache_sizes()` reads the options and the ratios
+   0.45 / 0.45 / 0.04 / 0.06; when the thread starts it derives the ceiling
+   (1 − 0.15) × 4096 − 768 = 2713 MiB and the floor 128 MiB
+   ([L5555](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L5555)).
 2. The thread starts; the tuner's first measurement puts `tuned_mem`
    between 128 MiB and the ceiling, depending on how much is already mapped.
 3. Every second, `tune_memory()` sees mapped memory below 4 GiB and grows
@@ -1262,7 +1277,7 @@ sequential reads of the hot region, then runs the measured pass.
 |---|---|---|---|
 | base | 2 GiB | defaults | off |
 | fw | 2 GiB | `osd_memory_base` 256 MiB, meta and kv ratios 0.30 | off |
-| pc | 1 GiB | the PR's advice: meta 0.50, kv 0.45 | on |
+| pc | 1 GiB | the PR's advice: `osd_memory_base` 256 MiB, meta 0.50, kv 0.45 | on |
 
 Per OSD the harness records `buffer_hit_bytes` and `buffer_miss_bytes`,
 `read_lat`, CPU time per read, and a perf profile of the threads:
@@ -1294,34 +1309,37 @@ Two things it was *not*:
 
 First, what a shard is. BlueStore does not keep one data cache and one
 onode cache; it cuts each into N independent pieces, so that the OSD's op
-threads do not all wait for one lock. N is the OSD's op-queue shard count
-(`osd_op_num_shards`, 8 on flash), set at start by
-[`set_cache_shards()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L9405).
+threads do not all wait for one lock. N is `osd_num_cache_shards`, 32 by
+default and fixed at start, passed by `OSD::init()` to
+[`set_cache_shards()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L9405); it is
+independent of the op-queue shard count.
 Each piece has its own lock, its own 2Q lists and its own byte limit. Every
 collection, that is every PG on the OSD, belongs to exactly one piece, and
 all of that PG's data is cached there. Budget cannot move between pieces.
 
 ```
         data cache budget, committed by the tuner: 816 MiB
-                         │  split 8 ways
+                         │  split 32 ways
    ┌──────────┬──────────┼──────────┬─────────────┐
- shard 0    shard 1    shard 2    shard 3   ...  shard 7      own lock, own lists,
- 102 MiB    102 MiB    102 MiB    102 MiB        102 MiB      own limit
+ shard 0    shard 1    shard 2    shard 3   ...  shard 31     own lock, own lists,
+ 25.5 MiB   25.5 MiB   25.5 MiB   25.5 MiB        25.5 MiB     own limit
    ▲          ▲          ▲          ▲              ▲
- PG 2.0     PG 2.1     PG 2.2     PG 2.3         PG 2.7       PG n -> shard n mod 8
- PG 2.8     PG 2.9     PG 2.a     PG 2.b         PG 2.f
+ PG 2.0     PG 2.1     PG 2.2     PG 2.3         PG 2.1f      PG n -> shard n mod 32
+ PG 2.20    PG 2.21    PG 2.22    PG 2.23        PG 2.3f
   ...        ...        ...        ...            ...
 ```
 
 [`_resize_shards()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L5699) gives every
 buffer shard the same limit, the committed bytes divided by the shard
-count (L5756). A collection goes to a shard by its PG number modulo the
+count (L5752). A collection goes to a shard by its PG number modulo the
 count ([`hash_to_shard()`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.h#L634)), and the PGs an OSD
-is primary for do not spread evenly: on these four OSDs the busiest shard
-carried 1.3 to 1.6 times the average.
+is primary for do not spread evenly: on a 4-OSD vstart with 320 PGs, two to
+five primaries per shard on average depending on the OSD, the busiest shard
+carried 1.5 to 2 times the average and one or two shards had no primary at
+all.
 
 ```
-example: tuner commits 816 MiB to the data cache; 8 shards, each allowed 816 / 8 = 102 MiB
+toy example with 8 shards (the OSD has 32): the tuner commits 816 MiB; each shard is allowed 816 / 8 = 102 MiB
 
 shard        0     1     2     3     4     5     6     7
 hot data   140   140    70    70    90   140   120   170  MiB  what the shard needs (940)
@@ -1332,8 +1350,9 @@ held       102   102    70    70    90   102   102   102  MiB  = 740 of 816
 ```
 
 The loaded shards sit at their limit and
-[`_trim_some()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1557) evicts on every
-insert; the light shards never reach theirs. The budget that is stranded in
+[`_trim()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1550) runs after every
+buffer insert (`did_read`, `write`), trimming the shard back to its byte
+limit; the light shards never reach theirs. The budget that is stranded in
 the light shards is lost, and inside a loaded shard the 2Q split between
 `warm_in` and `hot` (§8.2) loses a little more. Measured: 574 MiB held of
 816 committed, which is where the 85 % hit rate comes from. More budget
@@ -1344,7 +1363,7 @@ only helps by accident, when even the busiest shard fits.
 Keep a small floor per shard and split the rest by what each shard holds:
 
 ```
-max_i = floor + (committed - 8 * floor) * held_i / sum(held)      floor = committed / 64
+max_i = floor + (committed - N * floor) * held_i / sum(held)      floor = (committed / N) / 8
 ```
 
 The limits still add up to at most the committed size. A shard at its
@@ -1421,11 +1440,11 @@ osd_memory_target = 2048 MiB
 "everything else" is bounded per part, not by the target:
   RocksDB memtables   ≤ max_total_wal_size              1024 MiB   #1
   client messages     ≤ osd_client_message_size_cap      500 MiB   #2
-  pg log              ≈ 300000 entries/OSD × ~500 B    ~150 MiB   #3
+  pg log              ≈ 300000 entries/OSD × ~500 B    ~143 MiB   #3
   tcmalloc free lists   seen 15–140 MiB per OSD, released each round
   maps, threads, in-flight data, BlueFS                   tens of MiB
                                                          ----------
-  sum of the bounds                                     ~1.7 GiB  >  1075 MiB reserve
+  sum of the bounds                                     ~1.6 GiB  >  1075 MiB reserve
 ```
 
 1. In every phase of the test the "everything else" part stayed between
@@ -1502,8 +1521,10 @@ any phase.
 
 ### 14.3 Why the default is still 4 GiB
 
-The tuner measures `mapped` once per round and moves the caches toward
-`target − mapped`
+The tuner measures `mapped` once per round and moves the cache total a
+fraction of the way toward the ceiling while `mapped` is under the target,
+and toward the floor while it is over; the fraction is the relative gap
+(1 − mapped/target, or 1 − target/mapped)
 ([`tune_memory()`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/PriorityCache.cc#L119)).
 It sees a memtable or a message buffer only after it was allocated. The
 caches can give back at most about ceiling − 256 MiB (≈ 717 MiB at 2 GiB,
@@ -1518,15 +1539,16 @@ cgroup, not by Ceph.
  #1 memtables   16 MiB × up to 64 per column family, 12 families;
                 L and P merge 32 memtables before a flush;
                 the only global bound is max_total_wal_size = 1 GiB:
-                RocksDB flushes the family holding the oldest WAL
+                RocksDB flushes every family with data in the oldest WAL
                 when the WALs pass it, so ≈ 1 GiB can sit in memory.
-                No WriteBufferManager: nothing ties this to the target.
+                The WriteBufferManager is off (db_write_buffer_size = 0):
+                nothing ties this to the target.
  #2 messages    osd_client_message_size_cap = 500 MiB of client data
                 waiting in the messenger before the throttle blocks.
  #3 pg log      osd_target_pg_log_entries_per_osd = 300000 entries
                 plus osd_pg_log_dups_tracked = 3000 per PG.
             ───────────────────────────────────────────────────────
-                #1 + #2 + #3 ≈ 1.7 GiB   vs   reserve 1075 MiB
+                #1 + #2 + #3 ≈ 1.6 GiB   vs   reserve 1075 MiB
 ```
 
 On the VM none of this happened: writes are too slow to fill a memtable,
@@ -1538,11 +1560,13 @@ base and the 4 GiB default were sized for.
 Two details of how the target is set, for completeness. The option has a
 floor of 896 MiB, which is `osd_memory_base` + `osd_memory_cache_min`
 (`global.yaml.in`). Under Kubernetes the default becomes
-`osd_memory_target_cgroup_limit_ratio` (0.8) × `POD_MEMORY_LIMIT`
-([`config.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/config.cc#L553));
-the cgroup file it reads is the v1 path
-([`get_cgroup_memory_limit()`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/util.cc#L173)),
-so on a cgroup v2 host only the environment variable works.
+`osd_memory_target_cgroup_limit_ratio` (0.8) × `POD_MEMORY_LIMIT`, and with
+`POD_MEMORY_REQUEST` also set the target is min(request, limit × 0.8)
+([`config.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/config.cc#L553)). The target is never
+read from a cgroup file: Ceph's one cgroup reader,
+[`get_cgroup_memory_limit()`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/util.cc#L173),
+only fills the `mem_cgroup_limit` field of `ceph osd metadata`, and it reads
+the v1 path, so that field is missing on a cgroup v2 host.
 
 ### 14.4 What would make 2 GiB a safe default
 
@@ -1561,7 +1585,7 @@ In order of effect:
 3. **Lower `osd_memory_base` once 1 and 2 hold.** The measured
    "everything else" peaked at 460 MiB including 140 MiB of free lists.
    With bounded memtables and messages, a base of 256–384 MiB gives the
-   caches 1357–1484 MiB at 2 GiB instead of 973. r2p ran at that ceiling
+   caches 1356–1484 MiB at 2 GiB instead of 973. r2p ran at that ceiling
    (1441 of 1484 MiB) with no kill.
 4. **Let the shard limits follow demand** (§13.4, PR #73018). With the
    same 256 MiB base the stock OSD ended recovery with 514 MiB of data
@@ -1751,7 +1775,8 @@ makes the write durable. Then it inserts each key into a *memtable*, an
 in-memory sorted table, one per column family. A memtable is never edited in
 place: a key written ten times is in it ten times. A *flush* writes a
 memtable out as an SST file, the sorted on-disk format, and keeps only the
-newest version of each key. Until then every version takes memory.
+newest version of each key (plus delete markers). Until then every version
+takes memory.
 
 BlueStore spreads its keys over column families by key prefix
 ([prefixes](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L134),
@@ -1775,7 +1800,8 @@ are 16 MiB per memtable (`write_buffer_size`), up to 64 per column family
 #### 15.3.2 When RocksDB frees a memtable
 
 This state diagram shows the life of one memtable in RocksDB 7.9.2, the
-version in v21.3.0, and the three ways out of memory that apply to Ceph.
+version in v21.3.0 (the lab build ran 7.10.2, same code), and the three ways
+out of memory that apply to Ceph.
 
 ```mermaid
 stateDiagram-v2
@@ -1911,7 +1937,7 @@ flowchart shows the test RocksDB 7.9.2 runs before each write
 ```mermaid
 flowchart TD
     A["a write batch arrives"] --> B{"active memtables<br/>above 7/8 of the budget?"}
-    B -->|yes| F["flush one column family: the one whose<br/>active memtable is oldest and not already flushing"]
+    B -->|yes| F["flush one column family: the one whose<br/>active memtable is oldest, with no flush pending or running"]
     B -->|no| C{"all memtables at or above the budget,<br/>and active ones at least half of it?"}
     C -->|yes| F
     C -->|no| N["no flush"]
@@ -1920,7 +1946,8 @@ flowchart TD
 Take away: both triggers need the *active* memtables to be large; full
 memtables waiting for their merge count do not count as active.
 When a trigger fires, RocksDB flushes one column family: the one whose
-active memtable is the oldest, skipping families that are already flushing
+active memtable is the oldest, skipping families with a flush pending or
+running and families whose active memtable is empty
 ([`HandleWriteBufferManagerFlush()`](https://github.com/ceph/rocksdb/blob/24ea35870fe9b3ba15285ec8746ba97ed5d67ff3/db/db_impl/db_impl_write.cc#L1661)).
 
 A memtable leaves the "active" count as soon as it is full and becomes
@@ -2142,7 +2169,7 @@ erDiagram
     PrimaryLogPG ||--|| IndexedLog : "projected_log: a second IndexedLog on the primary, with its own dups"
     IndexedLog ||--o{ pg_log_entry_t : "log: mempool list"
     IndexedLog ||--o{ pg_log_dup_t : "dups: mempool list"
-    IndexedLog ||--o{ hash_index_node : "4 indexes: std::unordered_map, not counted"
+    IndexedLog ||--o{ hash_index_node : "4 indexes: std::unordered_map (one multimap), not counted"
     pg_log_entry_t ||--|| object_name : "soid: std::string, heap when over 15 chars"
     pg_log_entry_t ||--o{ clean_regions_node : "interval_set: std::map nodes, not counted"
     pg_log_entry_t {
@@ -2174,7 +2201,8 @@ The parts, from the code and from `gdb` on the test build:
 - The PG keeps four hash indexes into the log: by object, by request id, by
   extra request id and for dups
   ([`PGLog.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PGLog.h#L172)).
-  They are `std::unordered_map`s, each built the first time something
+  They are `std::unordered_map`s (`extra_caller_ops` a multimap), each built
+  the first time something
   looks it up. The primary looks up every client write's request id to
   catch resent ops
   ([`get_request()`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PGLog.h#L404)),
@@ -2191,7 +2219,7 @@ replicated pool leaves empty
 | `extra_reqids` | 40 | ops that carry more than one client request |
 | `extra_reqid_return_codes` | 64 | the same |
 | `reverting_to` | 16 | `LOST_REVERT` entries |
-| `op_returns` | 24 | ops that return data |
+| `op_returns` | 24 | ops sent with `CEPH_OSD_FLAG_RETURNVEC` (per-op return values) |
 | `written_shards` | 32 | EC partial writes |
 | total | 248 | |
 
@@ -2278,7 +2306,8 @@ sequenceDiagram
 
 Take away: the primary's projected log is trimmed by the same function as
 the pg log, so it keeps its own dup list, up to `osd_pg_log_dups_tracked`
-per primary PG, until the OSD stops being primary.
+per primary PG, until the PG's next peering interval or the OSD stops being
+primary.
 
 The pieces:
 
@@ -2297,9 +2326,11 @@ The pieces:
   and the list is only cut back at `osd_pg_log_dups_tracked` (L142). The
   window test, within `osd_pg_log_dups_tracked` versions of the head, always
   passes here, since the projected log holds only in-flight entries.
-- The list goes away in
-  [`clear_primary_state()`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PG.cc#L357)
-  and at restart. A PG that stays primary keeps it.
+- The list is reset by
+  [`clear_primary_state()`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PG.cc#L357):
+  at every new peering interval (`start_peering_interval()`, even when the
+  PG stays primary), when the PG stops being primary, and at restart.
+  Between interval changes a primary PG keeps it.
 - Every request in it is also in the pg log, which `check_in_progress_op()`
   checks next, so the copy answers nothing the pg log would not.
 
@@ -2477,7 +2508,7 @@ mempool's count, the dups per PG instance climbed to 3600–4100 during the
 write arms and fell by 1200–1500 at every OSD restart: the primaries'
 projected logs of §15.5, which start empty. The A/B of §15.5's flag, 15
 minutes of writes on a new cluster each: stock, the mempool's dups
-exceeded the PG instances' logs by 77000–130000 per OSD (14–22 MiB at
+exceeded the PG instances' logs by 77000–130000 per OSD (13–22 MiB at
 178 bytes), within 0.5 % of Σ min(writes, 3000) over the OSD's primaries;
 patched, by zero on all four OSDs.
 
@@ -2535,6 +2566,428 @@ The upstream default is off; with it on, set the threads (a pool since
 ceph-users reports of exactly this cost), and know that freed space
 reaches the allocator only when its discard completes.
 
+## 16. Every allocation of one I/O, end to end
+
+**Summary.** I traced every heap allocation that one 4 MiB I/O causes, in
+every process it passes through: an RBD write and read through librbd, an
+S3 PUT and GET through RGW, the recovery of one object, and a deep and a
+shallow scrub of the PG that holds it. Uprobes on the allocator record the
+size, the pointer and the call stack of each allocation. The payload is
+allocated once per hop, except on two paths that copy it again to align
+it: the primary of an RGW PUT, and the OSD that receives a recovery push.
+The counts come mostly from BlueStore, which makes 13 small allocations
+per 64 KiB blob, about 1,000 per OSD for a 4 MiB write. Little stays
+allocated after an op, with one exception: the OSD that receives a
+recovered object keeps its data for 10 minutes, pinned by the op history.
+§16.7 lists the fixes.
+
+### 16.1 The results in one view
+
+This diagram shows one 4 MiB RBD write to a new object, end to end:
+where the data is allocated and what each process allocates for the op.
+
+```
+ process (role)            the 4 MiB                    allocations                 left behind
+ ───────────────────────   ──────────────────────────   ─────────────────────────   ───────────────
+ rbdop (librbd client)     rbd_write copies the         149: messenger 62,          5, 296 B
+   │ MOSDOp                caller's buffer              librbd 51, objecter 36
+   ▼
+ osd.3 (primary)           messenger receive buffer,    2,022: BlueStore 1,034      473, 72 KiB:
+   │ MOSDRepOp × 2         page aligned: BlueStore      (832 = 64 blobs × 13),      blobs, RocksDB
+   ▼                       writes from it, no copy      osd 461, messenger 455      batch, op history
+ osd.1, osd.2 (replicas)   the same                     1,452-1,560 each:           420-439,
+                                                        BlueStore 1,019             57-67 KiB
+```
+
+Take away: four copies of the data for three copies on disk (the client's
+copy is the one librbd makes of the caller's buffer), and about 5,200
+allocations, 60 % of them in BlueStore.
+
+The other workloads, as allocations / bytes per process; the client column
+is librbd or radosgw:
+
+| 4 MiB workload | Client | Primary OSD | Other OSDs | Left behind |
+|---|---|---|---|---|
+| RBD write, new object | 149 / 4.0 MiB | 2,022 / 4.4 MiB | 1,452–1,560 / 4.3 MiB | 57–72 KiB per OSD: the object's metadata, a RocksDB batch, op history |
+| RBD read, from disk | 57 / 4.0 MiB | 1,197 / 4.1 MiB | – | 838 KiB of data in the cache |
+| RBD overwrite | 103 / 4.0 MiB | 1,428 / 4.2 MiB | 1,192–1,193 / 4.1 MiB | 34–36 KiB per OSD |
+| RGW PUT | 1,170 / 4.3 MiB | **2,064 / 8.3 MiB** | 1,054–1,366 / 4.1–4.3 MiB; index shard 948 / 267 KiB | 35–43 KiB per OSD |
+| RGW GET, from disk | 755 / 4.2 MiB | 1,306 / 4.1 MiB | – | 4.0 MiB in the cache |
+| Recovery of the object | – | source: 1,059 / 4.1 MiB | target: 1,887 / 4.2 MiB, plus the 4 MiB message | target: **the 4 MiB, for 600 s** |
+| Deep scrub | – | 1,008 / 4.1 MiB | 746–840 / 4.1 MiB | ≤ 2 KiB |
+| Shallow scrub | – | 410 / 119 KiB | 101–192 / 31–56 KiB | ≤ 1 KiB |
+| Idle, per second | radosgw 40–360 | – | 160–1,700 per OSD; 580–710 over 10 s | – |
+
+The findings:
+
+1. **Data.** Each hop allocates the payload once: the client copies the
+   caller's buffer, each OSD receives it into one aligned buffer and writes
+   that buffer as is. Two paths copy it again, 64 × 64 KiB in
+   `KernelDevice::aio_write()`: the primary of an RGW PUT (two xattrs come
+   before the data in the message, §16.4) and the target of a recovery push
+   (the data travels inside the message's payload, §16.5).
+2. **Counts.** BlueStore's work is per blob, and a blob is at most 64 KiB
+   on SSD (`bluestore_max_blob_size_ssd`): 13 allocations per blob on a
+   write, 12 on a read (the 64 KiB buffer included).
+3. **Held after the op.** The new object's metadata (25 KiB of it per
+   4 MiB object is per-blob state), cached data, and one leak-like case: the
+   op history keeps a received recovery push, data included, for up to
+   `osd_op_history_duration` (600 s); up to 160 MiB per OSD (§16.5).
+4. **Background.** An idle OSD allocates 580–710 times a second averaged
+   over 10 s, and 160–1,700 in any one second: heartbeats and PG lease
+   renewals come in bursts, the cache tuner's bookkeeping runs every
+   second. A 4 MiB write is worth 1–12 seconds of an idle OSD.
+
+### 16.2 How the trace is recorded
+
+The test runs on the c28 VM (8 vCPUs, 32 GiB) of §15: a new vstart
+cluster with 1 mon, 1 mgr, 1 RGW (beast) and four OSDs, one per disk (vdb,
+nvme0n1, sda, vdc). vdc reports itself rotational; it is set to SSD so that
+all four OSDs run BlueStore's SSD settings. Pools have 3 copies and 73 PGs
+in total: an idle OSD's allocations are mostly per-PG lease and heartbeat
+messages, so the PG count sets the background. Everything else is
+vstart's default, including the debug levels: `debug_osd 1/5` formats messages up to level 5
+into the in-memory log, and that cost is part of what is measured. Scrubs
+are off (`noscrub`, `nodeep-scrub`) except when the test asks for one.
+
+The build is `main` at c2158f46763 (dc7b747c37c plus 20 commits, none in
+the code traced here) plus the two PRs this post found:
+[PR #73018](https://github.com/ceph/ceph/pull/73018) (35e508847d1, the
+shard limits of §13.4) and
+[PR #73203](https://github.com/ceph/ceph/pull/73203) (fb0222ef01b,
+memtable memory of all column families), cherry-picked as
+`21.3.0-4871-g56790e96a29`: RelWithDebInfo, RocksDB 9.11.2 (the submodule
+`main` pins), RGW without its optional backends.
+
+**What is probed.** The OSDs and radosgw allocate through tcmalloc, the
+librbd client through glibc. One uprobe goes on each distinct entry
+address:
+
+| Library | Allocation entry points | Free entry points |
+|---|---|---|
+| tcmalloc 2.15 | `tc_new` (= `operator new`, `new[]`), `tc_new_nothrow`, `tc_malloc`, `tc_calloc`, `tc_realloc`, `tc_memalign` (= `memalign`, `aligned_alloc`), `tc_new_aligned`, `tc_new_aligned_nothrow` | `tc_free` (= `free`, `delete`), `tc_free_sized` (sized `delete`), `tc_delete_nothrow`, three aligned deletes |
+| glibc 2.41 | `__libc_malloc`, `__libc_calloc`, `__libc_realloc`, `__libc_memalign`, `aligned_alloc`, `posix_memalign` | `__libc_free` |
+
+An allocation entry records the size and a DWARF copy of the user stack, its
+return records the pointer, a free records the pointer. Three traps decided
+the list:
+
+- Aliases. `operator new` and `tc_new` are one address; so are `free`,
+  `delete` and `tc_free`. One probe per address counts each call once.
+- Allocators that call themselves. tcmalloc's `posix_memalign`, `valloc`
+  and `pvalloc` call `tc_memalign` through the PLT, so only `tc_memalign`
+  is probed. glibc's `posix_memalign` and `memalign` call `malloc`; the
+  analysis drops an entry that arrives while another is open on the same
+  thread. glibc's `posix_memalign` returns an int, so a second probe sits
+  on the instruction that stores the pointer (`posix_memalign+0x4f`).
+- PLT stubs. `perf probe tc_malloc%return` also puts a return probe on
+  libtcmalloc's own `tc_malloc@plt`, and `perf probe malloc` on libc's
+  `malloc@plt`: a call through the stub is then seen twice. The probes
+  are written to tracefs at the addresses `nm -D` gives.
+
+**How it is recorded.** All traced processes sit in one cgroup and perf
+records system-wide, filtered by it (`perf record -a -G memtrace`):
+recording by pid opens threads × CPUs × events file descriptors, 30,000
+for four OSDs. The build has no frame pointers, so stacks are DWARF: perf
+copies 32 KiB of stack per allocation, and 99.6 % of the stacks reach the
+thread entry. On a first cluster with 169 PGs, where an idle OSD
+allocated about 2,000 times a second, perf wrote 130 MB/s: a single perf
+thread writing to disk lost 22,000 samples. One reader thread per
+CPU (`--threads`) writing to tmpfs loses none in the measured windows;
+`allocstat.py` flags a window that overlaps a loss. Timestamps are `CLOCK_MONOTONIC`; the client marks each op's start
+and end with the same clock. An op's window runs from its start to 300 ms
+after it completed, so it also holds the work an OSD finishes after its
+reply; recovery and scrub windows are described in their sections.
+
+```
+   perf record (4 s to attach)
+   │ base: 1 s idle ──┐ op 1 ──┬─300 ms─┐ gap ┌ op 2 ...
+   ├──────────────────┼────────┴────────┼─────┼───────────
+   │                  │   window "op 1" │     │
+   └ background rate ─┘                        allocations whose entry
+     scaled to each window                     falls in the window
+```
+
+[`allocstat.py`]({{ site.baseurl }}/code/ceph/allocstat.py) turns the
+event stream into the tables below. It pairs each entry with its return on
+the same thread, then each pointer with its free. "Held" means still
+allocated at the end of the window. Each allocation gets three labels from
+its stack:
+
+| Label | How it is chosen | Values |
+|---|---|---|
+| layer | the component frame nearest the allocation | messenger, osd, pg log, bluestore, rocksdb, bluefs, librbd, librados / objecter, rgw, debug log, common |
+| context | why the code ran: the first rule that matches any frame | heartbeat / tick / stats, scrub, recovery, peering / osdmap, else I/O path |
+| call site | the first frame below allocator, container, buffer and encoder code | e.g. `bluestore::Collection::new_blob` |
+
+The RBD and RGW numbers below count the I/O path context; recovery and
+scrub count their own context.
+
+What it does not see: tcmalloc rounds each request up to a size class and
+keeps freed memory on its free lists (sizes here are as requested); memory
+from `mmap` and thread stacks; kernel memory (socket buffers, page cache).
+A free of memory allocated before the recording started counts as nothing.
+The probes slow everything down: the 4 MiB write took 242 ms, and the
+`ceph` CLI, a Python process that hits the system-wide glibc probes, takes
+seconds per command.
+
+[`memtrace.sh`]({{ site.baseurl }}/code/ceph/memtrace.sh) does every step,
+with [`rbdop.c`]({{ site.baseurl }}/code/ceph/rbdop.c) as the librbd
+client:
+
+```
+memtrace.sh up         # wipe the four disks; vstart with RGW; pools, bucket, cgroup; build rbdop
+memtrace.sh probes     # the 35 uprobes
+memtrace.sh rbd        # also: rgw, recovery, scrub, idle
+memtrace.sh report results/rbd-<time> --top 20 --stacks 8 [--context scrub]
+```
+
+### 16.3 RBD: a 4 MiB write and read
+
+The image's object 0 maps to PG 6.9 (osd.3, osd.1, osd.2) and its object
+map object to PG 6.4 on the same three OSDs: osd.3 is primary for both the
+object-map update and the data write. The client is
+[`rbdop`]({{ site.baseurl }}/code/ceph/rbdop.c): it opens the image, takes
+the exclusive lock with a 4 KiB write to the last object, and then runs
+the traced ops with `rbd_write()` + `rbd_flush()` and `rbd_read()`.
+
+| Op | Latency | rbdop | osd.3 (primary) | osd.1 | osd.2 |
+|---|---|---|---|---|---|
+| write, new object | 242 ms | 149 / 4.0 MiB | 2,022 / 4.4 MiB; held 473, 72 KiB | 1,452 / 4.3 MiB; held 439, 67 KiB | 1,560 / 4.3 MiB; held 420, 57 KiB |
+| read, from disk | 39 ms | 57 / 4.0 MiB | 1,197 / 4.1 MiB; held 71, 838 KiB | – | – |
+| read again, 1 s later | 25 ms | 57 / 4.0 MiB | 958 / 3.3 MiB; held 215, 3.2 MiB | – | – |
+| overwrite | 335 ms | 103 / 4.0 MiB | 1,428 / 4.2 MiB; held 350, 34 KiB | 1,192 / 4.1 MiB | 1,193 / 4.1 MiB |
+
+**The bytes.** The client's 4 MiB is
+[`create_write_raw()`](https://github.com/ceph/ceph/blob/dc7b747c37c/src/librbd/librbd.cc#L103)
+copying the caller's buffer. The synchronous `rbd_write()` always copies;
+`rbd_aio_write()` copies too by default (`rbd_disable_zero_copy_writes` is
+true), and any RBD cache forces the copy. Each OSD's 4 MiB is the receive buffer of
+[`ProtocolV2::read_frame_segment()`](https://github.com/ceph/ceph/blob/dc7b747c37c/src/msg/async/ProtocolV2.cc#L1228),
+page aligned; BlueStore writes from it without a copy and frees it with
+the transaction. On a read the primary reads into 64 aligned 64 KiB
+buffers, one per blob, and the client receives the reply into one 4 MiB
+buffer and copies it out to the caller.
+
+**The counts.** On the primary the write's 2,022 allocations split by layer
+into BlueStore 1,034, osd 461, messenger 455, RocksDB 26 and pg log 24; on
+each replica BlueStore makes 1,019. 832 of BlueStore's allocations are per
+blob:
+
+| Per 64 KiB blob, new-object write | Size | Stays with the onode |
+|---|---|---|
+| `bluestore::Collection::new_blob` (the Blob) | 120 B | yes |
+| `bluestore_blob_t::init_csum` (crc32c per 4 KiB) | 152 B | yes |
+| `bluestore_blob_use_tracker_t::allocate` | 64 B | yes |
+| `ExtentMap::set_lextent` (the Extent) | 48 B | yes |
+| `bluestore_blob_t::allocated` (physical extents) | 16 B | yes |
+| `KernelDevice::aio_write` (the aio) | 256 B | no |
+| `BufferSpace::write` (the Buffer, writing state) | 128 B | no |
+| `TransContext::add_writing` | 32 B | no |
+| `_do_alloc_write` | 16 + 24 B | no |
+| `_do_write_big`, `WriteContext::write_item`, `map_bl` | 3 × 24 B | no |
+| **13 allocations** | **~900 B** | **5, 400 B** |
+
+All 64 come from one call path in the op thread:
+
+```
+operator new[]
+bluestore::Collection::new_blob
+BlueStore::_do_write_big
+BlueStore::_do_write_data / _do_write / _write
+BlueStore::_txc_add_transaction / queue_transactions
+PrimaryLogPG::queue_transactions
+ReplicatedBackend::submit_transaction
+PrimaryLogPG::issue_repop / execute_ctx / do_op_impl / do_op
+OSD::dequeue_op ... ShardedThreadPool::WorkThreadSharded::entry
+```
+
+The five that stay make 25 KiB per 4 MiB object. The rest of the 72 KiB
+left on the primary is a 12 KiB RocksDB batch, about 11 KiB of op history
+(the ops and their messages), 8 KiB of queued small writes, the 4 KiB
+object-map bitmap, the onode and the pg log entry. An overwrite adds three per blob to release the old
+extents (`OldExtent` 112 B, use-tracker `put` 16 B, `release_extents`
+16 B). A read costs 12 per blob: the 64 KiB buffer and its 88 B raw
+header, the aio (256 + 2 × 24 B), `_read_cache` (64 + 48 + 88 B),
+`_generate_read_result_bl` (72 + 2 × 24 B) and the cache's Buffer (128 B).
+
+**The cache after a read.** The first read left 13 of the 64 blobs
+(832 KiB) in the data cache, the second read the rest. That is PR #73018
+on a cold shard: a shard's limit is 1/8 of its even share plus a share of
+the rest by what it held at the last resize, and this shard held nothing.
+The floor is 208 MiB committed to the data cache / 32 shards / 8 = 832 KiB,
+so `_trim()` cut the 4 MiB down to it at once; the stock even split
+(6.5 MiB) keeps it all. The next resize, at most 50 ms later
+(`bluestore_cache_trim_interval`), raised the shard's limit by what it
+then held, too late for the blobs already trimmed: a cold shard's first
+fill is cut to the floor.
+
+### 16.4 RGW: a 4 MiB PUT and GET
+
+The object fits in its head (`rgw_max_chunk_size` 4 MiB), which maps to
+PG 9.6 (osd.2, osd.3, osd.0); the bucket index shard's primary is osd.1.
+The client is curl with `--aws-sigv4`, one connection per request. A small
+PUT just before the trace refreshes RGW's metadata cache.
+
+| Op | Latency | radosgw | osd.2 (primary) | osd.3 | osd.0 | osd.1 (index) |
+|---|---|---|---|---|---|---|
+| PUT | 399 ms | 1,170 / 4.3 MiB | **2,064 / 8.3 MiB** | 1,054 / 4.1 MiB | 1,366 / 4.3 MiB | 948 / 267 KiB |
+| GET, from disk | 377 ms | 755 / 4.2 MiB | 1,306 / 4.1 MiB; 4.0 MiB held in the cache | – | – | – |
+| GET again | 364 ms | 832 / 4.2 MiB | 881 / 135 KiB | – | – | – |
+
+The counts include radosgw's own background RADOS traffic: in the GET
+window the three OSDs that did not serve the GET made 78–244 I/O-path
+allocations. Net of the idle rate the PUT is about 1,680 allocations on
+osd.2, 690–1,240 on the replicas, 560 on the index shard and 960 in
+radosgw.
+
+radosgw's PUT: a 4 MiB body buffer
+([`RGWPutObj_ObjStore::get_data()`](https://github.com/ceph/ceph/blob/dc7b747c37c/src/rgw/rgw_rest.cc#L1038)),
+a 64 KiB parse buffer per accepted connection (a `Connection` holds a
+64 KiB [`parse_buffer`](https://github.com/ceph/ceph/blob/dc7b747c37c/src/rgw/rgw_asio_frontend_connection.h#L18)),
+and about 1,100 small ones for authentication, boost.asio operations and
+three RADOS ops: the head write, and the bucket index prepare and complete.
+On a GET it serves the client from the 4 MiB reply buffer, without a copy.
+With an expired metadata cache (user and bucket info,
+`rgw_cache_expiry_interval`) the same PUT made 2,013 allocations and
+12 more RADOS reads.
+
+**The primary's second 4 MiB.** 64 aligned 64 KiB buffers, each with its
+88 B raw header and two 24 B list nodes (256 allocations), one call path:
+
+```
+aligned_alloc / tc_posix_memalign
+ceph::buffer::create_aligned
+ceph::buffer::list::rebuild_aligned_size_and_memory
+KernelDevice::aio_write
+map_bl / BlueStore::_do_alloc_write / _do_write / _write
+BlueStore::_txc_add_transaction / queue_transactions
+PrimaryLogPG::queue_transactions / ReplicatedBackend::submit_transaction
+PrimaryLogPG::issue_repop / execute_ctx / do_op
+```
+
+[`KernelDevice::aio_write()`](https://github.com/ceph/ceph/blob/dc7b747c37c/src/blk/kernel/KernelDevice.cc#L1160)
+copies data that is not aligned to the block size before it submits the
+I/O. RGW's data is not aligned because of the op order of the head write,
+as `dump_historic_ops` shows it:
+
+```
+[create, setxattr user.rgw.idtag (62) in=14b, setxattr user.rgw.tail_tag (62) in=17b,
+ writefull 0~4194304, setxattr user.rgw.manifest (368) in=17b, ...]
+```
+
+A message's data segment carries every op's input in op order, and the
+receive buffer is page aligned at its start. The two tag xattrs,
+14 + 62 + 17 + 62 = 155 bytes, come first, so the 4 MiB starts at byte
+155.
+[`prepare_atomic_modification()`](https://github.com/ceph/ceph/blob/dc7b747c37c/src/rgw/driver/rados/rgw_rados.cc#L7934)
+adds the tags before
+[`_do_write_meta()`](https://github.com/ceph/ceph/blob/dc7b747c37c/src/rgw/driver/rados/rgw_rados.cc#L3420)
+appends `write_full`. RBD's write is the first op with input data, so its
+data starts at byte 0. The replicas receive the data in a `MOSDRepOp` and
+do not copy it.
+
+### 16.5 Recovery of one object
+
+The object, `rec1` (4 MiB), maps to PG 7.3 (osd.3, osd.2, osd.0). The run
+stops osd.0 (`noout`), writes the object, sets `norecover`, restarts
+osd.0 and waits for the PG to peer. Then it records 3 s of idle and the
+7 s from `ceph osd unset norecover` to 3 s after the command returns (the
+CLI is slow under the probes). RGW is stopped for the run: its
+background writes to log and gc objects are otherwise recovered too (51
+pulls of small omap objects in one run). The table counts the recovery
+context:
+
+| OSD | Role | Allocations / bytes | Held at the end |
+|---|---|---|---|
+| osd.3 | primary, the source | 1,059 / 4.1 MiB: 64 × 64 KiB reads | 69, 838 KiB: 13 blobs in the data cache |
+| osd.0 | the target | 1,887 / 4.2 MiB: the 64 × 64 KiB realign copy | 341, 29 KiB |
+| osd.0 | the target, messenger | 1 / 4,195,215 B: the `MOSDPGPush` | **pinned for 600 s** |
+| osd.2 | the other replica | 5 / 841 B | – |
+
+The source reads the object the way an RBD read does and keeps 13 blobs of
+it: §15.4's `cache_dont_need` gap, cut to the cold-shard floor of §16.3.
+The target copies the data again because a `PushOp` carries it inside the
+message's payload, not in an aligned data segment.
+
+**The pinned push.** After the recovery osd.0's mempools showed
+`bluestore_writing`: 1 item, 4,195,215 bytes, while nothing was being
+written. That is the push message's receive buffer. This sequence shows
+who holds it:
+
+```
+MOSDPGPush arrives              receive buffer, 4 MiB + 911 B (ProtocolV2::read_frame_segment)
+  decode_payload()              pushes[0].data points into it
+  _do_push → submit_push_data   BlueStore copies it to align it; its Buffer, in writing
+                                state, tags the raw buffer bluestore_writing
+  transaction commits           the copy and the Buffer are freed
+  op done, unregistered         OpRequest::_unregistered(): clear_data(), clear_payload(),
+                                and Message::clear_buffers(), which MOSDPGPush does not override
+  op enters the op history      it keeps the 20 slowest ops of the last 600 s
+  ... 600 s ...                 op dropped → pushes freed → the 4 MiB freed
+```
+
+Evidence, from
+[`pgpush-history-repro.sh`]({{ site.baseurl }}/code/ceph/pgpush-history-repro.sh)
+(no probes; stop a replica, write a 4 MiB object, let it recover, poll the
+target every 30 s): the push arrived at 13:24:17, the target held
+4,195,227 bytes in `bluestore_writing` through 13:33:53 and nothing at
+13:34:23, the sample in which the push left `dump_historic_ops`: 606 s.
+With `osd_op_history_size 0` the traced recovery leaves
+`bluestore_writing` empty, and osd.0 holds 88 KiB at the end of the
+window instead of 4.1 MiB. With the fix of §16.7 it is empty too, while
+the push is still listed in `dump_historic_ops`.
+
+[`Message::clear_data()`](https://github.com/ceph/ceph/blob/dc7b747c37c/src/msg/Message.h#L419)
+calls a virtual `clear_buffers()` so that a message can drop what it
+decoded; `MOSDOp` and `MOSDECSubOpWrite` override it,
+[`MOSDPGPush`](https://github.com/ceph/ceph/blob/dc7b747c37c/src/messages/MOSDPGPush.h#L21)
+does not.
+[`OpHistory::cleanup()`](https://github.com/ceph/ceph/blob/dc7b747c37c/src/common/TrackedOp.cc#L140)
+drops ops older than `osd_op_history_duration` (600 s), then the shortest
+while more than `osd_op_history_size` (20) remain, so a push, slow next to
+a client op, stays the full 10 minutes. The bound per OSD is 20 slots ×
+about 8 MiB (`send_pushes()` fills a message up to `osd_max_push_cost`,
+plus one push) = 160 MiB. A push slower than 10 s also enters the slow-op
+history, which is trimmed by count (20) only, with no time limit. On
+`main` the mempool books it as `bluestore_writing`, the last tag the
+buffer got; v21.3.0's `_add_buffer()` re-tags every buffer
+`bluestore_cache_data` at once (§8.2), where it reads as cached data.
+Either way it points the wrong way.
+
+### 16.6 Scrub
+
+The PG of §16.5, deep scrub then shallow scrub, each started with
+`ceph pg (deep-)scrub 7.3`. The window runs from 0.2 s before the primary
+logs `deep-scrub starts` (reservations come first) to 0.3 s after
+`deep-scrub ok`; the scrub itself took 68 ms. Scrub context only:
+
+| OSD | Deep scrub | Shallow scrub |
+|---|---|---|
+| osd.3 (primary) | 1,008 / 4.1 MiB | 410 / 119 KiB |
+| osd.0 | 840 / 4.1 MiB | 192 / 56 KiB |
+| osd.2 | 746 / 4.1 MiB | 101 / 31 KiB |
+
+Each OSD reads the whole object for its checksum through the same 64 KiB
+per-blob path as a read, and holds nothing afterwards: scrub reads carry
+DONTNEED. The shallow scrub reads only metadata: RocksDB iterators
+(2.5 KiB each) and the primary's scrub bookkeeping.
+
+### 16.7 What to change
+
+| # | Change | Saves | Where |
+|---|---|---|---|
+| 1 | `MOSDPGPush::clear_buffers()`: drop each `PushOp`'s data, omap and attrs, keep what `dump_historic_ops` prints | up to 160 MiB per recovering OSD for 10 minutes | messages/MOSDPGPush.h |
+| 2 | Write the RGW head's data before its tag xattrs | one 4 MiB copy and 256 allocations per PUT on the primary | rgw_rados.cc |
+| 3 | Send push data in the aligned data segment | one copy per push on the target | ReplicatedBackend, MOSDPGPush |
+| 4 | Check the other messages that keep decoded buffers without `clear_buffers()`: `MOSDECSubOpReadReply` (EC read data on the primary), `MOSDRepScrubMap` | not measured | messages/ |
+| 5 | PR #73018: a shard that held nothing gets 1/8 of its even share until the next resize; raise that floor, or resize when a shard fills from empty | the first fill of a cold shard | BlueStore `_resize_shards()` |
+
+Takeaway for tracing allocations in a build without frame pointers: one
+uprobe per distinct allocator address, written to tracefs rather than
+through `perf probe`; DWARF stacks; system-wide recording filtered by
+cgroup; one perf thread per CPU writing to tmpfs.
+
 ## Glossary
 
 | Term | Meaning here |
@@ -2552,7 +3005,7 @@ reaches the allocator only when its discard completes.
 | LRU | Least recently used: evict the entry that went longest without being touched. |
 | 2Q | A cache with a probation list (`warm_in`), a ghost list (`warm_out`) and a main list (`hot`), so one-time reads do not evict repeatedly used data. |
 | age bin | A counter of bytes (or onodes) last touched during one interval; bins shift every `bluestore_cache_age_bin_interval`. |
-| priority (PRI0 to PRI11) | The tuner's twelve levels. PRI0 is the RocksDB caches' high-priority pool plus a 64 MiB minimum; PRI1 to PRI10 are age ranges; PRI11 (`LAST`) is everything older. |
+| priority (PRI0 to PRI11) | The tuner's twelve levels. PRI0 is the RocksDB caches' high-priority pool plus 64 MiB of headroom, rounded up to a chunk; PRI1 to PRI10 are age ranges; PRI11 (`LAST`) is everything older. |
 | PriorityCache | The tuner (`src/common/PriorityCache.cc`) that measures mapped memory and splits a total among caches by priority and ratio. |
 | mapped memory | Memory the allocator holds from the kernel: `generic.heap_size − tcmalloc.pageheap_unmapped_bytes`. |
 | tcmalloc | The memory allocator Ceph is built with. The tuner needs it for its statistics and to release free pages. |
@@ -2612,12 +3065,12 @@ All links point at tag `v21.3.0` of `ceph/ceph`; RocksDB links point at the
 | [`BlueStore::_collection_list()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L13897) | RocksDB iterator over the onode column family (backfill scans) |
 | [`ShardedCache::Insert()`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/ShardedCache.cc#L46) | The RocksDB cache entry point BlueStore's reads reach |
 | [`BinnedLRUCacheShard::Insert()`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/BinnedLRUCache.cc#L422) / [`EvictFromLRU()`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/BinnedLRUCache.cc#L277) / [`FreeDeleted()`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/BinnedLRUCache.cc#L296) / [`SetCapacity()`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/BinnedLRUCache.cc#L307) | Insert with eviction; the tuner's resize |
-| [`Manager::tune_memory()`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/PriorityCache.cc#L119) | Moves the cache budget toward `target − mapped`, between `min` and `max` (§5, §14.3) |
+| [`Manager::tune_memory()`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/PriorityCache.cc#L119) | Grows the cache budget toward `max` while mapped < target and shrinks it toward `min` while mapped > target, by the relative gap (§5, §14.3) |
 | [`get_cgroup_memory_limit()`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/util.cc#L173) / [`POD_MEMORY_LIMIT` in `config.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/config.cc#L553) | Where a container limit becomes the default target (§14.3) |
 | [`RocksDBStore::submit_common()`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/RocksDBStore.cc#L1607) | One BlueStore transaction, one RocksDB write batch (§15.3) |
 | [`RocksDBStore::verify_sharding()`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/RocksDBStore.cc#L1034) | Column-family options come from the definition stored at mkfs (§15.3) |
 | [`WriteBufferManager::ShouldFlush()`](https://github.com/ceph/rocksdb/blob/24ea35870fe9b3ba15285ec8746ba97ed5d67ff3/include/rocksdb/write_buffer_manager.h#L94) | Memtable budget test: active memtables only (§15.3.5) |
-| [`DBImpl::SwitchWAL()`](https://github.com/ceph/rocksdb/blob/24ea35870fe9b3ba15285ec8746ba97ed5d67ff3/db/db_impl/db_impl_write.cc#L1559) / [`MemTableList::IsFlushPending()`](https://github.com/ceph/rocksdb/blob/24ea35870fe9b3ba15285ec8746ba97ed5d67ff3/db/memtable_list.cc#L370) | The two automatic flush triggers (§15.3.2) |
+| [`DBImpl::SwitchWAL()`](https://github.com/ceph/rocksdb/blob/24ea35870fe9b3ba15285ec8746ba97ed5d67ff3/db/db_impl/db_impl_write.cc#L1559) / [`MemTableList::IsFlushPending()`](https://github.com/ceph/rocksdb/blob/24ea35870fe9b3ba15285ec8746ba97ed5d67ff3/db/memtable_list.cc#L370) | The WAL-full switch, and the merge-count gate on scheduling a flush (§15.3.2) |
 | [`PrimaryLogPG::recover_replicas()`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L13984) / [`recover_backfill()`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PrimaryLogPG.cc#L14152) | Background recovery; never sets `cache_dont_need` (§15.4) |
 | [`ReplicatedBackend::start_pushes()`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L2611) / [`build_push_op()`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/ReplicatedBackend.cc#L2238) | Push read with or without DONTNEED (§15.4) |
 | [`BlueStore::_do_readv()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L13562) | Buffered unless DONTNEED or NOCACHE (§15.4) |
@@ -2625,5 +3078,10 @@ All links point at tag `v21.3.0` of `ceph/ceph`; RocksDB links point at the
 | [`pg_log_entry_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.h#L4525) / [`pg_log_t`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/osd_types.h#L4733) | Log entry and the mempool lists (§15.5) |
 | [`PGLog::IndexedLog`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PGLog.h#L172) / [`get_request()`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PGLog.h#L404) | Hash indexes outside the mempool, built on lookup (§15.5) |
 | [`OSDService::get_target_pg_log_entries()`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OSD.cc#L9750) / [`IndexedLog::trim()`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/PGLog.cc#L56) | Entries per PG; entries to dups (§15.5) |
+| [`Message::clear_buffers()`](https://github.com/ceph/ceph/blob/v21.3.0/src/msg/Message.h#L416) / [`OpRequest::_unregistered()`](https://github.com/ceph/ceph/blob/v21.3.0/src/osd/OpRequest.cc#L96) | What a finished op drops; `MOSDPGPush` keeps its decoded pushes (§16.5) |
+| [`OpHistory::cleanup()`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/TrackedOp.cc#L136) | The op history: 600 s, then the 20 slowest (§16.5) |
+| [`KernelDevice::aio_write()`](https://github.com/ceph/ceph/blob/v21.3.0/src/blk/kernel/KernelDevice.cc#L1143) | Copies data that is not block aligned before the I/O (§16.4, §16.5) |
+| [`RGWRados::Object::prepare_atomic_modification()`](https://github.com/ceph/ceph/blob/v21.3.0/src/rgw/driver/rados/rgw_rados.cc#L7534) | Adds the tag xattrs ahead of the head's `write_full` (§16.4) |
+| [`create_write_raw()`](https://github.com/ceph/ceph/blob/v21.3.0/src/librbd/librbd.cc#L103) | librbd's copy of the caller's buffer (§16.3) |
 
 {% include mermaid.html %}
