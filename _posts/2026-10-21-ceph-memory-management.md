@@ -100,10 +100,22 @@ routine tuning. The loop has three preconditions, all defaults:
 - **Not a limit.** The caches shrink only once mapped memory is over the
   target, and only down to their floor (§1.3); if memory outside the caches
   keeps growing, mapped memory stays over. A hard bound is the cgroup's job.
-- **Mapped, not RSS.** The option's own description warns that RSS ran up
-  to 20 % above mapped memory on some kernels during development, because
-  the kernel does not always reclaim the pages tcmalloc unmapped. Leave that
-  margin between the target and a cgroup limit (§1.5).
+- **Mapped, not RSS.** Mapped is tcmalloc's own count: the OSD's live heap
+  plus tcmalloc's free lists (§5). It also counts heap pages never touched
+  or swapped out, which RSS does not. RSS also counts the binary and
+  libraries, tcmalloc's metadata, thread stacks and memory allocated outside
+  tcmalloc, which mapped does not. On an idle OSD of the test VM (§14) the
+  two errors nearly cancel: mapped 148 MiB, anonymous RSS 147.9 MiB, total
+  RSS 186.6 MiB with 38.7 MiB of file pages.
+- **The "20 %" warning.** The option's description says RSS ran up to 20 %
+  above mapped during development, because the kernel did not always
+  reclaim the pages tcmalloc unmapped. That cause does not hold for
+  gperftools 2.15 on Linux: it releases pages with `MADV_DONTNEED`
+  (`MADV_FREE` is compiled out,
+  [system-alloc.cc:63](https://github.com/gperftools/gperftools/blob/gperftools-2.15/src/system-alloc.cc#L63)),
+  which drops them from RSS at once. A cgroup limit still needs a margin
+  above the target, since the cgroup also charges file pages and page cache
+  (§1.5).
 - **Its floor.** The minimum of 896 MiB is the sum of the defaults of
   `osd_memory_base` and `osd_memory_cache_min`, written as a constant in the
   yaml: it does not follow when either option changes. `ceph config set`
@@ -249,7 +261,7 @@ so only a ratio in the OSD's local ceph.conf, or the default, is seen; one
 set with `ceph config set` never takes effect, even after a restart.
 
 - **Limit alone:** limit × ratio becomes the *default*, so any configured
-  value overrides it. 0.8 puts the limit 25 % above the target, the RSS
+  value overrides it. 0.8 puts the limit 25 % above the target, the
   margin of §1.2.
 - **Request as well:** `POD_MEMORY_REQUEST` is set at env level, capped at
   limit × ratio when both exist. Kubernetes fills the request with the
