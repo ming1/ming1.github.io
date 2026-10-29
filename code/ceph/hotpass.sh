@@ -203,7 +203,8 @@ hot() {
 }
 
 shards() {   # primaries per cache shard, per OSD: the imbalance behind the stall
-    local n; n=$(ceph daemon osd.0 config show | python3 -c 'import sys,json; d=json.load(sys.stdin); print(int(d["osd_op_num_shards"]) or int(d["osd_op_num_shards_ssd"]))' 2>/dev/null || echo 8)
+    # the cache shard count is osd_num_cache_shards (default 32), not the op-queue shard count
+    local n; n=$(ceph daemon osd.0 config get osd_num_cache_shards | python3 -c 'import sys,json; print(int(json.load(sys.stdin)["osd_num_cache_shards"]))' 2>/dev/null || echo 32)
     ceph pg dump pgs_brief -f json | python3 -c '
 import sys, json, collections
 n = int(sys.argv[1]); d = json.load(sys.stdin); pgs = d["pg_stats"] if "pg_stats" in d else d
