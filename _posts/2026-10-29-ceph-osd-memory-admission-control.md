@@ -51,7 +51,7 @@ RBD is not one of the workloads the changes aim at; it is the check that a
 hot set is still cached and that throughput holds (§4.4 has both pairs of
 RBD runs and the run-to-run spread).
 
-![osd.0 peak RSS per workload, unchanged build against the build with the three changes]({{ site.baseurl }}/assets/images/ceph-osd-mem-admission-peaks.png)
+![osd.0 peak RSS per workload, unchanged build against the build with the three changes]({{ site.baseurl }}/assets/images/ceph-osd-mem-admission-peaks-all.png)
 
 With §3.1 and the onode-cache change (§3.2), without §3.3, the numbers were: scrub 3.34, recovery
 3.94 / 2.00, RGW PUT 4M 1.59, PUT 4K 2.26, GET 4M 4.00, GET 4K 3.76, RBD
