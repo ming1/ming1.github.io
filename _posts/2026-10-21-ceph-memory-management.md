@@ -27,50 +27,258 @@ which is the only place other daemons enter the picture.
 "Mapped" means memory the process has actually taken from the kernel and not
 given back, as reported by the memory allocator (tcmalloc). It is not a hard
 limit. The OSD does not refuse allocations when it goes over; it shrinks its
-caches until it comes back under.
+caches to make room, down to a floor. Six more options decide where the number
+comes from and what BlueStore does with it.
 
-The options around it, all in
-[`src/common/options/global.yaml.in`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L3913):
+### 1.1 The seven options in one view
 
-| Option | Default | Meaning |
-|---|---|---|
-| `osd_memory_target` | 4 GiB (min 896 MiB) | Memory the OSD tries to keep mapped. Must be at least `osd_memory_base + osd_memory_cache_min`. Changeable at runtime. |
-| `osd_memory_base` | 768 MiB | Estimate of the memory the OSD needs *without* caches. Subtracted from the target before caches are sized. |
-| `osd_memory_expected_fragmentation` | 0.15 | Fraction of the target assumed lost to allocator fragmentation. |
-| `osd_memory_cache_min` | 128 MiB (min 128 MiB) | The least memory the caches get, whatever the target. |
-| `osd_memory_cache_resize_interval` | 1 s | How often the tuner re-measures mapped memory and resizes. |
-| `osd_memory_target_cgroup_limit_ratio` | 0.8 | In a container, the target defaults to the pod's memory limit times this ratio. |
-| `osd_memory_target_autotune` | false | Lets cephadm set the target per host (§11). |
+```
+                       who sets the target (§1.5)
+  ┌──────────────────────────────────────────────────────────────┐
+  │ container  POD_MEMORY_LIMIT                                  │
+  │              × osd_memory_target_cgroup_limit_ratio,         │
+  │            or POD_MEMORY_REQUEST                             │
+  │ cephadm    osd_memory_target_autotune → osd/host:X           │
+  │ operator   ceph config set osd... osd_memory_target          │
+  └───────────────────────────────┬──────────────────────────────┘
+                                  ▼
+                   osd_memory_target: the setpoint (§1.2)
+                   "keep tcmalloc's mapped bytes here"
+                                  │
+            ┌─────────────────────┴───────────────────────┐
+            ▼                                             ▼
+  cache range (§1.3)                          loop (§1.4)
+  static, from options only                   measured, every
+  ceiling = target × (1 − frag) − base        osd_memory_cache_resize_interval:
+  floor   = osd_memory_cache_min                mapped < target → grow the total
+                                                mapped ≥ target → shrink the total
+            └─────────────────────┬───────────────────────┘
+                                  ▼
+             caches' total, kept in [floor, ceiling]   (tuned_mem, §5)
+             split between kv | kv_onode | meta | data (§6)
 
-### 1.1 Where the number comes from
+  frag = osd_memory_expected_fragmentation      base = osd_memory_base
+```
 
-This flowchart shows the three ways `osd_memory_target` gets its value, from
-lowest to highest precedence.
+All seven are defined in
+[`src/common/options/global.yaml.in`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L3913)
+(L3913–L4017):
+
+| Group | Option | Default | Level | Takes effect | Role |
+|---|---|---|---|---|---|
+| setpoint | `osd_memory_target` | 4 GiB (min 896 MiB) | basic | at runtime | Mapped memory the tuner steers toward. |
+| cache range | `osd_memory_base` | 768 MiB | dev | at runtime | Guess of the non-cache memory; lowers the ceiling. |
+| | `osd_memory_expected_fragmentation` | 0.15 | dev | at runtime | Share of the target assumed lost in the allocator; lowers the ceiling. |
+| | `osd_memory_cache_min` | 128 MiB (min 128 MiB) | dev | at runtime | Floor of the caches' total. |
+| loop | `osd_memory_cache_resize_interval` | 1 s | dev | at mount | Period of the measure-and-resize step. |
+| who sets it | `osd_memory_target_cgroup_limit_ratio` | 0.8 (0 = off) | advanced | at process start, from ceph.conf only | Container: default target = `POD_MEMORY_LIMIT` × ratio. |
+| | `osd_memory_target_autotune` | false (`cephadm bootstrap` sets true) | advanced | next cephadm pass, about 10 min | cephadm splits a host's memory between its OSDs. |
+
+Only the target is `basic`; four of the seven are `dev`, not meant for
+routine tuning. The loop has three preconditions, all defaults:
+
+- **`bluestore_cache_autotune = true` and `rocksdb_cache_type = binned_lru`.**
+  With either off, no PriorityCache manager is created
+  ([L5569](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L5569)):
+  the caches get the fixed `bluestore_cache_size` (or `_hdd` 1 GiB / `_ssd`
+  3 GiB) split by the ratios, and none of the seven options sizes a cache.
+- **tcmalloc.** Without it the loop never runs `tune_memory()`: the caches'
+  total is fixed at the mount-time ceiling (§5), and the "at runtime"
+  changes in the table do not move it. Their setters only store the new
+  numbers
+  ([PriorityCache.h:138](https://github.com/ceph/ceph/blob/v21.3.0/src/common/PriorityCache.h#L138));
+  `tune_memory()` is what clamps the total to them.
+
+### 1.2 The setpoint: `osd_memory_target`
+
+- **What it sizes.** Only the four caches, through the feedback loop of §5:
+  each round the tuner reads mapped memory and moves the caches' total
+  toward what is left of the target. Memtables, the pg log and in-flight
+  messages have bounds of their own (§14, §15). Nothing in `src/osd/OSD.cc`
+  or `src/ceph_osd.cc` reads the option; the OSD never caps the allocator,
+  only BlueStore acts on the number.
+- **Not a limit.** The caches shrink only once mapped memory is over the
+  target, and only down to their floor (§1.3); if memory outside the caches
+  keeps growing, mapped memory stays over. A hard bound is the cgroup's job.
+- **Mapped, not RSS.** The option's own description warns that RSS ran up
+  to 20 % above mapped memory on some kernels during development, because
+  the kernel does not always reclaim the pages tcmalloc unmapped. Leave that
+  margin between the target and a cgroup limit (§1.5).
+- **Its floor.** The minimum of 896 MiB is the sum of the defaults of
+  `osd_memory_base` and `osd_memory_cache_min`, written as a constant in the
+  yaml: it does not follow when either option changes. `ceph config set`
+  rejects a smaller value; through `POD_MEMORY_LIMIT` the OSD asserts at
+  start instead (a limit below 1120 MiB at ratio 0.8,
+  [config.cc:276]({GH}src/common/config.cc#L276)), and a
+  too-small `POD_MEMORY_REQUEST` is dropped silently. Up to about 1054 MiB the caches get no tuning range at all
+  (§1.3).
+- **Other readers.** fsck sizes its shared-blob tracker from it
+  (target × `bluestore_fsck_shared_blob_tracker_size` 0.03125 = 128 MiB at
+  4 GiB,
+  [L11060](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L11060)),
+  and the allocation-map checks pass it to `compare_allocators()`.
+- **Runtime.** A change reaches the tuner within one loop pass (0.05 s,
+  §10); the caches follow at the next `tune_memory()` and `balance()`,
+  within 5 s.
+
+### 1.3 The cache range: `osd_memory_base`, `osd_memory_expected_fragmentation`, `osd_memory_cache_min`
+
+These three never measure anything. With the target they fix the range
+[floor, ceiling] of the §1.1 diagram; when the ceiling formula does not
+clear the floor, the ceiling is the floor. The code is
+[`MempoolThread::entry()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L5562),
+repeated in
+[`_update_cache_settings()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L5765)
+after a change; §2 has the default numbers.
+
+Base and fragmentation are a cap on the caches, not a reservation: nothing
+checks that the non-cache memory fits in them. The loop still aims mapped
+memory at the target, so two cases follow (target 4 GiB, ceiling 2713 MiB):
+
+```
+                     0                               2713            4096 MiB
+                     |─ caches may use ──────────────|─ base + frag ─|
+                                                      1382 MiB
+ A: non-cache 0.4G   |═══════════════════════════════|░░░░|             mapped < target
+ B: non-cache 2G     |═══════════════════════|░░░░░░░░░░░░░░░░░░░░░░░|  mapped ≈ target
+
+ ═ caches   ░ memory outside the caches
+```
+
+In case A, base + fragmentation decide the cache size: the caches stop at
+the ceiling, below what the target would allow. That is what the test VM of
+§14 showed, with 0.1–0.46 GiB outside the caches. In case B the loop
+decides it, and the three options only bound how far it can go.
+
+**`osd_memory_base`** (768 MiB). The guess for everything that is not
+cache: memtables, pg log, in-flight messages, OSD maps, threads, tcmalloc
+free lists. It is subtracted whole at every target, so it weighs more as the
+target shrinks: alone it is 19 % of 4 GiB and 38 % of 2 GiB; with the
+fragmentation share, a third and more than half (§14.1). Raising it only
+lowers the ceiling; it hands memory to nothing. Which parts it has to cover
+and when the guess is too low is §14 and §15.
+
+**`osd_memory_expected_fragmentation`** (0.15, range 0–1). The share of the
+*target* assumed held by the allocator but used by no object. Unlike the
+base it scales: 614 MiB at 4 GiB, 1.2 GiB at 8 GiB. The code comment calls
+it overhead "that scales with cache usage", but it is taken from the target,
+not from the cache size.
+
+Both are also read by the monitor: with `mon_memory_autotune`,
+[`OSDMonitor::_set_cache_sizes()`](https://github.com/ceph/ceph/blob/v21.3.0/src/mon/OSDMonitor.cc#L610)
+uses them for the ceiling of its own caches (its RocksDB block cache and
+the two osdmap caches) under `mon_memory_target`, read when the mon starts.
+Set them under `osd`, not `global`, or the mons move too at their next
+restart.
+
+**`osd_memory_cache_min`** (128 MiB, also its own minimum). The floor that
+[`tune_memory()`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/PriorityCache.cc#L119)
+never shrinks the total below, and the total's start value. It bounds the
+total handed out, not the caches' footprint: each of the four caches still
+commits its 64 MiB headroom on top (§6.3), so at the floor they hold
+256 MiB. Two consequences:
+
+- The floor wins over the target. Shrinking from the ceiling to the floor
+  frees about ceiling − 256 MiB: ≈ 2.4 GiB at 4 GiB, ≈ 0.7 GiB at 2 GiB.
+  Past that, mapped memory stays over the target (§1.2).
+- If (1 − frag) × target does not clear base + min, there is no range:
+  `max = min`. With the defaults that is any target up to
+  (768 + 128) / 0.85 ≈ 1054 MiB, so every target from the 896 MiB floor to
+  1054 MiB gives the same caches.
+
+The option's description warns that a low value thrashes the caches.
+
+### 1.4 The loop period: `osd_memory_cache_resize_interval`
+
+How often `bstore_mempool` runs `tune_memory()` (step 4 of §4, gated at
+[L5648](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L5648)).
+Each run does two things: asks tcmalloc to release its free pages to the
+kernel, and moves the caches' total one step: toward the ceiling while
+mapped < target, toward the floor otherwise, by (relative gap) × (room
+left) (§5).
+
+- **The total reaches the caches at `balance()`**, every
+  `bluestore_cache_autotune_interval` (5 s). With the defaults five
+  measurements happen per balance; below 5 s the interval adds steps between
+  balances, above it slows the reaction to growth outside the caches. The
+  option's description warns that too short an interval thrashes the
+  allocator.
+- **`0` stops both the measurement and the release.** The gate is
+  `resize_interval > 0`, so the total keeps the value from the constructor's
+  single call (§5) for the life of the OSD, and runtime changes to the
+  sizing options no longer move it.
+- **Mount only.** It has no `runtime` flag and is read once in
+  [`_set_cache_sizes()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L6155)
+  (§10).
+- **tcmalloc only.** Without it this step is skipped
+  ([L5649](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L5649));
+  age bins, `balance()` and `_resize_shards()` still run.
+
+### 1.5 Who sets the target: `osd_memory_target_cgroup_limit_ratio`, `osd_memory_target_autotune`
+
+The value in effect comes from the highest-priority source that has one.
+[`ConfigValues::get_value()`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/config_values.cc#L56)
+takes the highest level, in the order of
+[`config.h`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/config.h#L33):
+default < mon < file < env < cmdline < override. This flowchart lists the
+sources from lowest to highest.
 
 ```mermaid
 flowchart TD
-    A["Option default: 4 GiB"] --> D["osd_memory_target in effect"]
-    B["Container: POD_MEMORY_LIMIT env var<br/>× osd_memory_target_cgroup_limit_ratio<br/>(config.cc:545)"] -->|"sets the default"| D
-    B2["POD_MEMORY_REQUEST env var, if set:<br/>request, or min(request, limit × ratio)<br/>when the limit is set too (config.cc:565)"] -->|"sets the value at env level"| D
-    C["cephadm autotune, if enabled:<br/>ceph config set osd/host:X osd_memory_target"] -->|"sets it in the monitor config"| D
-    E["Operator: ceph config set osd.N osd_memory_target"] --> D
+    A["1. option default: 4 GiB"] --> D
+    B["2. POD_MEMORY_LIMIT × osd_memory_target_cgroup_limit_ratio<br/>replaces the default (config.cc:558)"] --> D
+    C["3. mon config store, most specific mask first:<br/>osd.N, osd/host:X (cephadm autotune), osd, global"] --> D
+    E["4. ceph.conf on the OSD host"] --> D
+    F["5. POD_MEMORY_REQUEST, capped at limit × ratio<br/>env level (config.cc:582)"] --> D
+    G["6. --osd_memory_target on the command line,<br/>then ceph tell osd.N config set"] --> D
+    D["osd_memory_target in effect:<br/>the highest-numbered source with a value"]
 ```
 
-Take away: the container path reads environment variables that the
-orchestrator sets, not the cgroup files; the cgroup limit itself is only
-reported in daemon metadata.
+Take away: the container path reads environment variables the orchestrator
+sets, not cgroup files, and a pod memory request beats anything set with
+`ceph config set`.
 
-In detail, from
-[`md_config_t::parse_env()`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/config.cc#L475):
+**`osd_memory_target_cgroup_limit_ratio`** (0.8, range 0–1). Read once at
+process start by
+[`md_config_t::parse_env()`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/config.cc#L475),
+for OSDs only, and only when the orchestrator exported `POD_MEMORY_LIMIT`
+(Rook does, from the container's memory limit). It runs before the command
+line, `CEPH_ARGS` and the mon config are applied
+([`global_init.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/global/global_init.cc#L174)),
+so only a ratio in the OSD's local ceph.conf, or the default, is seen; one
+set with `ceph config set` never takes effect, even after a restart.
 
-1. If `POD_MEMORY_LIMIT` is set and the ratio is above 0, the limit times the
-   ratio becomes the *default* of `osd_memory_target`.
-2. If `POD_MEMORY_REQUEST` is set, it is set as `osd_memory_target` at
-   environment level; when the limit is also set, the smaller of the request
-   and (limit × ratio) is used.
-3. Nothing in `src/osd/OSD.cc` or `src/ceph_osd.cc` reads
-   `osd_memory_target`. The OSD process itself never caps the allocator;
-   only BlueStore acts on the number.
+- **Limit alone:** limit × ratio becomes the *default*, so any configured
+  value overrides it. 0.8 puts the limit 25 % above the target, the RSS
+  margin of §1.2.
+- **Request as well:** `POD_MEMORY_REQUEST` is set at env level, capped at
+  limit × ratio when both exist. Kubernetes fills the request with the
+  limit when only a limit is given, which is why the cap is taken. Env
+  beats the mon store and ceph.conf, so `ceph config set` cannot change
+  this OSD's target; only `ceph tell` or the command line can.
+- **0** turns off the limit path; a request still applies, uncapped.
+- A plain container with a cgroup limit but no `POD_MEMORY_LIMIT` keeps
+  4 GiB.
+
+**`osd_memory_target_autotune`** (false). Read by the cephadm mgr module, not
+by the OSD; §11 has the algorithm.
+
+- **On in practice.** `cephadm bootstrap` writes
+  `osd_memory_target_autotune = true` under `[osd]` in the bootstrap config
+  and assimilates it into the mon store
+  ([`cephadm.py`](https://github.com/ceph/ceph/blob/v21.3.0/src/cephadm/cephadm.py#L2618)),
+  so cephadm clusters start with it on.
+- **Per OSD and per host.** It is read per daemon
+  ([`autotune.py`](https://github.com/ceph/ceph/blob/v21.3.0/src/pybind/mgr/cephadm/autotune.py#L54)):
+  turning it off for `osd.N` takes that OSD out of the split and subtracts
+  its own target from the host budget first. A whole host opts out with the
+  `_no_autotune_memory` label.
+- **Overwrites per-OSD values.** The result goes to the mask
+  `osd/host:<short hostname>` every `autotune_interval` (10 min). Since
+  `osd.N` would beat that mask, cephadm deletes any differing `osd.N` value
+  on an autotuned OSD
+  ([`serve.py`](https://github.com/ceph/ceph/blob/v21.3.0/src/pybind/mgr/cephadm/serve.py#L212)).
+  To pin one OSD's target, turn its autotune off first.
 
 ## 2. From the target to a cache ceiling
 
@@ -926,7 +1134,8 @@ and
 | Option | Takes effect |
 |---|---|
 | `osd_memory_target`, `osd_memory_base`, `osd_memory_cache_min`, `osd_memory_expected_fragmentation` | At runtime, within one loop pass (0.05 s): the change flags `config_changed`, the thread calls `_update_cache_settings()`. |
-| `bluestore_cache_autotune`, `bluestore_cache_autotune_interval`, `bluestore_cache_age_bin_interval`, `osd_memory_target_cgroup_limit_ratio` | Tracked, but no handler: only at mount. |
+| `bluestore_cache_autotune`, `bluestore_cache_autotune_interval`, `bluestore_cache_age_bin_interval` | Tracked, but no handler: only at mount. |
+| `osd_memory_target_cgroup_limit_ratio` | Tracked, but only `parse_env()` reads it, at process start and from ceph.conf (§1.5). |
 | `bluestore_cache_age_bins_*` | Only at mount. The tracked key names (`bluestore_cache_kv_age_bins` and so on) do not match the real option names, and there is no handler for them. |
 | `osd_memory_cache_resize_interval` | Only at mount; it is read once in `_set_cache_sizes()`. |
 | `osd_num_cache_shards` | Startup only. |
@@ -1183,8 +1392,9 @@ on every column once it is allowed to hold the data.
 
 The target sizes the caches and nothing else. Everything else the OSD
 allocates has its own bound, set by other options, and `osd_memory_base`
-is a fixed guess for the sum of those bounds. At 4 GiB the guess is a third
-of the target; at 2 GiB it is more than half. Measured on four capped OSDs,
+is a fixed guess for the sum of those bounds. With the fragmentation share,
+the part kept from the caches is a third of the target at 4 GiB and more
+than half at 2 GiB. Measured on four capped OSDs,
 a 2 GiB target never came close to its cgroup limit, so 2 GiB works for a
 normal read/write/recovery mix. It is not a safe *default* until the parts
 outside the target are tied to it.
@@ -1284,8 +1494,8 @@ The tuner measures `mapped` once per round and moves the caches toward
 `target − mapped`
 ([`tune_memory()`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/PriorityCache.cc#L119)).
 It sees a memtable or a message buffer only after it was allocated. The
-caches can give back at most `ceiling − osd_memory_cache_min` (845 MiB at
-2 GiB), and the shrink is one step per `bluestore_cache_autotune_interval`
+caches can give back at most about ceiling − 256 MiB (≈ 717 MiB at 2 GiB,
+§1.3), and the shrink is one step per `bluestore_cache_autotune_interval`
 (5 s). Anything outside the caches that grows faster or larger than that
 makes RSS pass the target; whether the OSD dies is then decided by the
 cgroup, not by Ceph.
