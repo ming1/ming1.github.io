@@ -1,7 +1,7 @@
 #!/bin/bash
 # One experiment: optional OSD config, restart the cluster (fresh daemons, same data), run the steps under
 # memtop into /root/git/ceph/wt/memtop-exp/<tag>, then remove the config again.
-#   usage: exp4.sh <tag> [-o key=value]... [-b binary-name]... <step>...
+#   usage: memtop-exp.sh <tag> [-o key=value]... [-b binary-name]... <step>...
 #   steps: put4k get4m (single RGW phases)  rgw recovery scrub rbd idle restart (as in memrun3.sh)
 set -e
 tag=$1; shift
