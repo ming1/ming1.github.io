@@ -1,0 +1,52 @@
+From fe0fd02754dc52b79390648393c0fbd1f2d51677 Mon Sep 17 00:00:00 2001
+From: Ming Lei <ming.lei@clyso.com>
+Date: Thu, 29 Oct 2026 03:46:29 -0500
+Subject: [PATCH 1/3] osd: do not cache data read for recovery pushes
+
+RecoveryHandle::cache_dont_need was never set, so the first chunk of every
+push (the whole object up to osd_recovery_max_chunk) was read with no
+fadvise flag, and BlueStore kept it in its buffer cache although recovery
+reads it once. Measured on a 2-OSD cluster: the source OSD's data cache
+grew from 0 to 1.10 GiB during backfill, and the cache tuner evicted
+onodes to make room for it.
+
+Default the flag to true. Keep it false only in maybe_kick_recovery, where
+a client op is waiting for the object and will read it next.
+---
+ src/osd/PGBackend.h     | 4 +++-
+ src/osd/PrimaryLogPG.cc | 1 +
+ 2 files changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/src/osd/PGBackend.h b/src/osd/PGBackend.h
+index 985ddac00a5..8cceacdc2c9 100644
+--- a/src/osd/PGBackend.h
++++ b/src/osd/PGBackend.h
+@@ -350,10 +350,12 @@ typedef std::shared_ptr<const OSDMap> OSDMapRef;
+     * the pending recovery operations.
+     */
+    struct RecoveryHandle {
++     /// Data read to push an object is read once; do not let it fill the
++     /// store's buffer cache.  Cleared where a client is waiting for the object.
+      bool cache_dont_need;
+      std::map<pg_shard_t, std::vector<std::pair<hobject_t, eversion_t> > > deletes;
+ 
+-     RecoveryHandle(): cache_dont_need(false) {}
++     RecoveryHandle(): cache_dont_need(true) {}
+      virtual ~RecoveryHandle() {}
+    };
+ 
+diff --git a/src/osd/PrimaryLogPG.cc b/src/osd/PrimaryLogPG.cc
+index 46125216406..6156380787c 100644
+--- a/src/osd/PrimaryLogPG.cc
++++ b/src/osd/PrimaryLogPG.cc
+@@ -632,6 +632,7 @@ void PrimaryLogPG::maybe_kick_recovery(
+   } else {
+     dout(7) << "object " << soid << " v " << v << ", recovering." << dendl;
+     PGBackend::RecoveryHandle *h = pgbackend->open_recovery_op();
++    h->cache_dont_need = false;  // a client op is waiting to read this object
+     if (is_missing_object(soid)) {
+       recover_missing(soid, v, CEPH_MSG_PRIO_HIGH, h);
+     } else if (recovery_state.get_missing_loc().is_deleted(soid)) {
+-- 
+2.56.0
+

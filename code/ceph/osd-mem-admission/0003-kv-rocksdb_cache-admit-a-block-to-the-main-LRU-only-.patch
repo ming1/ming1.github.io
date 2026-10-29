@@ -1,0 +1,326 @@
+From 0f9fd68c0a5899d9aa6026ce2c0e1e339bf83526 Mon Sep 17 00:00:00 2001
+From: Ming Lei <ming.lei@clyso.com>
+Date: Thu, 29 Oct 2026 05:17:17 -0500
+Subject: [PATCH 3/3] kv/rocksdb_cache: admit a block to the main LRU only when
+ it is used again later
+
+The binned LRU block cache inserts every block at the head of its
+low-priority pool, so one pass over many keys (backfill listing a
+collection, deep scrub reading every object's omap) fills the whole cache
+with blocks that are never read again, and the memory tuner grows the
+cache for them because they sit in its most recent age bins. Measured
+during backfill on a 2-OSD cluster: the onode block cache grew from 0.1
+to 0.9 GiB of listed onode values while the OSD ran at its memory target.
+
+Keep new blocks at the tail of the list, on probation, bounded by
+rocksdb_cache_probation_ratio of the capacity (default 0.1), and move a
+block into the main pool only when it is used in two cache age bins later
+than the one it came in. The hits of one op on the same block do not
+count, and neither does the one later use that a block gets when it
+straddles two scan chunks (an onode block holds about eight onodes, a
+scrub chunk fifteen objects). Probation bytes are left out of the age
+bins, so the tuner sees them at its lowest priority and does not grow the
+cache for them.
+---
+ src/common/options/global.yaml.in      | 15 +++++
+ src/kv/rocksdb_cache/BinnedLRUCache.cc | 88 ++++++++++++++++++++++----
+ src/kv/rocksdb_cache/BinnedLRUCache.h  | 37 +++++++++++
+ 3 files changed, 126 insertions(+), 14 deletions(-)
+
+diff --git a/src/common/options/global.yaml.in b/src/common/options/global.yaml.in
+index b30fc9b1ba7..7529c529dd7 100644
+--- a/src/common/options/global.yaml.in
++++ b/src/common/options/global.yaml.in
+@@ -3674,6 +3674,21 @@ options:
+     https://github.com/facebook/rocksdb/wiki/Partitioned-Index-Filters for more
+     information.'
+   default: 20
++- name: rocksdb_cache_probation_ratio
++  type: float
++  level: advanced
++  desc: Share of a binned_lru RocksDB block cache that holds blocks used only once.
++    A new block sits in this probation part and moves to the main part only
++    when it is used again in a later cache age bin; the memory tuner does not
++    grow the cache for blocks still on probation. One pass over many keys (a
++    collection listing, an omap scan) then recycles the probation part instead
++    of filling the cache. 0 disables it.
++  default: 0.1
++  min: 0
++  max: 1
++  see_also:
++  - rocksdb_cache_type
++  - bluestore_cache_age_bin_interval
+ - name: rocksdb_cache_index_and_filter_blocks
+   type: bool
+   level: dev
+diff --git a/src/kv/rocksdb_cache/BinnedLRUCache.cc b/src/kv/rocksdb_cache/BinnedLRUCache.cc
+index d615b71d4db..2426a9fb051 100644
+--- a/src/kv/rocksdb_cache/BinnedLRUCache.cc
++++ b/src/kv/rocksdb_cache/BinnedLRUCache.cc
+@@ -122,6 +122,11 @@ BinnedLRUCacheShard::BinnedLRUCacheShard(CephContext *c, size_t capacity, bool s
+   lru_.next = &lru_;
+   lru_.prev = &lru_;
+   lru_low_pri_ = &lru_;
++  lru_probation_ = &lru_;
++  probation_usage_ = 0;
++  probation_ratio_ =
++    c ? c->_conf.get_val<double>("rocksdb_cache_probation_ratio") : 0.0;
++  probation_capacity_ = 0;
+   SetCapacity(capacity);
+ }
+ 
+@@ -208,6 +213,9 @@ void BinnedLRUCacheShard::LRU_Remove(BinnedLRUHandle* e) {
+   if (lru_low_pri_ == e) {
+     lru_low_pri_ = e->prev;
+   }
++  if (lru_probation_ == e) {
++    lru_probation_ = e->prev;
++  }
+   e->next->prev = e->prev;
+   e->prev->next = e->next;
+   e->prev = e->next = nullptr;
+@@ -215,6 +223,9 @@ void BinnedLRUCacheShard::LRU_Remove(BinnedLRUHandle* e) {
+   if (e->InHighPriPool()) {
+     ceph_assert(high_pri_pool_usage_ >= e->charge);
+     high_pri_pool_usage_ -= e->charge;
++  } else if (e->InProbation()) {
++    ceph_assert(probation_usage_ >= e->charge);
++    probation_usage_ -= e->charge;
+   } else {
+     ceph_assert(*(e->age_bin) >= e->charge);
+     *(e->age_bin) -= e->charge;
+@@ -224,25 +235,56 @@ void BinnedLRUCacheShard::LRU_Remove(BinnedLRUHandle* e) {
+ void BinnedLRUCacheShard::LRU_Insert(BinnedLRUHandle* e) {
+   ceph_assert(e->next == nullptr);
+   ceph_assert(e->prev == nullptr);
+-  e->age_bin = age_bins.front();
+ 
+   if (high_pri_pool_ratio_ > 0 && e->IsHighPri()) {
+     // Inset "e" to head of LRU list.
++    e->age_bin = age_bins.front();
+     e->next = &lru_;
+     e->prev = lru_.prev;
+     e->prev->next = e;
+     e->next->prev = e;
+     e->SetInHighPriPool(true);
++    e->SetInProbation(false);
+     high_pri_pool_usage_ += e->charge;
+     MaintainPoolSize();
++  } else if (probation_ratio_ > 0 &&
++             (!e->HasHit() ||
++              (e->InProbation() &&
++               (e->age_bin == age_bins.front() || !e->HasLaterHit())))) {
++    // (Still) on probation, at the tail of the list: not used since it came
++    // in, used again within its stamp's age bin (one op touching the same
++    // block repeatedly), or used in a later bin for the first time. A block
++    // that straddles two scan chunks sees exactly one later use, so only the
++    // second one, in yet another bin, promotes. Probation bytes are not
++    // binned, so the tuner sees them at the lowest priority.
++    if (!e->InProbation()) {
++      e->age_bin = age_bins.front();
++      e->SetInProbation(true);
++      e->SetLaterHit(false);
++    } else if (e->HasHit() && e->age_bin != age_bins.front()) {
++      e->SetLaterHit(true);
++      e->age_bin = age_bins.front();  // the next use must be later than this
++    }
++    e->next = lru_probation_->next;
++    e->prev = lru_probation_;
++    e->prev->next = e;
++    e->next->prev = e;
++    e->SetInHighPriPool(false);
++    if (lru_low_pri_ == lru_probation_) {
++      lru_low_pri_ = e;  // nothing above probation: e is the newest low-pri entry
++    }
++    lru_probation_ = e;
++    probation_usage_ += e->charge;
+   } else {
+     // Insert "e" to the head of low-pri pool. Note that when
+     // high_pri_pool_ratio is 0, head of low-pri pool is also head of LRU list.
++    e->age_bin = age_bins.front();
+     e->next = lru_low_pri_->next;
+     e->prev = lru_low_pri_;
+     e->prev->next = e;
+     e->next->prev = e;
+     e->SetInHighPriPool(false);
++    e->SetInProbation(false);
+     lru_low_pri_ = e;
+     *(e->age_bin) += e->charge;
+   }
+@@ -274,22 +316,35 @@ void BinnedLRUCacheShard::MaintainPoolSize() {
+   }
+ }
+ 
++void BinnedLRUCacheShard::EvictEntry(BinnedLRUHandle* old,
++                                     BinnedLRUHandle*& deleted) {
++  ceph_assert(old->InCache());
++  ceph_assert(old->refs == 1);  // LRU list contains elements which may be evicted
++  stats[l_elems]--;
++  LRU_Remove(old);
++  table_.Remove(old->key(), old->hash);
++  old->SetInCache(false);
++  Unref(old);
++  usage_ -= old->charge;
++  ceph_assert(!old->next);
++  old->next = deleted;
++  deleted = old;
++}
++
+ void BinnedLRUCacheShard::EvictFromLRU(size_t charge,
+                                  BinnedLRUHandle*& deleted) {
+ 
+   while (usage_ + charge > capacity_ && lru_.next != &lru_) {
+-    BinnedLRUHandle* old = lru_.next;
+-    ceph_assert(old->InCache());
+-    ceph_assert(old->refs == 1);  // LRU list contains elements which may be evicted
+-    stats[l_elems]--;
+-    LRU_Remove(old);
+-    table_.Remove(old->key(), old->hash);
+-    old->SetInCache(false);
+-    Unref(old);
+-    usage_ -= old->charge;
+-    ceph_assert(!old->next);
+-    old->next = deleted;
+-    deleted = old;
++    EvictEntry(lru_.next, deleted);
++  }
++}
++
++// Probation beyond its share goes, oldest first, even while the shard as a
++// whole fits: one pass over many blocks must not grow the cache.
++void BinnedLRUCacheShard::MaintainProbationSize(BinnedLRUHandle*& deleted) {
++  while (probation_usage_ > probation_capacity_ && lru_.next != &lru_ &&
++         lru_.next->InProbation()) {
++    EvictEntry(lru_.next, deleted);
+   }
+ }
+ 
+@@ -310,7 +365,9 @@ void BinnedLRUCacheShard::SetCapacity(size_t capacity) {
+     std::lock_guard<std::mutex> l(mutex_);
+     capacity_ = capacity;
+     high_pri_pool_capacity_ = capacity_ * high_pri_pool_ratio_;
++    probation_capacity_ = capacity_ * probation_ratio_;
+     EvictFromLRU(0, deleted);
++    MaintainProbationSize(deleted);
+   }
+   // we free the entries here outside of mutex for
+   // performance reasons
+@@ -322,6 +379,7 @@ ShardStats BinnedLRUCacheShard::GetStats() {
+   stats[l_capacity] = capacity_;
+   stats[l_usage] = usage_;
+   stats[l_pinned] = usage_ - lru_usage_;
++  stats[l_probation] = probation_usage_;
+   stats[l_misses] = stats[l_lookups] - stats[l_hits];
+   return stats;
+ }
+@@ -484,6 +542,7 @@ rocksdb::Status BinnedLRUCacheShard::Insert(const rocksdb::Slice& key, uint32_t
+       }
+       if (handle == nullptr) {
+         LRU_Insert(e);
++        MaintainProbationSize(deleted);
+       } else {
+         *handle = e;
+       }
+@@ -730,7 +789,7 @@ void BinnedLRUCache::SetupPerfCounters()
+   int l_first = 0;
+   int l_last = l_first + 1 + stat_cnt;
+   PerfCountersBuilder b(cct, std::string("rocksdb-cache-") + name, l_first, l_last);
+-  for (uint32_t j = l_capacity; j <= l_misses; j++) {
++  for (uint32_t j = l_capacity; j < stat_cnt; j++) {
+     b.add_u64(1 + j, ShardStats::stat_name[j], ShardStats::stat_descr[j],
+       nullptr, PerfCountersBuilder::PRIO_USEFUL);
+   }
+@@ -901,6 +960,7 @@ void BinnedLRUCache::UpdatePerfCounters() {
+   for (int j = l_capacity ; j <= l_elems; j++) {
+     perfstats->set(1 + j, stats[j]);
+   }
++  perfstats->set(1 + l_probation, stats[l_probation]);
+   //increment these, so one can reset perf counters
+   ShardStats tmp = stats;
+   tmp.sub(prev_stats);
+diff --git a/src/kv/rocksdb_cache/BinnedLRUCache.h b/src/kv/rocksdb_cache/BinnedLRUCache.h
+index b5bcd9d4447..f59b8016909 100644
+--- a/src/kv/rocksdb_cache/BinnedLRUCache.h
++++ b/src/kv/rocksdb_cache/BinnedLRUCache.h
+@@ -122,6 +122,26 @@ struct BinnedLRUHandle : public rocksdb::Cache::Handle {
+ 
+   void SetHit() { flags |= 8; }
+ 
++  // On probation: not yet used in two later age bins, kept at the tail of the LRU list.
++  bool InProbation() { return flags & 16; }
++  void SetInProbation(bool in_probation) {
++    if (in_probation) {
++      flags |= 16;
++    } else {
++      flags &= ~16;
++    }
++  }
++  // While on probation: already used once in a bin later than the one it came in.
++  // (A block that merely straddles two scan chunks gets exactly one such use.)
++  bool HasLaterHit() { return flags & 32; }
++  void SetLaterHit(bool later_hit) {
++    if (later_hit) {
++      flags |= 32;
++    } else {
++      flags &= ~32;
++    }
++  }
++
+   void Free() {
+     ceph_assert((refs == 1 && InCache()) || (refs == 0 && !InCache()));
+     if (helper && helper->del_cb) {
+@@ -183,6 +203,7 @@ enum stat_e : int {
+   l_lookups,      // increased when trying to find element in shard
+   l_hits,         // increased when lookup successful
+   l_misses,       // calculated from lookups - hits
++  l_probation,    // bytes of entries used only once so far
+   stat_cnt
+ };
+ 
+@@ -201,6 +222,7 @@ struct ShardStats {
+     "lookups",
+     "hits",
+     "misses",
++    "probation",
+   };
+   static constexpr char const* stat_descr[stat_cnt] = {
+     "capacity assigned",
+@@ -211,6 +233,7 @@ struct ShardStats {
+     "lookups for an element",
+     "lookup successful",
+     "lookup failure",
++    "bytes of entries used only once so far",
+   };
+   void add(const ShardStats& other) {
+     for (int j = 0; j < stat_cnt; j++) {
+@@ -330,6 +353,12 @@ class alignas(CACHE_LINE_SIZE) BinnedLRUCacheShard : public CacheShard {
+   // holding the mutex_
+   void EvictFromLRU(size_t charge, BinnedLRUHandle*& deleted);
+ 
++  // Evict one unreferenced entry from the list onto the deleted chain.
++  void EvictEntry(BinnedLRUHandle* old, BinnedLRUHandle*& deleted);
++
++  // Trim probation to its share, oldest first.
++  void MaintainProbationSize(BinnedLRUHandle*& deleted);
++
+   int FreeDeleted(BinnedLRUHandle* deleted);
+ 
+   // Initialized before use.
+@@ -356,6 +385,14 @@ class alignas(CACHE_LINE_SIZE) BinnedLRUCacheShard : public CacheShard {
+   // Pointer to head of low-pri pool in LRU list.
+   BinnedLRUHandle* lru_low_pri_;
+ 
++  // Newest entry on probation. Entries used once so far sit at the tail of
++  // the list, below every other low-pri entry, and their total is bounded by
++  // probation_capacity_ (rocksdb_cache_probation_ratio of the capacity).
++  BinnedLRUHandle* lru_probation_;
++  size_t probation_usage_;
++  double probation_ratio_;
++  size_t probation_capacity_;
++
+   // Info about the shard
+   ShardStats stats;
+   // ------------^^^^^^^^^^^^^-----------
+-- 
+2.56.0
+

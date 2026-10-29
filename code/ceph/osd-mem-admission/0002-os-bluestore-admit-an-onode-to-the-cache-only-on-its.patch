@@ -1,0 +1,396 @@
+From 2bc119d6394ea3dcb12194b61be9754446306906 Mon Sep 17 00:00:00 2001
+From: Ming Lei <ming.lei@clyso.com>
+Date: Thu, 29 Oct 2026 04:11:52 -0500
+Subject: [PATCH 2/3] os/bluestore: admit an onode to the cache only on its
+ second use
+
+The onode cache is an LRU: every onode loaded or created goes to its
+front and stays until the cache is full. One pass over many objects (a
+deep scrub, backfill, recovery, or writes of objects that are not read
+back) fills the whole cache with onodes that will not be used again, and
+the cache tuner lets it, since it sees only the mempool bytes, about half
+of the real heap cost of a small object's onode. Measured on a 2-OSD
+cluster with a 4 GiB osd_memory_target: RGW 4 KiB PUTs drove an OSD to
+4.7 GiB, 3.0 GiB of it onodes that the phase never touched again.
+
+Keep new onodes on a bounded probation FIFO (a
+bluestore_onode_cache_probation_ratio share of the shard, default 0.1)
+and move one to the main LRU only when it is used again in a later cache
+age bin, so the touches of one op sequence do not count. Probation is
+trimmed first; the main LRU behaves as before. The age bins now rotate
+without the autotuner too. A new perf counter, onodes_probation, shows
+the split.
+---
+ src/common/options/global.yaml.in        |  16 +++
+ src/os/bluestore/BlueStore.cc            |  21 +++-
+ src/os/bluestore/BlueStore.h             |   1 +
+ src/os/bluestore/BlueStore_components.cc | 149 ++++++++++++++++-------
+ src/os/bluestore/BlueStore_components.h  |   7 +-
+ src/os/bluestore/BlueStore_objects.h     |   2 +
+ 6 files changed, 152 insertions(+), 44 deletions(-)
+
+diff --git a/src/common/options/global.yaml.in b/src/common/options/global.yaml.in
+index 77015fa8512..b30fc9b1ba7 100644
+--- a/src/common/options/global.yaml.in
++++ b/src/common/options/global.yaml.in
+@@ -5262,6 +5262,22 @@ options:
+   see_also:
+   - bluestore_cache_meta_ratio
+   with_legacy: true
++- name: bluestore_onode_cache_probation_ratio
++  type: float
++  level: advanced
++  desc: Share of each onode cache shard that holds onodes used only once.
++    An onode enters this probation segment on its first use and moves to the
++    main LRU only when it is used again in a later cache age bin (see
++    bluestore_cache_age_bin_interval). One pass over many objects (scrub,
++    recovery, writes that are not read back) then recycles the probation
++    segment instead of filling the whole cache. 0 disables it, admitting every
++    onode at once.
++  default: 0.1
++  min: 0
++  max: 1
++  see_also:
++  - bluestore_cache_meta_evict_limit
++  - bluestore_cache_age_bin_interval
+ - name: bluestore_cache_autotune
+   type: bool
+   level: dev
+diff --git a/src/os/bluestore/BlueStore.cc b/src/os/bluestore/BlueStore.cc
+index f786945f343..50b3df59f64 100644
+--- a/src/os/bluestore/BlueStore.cc
++++ b/src/os/bluestore/BlueStore.cc
+@@ -1739,6 +1739,9 @@ void *BlueStore::MempoolThread::entry()
+ 
+       if (pcm != nullptr) {
+         pcm->shift_bins();
++      } else {
++        // onode cache admission needs the bins to move even without autotune
++        meta_cache->shift_bins();
+       }
+       next_bin_rotation = ceph_clock_now();
+       next_bin_rotation += age_bin_interval;
+@@ -2058,6 +2061,7 @@ std::vector<std::string> BlueStore::get_tracked_keys() const noexcept
+     "bluestore_cache_kv_onode_age_bins"s,
+     "bluestore_cache_meta_age_bins"s,
+     "bluestore_cache_data_age_bins"s,
++    "bluestore_onode_cache_probation_ratio"s,
+     "bluestore_warn_on_legacy_statfs"s,
+     "bluestore_warn_on_no_per_pool_omap"s,
+     "bluestore_warn_on_no_per_pg_omap"s,
+@@ -2115,6 +2119,12 @@ void BlueStore::handle_conf_change(const ConfigProxy& conf,
+   if (changed.count("bluestore_onode_segment_size")) {
+     segment_size = (cct->_conf.get_val<Option::size_t>("bluestore_onode_segment_size"));
+   }
++  if (changed.count("bluestore_onode_cache_probation_ratio")) {
++    double r = conf.get_val<double>("bluestore_onode_cache_probation_ratio");
++    for (auto s : onode_cache_shards) {
++      s->probation_ratio = r;
++    }
++  }
+   if (changed.count("bluestore_max_blob_size") ||
+       changed.count("bluestore_max_blob_size_ssd") ||
+       changed.count("bluestore_max_blob_size_hdd")) {
+@@ -2742,6 +2752,8 @@ void BlueStore::_init_logger()
+ 	    "Number of onodes in cache");
+   b.add_u64(l_bluestore_pinned_onodes, "onodes_pinned",
+             "Number of pinned onodes in cache");
++  b.add_u64(l_bluestore_probation_onodes, "onodes_probation",
++            "Number of onodes in cache used only once so far");
+   b.add_u64_counter(l_bluestore_onode_hits, "onode_hits",
+ 		    "Count of onode cache lookup hits",
+ 		    "o_ht", PerfCountersBuilder::PRIO_USEFUL);
+@@ -5731,10 +5743,13 @@ void BlueStore::set_cache_shards(unsigned num)
+   ceph_assert(num >= oold && num >= bold);
+   onode_cache_shards.resize(num);
+   buffer_cache_shards.resize(num);
++  double probation_ratio =
++    cct->_conf.get_val<double>("bluestore_onode_cache_probation_ratio");
+   for (unsigned i = oold; i < num; ++i) {
+-    onode_cache_shards[i] = 
++    onode_cache_shards[i] =
+         OnodeCacheShard::create(cct, cct->_conf->bluestore_cache_type,
+                                  logger);
++    onode_cache_shards[i]->probation_ratio = probation_ratio;
+   }
+   for (unsigned i = bold; i < num; ++i) {
+     buffer_cache_shards[i] = 
+@@ -9022,12 +9037,13 @@ void BlueStore::refresh_perf_counters()
+ {
+   uint64_t num_onodes = 0;
+   uint64_t num_pinned_onodes = 0;
++  uint64_t num_probation_onodes = 0;
+   uint64_t num_extents = 0;
+   uint64_t num_blobs = 0;
+   uint64_t num_buffers = 0;
+   uint64_t num_buffer_bytes = 0;
+   for (auto c : onode_cache_shards) {
+-    c->add_stats(&num_onodes, &num_pinned_onodes);
++    c->add_stats(&num_onodes, &num_pinned_onodes, &num_probation_onodes);
+   }
+   for (auto c : buffer_cache_shards) {
+     c->add_stats(&num_extents, &num_blobs,
+@@ -9035,6 +9051,7 @@ void BlueStore::refresh_perf_counters()
+   }
+   logger->set(l_bluestore_onodes, num_onodes);
+   logger->set(l_bluestore_pinned_onodes, num_pinned_onodes);
++  logger->set(l_bluestore_probation_onodes, num_probation_onodes);
+   logger->set(l_bluestore_extents, num_extents);
+   logger->set(l_bluestore_blobs, num_blobs);
+   logger->set(l_bluestore_buffers, num_buffers);
+diff --git a/src/os/bluestore/BlueStore.h b/src/os/bluestore/BlueStore.h
+index 93392b6f3d3..1e6896ba697 100644
+--- a/src/os/bluestore/BlueStore.h
++++ b/src/os/bluestore/BlueStore.h
+@@ -198,6 +198,7 @@ enum {
+   //****************************************
+   l_bluestore_onodes,
+   l_bluestore_pinned_onodes,
++  l_bluestore_probation_onodes,
+   l_bluestore_onode_hits,
+   l_bluestore_onode_misses,
+   l_bluestore_onode_shard_hits,
+diff --git a/src/os/bluestore/BlueStore_components.cc b/src/os/bluestore/BlueStore_components.cc
+index d854f6dd113..c1b785f9ecf 100644
+--- a/src/os/bluestore/BlueStore_components.cc
++++ b/src/os/bluestore/BlueStore_components.cc
+@@ -245,17 +245,89 @@ struct LruOnodeCacheShard : public bluestore::OnodeCacheShard {
+       boost::intrusive::list_member_hook<>,
+       &bluestore::Onode::lru_item> > list_t;
+ 
+-  list_t lru;
++  list_t lru;        ///< onodes used again after their first use; front = most recent
++  list_t probation;  ///< onodes used once so far; FIFO, front = newest, bounded,
++                     ///< evicted before lru
+ 
+   explicit LruOnodeCacheShard(CephContext *cct) : bluestore::OnodeCacheShard(cct) {}
+ 
++  /// With a probation ratio of 0 every onode is admitted on first use (one LRU).
++  bool _admission() const
++  {
++    return probation_ratio.load() > 0;
++  }
++  /// How many onodes probation may hold; beyond that it is trimmed even when
++  /// the shard as a whole is under max.
++  uint64_t _probation_max() const
++  {
++    double r = probation_ratio.load();
++    return r > 0 ? std::max<uint64_t>(32, max.load() * std::min(r, 1.0)) : 0;
++  }
++  list_t& _list_of(bluestore::Onode* o)
++  {
++    return o->cache_promoted ? lru : probation;
++  }
++  void _link_front(list_t& l, bluestore::Onode* o)
++  {
++    l.push_front(*o);
++    o->cache_age_bin = age_bins.front();
++    *(o->cache_age_bin) += 1;
++  }
++  void _unlink(bluestore::Onode* o)
++  {
++    *(o->cache_age_bin) -= 1;
++    list_t& l = _list_of(o);
++    l.erase(l.iterator_to(*o));
++  }
++  /// A use of the onode ended (its last pin was dropped): admit, promote or
++  /// refresh it.  An onode enters probation on its first use and moves to lru
++  /// only when it is used again in a later age bin, so one pass over an object
++  /// (scrub, recovery, a write that is never read back) cannot push it into
++  /// the main list.  Lock held, o->exists.
++  void _touch(bluestore::Onode* o)
++  {
++    bool linked = o->lru_item.is_linked();
++    if (!o->cache_promoted) {
++      bool later = o->cache_age_bin && o->cache_age_bin != age_bins.front();
++      if (_admission() && !later) {
++        if (!linked) {
++          _link_front(probation, o);
++          dout(20) << __func__ << " " << this << " " << o->oid << " on probation"
++                   << dendl;
++        }
++        return; // used again within its admission bin: stays where it is
++      }
++      if (linked) {
++        _unlink(o);
++      }
++      o->cache_promoted = true;
++      _link_front(lru, o);
++      dout(20) << __func__ << " " << this << " " << o->oid << " promoted" << dendl;
++      return;
++    }
++    if (linked) {
++      // move onode within LRU
++      lru.erase(lru.iterator_to(*o));
++      lru.push_front(*o);
++      if (o->cache_age_bin != age_bins.front()) {
++        *(o->cache_age_bin) -= 1;
++        o->cache_age_bin = age_bins.front();
++        *(o->cache_age_bin) += 1;
++      }
++      dout(20) << __func__ << " " << this << " " << o->oid << " touched" << dendl;
++    } else {
++      _link_front(lru, o);
++      dout(20) << __func__ << " " << this << " " << o->oid << " unpinned" << dendl;
++    }
++  }
++
+   void _add(bluestore::Onode* o, int level) override
+   {
+     o->set_cached();
+     if (o->pin_nref == 1) {
+-      (level > 0) ? lru.push_front(*o) : lru.push_back(*o);
+-      o->cache_age_bin = age_bins.front();
+-      *(o->cache_age_bin) += 1;
++      // callers hold a reference, so this is not reached in practice: the
++      // onode is linked when that reference is dropped (maybe_unpin)
++      _touch(o);
+     }
+     ++num; // we count both pinned and unpinned entries
+     dout(20) << __func__ << " " << this << " " << o->oid << " added, num="
+@@ -265,9 +337,9 @@ struct LruOnodeCacheShard : public bluestore::OnodeCacheShard {
+   {
+     o->clear_cached();
+     if (o->lru_item.is_linked()) {
+-      *(o->cache_age_bin) -= 1;
+-      lru.erase(lru.iterator_to(*o));
++      _unlink(o);
+     }
++    o->cache_age_bin.reset(); // if re-added (split), it starts over on probation
+     ceph_assert(num);
+     --num;
+     dout(20) << __func__ << " " << this << " " << " " << o->oid << " removed, num=" << num << dendl;
+@@ -284,33 +356,16 @@ struct LruOnodeCacheShard : public bluestore::OnodeCacheShard {
+       ocs->lock.lock();
+     }
+     if (o->is_cached() && o->pin_nref == 1) {
+-      if(!o->lru_item.is_linked()) {
+-        if (o->exists) {
+-	  lru.push_front(*o);
+-	  o->cache_age_bin = age_bins.front();
+-	  *(o->cache_age_bin) += 1;
+-	  dout(20) << __func__ << " " << this << " " << o->oid << " unpinned"
+-                   << dendl;
+-        } else {
+-	  ceph_assert(num);
+-	  --num;
+-	  o->clear_cached();
+-	  dout(20) << __func__ << " " << this << " " << o->oid << " removed"
+-                   << dendl;
+-          // remove will also decrement nref
+-          o->c->onode_space._remove(o->oid);
+-        }
+-      } else if (o->exists) {
+-        // move onode within LRU
+-        lru.erase(lru.iterator_to(*o));
+-        lru.push_front(*o);
+-        if (o->cache_age_bin != age_bins.front()) {
+-          *(o->cache_age_bin) -= 1;
+-          o->cache_age_bin = age_bins.front();
+-          *(o->cache_age_bin) += 1;
+-        }
+-        dout(20) << __func__ << " " << this << " " << o->oid << " touched"
++      if (o->exists) {
++        _touch(o);
++      } else if (!o->lru_item.is_linked()) {
++	ceph_assert(num);
++	--num;
++	o->clear_cached();
++	dout(20) << __func__ << " " << this << " " << o->oid << " removed"
+                  << dendl;
++        // remove will also decrement nref
++        o->c->onode_space._remove(o->oid);
+       }
+     }
+     ocs->lock.unlock();
+@@ -318,16 +373,26 @@ struct LruOnodeCacheShard : public bluestore::OnodeCacheShard {
+ 
+   void _trim_to(uint64_t new_size) override
+   {
+-    if (new_size >= lru.size()) {
+-      return; // don't even try
+-    } 
+-    uint64_t n = num - new_size; // note: we might get empty LRU
++    uint64_t linked = lru.size() + probation.size();
++    uint64_t pmax = _probation_max();
++    // probation beyond its share goes first, even when the shard as a whole
++    // fits; a few at a time, as _trim_some does, unless this is a flush
++    uint64_t over = probation.size() > pmax ? probation.size() - pmax : 0;
++    int32_t max_steps = cct->_conf->bluestore_cache_meta_evict_limit;
++    if (new_size > 0 && max_steps >= 2) {
++      over = std::min<uint64_t>(over, max_steps);
++    }
++    uint64_t n = new_size < linked ? num - new_size : 0;
++                                 // note: we might get empty lists
+                                  // before n == 0 due to pinned
+                                  // entries. And hence being unable
+                                  // to reach new_size target.
+-    while (n-- > 0 && lru.size() > 0) {
+-      bluestore::Onode *o = &lru.back();
+-      lru.pop_back();
++    n = std::max(n, over);
++    while (n-- > 0 && (lru.size() + probation.size()) > 0) {
++      list_t& l = (!probation.empty() && (probation.size() > pmax || lru.empty()))
++        ? probation : lru;
++      bluestore::Onode *o = &l.back();
++      l.pop_back();
+ 
+       dout(20) << __func__ << "  rm " << o->oid << " "
+                << o->nref << " " << o->cached << dendl;
+@@ -352,11 +417,13 @@ struct LruOnodeCacheShard : public bluestore::OnodeCacheShard {
+     ceph_assert(o->nref > 1);
+     to->_add(o, 0);
+   }
+-  void add_stats(uint64_t *onodes, uint64_t *pinned_onodes) override
++  void add_stats(uint64_t *onodes, uint64_t *pinned_onodes,
++                 uint64_t *probation_onodes) override
+   {
+     std::lock_guard l(lock);
+     *onodes += num;
+-    *pinned_onodes += num - lru.size();
++    *pinned_onodes += num - lru.size() - probation.size();
++    *probation_onodes += probation.size();
+   }
+ #ifdef DEBUG_CACHE
+   void _audit(const char *when) override
+diff --git a/src/os/bluestore/BlueStore_components.h b/src/os/bluestore/BlueStore_components.h
+index 052c22c1aa4..ee109f186eb 100644
+--- a/src/os/bluestore/BlueStore_components.h
++++ b/src/os/bluestore/BlueStore_components.h
+@@ -556,6 +556,10 @@ namespace bluestore {
+     std::array<std::pair<ghobject_t, ceph::mono_clock::time_point>, 64> dumped_onodes;
+ 
+   public:
++    /// bluestore_onode_cache_probation_ratio, kept here so the hot path does
++    /// not look the option up
++    std::atomic<double> probation_ratio = {0.1};
++
+     OnodeCacheShard(CephContext* cct) : BlueStore::CacheShard(cct) {}
+     static OnodeCacheShard* create(CephContext* cct, std::string type,
+       PerfCounters* logger);
+@@ -567,7 +571,8 @@ namespace bluestore {
+     virtual void _move_pinned(OnodeCacheShard* to, Onode* o) = 0;
+ 
+     virtual void maybe_unpin(Onode* o) = 0;
+-    virtual void add_stats(uint64_t* onodes, uint64_t* pinned_onodes) = 0;
++    virtual void add_stats(uint64_t* onodes, uint64_t* pinned_onodes,
++                           uint64_t* probation_onodes) = 0;
+     bool empty() {
+       return _get_num() == 0;
+     }
+diff --git a/src/os/bluestore/BlueStore_objects.h b/src/os/bluestore/BlueStore_objects.h
+index 02c5a8b9efd..242130365d9 100644
+--- a/src/os/bluestore/BlueStore_objects.h
++++ b/src/os/bluestore/BlueStore_objects.h
+@@ -895,6 +895,8 @@ namespace bluestore {
+     bool cached;              ///< Onode is logically in the cache
+                               /// (it can be pinned and hence physically out
+                               /// of it at the moment though)
++    bool cache_promoted = false; ///< in the cache's main LRU, not on probation
++                                 /// (protected by the cache shard's lock)
+     uint16_t prev_spanning_cnt = 0; /// spanning blobs count
+     ExtentMap extent_map;
+     BlueStore::BufferSpace bc;             ///< buffer cache
+-- 
+2.56.0
+
