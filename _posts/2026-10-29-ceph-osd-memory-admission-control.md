@@ -42,11 +42,20 @@ of the cluster before every run. `osd_memory_target` is 4 GiB.
 | RGW PUT 4 KiB | 4.65 | **2.09** | −55% | 8043 → 8411 obj/s |
 | RGW GET 4 MiB | 4.30 | 4.19 | −3% | 2245 → 2834 MiB/s |
 | RGW GET 4 KiB | 4.01 | 3.50 | −13% | 3091 → 3091 obj/s |
+| RBD write 4 MiB | 2.72 | **1.36** | −50% | 1247 → 1267 MiB/s |
+| RBD write 4 KiB | 3.50 | **2.85** | −19% | 34.5k → 33.7k IOPS |
+| RBD read 4 KiB | 4.07 | 4.12 | +1% | 175k → 167k IOPS |
+| RBD read 4 MiB | 4.89 | 4.44 | −9% | 4599 → 4576 MiB/s |
+
+RBD is not one of the workloads the changes aim at; it is the check that a
+hot set is still cached and that throughput holds (§4.4 has both pairs of
+RBD runs and the run-to-run spread).
 
 ![osd.0 peak RSS per workload, unchanged build against the build with the three changes]({{ site.baseurl }}/assets/images/ceph-osd-mem-admission-peaks.png)
 
 With §3.1 and the onode-cache change (§3.2), without §3.3, the numbers were: scrub 3.34, recovery
-3.94 / 2.00, RGW PUT 4M 1.59, PUT 4K 2.26, GET 4M 4.00, GET 4K 3.76 (§4).
+3.94 / 2.00, RGW PUT 4M 1.59, PUT 4K 2.26, GET 4M 4.00, GET 4K 3.76, RBD
+write 4M 2.03, write 4K 3.87, read 4K 4.11, read 4M 4.69 (§4).
 
 The data set is larger than in the previous post: the RGW `small` bucket held
 about 6 million 4 KiB objects by the time these runs were made, so backfill and
