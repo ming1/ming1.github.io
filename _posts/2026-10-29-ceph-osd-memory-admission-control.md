@@ -284,25 +284,46 @@ such neighbour, is back at 1170 MiB/s.
 
 RBD is the workload with a hot set: fio touches the same 32 thousand 4 MiB
 objects over and over, so their onodes must be promoted and kept, or the
-cache would miss on every op. The RBD kind (four images, 4 MiB sequential
-writes, then 4 KiB random writes, 4 KiB random reads and 4 MiB reads; the
-4 MiB writes fill the four images, about 105 s, the other three phases run
-180 s each) run on both builds:
+cache would miss on every op. It is also the throughput check. The RBD
+workload (four images; 4 MiB sequential writes that fill them, about 105 s;
+then 4 KiB random writes, 4 KiB random reads and 4 MiB reads, 180 s each)
+was run five times on the same images, each after a cluster restart: the
+unchanged build twice, the build with §3.1 and §3.2 once, and the build with
+all three changes twice, so that the change can be read against the
+run-to-run spread.
 
-| Phase | Unchanged | All three | Change | Throughput, unchanged → all three |
-|---|---:|---:|---:|---|
-| write 4 MiB | 2.72 | 1.36 | −50% | 1247 → 1267 MiB/s |
-| write 4 KiB | 3.50 | 2.85 | −18% | 34.5k → 33.7k IOPS |
-| read 4 KiB | 4.07 | 4.12 | +1% | 175k → 167k IOPS |
-| read 4 MiB | 4.89 | 4.44 | −9% | 4599 → 4576 MiB/s |
+Peak RSS of osd.0, GiB:
 
-The onode cache holds the same hot set on both builds (0.92 and 0.93 GiB in
-read 4K): the random writes and reads touch each object several times a
-second, so an onode is promoted within its first second on probation. The
-reads fill the data cache as before, which is why read 4K stays at the
-target. The write phases lose the onodes that sequential 4 MiB writes create
-and never touch again. Throughput is within −5% to +2%; the one dip, read 4K
-at −4.6%, is within the run-to-run spread of this phase.
+| Phase | Unchanged | Unchanged, again | §3.1 + §3.2 | All three | All three, again |
+|---|---:|---:|---:|---:|---:|
+| write 4 MiB | 2.72 | 2.47 | 2.03 | **1.36** | **1.38** |
+| write 4 KiB | 3.50 | 3.41 | 3.87 | **2.85** | **2.92** |
+| read 4 KiB | 4.07 | 3.88 | 4.11 | 4.12 | 4.09 |
+| read 4 MiB | 4.89 | 4.72 | 4.69 | 4.44 | 4.68 |
+
+Throughput, fio over the four images:
+
+| Phase | Unchanged | Unchanged, again | §3.1 + §3.2 | All three | All three, again |
+|---|---:|---:|---:|---:|---:|
+| write 4 MiB, MiB/s | 1247 | 1181 | 1344 | 1267 | 1234 |
+| write 4 KiB, IOPS | 34.5k | 34.7k | 34.4k | 33.7k | 33.3k |
+| read 4 KiB, IOPS | 175k | 156k | 150k | 167k | 155k |
+| read 4 MiB, MiB/s | 4599 | 4524 | 4505 | 4576 | 4390 |
+
+- **The hot set is kept.** The onode cache holds 0.92–0.93 GiB in read 4K on
+  every build: the random writes and reads touch each object several times a
+  second, so an onode is promoted within its first second on probation.
+- **Memory.** Write 4 MiB loses about half of its peak: the onodes of 32
+  thousand objects written once in sequence and never touched again in the
+  phase. Write 4 KiB loses 16%. The reads stay at the target, because the
+  data cache fills with read data as before. With §3.1 and §3.2 alone, write
+  4 KiB went *up* to 3.87 GiB: the block caches took the room the onode cache
+  gave back, as in recovery (§2.3), until §3.3 bounded them.
+- **Throughput.** The two unchanged runs differ by 11% in read 4 KiB (175k
+  against 156k IOPS) and 5% in write 4 MiB. Every number of the changed
+  builds falls inside that spread, except write 4 KiB, where the all-three
+  runs are 2–4% below the unchanged ones. There is no throughput change that
+  the run-to-run spread does not cover.
 
 ## 5. How it was measured
 
@@ -358,6 +379,7 @@ at −4.6%, is within the run-to-run spread of this phase.
 | [`memtop-exp.sh`]({{ site.baseurl }}/code/ceph/osd-mem-admission/memtop-exp.sh) | one A/B run: optional config, pick the `ceph-osd` binary, restart the cluster, run the phases under memtop. A wrapper over the previous post's [`memtop-workloads.sh`]({{ site.baseurl }}/code/ceph/memtop-workloads.sh), whose functions it sources (edit the path at the top) |
 | [`memtop-quick-peaks.py`]({{ site.baseurl }}/code/ceph/osd-mem-admission/memtop-quick-peaks.py) | per phase and OSD: RSS peak and the held peaks of the main rows |
 | [`memtop-ab.py`]({{ site.baseurl }}/code/ceph/osd-mem-admission/memtop-ab.py) | the A/B tables of this post from two runs |
+| [`memtop-rbd-table.py`]({{ site.baseurl }}/code/ceph/osd-mem-admission/memtop-rbd-table.py) | the five-run RBD tables of §4.4: `memtop-rbd-table.py LABEL=RUN...` |
 
 ```
 cp build/bin/ceph-osd bin/ceph-osd.base      # before building the patched one
