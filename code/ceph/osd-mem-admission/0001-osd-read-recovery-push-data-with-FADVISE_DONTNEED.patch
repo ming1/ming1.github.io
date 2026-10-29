@@ -1,17 +1,20 @@
-From fe0fd02754dc52b79390648393c0fbd1f2d51677 Mon Sep 17 00:00:00 2001
+From 94343318677c3561f410484036380e63b6cb09fd Mon Sep 17 00:00:00 2001
 From: Ming Lei <ming.lei@clyso.com>
-Date: Thu, 29 Oct 2026 03:46:29 -0500
-Subject: [PATCH 1/3] osd: do not cache data read for recovery pushes
+Date: Thu, 29 Oct 2026 10:26:36 -0500
+Subject: [PATCH 1/3] osd: read recovery push data with FADVISE_DONTNEED
 
 RecoveryHandle::cache_dont_need was never set, so the first chunk of every
-push (the whole object up to osd_recovery_max_chunk) was read with no
-fadvise flag, and BlueStore kept it in its buffer cache although recovery
-reads it once. Measured on a 2-OSD cluster: the source OSD's data cache
-grew from 0 to 1.10 GiB during backfill, and the cache tuner evicted
-onodes to make room for it.
+push was read without a fadvise flag and BlueStore kept it in the buffer
+cache; later chunks already passed DONTNEED. During backfill on a 2-OSD
+test cluster the source OSD's data cache grew to 1.05 GiB this way and the
+tuner trimmed onodes to make room.
 
-Default the flag to true. Keep it false only in maybe_kick_recovery, where
-a client op is waiting for the object and will read it next.
+Default the flag to true. maybe_kick_recovery clears it: there a client op
+is waiting for the object and the primary reads it next. A push to more
+than one shard still caches its first read, as before. Only the replicated
+backend honours the flag.
+
+Data cache during the same backfill: 1.05 -> 0.00 GiB.
 ---
  src/osd/PGBackend.h     | 4 +++-
  src/osd/PrimaryLogPG.cc | 1 +

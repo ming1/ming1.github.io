@@ -1,36 +1,42 @@
-From 2bc119d6394ea3dcb12194b61be9754446306906 Mon Sep 17 00:00:00 2001
+From 6cc37e8a249b62ebd728c78b1f72b24be90d3ef4 Mon Sep 17 00:00:00 2001
 From: Ming Lei <ming.lei@clyso.com>
-Date: Thu, 29 Oct 2026 04:11:52 -0500
-Subject: [PATCH 2/3] os/bluestore: admit an onode to the cache only on its
- second use
+Date: Thu, 29 Oct 2026 10:26:36 -0500
+Subject: [PATCH 2/3] os/bluestore: admit an onode to the cache on its second
+ use
 
-The onode cache is an LRU: every onode loaded or created goes to its
-front and stays until the cache is full. One pass over many objects (a
-deep scrub, backfill, recovery, or writes of objects that are not read
-back) fills the whole cache with onodes that will not be used again, and
-the cache tuner lets it, since it sees only the mempool bytes, about half
-of the real heap cost of a small object's onode. Measured on a 2-OSD
-cluster with a 4 GiB osd_memory_target: RGW 4 KiB PUTs drove an OSD to
-4.7 GiB, 3.0 GiB of it onodes that the phase never touched again.
+Every onode loaded or created went to the front of the shard's LRU, so one
+pass over many objects (scrub, backfill, writes never read back) filled the
+cache with onodes used once, and the tuner let it: it counts only the
+mempool half of an onode's heap cost. RGW 4 KiB PUTs on a 2-OSD cluster
+with a 4 GiB target drove an OSD to 4.65 GiB, 2.8 GiB of it such onodes.
 
-Keep new onodes on a bounded probation FIFO (a
-bluestore_onode_cache_probation_ratio share of the shard, default 0.1)
-and move one to the main LRU only when it is used again in a later cache
-age bin, so the touches of one op sequence do not count. Probation is
-trimmed first; the main LRU behaves as before. The age bins now rotate
-without the autotuner too. A new perf counter, onodes_probation, shows
-the split.
+An onode now enters a bounded probation FIFO at its first use and moves to
+the LRU only after it is used in two cache age bins later than the one it
+came in: the touches of one op sequence fall into one bin, and a scan that
+lists objects and then reads them gives one later use, not two. Probation
+is trimmed first, even while the shard is under its max, but it always
+holds what came in during the last four age bins and at least 1024 onodes
+per shard (a backfill scan reads up to 512 objects of one PG, all in one
+shard, before pushing them), so admission keeps working however small the
+tuner has made the shard. The age bins rotate without the autotuner too.
+
+Option bluestore_onode_cache_probation_ratio (default 0.1; 0 gives the old
+single LRU). Perf counter onodes_probation.
+
+With the first version of the rule (one later use): deep scrub peak RSS
+4.35 -> 3.34 GiB, RGW PUT 4 KiB 4.65 -> 2.26 GiB; the RBD hot set stays
+cached and throughput is within run-to-run spread.
 ---
- src/common/options/global.yaml.in        |  16 +++
- src/os/bluestore/BlueStore.cc            |  21 +++-
+ src/common/options/global.yaml.in        |  16 ++
+ src/os/bluestore/BlueStore.cc            |  21 ++-
  src/os/bluestore/BlueStore.h             |   1 +
- src/os/bluestore/BlueStore_components.cc | 149 ++++++++++++++++-------
+ src/os/bluestore/BlueStore_components.cc | 187 ++++++++++++++++++-----
  src/os/bluestore/BlueStore_components.h  |   7 +-
- src/os/bluestore/BlueStore_objects.h     |   2 +
- 6 files changed, 152 insertions(+), 44 deletions(-)
+ src/os/bluestore/BlueStore_objects.h     |   4 +
+ 6 files changed, 191 insertions(+), 45 deletions(-)
 
 diff --git a/src/common/options/global.yaml.in b/src/common/options/global.yaml.in
-index 77015fa8512..b30fc9b1ba7 100644
+index 77015fa8512..2d2ee1fd896 100644
 --- a/src/common/options/global.yaml.in
 +++ b/src/common/options/global.yaml.in
 @@ -5262,6 +5262,22 @@ options:
@@ -40,13 +46,13 @@ index 77015fa8512..b30fc9b1ba7 100644
 +- name: bluestore_onode_cache_probation_ratio
 +  type: float
 +  level: advanced
-+  desc: Share of each onode cache shard that holds onodes used only once.
++  desc: Share of each onode cache shard that holds onodes not yet used again.
 +    An onode enters this probation segment on its first use and moves to the
-+    main LRU only when it is used again in a later cache age bin (see
-+    bluestore_cache_age_bin_interval). One pass over many objects (scrub,
-+    recovery, writes that are not read back) then recycles the probation
-+    segment instead of filling the whole cache. 0 disables it, admitting every
-+    onode at once.
++    main LRU only after it is used in two cache age bins later than the one it
++    came in (see bluestore_cache_age_bin_interval). One pass over many objects
++    (scrub, backfill, writes that are not read back) then recycles the
++    probation segment instead of filling the whole cache. 0 disables it,
++    admitting every onode at once.
 +  default: 0.1
 +  min: 0
 +  max: 1
@@ -151,10 +157,10 @@ index 93392b6f3d3..1e6896ba697 100644
    l_bluestore_onode_misses,
    l_bluestore_onode_shard_hits,
 diff --git a/src/os/bluestore/BlueStore_components.cc b/src/os/bluestore/BlueStore_components.cc
-index d854f6dd113..c1b785f9ecf 100644
+index d854f6dd113..5a0d413be5c 100644
 --- a/src/os/bluestore/BlueStore_components.cc
 +++ b/src/os/bluestore/BlueStore_components.cc
-@@ -245,17 +245,89 @@ struct LruOnodeCacheShard : public bluestore::OnodeCacheShard {
+@@ -245,17 +245,116 @@ struct LruOnodeCacheShard : public bluestore::OnodeCacheShard {
        boost::intrusive::list_member_hook<>,
        &bluestore::Onode::lru_item> > list_t;
  
@@ -171,11 +177,28 @@ index d854f6dd113..c1b785f9ecf 100644
 +    return probation_ratio.load() > 0;
 +  }
 +  /// How many onodes probation may hold; beyond that it is trimmed even when
-+  /// the shard as a whole is under max.
++  /// the shard as a whole is under max: a share of the shard, what came in
++  /// during the last few age bins, or a floor, whichever is more. The second
++  /// term gives every onode a few seconds to be used again however fast a
++  /// scan brings onodes in. The floor holds a backfill scan: it reads up to
++  /// osd_backfill_scan_max (512) objects of one PG at once, all in one shard,
++  /// and pushes them over the next seconds. Both keep admission possible
++  /// however small the tuner has made the shard (its budget follows the
++  /// binned onodes, which under a scan are probation itself).
++  static constexpr uint32_t PROBATION_BINS = 4;
++  static constexpr uint64_t PROBATION_FLOOR = 1024;
 +  uint64_t _probation_max() const
 +  {
 +    double r = probation_ratio.load();
-+    return r > 0 ? std::max<uint64_t>(32, max.load() * std::min(r, 1.0)) : 0;
++    if (r <= 0) {
++      return 0;
++    }
++    int64_t recent = 0;
++    for (uint32_t i = 0; i < PROBATION_BINS && i < age_bins.size(); i++) {
++      recent += *(age_bins[i]);
++    }
++    return std::max<uint64_t>({PROBATION_FLOOR, (uint64_t)(max.load() * std::min(r, 1.0)),
++                               (uint64_t)std::max<int64_t>(recent, 0)});
 +  }
 +  list_t& _list_of(bluestore::Onode* o)
 +  {
@@ -195,21 +218,31 @@ index d854f6dd113..c1b785f9ecf 100644
 +  }
 +  /// A use of the onode ended (its last pin was dropped): admit, promote or
 +  /// refresh it.  An onode enters probation on its first use and moves to lru
-+  /// only when it is used again in a later age bin, so one pass over an object
-+  /// (scrub, recovery, a write that is never read back) cannot push it into
-+  /// the main list.  Lock held, o->exists.
++  /// only after it is used in two age bins later than the one it came in: the
++  /// touches of one op sequence fall into one bin, and one pass over an
++  /// object (scrub, a backfill that lists and then pushes, a write never read
++  /// back) gives at most one later use.  Lock held, o->exists.
 +  void _touch(bluestore::Onode* o)
 +  {
 +    bool linked = o->lru_item.is_linked();
 +    if (!o->cache_promoted) {
 +      bool later = o->cache_age_bin && o->cache_age_bin != age_bins.front();
-+      if (_admission() && !later) {
++      if (_admission() && !(later && o->cache_later_hit)) {
++        if (later) {
++          // first use in a later bin: note it, and stamp this bin
++          o->cache_later_hit = true;
++          if (linked) {
++            *(o->cache_age_bin) -= 1;
++            o->cache_age_bin = age_bins.front();
++            *(o->cache_age_bin) += 1;
++          }
++        }
 +        if (!linked) {
 +          _link_front(probation, o);
 +          dout(20) << __func__ << " " << this << " " << o->oid << " on probation"
 +                   << dendl;
 +        }
-+        return; // used again within its admission bin: stays where it is
++        return; // stays on probation
 +      }
 +      if (linked) {
 +        _unlink(o);
@@ -238,17 +271,18 @@ index d854f6dd113..c1b785f9ecf 100644
    void _add(bluestore::Onode* o, int level) override
    {
      o->set_cached();
-     if (o->pin_nref == 1) {
+-    if (o->pin_nref == 1) {
 -      (level > 0) ? lru.push_front(*o) : lru.push_back(*o);
 -      o->cache_age_bin = age_bins.front();
 -      *(o->cache_age_bin) += 1;
++    if (o->pin_nref == 1 && o->exists) {
 +      // callers hold a reference, so this is not reached in practice: the
 +      // onode is linked when that reference is dropped (maybe_unpin)
 +      _touch(o);
      }
      ++num; // we count both pinned and unpinned entries
      dout(20) << __func__ << " " << this << " " << o->oid << " added, num="
-@@ -265,9 +337,9 @@ struct LruOnodeCacheShard : public bluestore::OnodeCacheShard {
+@@ -265,9 +364,12 @@ struct LruOnodeCacheShard : public bluestore::OnodeCacheShard {
    {
      o->clear_cached();
      if (o->lru_item.is_linked()) {
@@ -256,13 +290,23 @@ index d854f6dd113..c1b785f9ecf 100644
 -      lru.erase(lru.iterator_to(*o));
 +      _unlink(o);
      }
-+    o->cache_age_bin.reset(); // if re-added (split), it starts over on probation
++    // if re-added after a split, a promoted onode keeps its place in lru and a
++    // non-promoted one starts over on probation
++    o->cache_age_bin.reset();
++    o->cache_later_hit = false;
      ceph_assert(num);
      --num;
      dout(20) << __func__ << " " << this << " " << " " << o->oid << " removed, num=" << num << dendl;
-@@ -284,33 +356,16 @@ struct LruOnodeCacheShard : public bluestore::OnodeCacheShard {
+@@ -283,34 +385,23 @@ struct LruOnodeCacheShard : public bluestore::OnodeCacheShard {
+       ocs = o->c->get_onode_cache();
        ocs->lock.lock();
      }
++    if (ocs != this) {
++      // the onode is in another shard's lists now: that shard does the work
++      ocs->lock.unlock();
++      ocs->maybe_unpin(o);
++      return;
++    }
      if (o->is_cached() && o->pin_nref == 1) {
 -      if(!o->lru_item.is_linked()) {
 -        if (o->exists) {
@@ -303,7 +347,7 @@ index d854f6dd113..c1b785f9ecf 100644
        }
      }
      ocs->lock.unlock();
-@@ -318,16 +373,26 @@ struct LruOnodeCacheShard : public bluestore::OnodeCacheShard {
+@@ -318,16 +409,26 @@ struct LruOnodeCacheShard : public bluestore::OnodeCacheShard {
  
    void _trim_to(uint64_t new_size) override
    {
@@ -337,7 +381,7 @@ index d854f6dd113..c1b785f9ecf 100644
  
        dout(20) << __func__ << "  rm " << o->oid << " "
                 << o->nref << " " << o->cached << dendl;
-@@ -352,11 +417,13 @@ struct LruOnodeCacheShard : public bluestore::OnodeCacheShard {
+@@ -352,11 +453,13 @@ struct LruOnodeCacheShard : public bluestore::OnodeCacheShard {
      ceph_assert(o->nref > 1);
      to->_add(o, 0);
    }
@@ -379,15 +423,17 @@ index 052c22c1aa4..ee109f186eb 100644
        return _get_num() == 0;
      }
 diff --git a/src/os/bluestore/BlueStore_objects.h b/src/os/bluestore/BlueStore_objects.h
-index 02c5a8b9efd..242130365d9 100644
+index 02c5a8b9efd..18395dbd703 100644
 --- a/src/os/bluestore/BlueStore_objects.h
 +++ b/src/os/bluestore/BlueStore_objects.h
-@@ -895,6 +895,8 @@ namespace bluestore {
+@@ -895,6 +895,10 @@ namespace bluestore {
      bool cached;              ///< Onode is logically in the cache
                                /// (it can be pinned and hence physically out
                                /// of it at the moment though)
 +    bool cache_promoted = false; ///< in the cache's main LRU, not on probation
 +                                 /// (protected by the cache shard's lock)
++    bool cache_later_hit = false; ///< on probation, and used once in an age bin
++                                  /// later than the one it came in
      uint16_t prev_spanning_cnt = 0; /// spanning blobs count
      ExtentMap extent_map;
      BlueStore::BufferSpace bc;             ///< buffer cache

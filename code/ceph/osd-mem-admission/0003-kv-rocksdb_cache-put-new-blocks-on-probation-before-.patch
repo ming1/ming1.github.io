@@ -1,34 +1,37 @@
-From 0f9fd68c0a5899d9aa6026ce2c0e1e339bf83526 Mon Sep 17 00:00:00 2001
+From cee32ece8114a70ac61247c81b3b27ebdbad935f Mon Sep 17 00:00:00 2001
 From: Ming Lei <ming.lei@clyso.com>
-Date: Thu, 29 Oct 2026 05:17:17 -0500
-Subject: [PATCH 3/3] kv/rocksdb_cache: admit a block to the main LRU only when
- it is used again later
+Date: Thu, 29 Oct 2026 10:26:36 -0500
+Subject: [PATCH 3/3] kv/rocksdb_cache: put new blocks on probation before the
+ LRU
 
-The binned LRU block cache inserts every block at the head of its
-low-priority pool, so one pass over many keys (backfill listing a
-collection, deep scrub reading every object's omap) fills the whole cache
-with blocks that are never read again, and the memory tuner grows the
-cache for them because they sit in its most recent age bins. Measured
-during backfill on a 2-OSD cluster: the onode block cache grew from 0.1
-to 0.9 GiB of listed onode values while the OSD ran at its memory target.
+binned_lru inserted every block at the head of its low-priority pool, so
+one pass over many keys (a backfill listing, a deep scrub's omap reads)
+filled the cache with blocks read once, and the tuner grew the cache for
+them because they sat in its newest age bins. During backfill the onode
+block cache grew from 0.1 to 0.9 GiB while the OSD was at its target.
 
-Keep new blocks at the tail of the list, on probation, bounded by
-rocksdb_cache_probation_ratio of the capacity (default 0.1), and move a
-block into the main pool only when it is used in two cache age bins later
-than the one it came in. The hits of one op on the same block do not
-count, and neither does the one later use that a block gets when it
-straddles two scan chunks (an onode block holds about eight onodes, a
-scrub chunk fifteen objects). Probation bytes are left out of the age
-bins, so the tuner sees them at its lowest priority and does not grow the
-cache for them.
+A new block now sits at the tail of the list, on probation, and moves to
+the main pool only after it is used in two age bins later than the one it
+came in: the hits of one op do not count, nor does the single later use a
+block gets when it straddles two scan chunks. Probation is bounded to
+rocksdb_cache_probation_ratio of the capacity (default 0.1; 0 disables),
+trimmed on every insert, kept at least half full when the main pool is
+evicted, and not binned, so the tuner sees it at its lowest priority. The
+kv caches' age bins rotate without the autotuner too.
+
+Cache stat and perf counter: probation (bytes).
+
+Deep scrub peak RSS 3.34 -> 1.57 GiB, recovery source 3.94 -> 3.10 GiB,
+with the two patches before this one.
 ---
- src/common/options/global.yaml.in      | 15 +++++
- src/kv/rocksdb_cache/BinnedLRUCache.cc | 88 ++++++++++++++++++++++----
- src/kv/rocksdb_cache/BinnedLRUCache.h  | 37 +++++++++++
- 3 files changed, 126 insertions(+), 14 deletions(-)
+ src/common/options/global.yaml.in      |  15 ++++
+ src/kv/rocksdb_cache/BinnedLRUCache.cc | 102 +++++++++++++++++++++----
+ src/kv/rocksdb_cache/BinnedLRUCache.h  |  37 +++++++++
+ src/os/bluestore/BlueStore.cc          |   8 +-
+ 4 files changed, 147 insertions(+), 15 deletions(-)
 
 diff --git a/src/common/options/global.yaml.in b/src/common/options/global.yaml.in
-index b30fc9b1ba7..7529c529dd7 100644
+index 2d2ee1fd896..1ad77e6f9b2 100644
 --- a/src/common/options/global.yaml.in
 +++ b/src/common/options/global.yaml.in
 @@ -3674,6 +3674,21 @@ options:
@@ -43,7 +46,7 @@ index b30fc9b1ba7..7529c529dd7 100644
 +    when it is used again in a later cache age bin; the memory tuner does not
 +    grow the cache for blocks still on probation. One pass over many keys (a
 +    collection listing, an omap scan) then recycles the probation part instead
-+    of filling the cache. 0 disables it.
++    of filling the cache. 0 disables it. Read when the daemon starts.
 +  default: 0.1
 +  min: 0
 +  max: 1
@@ -54,7 +57,7 @@ index b30fc9b1ba7..7529c529dd7 100644
    type: bool
    level: dev
 diff --git a/src/kv/rocksdb_cache/BinnedLRUCache.cc b/src/kv/rocksdb_cache/BinnedLRUCache.cc
-index d615b71d4db..2426a9fb051 100644
+index d615b71d4db..37a0583f0a1 100644
 --- a/src/kv/rocksdb_cache/BinnedLRUCache.cc
 +++ b/src/kv/rocksdb_cache/BinnedLRUCache.cc
 @@ -122,6 +122,11 @@ BinnedLRUCacheShard::BinnedLRUCacheShard(CephContext *c, size_t capacity, bool s
@@ -147,7 +150,7 @@ index d615b71d4db..2426a9fb051 100644
      lru_low_pri_ = e;
      *(e->age_bin) += e->charge;
    }
-@@ -274,22 +316,35 @@ void BinnedLRUCacheShard::MaintainPoolSize() {
+@@ -274,22 +316,44 @@ void BinnedLRUCacheShard::MaintainPoolSize() {
    }
  }
  
@@ -182,7 +185,16 @@ index d615b71d4db..2426a9fb051 100644
 -    ceph_assert(!old->next);
 -    old->next = deleted;
 -    deleted = old;
-+    EvictEntry(lru_.next, deleted);
++    BinnedLRUHandle* victim = lru_.next;
++    if (victim->InProbation() && probation_usage_ < probation_capacity_ / 2) {
++      // keep room for new blocks to prove themselves: while probation is
++      // below half its share, take the main pool's oldest entry instead
++      BinnedLRUHandle* oldest_main = lru_probation_->next;
++      if (oldest_main != &lru_ && !oldest_main->InHighPriPool()) {
++        victim = oldest_main;
++      }
++    }
++    EvictEntry(victim, deleted);
 +  }
 +}
 +
@@ -195,7 +207,7 @@ index d615b71d4db..2426a9fb051 100644
    }
  }
  
-@@ -310,7 +365,9 @@ void BinnedLRUCacheShard::SetCapacity(size_t capacity) {
+@@ -310,7 +374,9 @@ void BinnedLRUCacheShard::SetCapacity(size_t capacity) {
      std::lock_guard<std::mutex> l(mutex_);
      capacity_ = capacity;
      high_pri_pool_capacity_ = capacity_ * high_pri_pool_ratio_;
@@ -205,7 +217,7 @@ index d615b71d4db..2426a9fb051 100644
    }
    // we free the entries here outside of mutex for
    // performance reasons
-@@ -322,6 +379,7 @@ ShardStats BinnedLRUCacheShard::GetStats() {
+@@ -322,6 +388,7 @@ ShardStats BinnedLRUCacheShard::GetStats() {
    stats[l_capacity] = capacity_;
    stats[l_usage] = usage_;
    stats[l_pinned] = usage_ - lru_usage_;
@@ -213,7 +225,31 @@ index d615b71d4db..2426a9fb051 100644
    stats[l_misses] = stats[l_lookups] - stats[l_hits];
    return stats;
  }
-@@ -484,6 +542,7 @@ rocksdb::Status BinnedLRUCacheShard::Insert(const rocksdb::Slice& key, uint32_t
+@@ -385,6 +452,7 @@ bool BinnedLRUCacheShard::Release(rocksdb::Cache::Handle* handle, bool force_era
+   }
+   BinnedLRUHandle* e = static_cast<BinnedLRUHandle*>(handle);
+   bool last_reference = false;
++  BinnedLRUHandle* deleted = nullptr;
+   {
+     std::lock_guard<std::mutex> l(mutex_);
+     last_reference = Unref(e);
+@@ -408,11 +476,15 @@ bool BinnedLRUCacheShard::Release(rocksdb::Cache::Handle* handle, bool force_era
+       } else {
+         // put the item on the list to be potentially freed
+         LRU_Insert(e);
++        // blocks read through a handle enter the list here: keep probation
++        // within its share
++        MaintainProbationSize(deleted);
+       }
+     }
+   }
+ 
+   // free outside of mutex
++  FreeDeleted(deleted);
+   if (last_reference) {
+     e->Free();
+   }
+@@ -484,6 +556,7 @@ rocksdb::Status BinnedLRUCacheShard::Insert(const rocksdb::Slice& key, uint32_t
        }
        if (handle == nullptr) {
          LRU_Insert(e);
@@ -221,7 +257,7 @@ index d615b71d4db..2426a9fb051 100644
        } else {
          *handle = e;
        }
-@@ -730,7 +789,7 @@ void BinnedLRUCache::SetupPerfCounters()
+@@ -730,7 +803,7 @@ void BinnedLRUCache::SetupPerfCounters()
    int l_first = 0;
    int l_last = l_first + 1 + stat_cnt;
    PerfCountersBuilder b(cct, std::string("rocksdb-cache-") + name, l_first, l_last);
@@ -230,7 +266,7 @@ index d615b71d4db..2426a9fb051 100644
      b.add_u64(1 + j, ShardStats::stat_name[j], ShardStats::stat_descr[j],
        nullptr, PerfCountersBuilder::PRIO_USEFUL);
    }
-@@ -901,6 +960,7 @@ void BinnedLRUCache::UpdatePerfCounters() {
+@@ -901,6 +974,7 @@ void BinnedLRUCache::UpdatePerfCounters() {
    for (int j = l_capacity ; j <= l_elems; j++) {
      perfstats->set(1 + j, stats[j]);
    }
@@ -321,6 +357,26 @@ index b5bcd9d4447..f59b8016909 100644
    // Info about the shard
    ShardStats stats;
    // ------------^^^^^^^^^^^^^-----------
+diff --git a/src/os/bluestore/BlueStore.cc b/src/os/bluestore/BlueStore.cc
+index 50b3df59f64..277e4a73753 100644
+--- a/src/os/bluestore/BlueStore.cc
++++ b/src/os/bluestore/BlueStore.cc
+@@ -1740,8 +1740,14 @@ void *BlueStore::MempoolThread::entry()
+       if (pcm != nullptr) {
+         pcm->shift_bins();
+       } else {
+-        // onode cache admission needs the bins to move even without autotune
++        // cache admission needs the bins to move even without autotune
+         meta_cache->shift_bins();
++        if (binned_kv_cache != nullptr) {
++          binned_kv_cache->shift_bins();
++        }
++        if (binned_kv_onode_cache != nullptr) {
++          binned_kv_onode_cache->shift_bins();
++        }
+       }
+       next_bin_rotation = ceph_clock_now();
+       next_bin_rotation += age_bin_interval;
 -- 
 2.56.0
 
