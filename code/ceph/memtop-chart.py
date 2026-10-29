@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """One OSD's RSS at its peak in each workload, split by part (stacked horizontal bars).
 
-usage: memtop-chart.py summary.json out.png
+usage: memtop-chart.py summary.json out.png [other-summary.json]
+With a second summary, a tick on each bar marks that run's RSS peak.
 """
 import json
 import sys
@@ -58,14 +59,16 @@ def split(rows):
 
 def main():
     st = json.load(open(sys.argv[1]))
-    bars = [(lab, split(st[ph]["at_peak"][d]), st[ph]["rss"][d]["peak"])
+    other = json.load(open(sys.argv[3])) if len(sys.argv) > 3 else {}
+    bars = [(lab, split(st[ph]["at_peak"][d]), st[ph]["rss"][d]["peak"],
+             other[ph]["rss"][d]["peak"] if d in other.get(ph, {}).get("rss", {}) else None)
             for ph, d, lab in BARS if ph in st and d in st[ph]["at_peak"]]
     plt.rcParams.update({"font.family": "Noto Sans", "font.size": 10})
     fig, ax = plt.subplots(figsize=(10, 0.42 * len(bars) + 1.6), dpi=150)
     fig.patch.set_facecolor(SURFACE)
     ax.set_facecolor(SURFACE)
     gap = 0.012   # surface gap between stacked segments, GiB
-    for i, (lab, parts, rss) in enumerate(bars):
+    for i, (lab, parts, rss, rss_other) in enumerate(bars):
         y = len(bars) - 1 - i
         x = 0.0
         for (name, color, _), v in zip(PARTS, parts):
@@ -77,6 +80,11 @@ def main():
                 ax.text(x + w / 2, y, "%.1f" % w, ha="center", va="center", fontsize=8,
                         color=INK if color in DARK_LABEL else "#ffffff")
             x += w
+        if rss_other is not None:
+            xo = rss_other / GiB
+            ax.plot([xo, xo], [y - 0.44, y + 0.44], color=SURFACE, linewidth=5, solid_capstyle="butt", zorder=3)
+            ax.plot([xo, xo], [y - 0.44, y + 0.44], color=INK, linewidth=2, solid_capstyle="butt", zorder=4)
+            x = max(x, xo)
         ax.text(x + 0.05, y, "%.2f GiB" % (rss / GiB), ha="left", va="center", fontsize=9, color=INK2,
                 bbox=dict(boxstyle="square,pad=0.15", facecolor=SURFACE, edgecolor="none"))
     ax.axvline(4.0, color=MUTED, linewidth=1, linestyle=(0, (4, 3)))
@@ -95,9 +103,13 @@ def main():
         ax.spines[s].set_visible(False)
     ax.spines["bottom"].set_color(BASE)
     handles = [plt.Rectangle((0, 0), 1, 1, color=c) for _, c, _ in PARTS]
-    fig.legend(handles, [n for n, _, _ in PARTS], loc="upper center", ncol=4, frameon=False, fontsize=9,
+    names = [n for n, _, _ in PARTS]
+    if other:
+        handles.append(plt.Line2D([0], [0], color=INK, linewidth=2))
+        names.append("RSS peak, back-to-back run")
+    fig.legend(handles, names, loc="upper center", ncol=3 if other else 4, frameon=False, fontsize=9,
                labelcolor=INK, bbox_to_anchor=(0.55, 1.0))
-    fig.tight_layout(rect=(0, 0, 1, 0.9))
+    fig.tight_layout(rect=(0, 0, 1, 0.87 if other else 0.9))
     fig.savefig(sys.argv[2], facecolor=SURFACE)
 
 

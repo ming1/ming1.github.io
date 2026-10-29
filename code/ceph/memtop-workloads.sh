@@ -5,7 +5,10 @@
 #   rec/<phase>.jsonl           memtop's JSON view of every sample
 #   log/<phase>.*               workload output, events (ms timestamps)
 #
-# usage: memtop-workloads.sh setup | idle | rbd | rgw | recovery | scrub | all | heapprof [secs]
+# usage: memtop-workloads.sh setup | idle | rbd | rgw | recovery | scrub | restart | kinds | all
+#        | heapprof [secs]
+#   kinds: a fresh cluster, idle, then each kind of workload (rbd, rgw, recovery, scrub) after
+#          a restart of every daemon; all: the same without the restarts
 # Needs ceph-memtop and warp in $RUN/bin, heaptop.py in $RUN; memtop-peaks.py turns
 # rec/*.jsonl into the tables of the post.
 set -e
@@ -233,6 +236,19 @@ heapprof() {
     head -45 $RUN/log/heapprof.top
 }
 
+# Stop every daemon, drop the page cache and start the cluster again from the same conf and
+# data: each kind of workload then starts from fresh processes (empty caches, no free lists).
+restart_cluster() {
+    log "restart cluster"
+    (cd $B && ../src/stop.sh) >> $RUN/log/restart.log 2>&1
+    sync
+    echo 3 > /proc/sys/vm/drop_caches
+    (cd $B && ../src/vstart.sh --without-dashboard) >> $RUN/log/restart.log 2>&1
+    wait_clean 600
+    sleep 30
+    log "restarted: $(ceph -s | grep -E 'osd:|pgs:' | tr -s ' ' | tr '\n' ' ')"
+}
+
 case "$1" in
 setup) setup ;;
 idle) idle ;;
@@ -240,6 +256,9 @@ rbd) rbd_all ;;
 rgw) rgw_all ;;
 recovery) recovery ;;
 scrub) scrub ;;
+restart) restart_cluster ;;
+kinds) setup; idle; restart_cluster; rbd_all; restart_cluster; rgw_all; restart_cluster; recovery
+    restart_cluster; scrub ;;
 all) setup; idle; rbd_all; rgw_all; recovery; scrub ;;
 *) "$@" ;;
 esac

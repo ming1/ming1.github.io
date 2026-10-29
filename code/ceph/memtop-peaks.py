@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Memory peaks per workload phase from ceph-memtop JSON recordings.
 
-usage: memtop-peaks.py RUNDIR [phase ...]
+usage: memtop-peaks.py RUNDIR [--vs OTHER_RUNDIR] [phase ...]
 Reads RUNDIR/rec/<phase>.jsonl (ceph-memtop --json, one line per sample) and
 RUNDIR/log/<phase>.events; prints markdown tables and writes
-RUNDIR/report/summary.json.
+RUNDIR/report/summary.json. With --vs, also a table of this run against OTHER_RUNDIR's
+summary.json, phase by phase.
 
 A row's peak is the highest value it held for HOLD consecutive samples: a
 one-sample spike in a row can be read skew between /proc and the admin socket
@@ -165,6 +166,12 @@ def ranked(st, n=10):
     return sorted(items, key=key, reverse=True)[:n]
 
 
+def is_carried(v):
+    """Highest at the start of the phase, then falling: left over from the phase before."""
+    return v["held"] is not None and v["held"] >= 16 * MiB and v["start"] >= 0.9 * v["held"] \
+        and v["end"] < 0.8 * v["held"]
+
+
 def matrix(allst, cols, n=10, rgw=False):
     """One table for a group of phases: a row per consumer, a column per (phase, daemons).
 
@@ -181,8 +188,7 @@ def matrix(allst, cols, n=10, rgw=False):
                 if not name.startswith(prefix) or v["held"] is None or rid in UNREAD:
                     continue
                 who = "OSD" if name.startswith("osd.") else name.split(".")[0].replace("client", "RGW")
-                # highest at the start, then falling: left over from the phase before
-                carried = v["held"] >= 16 * MiB and v["start"] >= 0.9 * v["held"] and v["end"] < 0.8 * v["held"]
+                carried = is_carried(v)
                 vals.append(((who, rid), (v["held"], carried)))
         best = {}
         for k, v in vals:
@@ -213,7 +219,7 @@ def matrix(allst, cols, n=10, rgw=False):
 
 
 GROUPS = {
-    "rbd": [("idle", "idle", ""), ("write 4M", "rbd-write-4m", ""), ("write 4K", "rbd-write-4k", ""),
+    "rbd": [("write 4M", "rbd-write-4m", ""), ("write 4K", "rbd-write-4k", ""),
             ("read 4K", "rbd-read-4k", ""), ("read 4M", "rbd-read-4m", "")],
     "rgw": [("PUT 4M", "rgw-put-4m", ""), ("PUT 4K", "rgw-put-4k", ""), ("GET 4M", "rgw-get-4m", ""),
             ("GET 4K", "rgw-get-4k", "")],
@@ -222,9 +228,50 @@ GROUPS = {
 }
 
 
+# phases compared by --vs: (label, phase, daemon prefix); the largest OSD that matches
+CMP = [("idle", "idle", "osd."), ("RBD write 4M", "rbd-write-4m", "osd."), ("RBD write 4K", "rbd-write-4k", "osd."),
+       ("RBD read 4K", "rbd-read-4k", "osd."), ("RBD read 4M", "rbd-read-4m", "osd."),
+       ("RGW PUT 4M", "rgw-put-4m", "osd."), ("RGW PUT 4K", "rgw-put-4k", "osd."),
+       ("RGW GET 4M", "rgw-get-4m", "osd."), ("RGW GET 4K", "rgw-get-4k", "osd."),
+       ("degraded write, osd.0", "recovery-degraded", "osd.0"), ("recovery, osd.0", "recovery", "osd.0"),
+       ("recovery, osd.1", "recovery", "osd.1"), ("deep scrub", "scrub", "osd.")]
+CMP_ROWS = [("free lists", "heap:free"), ("data cache", "cache:data"), ("meta cache", "cache:meta"),
+            ("memtables", "nocache:memtables"), ("not in a mempool", "heap:unattributed")]
+
+
+def compare(a, b):
+    """a, b: summaries of two runs. Per phase: the OSD's RSS at start and peak, and held peaks."""
+    def get(st, ph, prefix):
+        if ph not in st:
+            return None
+        rss = [v for n, v in st[ph]["rss"].items() if n.startswith(prefix)]
+        out = {"start": max(v["start"] for v in rss), "peak": max(v["peak"] for v in rss)}
+        for _, rid in CMP_ROWS:
+            out[rid] = max([v["held"] or 0 for n, v in st[ph]["rows"].get(rid, {}).items() if n.startswith(prefix)]
+                           or [0])
+        return out
+    g = lambda v: "%.2f" % (v / (1 << 30))
+    hdr = ["RSS at start", "RSS peak"] + [n for n, _ in CMP_ROWS]
+    out = ["| workload | " + " | ".join(hdr) + " |", "|---|" + "---:|" * len(hdr)]
+    for label, ph, prefix in CMP:
+        x, y = get(a, ph, prefix), get(b, ph, prefix)
+        if x is None or y is None:
+            continue
+        cells = [x["start"], x["peak"]] + [x[rid] for _, rid in CMP_ROWS]
+        other = [y["start"], y["peak"]] + [y[rid] for _, rid in CMP_ROWS]
+        out.append("| %s | %s |" % (label, " | ".join("%s / %s" % (g(c), g(o)) for c, o in zip(cells, other))))
+    return "\n".join(out)
+
+
 def main():
-    run = sys.argv[1]
-    phases = sys.argv[2:] or sorted(p[:-6] for p in os.listdir(os.path.join(run, "rec")) if p.endswith(".jsonl"))
+    args = sys.argv[1:]
+    vs = None
+    if "--vs" in args:
+        i = args.index("--vs")
+        vs = args[i + 1]
+        del args[i:i + 2]
+    run = args[0]
+    phases = args[1:] or sorted(p[:-6] for p in os.listdir(os.path.join(run, "rec")) if p.endswith(".jsonl"))
     allst = {}
     for ph in phases:
         st = phase_stats(run, ph)
@@ -250,12 +297,13 @@ def main():
     print("|---|" + "---:|" * len(names))
     for ph, st in allst.items():
         print("| %s | %s |" % (ph, " | ".join(fmt(st["rss"][n]["peak"]) if n in st["rss"] else "-" for n in names)))
-    # the top consumers over all phases: each consumer's highest held peak, and where
+    # the top consumers over all phases: each consumer's highest held peak that its phase made
+    # (not one left over from the phase before), and where
     best = {}
     for ph, st in allst.items():
         for rid, per in st["rows"].items():
             for name, v in per.items():
-                if rid in UNREAD:
+                if rid in UNREAD or is_carried(v):
                     continue
                 who = "osd" if name.startswith("osd.") else name
                 k = (who, rid)
@@ -269,6 +317,9 @@ def main():
     for g, cols in GROUPS.items():
         if all(c[1] in allst for c in cols):
             print("\n## matrix %s\n\n%s" % (g, matrix(allst, cols, rgw=(g == "rgw"))))
+    if vs:
+        other = json.load(open(os.path.join(vs, "report", "summary.json")))
+        print("\n## this run / %s (GiB, held peaks)\n\n%s" % (vs, compare(allst, other)))
     os.makedirs(os.path.join(run, "report"), exist_ok=True)
     with open(os.path.join(run, "report", "summary.json"), "w") as f:
         json.dump(allst, f, indent=1)
