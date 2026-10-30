@@ -178,8 +178,8 @@ their recovery reads with no fadvise flag at all: `ECBackendL`, the backend
 new EC pools get by default, passes 0 for them, and the new `ECCommon` read
 request leaves its default, also 0. So on an EC pool the OSDs that serve a
 shard reconstruction still cache what they read for it. §4.6 measures this
-and the fix, the same flag in those two places, as a fourth patch kept
-separate from the three.
+and the fix, the same flag in those two places, as a fourth patch, the
+second commit of the PR (§7).
 
 ### 3.2 Onode cache: admit on the second use
 
@@ -507,7 +507,7 @@ fourth patch puts the flag on the EC recovery reads of both backends; run
 back to back against the three-patch build on the same recipe, the sources'
 data cache stays at zero, their peak is the pre-recovery 1.16 GiB, and the
 rebuild finishes 5% sooner (164 s → 156 s; the earlier three-patch run took
-168 s). It is a separate change, §7 has it.
+168 s). It is the PR's second commit (§7).
 
 Scrub: the same picture as §4.1 on all six OSDs. Unchanged, each sits at
 4.4 GiB with 1.5 GiB of onodes, 1.9 GiB of their untracked twin and a 0.9 GiB
@@ -616,7 +616,7 @@ OSD instead of 390–560 thousand, almost all on probation, and the scrub is
   reconstruction with no fadvise flag, so the sources cache what they read
   (§4.6: 1.9 GiB per source OSD). Patch 1 does not reach them. The fourth
   patch of §7 puts `FADVISE_DONTNEED` on those reads and takes the sources
-  back to 1.16 GiB (§4.6); it is not upstream yet.
+  back to 1.16 GiB (§4.6); it is the PR's second commit (§7).
 - **Ratios.** Both probation ratios were swept on new clusters with the final
   patches (§4.5's recipe), scrub as the scan and RBD as the hot set:
 
@@ -643,7 +643,7 @@ OSD instead of 390–560 thousand, almost all on probation, and the scrub is
 | [`0001-osd-read-recovery-push-data-with-FADVISE_DONTNEED.patch`]({{ site.baseurl }}/code/ceph/osd-mem-admission/0001-osd-read-recovery-push-data-with-FADVISE_DONTNEED.patch) | §3.1 |
 | [`0002-os-bluestore-admit-an-onode-to-the-cache-on-its-seco.patch`]({{ site.baseurl }}/code/ceph/osd-mem-admission/0002-os-bluestore-admit-an-onode-to-the-cache-on-its-seco.patch) | §3.2 |
 | [`0003-kv-rocksdb_cache-put-new-blocks-on-probation-before-.patch`]({{ site.baseurl }}/code/ceph/osd-mem-admission/0003-kv-rocksdb_cache-put-new-blocks-on-probation-before-.patch) | §3.3 |
-| [`0004-osd-read-EC-recovery-data-with-FADVISE_DONTNEED.patch`]({{ site.baseurl }}/code/ceph/osd-mem-admission/0004-osd-read-EC-recovery-data-with-FADVISE_DONTNEED.patch) | §3.1, §4.6: EC recovery reads; separate from the three, applies on main alone |
+| [`0004-osd-read-EC-recovery-data-with-FADVISE_DONTNEED.patch`]({{ site.baseurl }}/code/ceph/osd-mem-admission/0004-osd-read-EC-recovery-data-with-FADVISE_DONTNEED.patch) | §3.1, §4.6: EC recovery reads; the PR's second commit |
 | [`memtop-exp.sh`]({{ site.baseurl }}/code/ceph/osd-mem-admission/memtop-exp.sh) | one A/B run: optional config, pick the `ceph-osd` binary, restart the cluster, run the phases under memtop. A wrapper over the previous post's [`memtop-workloads.sh`]({{ site.baseurl }}/code/ceph/memtop-workloads.sh), whose functions it sources (edit the path at the top) |
 | [`memtop-exp-fresh.sh`]({{ site.baseurl }}/code/ceph/osd-mem-admission/memtop-exp-fresh.sh) | the same for a new cluster (§4.5): `vstart -n`, unrecorded fill steps, then the recorded phases; `-o key=value` sets an OSD option (the §6 ratio sweep), the step `get4m-scan` is the §6 read-once GET |
 | [`memtop-exp-ec.sh`]({{ site.baseurl }}/code/ceph/osd-mem-admission/memtop-exp-ec.sh) | §4.6: the same on six OSDs (three partitions per NVMe) with the RGW data pool erasure coded 4+2, and the step `recovery-ec` (osd.1 down during 4 MiB PUTs to the EC pool, then back) |
@@ -664,7 +664,10 @@ for b in base new; do
 done
 ```
 
-The patches apply on Ceph main at f8f6ac2a1c1 (October 2026) plus the open
-PRs [#73203](https://github.com/ceph/ceph/pull/73203) and
+The four patches are upstream as PR
+[#73273](https://github.com/ceph/ceph/pull/73273), in the order 0001, 0004,
+0002, 0003 on main at 0a9180fb4e6. They apply on Ceph main at f8f6ac2a1c1
+(October 2026) plus the open PRs
+[#73203](https://github.com/ceph/ceph/pull/73203) and
 [#73018](https://github.com/ceph/ceph/pull/73018), which the test build
 included.
