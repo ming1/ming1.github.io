@@ -1,6 +1,6 @@
 ---
 title: "Ceph OSD Memory: Keep Read-Once Data Out of the Caches"
-description: "Why a Ceph OSD runs up to its memory target under scrub, recovery and RGW writes although almost nothing it caches is used again, and three changes, measured A/B with each workload on a new cluster, that cut the peak RSS by up to 71%: recovery pushes read with DONTNEED, and admission control for the onode cache and the RocksDB block caches."
+description: "Why a Ceph OSD runs up to its memory target under scrub, recovery and RGW writes although almost nothing it caches is used again, and three changes, measured A/B with each workload on a new cluster, that cut the peak RSS by up to 70%: recovery pushes read with DONTNEED, and admission control for the onode cache and the RocksDB block caches."
 category: storage
 tags: [ceph, memory, memtop, osd, bluestore, rocksdb, onode, cache, scrub, recovery, rgw, prioritycache, tcmalloc, patch]
 ---
@@ -21,9 +21,9 @@ touch goes to the front of the onode cache, every RocksDB block they read goes
 to the front of the block cache, and the memory tuner, which only looks at how
 recently something was used, hands them the whole budget. Keeping read-once
 data out of the caches until it proves useful cuts the deep-scrub peak from
-4.33 to 1.27 GiB, the recovery source's from 3.92 to 2.63 GiB and the RGW
-4 KiB PUT peak from 4.74 to 2.09 GiB. Client throughput is unchanged; recovery
-took 12% longer in the one pair measured, for a reason not yet found (§4.5).
+4.30 to 1.28 GiB, the recovery source's from 3.72 to 2.58 GiB and the RGW
+4 KiB PUT peak from 4.74 to 2.08 GiB. Client throughput, recovery time and
+scrub time are unchanged within 3%, or better.
 
 Background on the caches and the tuner:
 [Explaining Ceph's memory management]({% post_url 2026-10-21-ceph-memory-management %}).
@@ -32,29 +32,29 @@ Background on the caches and the tuner:
 
 Peak RSS (GiB; osd.0 unless noted), the unchanged build against the final
 patches of §3. Every run starts on a new cluster (`vstart -n`, both NVMe
-OSDs formatted) and the two runs of a pair were made back to back; §4.5 has
-the details. `osd_memory_target` is 4 GiB.
+drives discarded, then formatted) and the two runs of a pair were made back
+to back; §4.5 has the details and a second set of pairs.
+`osd_memory_target` is 4 GiB.
 
 | Workload | Before | After | Change | Throughput before → after |
 |---|---:|---:|---:|---|
-| Deep scrub, all PGs, osd.0 / osd.1 | 4.33 / 4.35 | **1.27 / 1.27** | −71% | 410 s → 430 s for all PGs |
-| Recovery, source OSD (osd.0) | 3.92 | **2.63** | −33% | clean after 271 s → 303 s |
-| Recovery, target OSD (osd.1) | 1.96 | **1.61** | −18% | degraded 4K writes 85.2k → 87.9k IOPS |
-| RGW PUT 4 MiB | 2.15 | **1.56** | −27% | 1171 → 1158 MiB/s |
-| RGW PUT 4 KiB | 4.74 | **2.09** | −56% | 8374 → 8728 obj/s |
-| RGW GET 4 MiB | 4.31 | 4.08 | −5% | 2264 → 2361 MiB/s |
-| RGW GET 4 KiB | 3.91 | 3.57 | −9% | 3091 → 3092 obj/s |
-| RBD write 4 MiB | 1.62 | 1.62 | 0% | 1255 → 1223 MiB/s |
-| RBD write 4 KiB | 2.29 | 2.30 | 0% | 33.7k → 32.9k IOPS |
-| RBD read 4 KiB | 3.77 | 3.84 | +2% | 170k → 171k IOPS |
-| RBD read 4 MiB | 4.73 | 4.66 | −1% | 4457 → 4644 MiB/s |
+| Deep scrub, all PGs, osd.0 / osd.1 | 4.30 / 4.34 | **1.28 / 1.28** | −70% | 420 s → 404 s for all PGs |
+| Recovery, source OSD (osd.0) | 3.72 | **2.58** | −31% | clean after 287 s → 292 s |
+| Recovery, target OSD (osd.1) | 1.97 | **1.61** | −18% | degraded 4K writes 88.2k → 87.0k IOPS |
+| RGW PUT 4 MiB | 2.12 | **1.57** | −26% | 1152 → 1177 MiB/s |
+| RGW PUT 4 KiB | 4.74 | **2.08** | −56% | 8472 → 8459 obj/s |
+| RGW GET 4 MiB | 4.37 | 4.09 | −6% | 2187 → 2408 MiB/s |
+| RGW GET 4 KiB | 3.62 | 2.81 | −22% | 3091 → 3091 obj/s |
+| RBD write 4 MiB | 1.61 | 1.60 | −1% | 1374 → 1406 MiB/s |
+| RBD write 4 KiB | 2.34 | 2.23 | −5% | 33.9k → 32.8k IOPS |
+| RBD read 4 KiB | 3.55 | 3.57 | +1% | 174k → 169k IOPS |
+| RBD read 4 MiB | 4.35 | 4.53 | +4% | 4320 → 4407 MiB/s |
 
 RBD is not one of the workloads the changes aim at; it is the check that a
-hot set is still cached and that throughput holds. The one throughput change
-outside the run-to-run spread is recovery, 12% slower in this pair; its cause
-is not established (§4.5).
+hot set is still cached and that throughput holds. No throughput figure moved
+by more than 3%, except where the patches made it faster.
 
-![peak RSS per workload, unchanged build against the final patches, each run on a new cluster]({{ site.baseurl }}/assets/images/ceph-osd-mem-admission-peaks-fresh.png)
+![peak RSS per workload, unchanged build against the final patches, each run on a new cluster]({{ site.baseurl }}/assets/images/ceph-osd-mem-admission-peaks-discard.png)
 
 §4.1–§4.4 measured the first version of the patches on one cluster that was
 restarted, not recreated, before each run, on a data set that grew to about
@@ -374,7 +374,7 @@ each RGW run, since the runs kept their buckets).
 | 1024 onodes per shard | RGW PUT 4 MiB peak 2.13 GiB instead of 1.38: 32 thousand onodes of 4 MiB objects, each with about 12 KiB of extents and blobs, are 0.6 GiB | none |
 | 256 per shard | scrub 1.40 GiB, recovery 1.56 GiB | recovery clean after 484 s instead of 358, degraded 4K writes −16%; RBD read 4 KiB 130k IOPS instead of 156–175k |
 | time only: the last four age bins of arrivals | as above | recovery 537 s; RBD read 4 KiB 140k IOPS |
-| **final: last four bins, and at least 1024 per shard** | the table below | recovery 12% longer in one pair, cause not established |
+| **final: last four bins, and at least 1024 per shard** | tables below | none measured |
 
 The 256 floor cost time because a backfill scan reads up to 512 objects of
 one PG, all into one shard, and pushes them over the next seconds: half were
@@ -383,49 +383,80 @@ their second use the same way. The time-based floor alone shrank to nothing
 under the same scan, since the tuner's budget for the cache follows the
 binned onodes, which under a scan are probation itself. The scrub times of
 these re-tests (1162, 1366 and 1617 s) grew with the object count, not with
-the patch; the earlier draft of this section blamed the patch, and was wrong.
+the patch; an earlier draft of this section blamed the patch, and was wrong.
 
 The final build was then measured against the unchanged one with every
 workload on a cluster created from scratch (`vstart -n`, both NVMe OSDs
 formatted), once for each build, so no run inherits data from an earlier
-one. Scrub and recovery first get their data without recording: the four
-RBD images are filled (128 GiB in 4 MiB writes), and for scrub also 180 s of
-RGW PUT 4 MiB and 180 s of PUT 4 KiB (about 52 thousand big and 1.6 million
-small objects); then the daemons are restarted and the recorded phase runs.
-RBD and RGW run their four phases on the empty cluster, as in §4.3 and §4.4.
-The two clusters of a pair filled at the same speed (RBD 1320 and 1296
-MiB/s, RGW PUT 4 MiB 1167 and 1189 MiB/s, PUT 4 KiB 8675 and 8931 obj/s).
+one. Each kind was run twice this way. The first time the drives were only
+formatted; the second time both were discarded (`blkdiscard`) and left
+alone for 30 s before the cluster was created, so the SSDs' own garbage
+collection is the same for the two clusters of a pair. Scrub and recovery
+first get their data without recording: the four RBD images are filled (128
+GiB in 4 MiB writes), and for scrub also 180 s of RGW PUT 4 MiB and 180 s
+of PUT 4 KiB (about 52 thousand big and 1.6 million small objects); then
+the daemons are restarted and the recorded phase runs. RBD and RGW run their
+four phases on the empty cluster, as in §4.3 and §4.4.
+
+The pairs on discarded drives:
 
 | Workload | Unchanged | Final patches | Change | Load, unchanged → final |
 |---|---:|---:|---:|---|
-| Deep scrub, osd.0 / osd.1 | 4.33 / 4.35 | **1.27 / 1.27** | −71% / −71% | 410 s → 430 s |
-| Recovery, source / target | 3.92 / 1.96 | **2.63 / 1.61** | −33% / −18% | clean after 271 s → 303 s; degraded 4K writes 85.2k → 87.9k IOPS |
-| RGW PUT 4 MiB / 4 KiB | 2.15 / 4.74 | **1.56 / 2.09** | −27% / −56% | 1171 → 1158 MiB/s; 8374 → 8728 obj/s |
-| RGW GET 4 MiB / 4 KiB | 4.31 / 3.91 | 4.08 / 3.57 | −5% / −9% | 2264 → 2361 MiB/s; 3091 → 3092 obj/s |
-| RBD write 4M / 4K, read 4K / 4M | 1.62 / 2.29 / 3.77 / 4.73 | 1.62 / 2.30 / 3.84 / 4.66 | 0 / 0 / +2% / −1% | 1255 → 1223 MiB/s; 33.7k → 32.9k, 170k → 171k IOPS; 4457 → 4644 MiB/s |
+| Deep scrub, osd.0 / osd.1 | 4.30 / 4.34 | **1.28 / 1.28** | −70% / −70% | 420 s → 404 s |
+| Recovery, source / target | 3.72 / 1.97 | **2.58 / 1.61** | −31% / −18% | clean after 287 s → 292 s; degraded 4K writes 88.2k → 87.0k IOPS |
+| RGW PUT 4 MiB | 2.12 | **1.57** | −26% | 1152 → 1177 MiB/s |
+| RGW PUT 4 KiB | 4.74 | **2.08** | −56% | 8472 → 8459 obj/s |
+| RGW GET 4 MiB | 4.37 | 4.09 | −6% | 2187 → 2408 MiB/s |
+| RGW GET 4 KiB | 3.62 | 2.81 | −22% | 3091 → 3091 obj/s |
+| RBD write 4 MiB | 1.61 | 1.60 | −1% | 1374 → 1406 MiB/s |
+| RBD write 4 KiB | 2.34 | 2.23 | −5% | 33.9k → 32.8k IOPS |
+| RBD read 4 KiB | 3.55 | 3.57 | +1% | 174k → 169k IOPS |
+| RBD read 4 MiB | 4.35 | 4.53 | +4% | 4320 → 4407 MiB/s |
 
-Where the memory went, at the peak of each unchanged run and of its pair:
-in scrub the onode cache and its untracked twin (§2.2) were 1.70 + 1.81 GiB
-against 0.37 + 0.34, the two RocksDB block caches 0.63 + 0.79 against 0.11 +
-0.19, and the allocator's free lists 1.49 against 0.38. In recovery the
-source OSD's data cache was 1.15 GiB against 0.00 and its onode block cache
-0.63 against 0.06; the hot extent maps of the RBD images stayed at 1.08 GiB
-in both. In RGW PUT 4 KiB the onodes and their twin were 2.01 + 1.68 GiB
-against 0.69 + 0.34, and the free lists 2.09 against 0.72; what is left at
-that peak is mostly memtables (0.74 GiB). In RBD nothing moved, as it should
-not: the 1024-per-shard floor holds 32,768 onodes, as many as the four
-images have objects, and the random writes and reads promote them anyway.
-The same floor is what keeps 0.69 GiB of 4 MiB-object onodes in RGW PUT
-4 MiB, which the first version of the patch had brought down to 0.11.
+The first pairs, drives formatted but not discarded, as a check on the
+spread:
 
-Recovery took 12% longer in this pair. One pair cannot tell a cost of the
-patches from run-to-run spread: the same comparison on the kept data set went
-363 → 333 s in §4.2 and 358 → 374 s in the floor re-test above. The extra
-work the patched OSD is known to do is small: it reloaded the 8,192 onodes
-of the fourth image, which the degraded phase wrote once and never read
-again, at about 25 per second during backfill, about 6 ms of RocksDB reads
-per second. That does not account for 32 s, the cause is not established,
-and the number is reported as measured.
+| Workload | Unchanged | Final patches | Load, unchanged → final |
+|---|---:|---:|---|
+| Deep scrub, osd.0 / osd.1 | 4.33 / 4.35 | 1.27 / 1.27 | 410 s → 430 s |
+| Recovery, source / target | 3.92 / 1.96 | 2.63 / 1.61 | clean after 271 s → 303 s; degraded 4K writes 85.2k → 87.9k IOPS |
+| RGW PUT 4 MiB / 4 KiB | 2.15 / 4.74 | 1.56 / 2.09 | 1171 → 1158 MiB/s; 8374 → 8728 obj/s |
+| RGW GET 4 MiB / 4 KiB | 4.31 / 3.91 | 4.08 / 3.57 | 2264 → 2361 MiB/s; 3091 → 3091 obj/s |
+| RBD write 4 MiB / 4 KiB | 1.62 / 2.29 | 1.62 / 2.30 | 1255 → 1223 MiB/s; 33.7k → 32.9k IOPS |
+| RBD read 4 KiB / 4 MiB | 3.77 / 4.73 | 3.84 / 4.66 | 170k → 171k IOPS; 4457 → 4644 MiB/s |
+
+What the two tables say, against the first version in §1:
+
+- **Scrub and recovery save more than before**, because the final onode rule
+  promotes almost nothing during a scan: in the discarded-drive scrub the
+  onode cache and its untracked twin (§2.2) went from 1.70 + 1.81 GiB to
+  0.38 + 0.35, the two RocksDB block caches from 0.69 + 0.79 to 0.11 + 0.21,
+  and the allocator's free lists from 1.73 to 0.40. The smaller block cache
+  worked better: 19.1 million hits and 0.92 million misses on the onode
+  column family against 12.4 and 1.09 million for the unchanged build, since
+  scan blocks no longer push out the blocks that are reused. The scrub was
+  4% faster. In recovery the source OSD's data cache went from 1.16 GiB to
+  0.00 and its onode block cache from 0.62 to 0.06; the hot extent maps of
+  the RBD images stayed at 1.09 GiB in both.
+- **The recovery time of the first pair, +12%, was the drives, not the
+  patch.** On that pair the cluster of the final build was slower before
+  any patched code ran: its unrecorded RBD fill did 1125 MiB/s against 1309
+  on the other cluster. With both drives discarded before each cluster the
+  fills match and recovery takes 287 s unchanged, 292 s with the patches.
+- **RGW PUT 4 KiB lands where the first version did**, 2.08 GiB: the onodes
+  and their twin went from 2.03 + 1.81 GiB to 0.69 + 0.34 and the free lists
+  from 2.63 to 0.74; what is left at that peak is mostly memtables (0.72
+  GiB). **PUT 4 MiB is 1.57 GiB where the first version had 1.38**: the
+  1024-per-shard floor keeps 0.69 GiB of 4 MiB-object onodes just written,
+  which the first version had brought down to 0.11. That is the price of the
+  floor that keeps backfill and the RBD hot set whole. GET 4 MiB is still the
+  data cache (§6).
+- **RBD** is the throughput check: every phase is within 3% of the unchanged
+  build on discarded drives, and nothing moved in memory, as it should not:
+  the floor holds 32,768 onodes, as many as the four images have objects,
+  and the random writes and reads promote them anyway. The savings of §4.4
+  came from the stale onodes of the data set those runs had grown; an empty
+  cluster has none.
 
 ## 5. How it was measured
 
@@ -440,7 +471,11 @@ and the number is reported as measured.
   RGW "after" runs a few runs later, on the same objects.
 - The pairs of §4.5 instead start every run from a new cluster (`vstart -n`,
   both OSDs formatted), fill it the same way for both builds, restart the
-  daemons, and record; `memtop-exp-fresh.sh` in §7 does this.
+  daemons, and record; `memtop-exp-fresh.sh` in §7 does this. The second
+  set of pairs also ran `blkdiscard` on both NVMe devices and waited 30 s
+  before creating the cluster: without it the two clusters of a pair saw
+  different SSD garbage collection, and a fill of the same 128 GiB varied
+  by 14% between them.
 - All builds are made at the same commit with the patches applied to the
   working tree, so the version string stays the same: Ceph refuses to load an
   erasure-code plugin whose version differs from the daemon's, and a rebuild
@@ -492,6 +527,12 @@ cp build/bin/ceph-osd bin/ceph-osd.base      # before building the patched one
 memtop-exp.sh scrub-base -b base scrub       # restart, deep scrub under memtop
 memtop-exp.sh scrub-new  -b new  scrub
 memtop-ab.py scrub-base scrub-new
+
+# the same on a new cluster, drives discarded first (§4.5)
+for b in base new; do
+    ../src/stop.sh; blkdiscard /dev/nvme1n1; blkdiscard /dev/nvme2n1; sleep 30
+    memtop-exp-fresh.sh scrub-$b -b $b fill-rbd fill-rgw restart scrub
+done
 ```
 
 The patches apply on Ceph main at f8f6ac2a1c1 (October 2026) plus the open

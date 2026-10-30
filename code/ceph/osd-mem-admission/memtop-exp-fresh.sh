@@ -1,10 +1,10 @@
 #!/bin/bash
 # One experiment on a NEW cluster: optional OSD config, pick the ceph-osd binary, create the cluster from
 # scratch (vstart -n, OSDs formatted), optional unrecorded fill steps, then run the recorded steps under memtop
-# into /root/git/ceph/wt/memtop-exp/<tag>. Sibling of memtop-exp.sh, which restarts the daemons on the same data.
+# into /root/git/ceph/wt/memtop-exp/<tag>; perf counters of both OSDs are saved at the end. Sibling of
+# memtop-exp.sh, which restarts the daemons on the same data.
 #   usage: memtop-exp-fresh.sh <tag> [-o key=value]... [-b binary-name] <step>...
 #   steps: fill-rbd fill-rgw (not recorded)  scrub recovery rbd rgw3 restart (recorded, as in memtop-exp.sh)
-
 set -e
 tag=$1; shift
 opts=()
@@ -18,10 +18,10 @@ source /root/git/ceph/wt/memtop-run-restart/memrun3.sh true   # functions only; 
 E=/root/git/ceph/wt/memtop-exp/exp.log
 elog() { echo "$(date +%F_%T) [$tag] $*" >> $E; }
 elog "start: $* opts=[${opts[*]}] ceph-osd=$(stat -c %y $B/bin/ceph-osd | cut -c1-19) $(cd $SRC && git log --oneline -1)"
-for o in "${opts[@]}"; do ceph config set osd "${o%%=*}" "${o#*=}"; done
 if [ -n "$bin" ]; then cp --remove-destination /root/git/ceph/wt/memtop-exp/bin/ceph-osd.$bin $B/bin/ceph-osd || { elog "copy of ceph-osd.$bin failed"; exit 1; }; elog "ceph-osd := $bin $(md5sum $B/bin/ceph-osd | cut -c1-8)"; fi
 [ "$($B/bin/ceph-osd --version | head -1)" = "$($B/bin/ceph-mon --version | head -1)" ] || { elog "version check: ceph-osd and ceph-mon differ, abort"; exit 1; }
 setup   # a new cluster: vstart -n, both OSDs formatted, pools and images created
+for o in "${opts[@]}"; do ceph config set osd "${o%%=*}" "${o#*=}"; done   # after setup: vstart -n wipes the config store; takes effect at the restart step
 ceph config dump > $RUN/log/config.dump 2>/dev/null || true
 # warp with its own bucket, kept (--noclear) so the recording ends with the PUTs; purged afterwards, unrecorded
 warp_fresh() { local name=$1; shift; (cd $RUN/log && $RUN/bin/warp "$@" $S3 --noclear --no-color --benchdata $RUN/log/$name.warp > $RUN/log/$name.out 2>&1) || log "warp exit $?"; grep -E "Average|Reqs" $RUN/log/$name.out | head -2 | tee -a $RUN/log/run.log; }
@@ -56,4 +56,8 @@ for s in "$@"; do
     esac
 done
 for o in "${opts[@]}"; do ceph config rm osd "${o%%=*}"; done
+for o in 0 1; do   # counters at the end of the run
+    ceph tell osd.$o perf dump > $RUN/log/perf-osd.$o.json 2>/dev/null || true
+    ceph daemon osd.$o dump_objectstore_kv_stats > $RUN/log/kvstats-osd.$o.json 2>/dev/null || true
+done
 elog "done"
