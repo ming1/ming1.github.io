@@ -35,7 +35,10 @@ dense object-storage hosts running many OSDs, where memory per OSD is a
 direct cost and the workload is RGW writes and reads. An OSD that sits at
 its `osd_memory_target` through every such phase leaves nothing to lower,
 so the aim is a lower peak under RGW load, with deep scrub and recovery,
-which run on the same hosts, in scope too.
+which run on the same hosts, in scope too. With the changes the OSD's peak
+under RGW writes is about half the target at the same throughput, and its
+reads hit the data cache as well or better (§1, §6), so it becomes possible
+to lower `osd_memory_target` for RGW workloads without hurting performance.
 
 Peak RSS (GiB; osd.0 unless noted), the unchanged build against the final
 patches of §3. Every run starts on a new cluster (`vstart -n`, both NVMe
