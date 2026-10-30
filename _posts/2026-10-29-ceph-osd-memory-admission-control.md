@@ -256,16 +256,15 @@ Five runs on the same data, each after a cluster restart:
 | unchanged, repeated | 4.35 | 4.46 | 616 s | digests present: the clean baseline |
 | + block admission, second use (§3.3) | **1.57** | **1.58** | 633 s | |
 
-A deep scrub updates the digest of objects older than two hours that have
-none, so the first scrub after a bulk write also writes. That is the 0.55–0.64
-GiB of memtables in two of the runs, and why the pairs compared in §1 are the
-last two.
+A deep scrub writes digests for objects older than two hours that have
+none, so the first scrub after a bulk write also writes: that is the
+0.55–0.64 GiB of memtables in two runs. The clean pair is the last two rows.
 
 ### 4.2 Recovery
 
-The recovery workload: osd.1 is stopped, 32 GiB of 4 MiB writes and 90 s of 4 KiB
-random writes land on osd.0 alone, then osd.1 returns and 177 PGs recover
-(113 from their logs, 64 by backfill). osd.0 is the source, osd.1 the target.
+osd.1 is stopped, 32 GiB of 4 MiB writes and 90 s of 4 KiB random writes
+land on osd.0 alone, then osd.1 returns and 177 PGs recover (113 from their
+logs, 64 by backfill). osd.0 is the source, osd.1 the target.
 
 | Run | osd.0 (source) | osd.1 (target) | Clean after | Note |
 |---|---:|---:|---:|---|
@@ -273,18 +272,16 @@ random writes land on osd.0 alone, then osd.1 returns and 177 PGs recover
 | §3.1 + §3.2 | 3.94 | 2.00 | 347 s | data cache 0.00, onode block cache 0.89 at the peak sample: the room moved |
 | §3.1 + §3.2 + §3.3 | **3.10** | **1.33** | 333 s | onode block cache 0.16, data cache 0.00 |
 
-The degraded write phase before it (osd.0 alone takes 32 GiB of 4 MiB writes
-and 90 s of 4 KiB random writes) went from 4.13 to 3.30 GiB at 86.0k → 84.1k
-IOPS. What stays on the source is real: 1.3 GiB of onodes and extent maps for
-the 32 thousand RBD objects that the 4 KiB random writes fragmented, touched again and again
-during the write phase and kept, correctly, in the main LRU.
+The degraded write phase before it went from 4.13 to 3.30 GiB at 86.0k →
+84.1k IOPS. What stays on the source is real: 1.3 GiB of onodes and extent
+maps of the 32 thousand RBD objects that the random writes fragmented and
+touched again and again, kept, correctly, in the main LRU.
 
 ### 4.3 RGW
 
-Four phases on fresh buckets: PUT 4 MiB, PUT 4 KiB, GET 4 MiB, GET 4 KiB,
-180 s each. The buckets of the first two runs were removed afterwards, so the
-data set did not grow between the runs; the last run kept its buckets, as
-nothing followed it.
+Four phases on fresh buckets, 180 s each: PUT 4 MiB, PUT 4 KiB, GET 4 MiB,
+GET 4 KiB. The buckets of the first two runs were removed afterwards; the
+last run kept its, as nothing followed it.
 
 | Phase | Unchanged | §3.1 + §3.2 | all three | Throughput, unchanged → §3.2 → all |
 |---|---:|---:|---:|---|
@@ -293,33 +290,29 @@ nothing followed it.
 | GET 4 MiB | 4.30 | 4.00 | 4.19 | 2245 → 2332 → 2834 MiB/s |
 | GET 4 KiB | 4.01 | 3.76 | 3.50 | 3091 → 3091 → 3091 obj/s |
 
-In PUT 4 KiB the onodes of the written objects were 2.76 GiB of the 4.65 GiB
-peak (2.98 of 4.72 in the separate run of §2.2); with admission they are
-0.11 GiB counted and 0.34 untracked, and what remains at the peak is
-RocksDB's memtables (0.71 GiB), which the tuner does not control. The GET
-phases keep the OSD near the target for a legitimate reason: the reads fill
-the data cache (2.14 GiB in both GET phases) with a working set the
-benchmark reads again and again (2,500 objects, 10 GiB; §6), and the cache
-serves about 30% of the read bytes over the phase, 40% once it is full. The free lists are much
-smaller there too (1.69 → 0.36 GiB in GET 4M), because the onode cache no
-longer churns.
-
-The one PUT 4 MiB throughput drop (1182 → 1069 MiB/s, middle column) was
-measured right after a 23-minute deletion of 1.5 million objects, with
-RocksDB compacting the deletion markers (tombstones); the run with all three changes, with no
-such neighbour, is back at 1170 MiB/s.
+- **PUT 4 KiB.** The written objects' onodes were 2.76 GiB of the 4.65 GiB
+  peak (2.98 of 4.72 in §2.2's run); with admission they are 0.11 GiB
+  counted and 0.34 untracked, and what remains is RocksDB's memtables
+  (0.71 GiB), outside the tuner.
+- **The GETs** stay near the target for a legitimate reason: the data cache
+  (2.14 GiB in both phases) holds a working set the benchmark reads again
+  and again (2,500 objects, 10 GiB; §6) and serves about 30% of the read
+  bytes over the phase, 40% once it is full. The free lists are smaller too
+  (1.69 → 0.36 GiB in GET 4 MiB), because the onode cache no longer churns.
+- **The PUT 4 MiB dip** in the middle column (1069 MiB/s) was measured right
+  after a 23-minute deletion of 1.5 million objects, with RocksDB compacting
+  the tombstones; the run with all three changes, with no such neighbour, is
+  back at 1170 MiB/s.
 
 ### 4.4 RBD: the hot-set check
 
-RBD is the workload with a hot set: fio touches the same 32 thousand 4 MiB
-objects over and over, so their onodes must be promoted and kept, or the
-cache would miss on every op. It is also the throughput check. The RBD
-workload (four images; 4 MiB sequential writes that fill them, about 105 s;
-then 4 KiB random writes, 4 KiB random reads and 4 MiB reads, 180 s each)
-was run five times on the same images, each after a cluster restart: the
-unchanged build twice, the build with §3.1 and §3.2 once, and the build with
-all three changes twice, so that the change can be read against the
-run-to-run spread.
+RBD has a hot set: fio touches the same 32 thousand 4 MiB objects over and
+over, so their onodes must be promoted and kept, or every op would miss. It
+is also the throughput check. Four images; a 4 MiB sequential fill (about
+105 s), then 4 KiB random writes, 4 KiB random reads and 4 MiB reads, 180 s
+each; five runs on the same images after restarts (the unchanged build
+twice, §3.1 + §3.2 once, all three twice), so the change can be read
+against the run-to-run spread.
 
 Peak RSS of osd.0, GiB:
 
@@ -339,34 +332,29 @@ Throughput, fio over the four images:
 | read 4 KiB, IOPS | 175k | 156k | 150k | 167k | 155k |
 | read 4 MiB, MiB/s | 4599 | 4524 | 4505 | 4576 | 4390 |
 
-- **The hot set is kept.** The onode cache holds 0.92–0.93 GiB in read 4K on
-  every build: the random writes and reads touch each object several times a
-  second, so an onode is promoted within its first second on probation.
-- **Memory.** Write 4 MiB loses about half of its peak: the onodes of 32
-  thousand objects written once in sequence and never touched again in the
-  phase. Write 4 KiB loses 16%. The reads stay at the target, because the
-  data cache fills with read data as before. With §3.1 and §3.2 alone, write
-  4 KiB went *up* to 3.87 GiB: the block caches took the room the onode cache
-  gave back, as in recovery (§2.3), until §3.3 bounded them.
+- **The hot set is kept.** The onode cache holds 0.92–0.93 GiB in read 4 KiB
+  on every build: each object is touched several times a second and is
+  promoted within its first second on probation.
+- **Memory.** Write 4 MiB loses half its peak (32 thousand onodes written
+  once, in sequence, never touched again in the phase); write 4 KiB loses
+  16%; the reads stay at the target, since the data cache fills as before.
+  With §3.1 and §3.2 alone, write 4 KiB *rose* to 3.87 GiB: the block caches
+  took the room the onode cache gave back, as in recovery (§2.3), until §3.3
+  bounded them.
 - **Throughput.** The two unchanged runs differ by 11% in read 4 KiB (175k
   against 156k IOPS) and 5% in write 4 MiB. Every number of the changed
-  builds falls inside that spread, except write 4 KiB, where the all-three
-  runs are 2–4% below the unchanged ones. There is no throughput change that
-  the run-to-run spread does not cover.
+  builds falls inside that spread, except write 4 KiB, 2–4% below.
 
 ### 4.5 Re-test of the final patches, each workload on a new cluster
 
-A review of the three patches (correctness, effect, and the commit logs)
-changed four things: onodes are promoted after two later uses, not one
-(§3.2), and probation has a floor; the block cache trims probation on every
-insert, keeps it at least half full when the main pool is evicted, and
-rotates its age bins without the autotuner (§3.3); and `maybe_unpin` now
-works on the shard an onode was moved to during a PG split (a pre-existing
-race).
-
-Three re-tests went into the floor, on the data set as it had grown by the
-end of §4.3 (about 7.5 million small objects, and 1.5 million more after
-each RGW run, since the runs kept their buckets).
+A review of the three patches changed four things: onodes are promoted
+after two later uses, not one, and probation has a floor (§3.2); the block
+cache trims probation on every insert, keeps it at least half full when the
+main pool is evicted, and rotates its age bins without the autotuner
+(§3.3); and `maybe_unpin` works on the shard an onode was moved to during a
+PG split (a pre-existing race). Three re-tests went into the floor, on the
+data set as it had grown by the end of §4.3 (about 7.5 million small
+objects, 1.5 million more after each RGW run):
 
 | Probation floor | Memory | Cost |
 |---|---|---|
@@ -376,26 +364,23 @@ each RGW run, since the runs kept their buckets).
 | **final: last four bins, and at least 1024 per shard** | tables below | none measured |
 
 The 256 floor cost time because a backfill scan reads up to 512 objects of
-one PG, all into one shard, and pushes them over the next seconds: half were
-evicted before their push, and the hot RBD onodes lost their place before
-their second use the same way. The time-based floor alone shrank to nothing
-under the same scan, since the tuner's budget for the cache follows the
-binned onodes, which under a scan are probation itself. The scrub times of
-these re-tests (1162, 1366 and 1617 s) grew with the object count, not with
-the patch; an earlier draft of this section blamed the patch, and was wrong.
+one PG into one shard and pushes them over the next seconds: half were
+evicted before their push, and the RBD hot set lost onodes before their
+second use the same way. The time rule alone shrank to nothing under a
+scan, since the tuner's budget follows the binned onodes, which under a
+scan are probation itself. The scrub times of these re-tests (1162, 1366,
+1617 s) tracked the growing object count, not the patch; an earlier draft
+blamed the patch and was wrong.
 
 The final build was then measured against the unchanged one with every
-workload on a cluster created from scratch (`vstart -n`, both NVMe OSDs
-formatted), once for each build, so no run inherits data from an earlier
-one. Each kind was run twice this way. The first time the drives were only
-formatted; the second time both were discarded (`blkdiscard`) and left
-alone for 30 s before the cluster was created, so the SSDs' own garbage
-collection is the same for the two clusters of a pair. Scrub and recovery
-first get their data without recording: the four RBD images are filled (128
-GiB in 4 MiB writes), and for scrub also 180 s of RGW PUT 4 MiB and 180 s
-of PUT 4 KiB (about 52 thousand big and 1.6 million small objects); then
-the daemons are restarted and the recorded phase runs. RBD and RGW run their
-four phases on the empty cluster, as in §4.3 and §4.4.
+workload on a cluster created from scratch (`vstart -n`), twice: once with
+the drives only formatted, once with both discarded (`blkdiscard`) and left
+alone for 30 s first, so the SSDs' garbage collection is the same within a
+pair. Scrub and recovery get their data unrecorded first (the four RBD
+images filled, 128 GiB; for scrub also 180 s of RGW PUT 4 MiB and of PUT
+4 KiB, about 52 thousand big and 1.6 million small objects), then a daemon
+restart and the recorded phase; RBD and RGW run their four phases on the
+empty cluster, as in §4.3 and §4.4.
 
 The pairs on discarded drives:
 
@@ -424,38 +409,29 @@ spread:
 | RBD write 4 MiB / 4 KiB | 1.62 / 2.29 | 1.62 / 2.30 | 1255 → 1223 MiB/s; 33.7k → 32.9k IOPS |
 | RBD read 4 KiB / 4 MiB | 3.77 / 4.73 | 3.84 / 4.66 | 170k → 171k IOPS; 4457 → 4644 MiB/s |
 
-What the two tables say, against the first version in §1:
+Against the first version in §1:
 
-- **Scrub and recovery save more than before**, because the final onode rule
-  promotes almost nothing during a scan: in the discarded-drive scrub the
-  onode cache and its untracked twin (§2.2) went from 1.70 + 1.81 GiB to
-  0.38 + 0.35, the two RocksDB block caches from 0.69 + 0.79 to 0.11 + 0.21,
-  and the allocator's free lists from 1.73 to 0.40. The smaller block cache
-  worked better: 19.1 million hits and 0.92 million misses on the onode
-  column family against 12.4 and 1.09 million for the unchanged build, since
-  scan blocks no longer push out the blocks that are reused. The scrub was
-  4% faster. In recovery the source OSD's data cache went from 1.16 GiB to
-  0.00 and its onode block cache from 0.62 to 0.06; the hot extent maps of
-  the RBD images stayed at 1.09 GiB in both.
-- **The recovery time of the first pair, +12%, was the drives, not the
-  patch.** On that pair the cluster of the final build was slower before
-  any patched code ran: its unrecorded RBD fill did 1125 MiB/s against 1309
-  on the other cluster. With both drives discarded before each cluster the
-  fills match and recovery takes 287 s unchanged, 292 s with the patches.
-- **RGW PUT 4 KiB lands where the first version did**, 2.08 GiB: the onodes
-  and their twin went from 2.03 + 1.81 GiB to 0.69 + 0.34 and the free lists
-  from 2.63 to 0.74; what is left at that peak is mostly memtables (0.72
-  GiB). **PUT 4 MiB is 1.57 GiB where the first version had 1.38**: the
-  1024-per-shard floor keeps 0.69 GiB of 4 MiB-object onodes just written,
-  which the first version had brought down to 0.11. That is the price of the
-  floor that keeps backfill and the RBD hot set whole. GET 4 MiB is still the
-  data cache (§6).
-- **RBD** is the throughput check: every phase is within 3% of the unchanged
-  build on discarded drives, and nothing moved in memory, as it should not:
-  the floor holds 32,768 onodes, as many as the four images have objects,
-  and the random writes and reads promote them anyway. The savings of §4.4
-  came from the stale onodes of the data set those runs had grown; an empty
-  cluster has none.
+- **Scrub and recovery save more**, because the final rule promotes almost
+  nothing during a scan. Discarded-drive scrub, osd.0: onodes and their
+  untracked twin (§2.2) 1.70 + 1.81 → 0.38 + 0.35 GiB, the two block caches
+  0.69 + 0.79 → 0.11 + 0.21, free lists 1.73 → 0.40. The smaller block
+  cache hit more (19.1 M hits, 0.92 M misses on the onode column family
+  against 12.4 M and 1.09 M), since scan blocks no longer evict the reused
+  ones; the scrub was 4% faster. Recovery: the source's data cache 1.16 →
+  0.00, its onode block cache 0.62 → 0.06, the RBD extent maps 1.09 GiB in
+  both.
+- **The first pair's +12% recovery time was the drives.** That cluster's
+  unrecorded fill ran 1125 MiB/s against 1309, before any patched code
+  ran. With the drives discarded: 287 s unchanged, 292 s with the patches.
+- **RGW PUT 4 KiB lands where the first version did**, 2.08 GiB: onodes and
+  twin 2.03 + 1.81 → 0.69 + 0.34, free lists 2.63 → 0.74, memtables 0.72
+  remain. **PUT 4 MiB is 1.57 against 1.38**: the 1024 floor keeps 0.69 GiB
+  of just-written 4 MiB-object onodes (0.11 before), the price of keeping
+  backfill and the RBD hot set whole. GET 4 MiB: §6.
+- **RBD**: throughput within 3%, and nothing moved in memory, as it should
+  not: the floor holds 32,768 onodes, as many as the images have objects,
+  and the random I/O promotes them anyway. §4.4's savings came from the stale
+  onodes of a grown data set; an empty cluster has none.
 
 ## 5. How it was measured
 
@@ -487,25 +463,22 @@ What the two tables say, against the first version in §1:
 
 ## 6. What is left
 
-- **Memtables.** 0.71 GiB in RGW PUT 4K, outside the tuner. They are the
-  largest consumer left in that workload.
-- **The data cache under RGW GETs is doing its job.** GET 4 MiB is the row
-  the patches change least (4.37 → 4.09 GiB in §1), and the reason is not
-  read-once data. The benchmark reads a working set: warp's `--list-existing`
-  keeps the first `--objects` keys of the bucket, 2,500 by default, and its
-  GET loop picks among them at random. The RGW log of one run shows 2,501
+- **Memtables.** 0.72 GiB in RGW PUT 4 KiB, outside the tuner: the largest
+  consumer left in that workload.
+- **The data cache under RGW GETs is doing its job.** GET 4 MiB moves least
+  in §1 (4.37 → 4.09 GiB), and not because of read-once data. warp's
+  `--list-existing` keeps the first `--objects` keys of the bucket, 2,500 by
+  default, and reads them at random: the RGW log of one run shows 2,501
   distinct keys requested out of 53,774 written, 112 thousand times in
-  180 s, about 45 reads per object. osd.0 holds the primary copy of 55% of
-  them, a 5.4 GiB set; its data cache at the end of the phase, 2.15 GiB, is
-  40% of that set, and 40% of the read bytes hit it in the last ten seconds
-  (31% over the phase, during which the cache grew from nothing). Uniformly
-  random reads hit exactly the resident fraction, whatever the policy. A
-  trace of the 2Q shards during the phase (uprobes on the shard's add,
-  touch and remove) shows the re-reads directly: a third of the inserts are
-  objects evicted seconds earlier and read again, promoted from the ghost
-  list to the hot list, which stays full and cycles.
-
-  The two peaks of the row are different events:
+  180 s, 45 reads per object. osd.0 holds the primary copy of 55% of them,
+  a 5.4 GiB set; its data cache at the end of the phase, 2.15 GiB, is 40% of
+  that, and 40% of the read bytes hit it in the last ten seconds (31% over
+  the phase, while the cache grew from nothing). Uniformly random reads hit
+  exactly the resident fraction, whatever the policy. A trace of the 2Q
+  shards (uprobes on add, touch and remove) shows the re-reads: a third of
+  the inserts are objects evicted seconds earlier and read again, promoted
+  from the ghost list to the hot list, which stays full. The two peaks are
+  different events:
 
   | osd.0 at its peak | Unchanged, 47 s in | Final patches, 179 s in |
   |---|---:|---:|
@@ -514,37 +487,35 @@ What the two tables say, against the first version in §1:
   | onodes + untracked heap | 0.32 + 0.42 | 0.11 + 0.19 |
   | allocator free lists | 2.00 | 0.73 |
 
-  The unchanged build's peak is the residue of PUT 4 KiB, free lists above
-  all, pushing mapped memory over the target until tcmalloc releases it 15 s
-  later; the final build's is the data cache filled to the tuner's budget at
-  the end of the phase, under the target (the §1 figure, 4.09, includes the
-  15 s after warp stops). That budget is 0.85 × target − 768 MiB = 2.65 GiB;
-  the kv and onode caches keep about 0.4 GiB of it, the data cache takes the
-  rest, 64 MiB per five-second round, and RSS ends at 3.6–3.9 GiB. So the
-  patches removed the cause of the old peak, and what is left is the working
-  set filled to the budget, which is what the tuner is for. The gain shows
-  in throughput instead: with the residue holding mapped memory over the
+  The unchanged build's peak is PUT 4 KiB residue, free lists above all,
+  holding mapped memory over the target until tcmalloc releases it 15 s
+  later. The final build's is the data cache filled to the tuner's budget
+  (0.85 × target − 768 MiB = 2.65 GiB, of which the kv and onode caches keep
+  about 0.4 GiB; the data cache takes the rest, 64 MiB per five-second
+  round) at the end of the phase, under the target; the §1 figure of 4.09
+  includes the 15 s after warp stops. The patches removed the cause of the
+  old peak; what is left is the working set at the budget, which is what the
+  tuner is for. The gain shows as throughput: with the residue over the
   target, the unchanged build's tuner cuts its budget twice during the
-  phase, the data cache grows slower, and GET 4 MiB runs 10–12% slower
+  phase, its data cache grows slower, and GET 4 MiB runs 10–12% slower
   (2187 → 2408 MiB/s in §4.5, 2225 → 2485 in the traced pair) from the same
   number of drive reads. Admission control for the data cache would not
   help here; it would cost drive reads. An earlier version of this section
-  said the GETs filled the cache with data that would not be read again and
-  named data-cache probation as the next change; that was wrong about the
-  benchmark. A one-pass scan of a bucket larger than memory would be
-  read-once, and the 2Q warm-in bound does not hold for one (the hot list's
-  unused share is lent to warm-in, and warm-in bytes count as fresh for the
-  tuner); that case is untested here.
-- **Counting the onodes' real cost.** The tuner still budgets the onode cache
-  from mempool bytes, half the real heap for small objects. With admission the
-  cache is small enough that this matters less, but a workload with a large
+  called the GET data read-once and named data-cache probation as the next
+  change; that was wrong about the benchmark. A one-pass scan of a bucket
+  larger than memory would be read-once, and the 2Q warm-in bound does not
+  hold for one (the hot list's unused share is lent to warm-in, and warm-in
+  bytes count as fresh for the tuner); that case is untested here.
+- **Counting the onodes' real cost.** The tuner still budgets the onode
+  cache from mempool bytes, half the real heap for small objects. With
+  admission the cache is small enough that this matters less, but a large
   hot set of small objects would still overshoot.
 - **A ghost list.** An onode or block reused with a period longer than its
-  stay on probation is never promoted. 2Q's answer is a small list of recently
-  evicted keys; neither patch has one.
-- **Ratios.** 0.1 was the first value tried for both probation ratios. The 2Q
-  literature suggests about 0.25 for the admission queue; a larger probation
-  costs memory in scans and protects more of the slow-reuse set.
+  stay on probation is never promoted. 2Q's answer is a small list of
+  recently evicted keys; neither patch has one.
+- **Ratios.** 0.1 was the first value tried for both probation ratios. The
+  2Q literature suggests about 0.25 for the admission queue; a larger
+  probation costs memory in scans and protects more of the slow-reuse set.
 
 ## 7. Reproduce
 
