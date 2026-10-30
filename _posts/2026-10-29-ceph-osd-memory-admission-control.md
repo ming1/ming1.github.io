@@ -30,6 +30,13 @@ Background on the caches and the tuner:
 
 ## 1. The results in one view
 
+**Motivation.** This work is for RGW deployments of the Dropbox kind:
+dense object-storage hosts running many OSDs, where memory per OSD is a
+direct cost and the workload is RGW writes and reads. An OSD that sits at
+its `osd_memory_target` through every such phase leaves nothing to lower,
+so the aim is a lower peak under RGW load, with deep scrub and recovery,
+which run on the same hosts, in scope too.
+
 Peak RSS (GiB; osd.0 unless noted), the unchanged build against the final
 patches of §3. Every run starts on a new cluster (`vstart -n`, both NVMe
 drives discarded, then formatted) and the two runs of a pair were made back
