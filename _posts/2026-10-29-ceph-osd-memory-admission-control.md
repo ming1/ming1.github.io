@@ -39,6 +39,9 @@ which run on the same hosts, in scope too. With the changes the OSD's peak
 under RGW writes is about half the target at the same throughput, and its
 reads hit the data cache as well or better (§1, §6), so it becomes possible
 to lower `osd_memory_target` for RGW workloads without hurting performance.
+Such deployments keep the data pool erasure coded; §4.6 repeats the
+measurements on a 4+2 pool, where the changes hold up and recovery shows
+one gap.
 
 Peak RSS (GiB; osd.0 unless noted), the unchanged build against the final
 patches of §3. Every run starts on a new cluster (`vstart -n`, both NVMe
@@ -169,6 +172,13 @@ room for it.
 The patch makes the flag default to true and clears it only in
 `maybe_kick_recovery`, where a client op is waiting for the object and will
 read it next. Data cache during recovery: 1.05 → 0.00 GiB.
+
+Only the replicated backend reads the flag. Both erasure-code backends issue
+their recovery reads with no fadvise flag at all: `ECBackendL`, the backend
+new EC pools get by default, passes 0 for them, and the new `ECCommon` read
+request leaves its default, also 0. So on an EC pool the OSDs that serve a
+shard reconstruction still cache what they read for it. §4.6 measures this;
+the fix is the same flag in those two places and is left for a follow-up.
 
 ### 3.2 Onode cache: admit on the second use
 
@@ -443,6 +453,61 @@ Against the first version in §1:
   and the random I/O promotes them anyway. §4.4's savings came from the stale
   onodes of a grown data set; an empty cluster has none.
 
+### 4.6 An erasure-coded data pool
+
+RGW deployments of the Dropbox kind keep the data pool erasure coded, so the
+final patches were run once more with `default.rgw.buckets.data` as an EC
+pool, k=4 m=2, failure domain OSD. The box has two NVMe drives, so each was
+split in three and the cluster has six OSDs, `osd_memory_target` 4 GiB each
+as before; the index and RBD pools stay replicated (size 3). Every run is on
+a new cluster with both drives discarded first, as in §4.5. Each OSD holds a
+1 MiB shard of every 4 MiB object and a 4 KiB shard of every small one
+(three of the four data shards all zeros), so per byte stored an EC OSD has more onodes than a replicated one.
+
+What the code says before measuring: the onode and block probation (§3.2,
+§3.3) sit below the pool type and apply to every shard; the recovery flag
+(§3.1) is read by the replicated backend only, and EC recovery reads carry
+no fadvise flag at all. EC writes already send parity shards with
+`FADVISE_DONTNEED` when the PG is not undersized; data shards are cached as
+on a replicated pool.
+
+Peak RSS, GiB, the highest of the six OSDs (osd.1 for the recovering OSD):
+
+| Workload on the EC pool | Unchanged | Final patches | Change | Load, unchanged → final |
+|---|---:|---:|---:|---|
+| RGW PUT 4 MiB | 1.15 | **0.95** | −17% | 1079 → 1079 MiB/s |
+| RGW PUT 4 KiB | 4.57 | **1.63** | −64% | 6210 → 7039 obj/s |
+| RGW GET 4 MiB | 4.46 | **3.49** | −22% | 2058 → 2260 MiB/s |
+| RGW GET 4 KiB | 4.14 | **2.99** | −28% | 3075 → 3076 obj/s |
+| Deep scrub | 4.44 | **1.24** | −72% | 340 s → 325 s |
+| Recovery of EC shards, source OSDs / osd.1 | 3.05 / 1.11 | 3.07 / 1.09 | +1% / −2% | clean after 158 s → 168 s |
+| Recovery of RBD writes (replicated), source / osd.1 | 2.71 / 1.41 | 1.78 / 1.34 | −34% / −5% | clean after 80 s → 81 s |
+
+RGW: under 4 KiB PUTs all six OSDs of the unchanged build ran past the
+target, onodes and their untracked twin at about 3.5 GiB each; with the
+patches the onode cache stays at 0.23 GiB and the phase writes 13% more
+objects per second. GET 4 MiB
+drops 22% here against 6% in §4.5: the per-OSD working set is a quarter of
+the replicated one (1 MiB shards), so the data cache settles further under
+the budget.
+
+Recovery: the gap of §3.1, measured. osd.1 was down for 120 s of 4 MiB
+PUTs to the EC pool, 33–34 thousand objects, then rebuilt its shards from
+the other five OSDs. For each object the primary reads four of the five
+remaining shards, one from each source, with no fadvise flag, and every
+source's data cache grew from zero to 1.8–2.0 GiB in both builds: the
+patches do not reach EC recovery reads, and the sources' peak is the same
+with and without them. The patched run wrote 2% more objects while degraded
+and took 6% longer to recover, within the spread of the §4.5 recovery pairs.
+The replicated recovery on the same six-OSD layout, RBD writes while osd.1
+was down, behaves as in §4.2: the sources' data cache at zero, −34%.
+
+Scrub: the same picture as §4.1 on all six OSDs. Unchanged, each sits at
+4.4 GiB with 1.5 GiB of onodes, 1.9 GiB of their untracked twin and a 0.9 GiB
+onode block cache; with the patches 73–76 thousand onodes are resident per
+OSD instead of 390–560 thousand, almost all on probation, and the scrub is
+4% faster.
+
 ## 5. How it was measured
 
 - The cluster, build and tools are those of the previous post: vstart, two
@@ -540,6 +605,10 @@ Against the first version in §1:
 - **A ghost list.** An onode or block reused with a period longer than its
   stay on probation is never promoted. 2Q's answer is a small list of
   recently evicted keys; neither patch has one.
+- **EC recovery reads.** Both erasure-code backends read for a shard
+  reconstruction with no fadvise flag, so the sources cache what they read
+  (§4.6: 1.9 GiB per source OSD). Patch 1 does not reach them; the fix is
+  `FADVISE_DONTNEED` on those reads, in two places.
 - **Ratios.** Both probation ratios were swept on new clusters with the final
   patches (§4.5's recipe), scrub as the scan and RBD as the hot set:
 
@@ -568,6 +637,7 @@ Against the first version in §1:
 | [`0003-kv-rocksdb_cache-put-new-blocks-on-probation-before-.patch`]({{ site.baseurl }}/code/ceph/osd-mem-admission/0003-kv-rocksdb_cache-put-new-blocks-on-probation-before-.patch) | §3.3 |
 | [`memtop-exp.sh`]({{ site.baseurl }}/code/ceph/osd-mem-admission/memtop-exp.sh) | one A/B run: optional config, pick the `ceph-osd` binary, restart the cluster, run the phases under memtop. A wrapper over the previous post's [`memtop-workloads.sh`]({{ site.baseurl }}/code/ceph/memtop-workloads.sh), whose functions it sources (edit the path at the top) |
 | [`memtop-exp-fresh.sh`]({{ site.baseurl }}/code/ceph/osd-mem-admission/memtop-exp-fresh.sh) | the same for a new cluster (§4.5): `vstart -n`, unrecorded fill steps, then the recorded phases; `-o key=value` sets an OSD option (the §6 ratio sweep), the step `get4m-scan` is the §6 read-once GET |
+| [`memtop-exp-ec.sh`]({{ site.baseurl }}/code/ceph/osd-mem-admission/memtop-exp-ec.sh) | §4.6: the same on six OSDs (three partitions per NVMe) with the RGW data pool erasure coded 4+2, and the step `recovery-ec` (osd.1 down during 4 MiB PUTs to the EC pool, then back) |
 | [`memtop-quick-peaks.py`]({{ site.baseurl }}/code/ceph/osd-mem-admission/memtop-quick-peaks.py) | per phase and OSD: RSS peak and the held peaks of the main rows |
 | [`memtop-ab.py`]({{ site.baseurl }}/code/ceph/osd-mem-admission/memtop-ab.py) | the A/B tables of this post from two runs |
 | [`memtop-rbd-table.py`]({{ site.baseurl }}/code/ceph/osd-mem-admission/memtop-rbd-table.py) | the five-run RBD tables of §4.4: `memtop-rbd-table.py LABEL=RUN...` |
