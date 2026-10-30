@@ -2569,144 +2569,121 @@ reaches the allocator only when its discard completes.
 ## 16. Every allocation of one I/O, end to end
 
 **Summary.** I traced every heap allocation that one 4 MiB I/O causes, in
-every process it passes through: an RBD write and read through librbd, an
-S3 PUT and GET through RGW, the recovery of one object, and a deep and a
-shallow scrub of the PG that holds it. Uprobes on the allocator record the
-size, the pointer and the call stack of each allocation. The payload is
-allocated once per hop, except on two paths that copy it again to align
-it: the primary of an RGW PUT, and the OSD that receives a recovery push.
-The counts come mostly from BlueStore, which makes 13 small allocations
-per 64 KiB blob, about 1,000 per OSD for a 4 MiB write. Little stays
-allocated after an op, with one exception: the OSD that receives a
-recovered object keeps its data for 10 minutes, pinned by the op history.
-§16.7 lists the fixes.
+every process on its path. Uprobes on the allocator record the size, the
+pointer and the call stack of each allocation. The workloads are an RBD
+write and read (librbd), an S3 PUT and GET (RGW), the recovery of one
+object, and a deep and a shallow scrub of its PG. §16.1 shows the results;
+§16.7 lists the changes they suggest.
 
 ### 16.1 The results in one view
 
-This diagram shows one 4 MiB RBD write to a new object, end to end:
-where the data is allocated and what each process allocates for the op.
+One 4 MiB RBD write to a new object. The diagram shows where the data is
+allocated; the table shows what each process allocates for the op.
 
 ```
- process (role)            the 4 MiB                    allocations                 left behind
- ───────────────────────   ──────────────────────────   ─────────────────────────   ───────────────
- rbdop (librbd client)     rbd_write copies the         149: messenger 62,          5, 296 B
-   │ MOSDOp                caller's buffer              librbd 51, objecter 36
+ rbdop (librbd client)     copies the caller's buffer            copy 1
+   │
+   │ MOSDOp
    ▼
- osd.3 (primary)           messenger receive buffer,    2,022: BlueStore 1,034      473, 72 KiB:
-   │ MOSDRepOp × 2         page aligned: BlueStore      (832 = 64 blobs × 13),      blobs, RocksDB
-   ▼                       writes from it, no copy      osd 461, messenger 455      batch, op history
- osd.1, osd.2 (replicas)   the same                     1,452-1,560 each:           420-439,
-                                                        BlueStore 1,019             57-67 KiB
+ osd.3 (primary)           receives it into one page-aligned     copy 2
+                           buffer; BlueStore writes from that
+                           buffer without a copy
+   │
+   │ MOSDRepOp × 2
+   ▼
+ osd.1, osd.2 (replicas)   the same                              copies 3, 4
 ```
 
-Take away: four copies of the data for three copies on disk (the client's
-copy is the one librbd makes of the caller's buffer), and about 5,200
-allocations, 60 % of them in BlueStore.
-
-The other workloads, as allocations / bytes per process; the client column
-is librbd or radosgw:
-
-| 4 MiB workload | Client | Primary OSD | Other OSDs | Left behind |
+| Process (role) | Allocations | Main layers | Held at the end (allocs / bytes) | What is held |
 |---|---|---|---|---|
-| RBD write, new object | 149 / 4.0 MiB | 2,022 / 4.4 MiB | 1,452–1,560 / 4.3 MiB | 57–72 KiB per OSD: the object's metadata, a RocksDB batch, op history |
-| RBD read, from disk | 57 / 4.0 MiB | 1,197 / 4.1 MiB | – | 838 KiB of data in the cache |
-| RBD overwrite | 103 / 4.0 MiB | 1,428 / 4.2 MiB | 1,192–1,193 / 4.1 MiB | 34–36 KiB per OSD |
-| RGW PUT | 1,170 / 4.3 MiB | **2,064 / 8.3 MiB** | 1,054–1,366 / 4.1–4.3 MiB; index shard 948 / 267 KiB | 35–43 KiB per OSD |
-| RGW GET, from disk | 755 / 4.2 MiB | 1,306 / 4.1 MiB | – | 4.0 MiB in the cache |
-| Recovery of the object | – | source: 1,059 / 4.1 MiB | target: 1,887 / 4.2 MiB, plus the 4 MiB message | target: **the 4 MiB, for 600 s** |
-| Deep scrub | – | 1,008 / 4.1 MiB | 746–840 / 4.1 MiB | ≤ 2 KiB |
-| Shallow scrub | – | 410 / 119 KiB | 101–192 / 31–56 KiB | ≤ 1 KiB |
-| Idle, per second | radosgw 40–360 | – | 160–1,700 per OSD; 580–710 over 10 s | – |
+| rbdop (librbd client) | 149 | messenger 62, librbd 51, objecter 36 | 5 / 296 B | |
+| osd.3 (primary) | 2,022 | BlueStore 1,034 (832 = 64 blobs × 13), osd 461, messenger 455 | 473 / 72 KiB | blobs, RocksDB batch, op history |
+| osd.1, osd.2 (replicas) | 1,452–1,560 each | BlueStore 1,019 | 420–439 / 57–67 KiB | |
 
-The findings:
+Take away: four copies of the data for three copies on disk, and about
+5,200 allocations, 60 % of them in BlueStore.
 
-1. **Data.** Each hop allocates the payload once: the client copies the
-   caller's buffer, each OSD receives it into one aligned buffer and writes
-   that buffer as is. Two paths copy it again, 64 × 64 KiB in
-   `KernelDevice::aio_write()`: the primary of an RGW PUT (two xattrs come
-   before the data in the message, §16.4) and the target of a recovery push
-   (the data travels inside the message's payload, §16.5).
-2. **Counts.** BlueStore's work is per blob, and a blob is at most 64 KiB
-   on SSD (`bluestore_max_blob_size_ssd`): 13 allocations per blob on a
-   write, 12 on a read (the 64 KiB buffer included).
-3. **Held after the op.** The new object's metadata (25 KiB of it per
-   4 MiB object is per-blob state), cached data, and one leak-like case: the
-   op history keeps a received recovery push, data included, for up to
-   `osd_op_history_duration` (600 s); up to 160 MiB per OSD (§16.5).
-4. **Background.** An idle OSD allocates 580–710 times a second averaged
-   over 10 s, and 160–1,700 in any one second: heartbeats and PG lease
-   renewals come in bursts, the cache tuner's bookkeeping runs every
-   second. A 4 MiB write is worth 1–12 seconds of an idle OSD.
+All workloads, as allocations / bytes in each process:
+
+| 4 MiB workload | Client ¹ | Primary OSD | Replica OSDs | Held at the end | What is held |
+|---|---|---|---|---|---|
+| RBD write, new object | 149 / 4.0 MiB | 2,022 / 4.4 MiB | 1,452–1,560 / 4.3 MiB | 57–72 KiB per OSD | object metadata, RocksDB batch, op history |
+| RBD read, from disk | 57 / 4.0 MiB | 1,197 / 4.1 MiB | – | 838 KiB | data in the cache |
+| RBD overwrite | 103 / 4.0 MiB | 1,428 / 4.2 MiB | 1,192–1,193 / 4.1 MiB | 34–36 KiB per OSD | |
+| RGW PUT ² | 1,170 / 4.3 MiB | **2,064 / 8.3 MiB** | 1,054–1,366 / 4.1–4.3 MiB | 35–43 KiB per OSD | |
+| RGW GET, from disk | 755 / 4.2 MiB | 1,306 / 4.1 MiB | – | 4.0 MiB | data in the cache |
+| Recovery ³ | – | 1,059 / 4.1 MiB | 1,887 / 4.2 MiB, plus the 4 MiB message | 4 MiB on the target | **the pushed data, for 600 s** |
+| Deep scrub | – | 1,008 / 4.1 MiB | 746–840 / 4.1 MiB | ≤ 2 KiB | |
+| Shallow scrub | – | 410 / 119 KiB | 101–192 / 31–56 KiB | ≤ 1 KiB | |
+
+- ¹ librbd or radosgw.
+- ² Plus the primary of the bucket index shard: 948 / 267 KiB.
+- ³ The primary is the source of the push. The replica column is the
+  target, the OSD that was down.
+
+| # | Finding | Details | See |
+|---|---|---|---|
+| 1 | One copy of the data per hop | The client copies the caller's buffer. Each OSD receives the data into one aligned buffer and writes that buffer as is. Two paths copy it again (64 × 64 KiB, in `KernelDevice::aio_write()`). RGW PUT primary: two xattrs come before the data in the message. Recovery push target: the data is inside the message payload. | §16.4, §16.5 |
+| 2 | BlueStore's counts are per blob | A blob is at most 64 KiB on SSD (`bluestore_max_blob_size_ssd`). A write makes 13 allocations per blob. A read makes 12, including the 64 KiB data buffer. | §16.3 |
+| 3 | What is held after the op | The new object's metadata (25 KiB per 4 MiB object is per-blob state) and cached data. One case acts like a leak: the op history keeps a received recovery push, data included, for up to `osd_op_history_duration` (600 s). With 20 history slots, that is up to 160 MiB per OSD. | §16.3, §16.5 |
+| 4 | Background | An idle OSD allocates 160–1,700 times in any one second, and 580–710 times a second averaged over 10 s; an idle radosgw 40–360 times a second. Heartbeats and PG lease renewals come in bursts; the cache tuner's bookkeeping runs every second. One OSD's 1,452–2,022 allocations for a 4 MiB write equal about 1–13 s of idle. | §16.2 |
 
 ### 16.2 How the trace is recorded
 
-The test runs on the c28 VM (8 vCPUs, 32 GiB) of §15: a new vstart
-cluster with 1 mon, 1 mgr, 1 RGW (beast) and four OSDs, one per disk (vdb,
-nvme0n1, sda, vdc). vdc reports itself rotational; it is set to SSD so that
-all four OSDs run BlueStore's SSD settings. Pools have 3 copies and 73 PGs
-in total: an idle OSD's allocations are mostly per-PG lease and heartbeat
-messages, so the PG count sets the background. Everything else is
-vstart's default, including the debug levels: `debug_osd 1/5` formats messages up to level 5
-into the in-memory log, and that cost is part of what is measured. Scrubs
-are off (`noscrub`, `nodeep-scrub`) except when the test asks for one.
+| Setting | Value |
+|---|---|
+| Host | the c28 VM of §15 (8 vCPUs, 32 GiB) |
+| Cluster | a new vstart: 1 mon, 1 mgr, 1 RGW (beast), 4 OSDs, one per disk (vdb, nvme0n1, sda, vdc) |
+| Device class | vdc reports itself rotational; it is set to SSD, so all four OSDs use BlueStore's SSD settings |
+| Pools | 3 copies, 73 PGs in total. An idle OSD's allocations are mostly per-PG lease and heartbeat messages, so the PG count sets the background. |
+| Debug levels | vstart's defaults. `debug_osd 1/5` formats messages up to level 5 into the in-memory log; that cost is part of the measurement. |
+| Scrub | off (`noscrub`, `nodeep-scrub`), except in the scrub test |
+| Other settings | vstart's defaults |
+| Build | `main` at c2158f46763 (dc7b747c37c plus 20 commits, none in the traced code), plus the two PRs from this post: [PR #73018](https://github.com/ceph/ceph/pull/73018) (35e508847d1, the shard limits of §13.4) and [PR #73203](https://github.com/ceph/ceph/pull/73203) (fb0222ef01b, memtable memory of all column families). Cherry-picked as `21.3.0-4871-g56790e96a29`; RelWithDebInfo, RocksDB 9.11.2 (the submodule pin), RGW without its optional backends. |
 
-The build is `main` at c2158f46763 (dc7b747c37c plus 20 commits, none in
-the code traced here) plus the two PRs this post found:
-[PR #73018](https://github.com/ceph/ceph/pull/73018) (35e508847d1, the
-shard limits of §13.4) and
-[PR #73203](https://github.com/ceph/ceph/pull/73203) (fb0222ef01b,
-memtable memory of all column families), cherry-picked as
-`21.3.0-4871-g56790e96a29`: RelWithDebInfo, RocksDB 9.11.2 (the submodule
-`main` pins), RGW without its optional backends.
-
-**What is probed.** The OSDs and radosgw allocate through tcmalloc, the
-librbd client through glibc. One uprobe goes on each distinct entry
-address:
+**What is probed.** The OSDs and radosgw allocate through tcmalloc; the
+librbd client allocates through glibc. One uprobe goes on each distinct
+entry address:
 
 | Library | Allocation entry points | Free entry points |
 |---|---|---|
 | tcmalloc 2.15 | `tc_new` (= `operator new`, `new[]`), `tc_new_nothrow`, `tc_malloc`, `tc_calloc`, `tc_realloc`, `tc_memalign` (= `memalign`, `aligned_alloc`), `tc_new_aligned`, `tc_new_aligned_nothrow` | `tc_free` (= `free`, `delete`), `tc_free_sized` (sized `delete`), `tc_delete_nothrow`, three aligned deletes |
 | glibc 2.41 | `__libc_malloc`, `__libc_calloc`, `__libc_realloc`, `__libc_memalign`, `aligned_alloc`, `posix_memalign` | `__libc_free` |
 
-An allocation entry records the size and a DWARF copy of the user stack, its
-return records the pointer, a free records the pointer. Three traps decided
-the list:
+| Probe | Records |
+|---|---|
+| allocation entry | the size, and a DWARF copy of the user stack |
+| allocation return | the pointer |
+| free | the pointer |
 
-- Aliases. `operator new` and `tc_new` are one address; so are `free`,
-  `delete` and `tc_free`. One probe per address counts each call once.
-- Allocators that call themselves. tcmalloc's `posix_memalign`, `valloc`
-  and `pvalloc` call `tc_memalign` through the PLT, so only `tc_memalign`
-  is probed. glibc's `posix_memalign` and `memalign` call `malloc`; the
-  analysis drops an entry that arrives while another is open on the same
-  thread. glibc's `posix_memalign` returns an int, so a second probe sits
-  on the instruction that stores the pointer (`posix_memalign+0x4f`).
-- PLT stubs. `perf probe tc_malloc%return` also puts a return probe on
-  libtcmalloc's own `tc_malloc@plt`, and `perf probe malloc` on libc's
-  `malloc@plt`: a call through the stub is then seen twice. The probes
-  are written to tracefs at the addresses `nm -D` gives.
+Four traps decided the list:
 
-**How it is recorded.** All traced processes sit in one cgroup and perf
-records system-wide, filtered by it (`perf record -a -G memtrace`):
-recording by pid opens threads × CPUs × events file descriptors, 30,000
-for four OSDs. The build has no frame pointers, so stacks are DWARF: perf
-copies 32 KiB of stack per allocation, and 99.6 % of the stacks reach the
-thread entry. On a first cluster with 169 PGs, where an idle OSD
-allocated about 2,000 times a second, perf wrote 130 MB/s: a single perf
-thread writing to disk lost 22,000 samples. One reader thread per
-CPU (`--threads`) writing to tmpfs loses none in the measured windows;
-`allocstat.py` flags a window that overlaps a loss. Timestamps are `CLOCK_MONOTONIC`; the client marks each op's start
-and end with the same clock. An op's window runs from its start to 300 ms
-after it completed, so it also holds the work an OSD finishes after its
-reply; recovery and scrub windows are described in their sections.
+| Trap | Problem | Solution |
+|---|---|---|
+| Aliases | `operator new` and `tc_new` are one address; so are `free`, `delete` and `tc_free`. | One probe per address, so each call counts once. |
+| Allocators that call allocators | tcmalloc's `posix_memalign`, `valloc` and `pvalloc` call `tc_memalign` through the PLT. glibc's `posix_memalign` and `memalign` call `malloc`. | Probe only `tc_memalign`. For glibc, the analysis drops an entry that arrives while another entry is open on the same thread. |
+| glibc `posix_memalign` returns an int | The return value is not the pointer. | A second probe on the instruction that stores the pointer (`posix_memalign+0x4f`). |
+| PLT stubs | `perf probe tc_malloc%return` also probes libtcmalloc's own `tc_malloc@plt`, and `perf probe malloc` also probes libc's `malloc@plt`. A call through the stub is seen twice. | Write the probes to tracefs, at the addresses that `nm -D` gives. |
+
+**How it is recorded.**
+
+| Choice | Reason and result |
+|---|---|
+| All traced processes in one cgroup; perf records system-wide, filtered by it (`perf record -a -G memtrace`) | Recording by pid opens threads × CPUs × events file descriptors: 30,000 for four OSDs. |
+| DWARF stacks, 32 KiB of stack copied per allocation | The build has no frame pointers. 99.6 % of the stacks reach the thread entry. |
+| One perf reader thread per CPU (`--threads`), writing to tmpfs | On a first cluster with 169 PGs, an idle OSD allocated about 2,000 times a second and perf wrote 130 MB/s; one perf thread writing to disk lost 22,000 samples. With this setup, no samples are lost in the measured windows, and `allocstat.py` flags a window that overlaps a loss. |
+| `CLOCK_MONOTONIC` timestamps | The client marks each op's start and end with the same clock. |
+| Window: op start to 300 ms after the op completes | The window also holds the work an OSD finishes after its reply. Recovery and scrub windows are in their sections. |
 
 ```
-   perf record (4 s to attach)
-   │ base: 1 s idle ──┐ op 1 ──┬─300 ms─┐ gap ┌ op 2 ...
-   ├──────────────────┼────────┴────────┼─────┼───────────
-   │                  │   window "op 1" │     │
-   └ background rate ─┘                        allocations whose entry
-     scaled to each window                     falls in the window
+ time ----------------------------------------------------------------------->
+ perf attaches (4 s) | base: 1 s idle |  op 1  | +300 ms    | gap | op 2 | ...
+                     |                |<-- window "op 1" -->|
+                     '----------------' background rate, measured here,
+                                        scaled to each window
 ```
+
+An allocation counts in the window that holds its entry.
 
 [`allocstat.py`]({{ site.baseurl }}/code/ceph/allocstat.py) turns the
 event stream into the tables below. It pairs each entry with its return on
@@ -2720,16 +2697,15 @@ its stack:
 | context | why the code ran: the first rule that matches any frame | heartbeat / tick / stats, scrub, recovery, peering / osdmap, else I/O path |
 | call site | the first frame below allocator, container, buffer and encoder code | e.g. `bluestore::Collection::new_blob` |
 
-The RBD and RGW numbers below count the I/O path context; recovery and
-scrub count their own context.
+The RBD and RGW numbers count the I/O path context. Recovery and scrub
+count their own context.
 
-What it does not see: tcmalloc rounds each request up to a size class and
-keeps freed memory on its free lists (sizes here are as requested); memory
-from `mmap` and thread stacks; kernel memory (socket buffers, page cache).
-A free of memory allocated before the recording started counts as nothing.
-The probes slow everything down: the 4 MiB write took 242 ms, and the
-`ceph` CLI, a Python process that hits the system-wide glibc probes, takes
-seconds per command.
+| Limit | Effect |
+|---|---|
+| tcmalloc size classes and free lists | Sizes are as requested, not rounded up to a size class. Freed memory that tcmalloc keeps is not seen. |
+| `mmap`, thread stacks, kernel memory (socket buffers, page cache) | Not seen. |
+| A free of memory allocated before the recording | Counts as nothing. |
+| Probe overhead | The 4 MiB write took 242 ms. The `ceph` CLI is a Python process that hits the system-wide glibc probes, so it takes seconds per command. |
 
 [`memtrace.sh`]({{ site.baseurl }}/code/ceph/memtrace.sh) does every step,
 with [`rbdop.c`]({{ site.baseurl }}/code/ceph/rbdop.c) as the librbd
@@ -2744,35 +2720,39 @@ memtrace.sh report results/rbd-<time> --top 20 --stacks 8 [--context scrub]
 
 ### 16.3 RBD: a 4 MiB write and read
 
-The image's object 0 maps to PG 6.9 (osd.3, osd.1, osd.2) and its object
-map object to PG 6.4 on the same three OSDs: osd.3 is primary for both the
-object-map update and the data write. The client is
-[`rbdop`]({{ site.baseurl }}/code/ceph/rbdop.c): it opens the image, takes
-the exclusive lock with a 4 KiB write to the last object, and then runs
-the traced ops with `rbd_write()` + `rbd_flush()` and `rbd_read()`.
+The image's object 0 maps to PG 6.9 (osd.3, osd.1, osd.2). Its object-map
+object is in PG 6.4, on the same three OSDs and also with osd.3 as primary.
+So osd.3 is the primary for both the object-map update and the data write. The client is
+[`rbdop`]({{ site.baseurl }}/code/ceph/rbdop.c). It opens the image, takes
+the exclusive lock with a 4 KiB write to the last object, then runs the
+traced ops with `rbd_write()` + `rbd_flush()` and `rbd_read()`.
+
+Cells are allocations / bytes. In parentheses: what is still held at the
+end of the window.
 
 | Op | Latency | rbdop | osd.3 (primary) | osd.1 | osd.2 |
 |---|---|---|---|---|---|
-| write, new object | 242 ms | 149 / 4.0 MiB | 2,022 / 4.4 MiB; held 473, 72 KiB | 1,452 / 4.3 MiB; held 439, 67 KiB | 1,560 / 4.3 MiB; held 420, 57 KiB |
-| read, from disk | 39 ms | 57 / 4.0 MiB | 1,197 / 4.1 MiB; held 71, 838 KiB | – | – |
-| read again, 1 s later | 25 ms | 57 / 4.0 MiB | 958 / 3.3 MiB; held 215, 3.2 MiB | – | – |
-| overwrite | 335 ms | 103 / 4.0 MiB | 1,428 / 4.2 MiB; held 350, 34 KiB | 1,192 / 4.1 MiB | 1,193 / 4.1 MiB |
+| write, new object | 242 ms | 149 / 4.0 MiB (5 / 296 B) | 2,022 / 4.4 MiB (473 / 72 KiB) | 1,452 / 4.3 MiB (439 / 67 KiB) | 1,560 / 4.3 MiB (420 / 57 KiB) |
+| read, from disk | 39 ms | 57 / 4.0 MiB | 1,197 / 4.1 MiB (71 / 838 KiB) | – | – |
+| read again, 1 s later | 25 ms | 57 / 4.0 MiB | 958 / 3.3 MiB (215 / 3.2 MiB) | – | – |
+| overwrite | 335 ms | 103 / 4.0 MiB | 1,428 / 4.2 MiB (350 / 34 KiB) | 1,192 / 4.1 MiB | 1,193 / 4.1 MiB |
 
-**The bytes.** The client's 4 MiB is
-[`create_write_raw()`](https://github.com/ceph/ceph/blob/dc7b747c37c/src/librbd/librbd.cc#L103)
-copying the caller's buffer. The synchronous `rbd_write()` always copies;
+**The bytes.**
+
+| Op | Where | The data buffer |
+|---|---|---|
+| write | client | a 4 MiB copy of the caller's buffer, made by [`create_write_raw()`](https://github.com/ceph/ceph/blob/dc7b747c37c/src/librbd/librbd.cc#L103) |
+| write | each OSD | the 4 MiB receive buffer of [`ProtocolV2::read_frame_segment()`](https://github.com/ceph/ceph/blob/dc7b747c37c/src/msg/async/ProtocolV2.cc#L1228), page aligned. BlueStore writes from it without a copy and frees it with the transaction. |
+| read | primary | 64 aligned 64 KiB buffers, one per blob |
+| read | client | one 4 MiB receive buffer for the reply, then a copy to the caller's buffer |
+
+The client copy on a write: the synchronous `rbd_write()` always copies.
 `rbd_aio_write()` copies too by default (`rbd_disable_zero_copy_writes` is
-true), and any RBD cache forces the copy. Each OSD's 4 MiB is the receive buffer of
-[`ProtocolV2::read_frame_segment()`](https://github.com/ceph/ceph/blob/dc7b747c37c/src/msg/async/ProtocolV2.cc#L1228),
-page aligned; BlueStore writes from it without a copy and frees it with
-the transaction. On a read the primary reads into 64 aligned 64 KiB
-buffers, one per blob, and the client receives the reply into one 4 MiB
-buffer and copies it out to the caller.
+true), and any RBD cache forces the copy.
 
-**The counts.** On the primary the write's 2,022 allocations split by layer
-into BlueStore 1,034, osd 461, messenger 455, RocksDB 26 and pg log 24; on
-each replica BlueStore makes 1,019. 832 of BlueStore's allocations are per
-blob:
+**The counts.** The primary's 2,022 write allocations by layer: BlueStore
+1,034, osd 461, messenger 455, RocksDB 26, pg log 24, other 22. Each replica's
+BlueStore makes 1,019. 832 of BlueStore's allocations are per blob:
 
 | Per 64 KiB blob, new-object write | Size | Stays with the onode |
 |---|---|---|
@@ -2786,7 +2766,7 @@ blob:
 | `TransContext::add_writing` | 32 B | no |
 | `_do_alloc_write` | 16 + 24 B | no |
 | `_do_write_big`, `WriteContext::write_item`, `map_bl` | 3 × 24 B | no |
-| **13 allocations** | **~900 B** | **5, 400 B** |
+| **13 allocations** | **~900 B** | **5 / 400 B** |
 
 All 64 come from one call path in the op thread:
 
@@ -2802,58 +2782,76 @@ PrimaryLogPG::issue_repop / execute_ctx / do_op_impl / do_op
 OSD::dequeue_op ... ShardedThreadPool::WorkThreadSharded::entry
 ```
 
-The five that stay make 25 KiB per 4 MiB object. The rest of the 72 KiB
-left on the primary is a 12 KiB RocksDB batch, about 11 KiB of op history
-(the ops and their messages), 8 KiB of queued small writes, the 4 KiB
-object-map bitmap, the onode and the pg log entry. An overwrite adds three per blob to release the old
-extents (`OldExtent` 112 B, use-tracker `put` 16 B, `release_extents`
-16 B). A read costs 12 per blob: the 64 KiB buffer and its 88 B raw
-header, the aio (256 + 2 × 24 B), `_read_cache` (64 + 48 + 88 B),
-`_generate_read_result_bl` (72 + 2 × 24 B) and the cache's Buffer (128 B).
+What the write leaves on the primary, 72 KiB:
+
+| Held | Size |
+|---|---|
+| per-blob state (5 allocations × 64 blobs) | 25 KiB |
+| RocksDB batch | 12 KiB |
+| op history (the ops and their messages) | about 11 KiB |
+| queued small writes | 8 KiB |
+| object-map bitmap | 4 KiB |
+| the onode, the pg log entry | the rest |
+
+Other ops, per blob:
+
+| Op | Allocations per blob |
+|---|---|
+| overwrite | the 13 above, plus 3 to release the old extents: `OldExtent` 112 B, use-tracker `put` 16 B, `release_extents` 16 B |
+| read | 12: the 64 KiB buffer and its 88 B raw header; the aio (256 + 2 × 24 B); `_read_cache` (64 + 48 + 88 B); `_generate_read_result_bl` (72 + 2 × 24 B); the cache's Buffer (128 B) |
 
 **The cache after a read.** The first read left 13 of the 64 blobs
-(832 KiB) in the data cache, the second read the rest. That is PR #73018
-on a cold shard: a shard's limit is 1/8 of its even share plus a share of
-the rest by what it held at the last resize, and this shard held nothing.
-The floor is 208 MiB committed to the data cache / 32 shards / 8 = 832 KiB,
-so `_trim()` cut the 4 MiB down to it at once; the stock even split
-(6.5 MiB) keeps it all. The next resize, at most 50 ms later
-(`bluestore_cache_trim_interval`), raised the shard's limit by what it
-then held, too late for the blobs already trimmed: a cold shard's first
-fill is cut to the floor.
+(832 KiB) in the data cache; the second read added the rest. This is
+PR #73018 on a cold shard, a shard that held nothing at the last resize:
+
+```
+ PR #73018 shard limit = floor + a share of the rest, by what the shard held at the last resize
+ floor                 = even share / 8
+ cold shard (held 0)   = 208 MiB committed to the data cache / 32 shards / 8 = 832 KiB
+                         → _trim() cuts the 4 MiB to 13 blobs at once
+ stock even split      = 208 MiB / 32 shards = 6.5 MiB → keeps all 64 blobs
+ next resize, ≤ 50 ms later (bluestore_cache_trim_interval): the limit grows by what
+ the shard then held, too late for the trimmed blobs
+```
+
+So a cold shard's first fill is cut to the floor, 832 KiB.
 
 ### 16.4 RGW: a 4 MiB PUT and GET
 
-The object fits in its head (`rgw_max_chunk_size` 4 MiB), which maps to
-PG 9.6 (osd.2, osd.3, osd.0); the bucket index shard's primary is osd.1.
-The client is curl with `--aws-sigv4`, one connection per request. A small
-PUT just before the trace refreshes RGW's metadata cache.
+The object fits in its head (`rgw_max_chunk_size` 4 MiB). The head maps to
+PG 9.6 (osd.2, osd.3, osd.0); the primary of the bucket index shard is
+osd.1. The client is curl with `--aws-sigv4`, one connection per request.
+A small PUT just before the trace refreshes RGW's metadata cache.
+
+Cells are allocations / bytes. In parentheses: what is held at the end.
 
 | Op | Latency | radosgw | osd.2 (primary) | osd.3 | osd.0 | osd.1 (index) |
 |---|---|---|---|---|---|---|
 | PUT | 399 ms | 1,170 / 4.3 MiB | **2,064 / 8.3 MiB** | 1,054 / 4.1 MiB | 1,366 / 4.3 MiB | 948 / 267 KiB |
-| GET, from disk | 377 ms | 755 / 4.2 MiB | 1,306 / 4.1 MiB; 4.0 MiB held in the cache | – | – | – |
+| GET, from disk | 377 ms | 755 / 4.2 MiB | 1,306 / 4.1 MiB (4.0 MiB of cached data) | – | – | – |
 | GET again | 364 ms | 832 / 4.2 MiB | 881 / 135 KiB | – | – | – |
 
 The counts include radosgw's own background RADOS traffic: in the GET
-window the three OSDs that did not serve the GET made 78–244 I/O-path
-allocations. Net of the idle rate the PUT is about 1,680 allocations on
+window, the three OSDs that did not serve the GET made 78–244 I/O-path
+allocations. After subtracting the idle rate, the PUT is about 1,680 allocations on
 osd.2, 690–1,240 on the replicas, 560 on the index shard and 960 in
 radosgw.
 
-radosgw's PUT: a 4 MiB body buffer
-([`RGWPutObj_ObjStore::get_data()`](https://github.com/ceph/ceph/blob/dc7b747c37c/src/rgw/rgw_rest.cc#L1038)),
-a 64 KiB parse buffer per accepted connection (a `Connection` holds a
-64 KiB [`parse_buffer`](https://github.com/ceph/ceph/blob/dc7b747c37c/src/rgw/rgw_asio_frontend_connection.h#L18)),
-and about 1,100 small ones for authentication, boost.asio operations and
-three RADOS ops: the head write, and the bucket index prepare and complete.
-On a GET it serves the client from the 4 MiB reply buffer, without a copy.
+What radosgw allocates for the PUT:
+
+| Allocation | Count | Size |
+|---|---|---|
+| the body buffer, [`RGWPutObj_ObjStore::get_data()`](https://github.com/ceph/ceph/blob/dc7b747c37c/src/rgw/rgw_rest.cc#L1038) | 1 | 4 MiB |
+| the parse buffer of a `Connection`, [`parse_buffer`](https://github.com/ceph/ceph/blob/dc7b747c37c/src/rgw/rgw_asio_frontend_connection.h#L18) | 1 per accepted connection | 64 KiB |
+| authentication, boost.asio operations, three RADOS ops (the head write, the bucket index prepare and complete) | about 1,100 | small |
+
 With an expired metadata cache (user and bucket info,
-`rgw_cache_expiry_interval`) the same PUT made 2,013 allocations and
-12 more RADOS reads.
+`rgw_cache_expiry_interval`), the same PUT makes 2,013 allocations and 12
+more RADOS reads. On a GET, radosgw serves the client from the 4 MiB reply
+buffer, without a copy.
 
 **The primary's second 4 MiB.** 64 aligned 64 KiB buffers, each with its
-88 B raw header and two 24 B list nodes (256 allocations), one call path:
+88 B raw header and two 24 B list nodes: 256 allocations, one call path:
 
 ```
 aligned_alloc / tc_posix_memalign
@@ -2876,49 +2874,60 @@ as `dump_historic_ops` shows it:
  writefull 0~4194304, setxattr user.rgw.manifest (368) in=17b, ...]
 ```
 
-A message's data segment carries every op's input in op order, and the
-receive buffer is page aligned at its start. The two tag xattrs,
-14 + 62 + 17 + 62 = 155 bytes, come first, so the 4 MiB starts at byte
-155.
+A message's data segment carries the input of every op, in op order, and
+the receive buffer is page aligned at the start of the segment. The two
+tag xattrs come first, 14 + 62 + 17 + 62 = 155 bytes, so the 4 MiB starts
+at byte 155:
+
+```
+ byte 0                                                     byte 155
+ | idtag: name 14 | value 62 | tail_tag: name 17 | value 62 | writefull: 4 MiB of data ...
+                                                            ^ not block aligned: aio_write() copies it
+```
+
 [`prepare_atomic_modification()`](https://github.com/ceph/ceph/blob/dc7b747c37c/src/rgw/driver/rados/rgw_rados.cc#L7934)
-adds the tags before
+adds the two tags before
 [`_do_write_meta()`](https://github.com/ceph/ceph/blob/dc7b747c37c/src/rgw/driver/rados/rgw_rados.cc#L3420)
-appends `write_full`. RBD's write is the first op with input data, so its
-data starts at byte 0. The replicas receive the data in a `MOSDRepOp` and
-do not copy it.
+appends `write_full`. In RBD's write the data belongs to the first op with
+input, so it starts at byte 0. The replicas receive the data in a
+`MOSDRepOp` and do not copy it.
 
 ### 16.5 Recovery of one object
 
-The object, `rec1` (4 MiB), maps to PG 7.3 (osd.3, osd.2, osd.0). The run
-stops osd.0 (`noout`), writes the object, sets `norecover`, restarts
-osd.0 and waits for the PG to peer. Then it records 3 s of idle and the
-7 s from `ceph osd unset norecover` to 3 s after the command returns (the
-CLI is slow under the probes). RGW is stopped for the run: its
-background writes to log and gc objects are otherwise recovered too (51
-pulls of small omap objects in one run). The table counts the recovery
-context:
+The object `rec1` (4 MiB) maps to PG 7.3 (osd.3, osd.2, osd.0). The run:
+
+```
+ stop osd.0 (noout) → write rec1 → set norecover → restart osd.0 → wait until the PG peers
+ → record 3 s idle → record 7 s: from 'ceph osd unset norecover' until 3 s after it returns
+```
+
+The CLI is slow under the probes, so the window is 7 s long. RGW is stopped for the
+run: otherwise its background writes to log and gc objects are recovered
+too (51 pulls of small omap objects in one run). The table counts the
+recovery context:
 
 | OSD | Role | Allocations / bytes | Held at the end |
 |---|---|---|---|
-| osd.3 | primary, the source | 1,059 / 4.1 MiB: 64 × 64 KiB reads | 69, 838 KiB: 13 blobs in the data cache |
-| osd.0 | the target | 1,887 / 4.2 MiB: the 64 × 64 KiB realign copy | 341, 29 KiB |
-| osd.0 | the target, messenger | 1 / 4,195,215 B: the `MOSDPGPush` | **pinned for 600 s** |
+| osd.3 | primary, the source | 1,059 / 4.1 MiB: 64 × 64 KiB reads | 69 / 838 KiB: 13 blobs in the data cache |
+| osd.0 | the target | 1,887 / 4.2 MiB: the 64 × 64 KiB realign copy | 341 / 29 KiB |
+| osd.0 | the target, messenger | 1 / 4,195,215 B: the `MOSDPGPush` | **held for 600 s** |
 | osd.2 | the other replica | 5 / 841 B | – |
 
-The source reads the object the way an RBD read does and keeps 13 blobs of
-it: §15.4's `cache_dont_need` gap, cut to the cold-shard floor of §16.3.
-The target copies the data again because a `PushOp` carries it inside the
-message's payload, not in an aligned data segment.
+- **The source** reads the object like an RBD read and keeps 13 blobs of
+  it: the `cache_dont_need` gap of §15.4, cut to the cold-shard floor of
+  §16.3.
+- **The target** copies the data again: a `PushOp` carries the data inside
+  the message payload, not in an aligned data segment.
 
-**The pinned push.** After the recovery osd.0's mempools showed
+**The held push.** After the recovery, osd.0's mempools showed
 `bluestore_writing`: 1 item, 4,195,215 bytes, while nothing was being
-written. That is the push message's receive buffer. This sequence shows
+written. It is the receive buffer of the push message. This sequence shows
 who holds it:
 
 ```
 MOSDPGPush arrives              receive buffer, 4 MiB + 911 B (ProtocolV2::read_frame_segment)
   decode_payload()              pushes[0].data points into it
-  _do_push → submit_push_data   BlueStore copies it to align it; its Buffer, in writing
+  _do_push, submit_push_data    BlueStore copies it to align it; its Buffer, in writing
                                 state, tags the raw buffer bluestore_writing
   transaction commits           the copy and the Buffer are freed
   op done, unregistered         OpRequest::_unregistered(): clear_data(), clear_payload(),
@@ -2927,40 +2936,48 @@ MOSDPGPush arrives              receive buffer, 4 MiB + 911 B (ProtocolV2::read_
   ... 600 s ...                 op dropped → pushes freed → the 4 MiB freed
 ```
 
-Evidence, from
+Evidence from
 [`pgpush-history-repro.sh`]({{ site.baseurl }}/code/ceph/pgpush-history-repro.sh)
-(no probes; stop a replica, write a 4 MiB object, let it recover, poll the
-target every 30 s): the push arrived at 13:24:17, the target held
-4,195,227 bytes in `bluestore_writing` through 13:33:53 and nothing at
-13:34:23, the sample in which the push left `dump_historic_ops`: 606 s.
-With `osd_op_history_size 0` the traced recovery leaves
-`bluestore_writing` empty, and osd.0 holds 88 KiB at the end of the
-window instead of 4.1 MiB. With the fix of §16.7 it is empty too, while
-the push is still listed in `dump_historic_ops`.
+(no probes: stop a replica, write a 4 MiB object, let it recover, poll the
+target every 30 s):
 
-[`Message::clear_data()`](https://github.com/ceph/ceph/blob/dc7b747c37c/src/msg/Message.h#L419)
-calls a virtual `clear_buffers()` so that a message can drop what it
-decoded; `MOSDOp` and `MOSDECSubOpWrite` override it,
-[`MOSDPGPush`](https://github.com/ceph/ceph/blob/dc7b747c37c/src/messages/MOSDPGPush.h#L21)
-does not.
-[`OpHistory::cleanup()`](https://github.com/ceph/ceph/blob/dc7b747c37c/src/common/TrackedOp.cc#L140)
-drops ops older than `osd_op_history_duration` (600 s), then the shortest
-while more than `osd_op_history_size` (20) remain, so a push, slow next to
-a client op, stays the full 10 minutes. The bound per OSD is 20 slots ×
-about 8 MiB (`send_pushes()` fills a message up to `osd_max_push_cost`,
-plus one push) = 160 MiB. A push slower than 10 s also enters the slow-op
-history, which is trimmed by count (20) only, with no time limit. On
-`main` the mempool books it as `bluestore_writing`, the last tag the
-buffer got; v21.3.0's `_add_buffer()` re-tags every buffer
-`bluestore_cache_data` at once (§8.2), where it reads as cached data.
-Either way it points the wrong way.
+| Time | Target |
+|---|---|
+| 13:24:17 | the push arrives |
+| 13:24:17 – 13:33:53 | 4,195,227 bytes in `bluestore_writing` |
+| 13:34:23 | nothing; in this sample the push has left `dump_historic_ops`, 606 s after it arrived |
+
+A/B in the traced recovery:
+
+| Run | `bluestore_writing` on osd.0 | osd.0 holds at the end of the window |
+|---|---|---|
+| as traced (op history size 20) | 1 item, 4,195,215 B | 4.1 MiB |
+| `osd_op_history_size 0` | empty | 88 KiB |
+| fix #1 of §16.7 | empty, while the push is still listed in `dump_historic_ops` | not measured |
+
+Why it is held:
+
+| Code | Behaviour |
+|---|---|
+| [`Message::clear_data()`](https://github.com/ceph/ceph/blob/dc7b747c37c/src/msg/Message.h#L419) | calls a virtual `clear_buffers()`, so that a message can drop what it decoded |
+| `MOSDOp`, `MOSDECSubOpWrite` | override `clear_buffers()` |
+| [`MOSDPGPush`](https://github.com/ceph/ceph/blob/dc7b747c37c/src/messages/MOSDPGPush.h#L21) | does not override it |
+| [`OpHistory::cleanup()`](https://github.com/ceph/ceph/blob/dc7b747c37c/src/common/TrackedOp.cc#L140) | drops ops older than `osd_op_history_duration` (600 s), then the shortest while more than `osd_op_history_size` (20) remain. A push is slower than a client op, so it stays the full 10 minutes. |
+| slow-op history | a push slower than 10 s also enters it; it is trimmed by count (20) only, with no time limit |
+
+- **Bound per OSD:** 20 slots × about 8 MiB = 160 MiB. `send_pushes()`
+  fills a message up to `osd_max_push_cost`, plus one push.
+- **Mempool name:** on `main` the buffer is booked as `bluestore_writing`,
+  the last tag it got. v21.3.0's `_add_buffer()` re-tags every buffer
+  `bluestore_cache_data` at once (§8.2), so there it looks like cached
+  data. Both names are misleading.
 
 ### 16.6 Scrub
 
-The PG of §16.5, deep scrub then shallow scrub, each started with
+The PG of §16.5: a deep scrub, then a shallow scrub, each started with
 `ceph pg (deep-)scrub 7.3`. The window runs from 0.2 s before the primary
 logs `deep-scrub starts` (reservations come first) to 0.3 s after
-`deep-scrub ok`; the scrub itself took 68 ms. Scrub context only:
+`deep-scrub ok`. The scrub itself took 68 ms. Scrub context only:
 
 | OSD | Deep scrub | Shallow scrub |
 |---|---|---|
@@ -2968,25 +2985,30 @@ logs `deep-scrub starts` (reservations come first) to 0.3 s after
 | osd.0 | 840 / 4.1 MiB | 192 / 56 KiB |
 | osd.2 | 746 / 4.1 MiB | 101 / 31 KiB |
 
-Each OSD reads the whole object for its checksum through the same 64 KiB
-per-blob path as a read, and holds nothing afterwards: scrub reads carry
-DONTNEED. The shallow scrub reads only metadata: RocksDB iterators
-(2.5 KiB each) and the primary's scrub bookkeeping.
+- **Deep scrub:** each OSD reads the whole object for its checksum,
+  through the same 64 KiB per-blob path as a read. Almost nothing
+  is held afterwards (≤ 2 KiB), because scrub reads carry DONTNEED.
+- **Shallow scrub:** reads only metadata: RocksDB iterators (2.5 KiB each)
+  and the primary's scrub bookkeeping.
 
 ### 16.7 What to change
 
-| # | Change | Saves | Where |
-|---|---|---|---|
-| 1 | `MOSDPGPush::clear_buffers()`: drop each `PushOp`'s data, omap and attrs, keep what `dump_historic_ops` prints | up to 160 MiB per recovering OSD for 10 minutes | messages/MOSDPGPush.h |
-| 2 | Write the RGW head's data before its tag xattrs | one 4 MiB copy and 256 allocations per PUT on the primary | rgw_rados.cc |
-| 3 | Send push data in the aligned data segment | one copy per push on the target | ReplicatedBackend, MOSDPGPush |
-| 4 | Check the other messages that keep decoded buffers without `clear_buffers()`: `MOSDECSubOpReadReply` (EC read data on the primary), `MOSDRepScrubMap` | not measured | messages/ |
-| 5 | PR #73018: a shard that held nothing gets 1/8 of its even share until the next resize; raise that floor, or resize when a shard fills from empty | the first fill of a cold shard | BlueStore `_resize_shards()` |
+| # | Change | Saves | Where | Status |
+|---|---|---|---|---|
+| 1 | `MOSDPGPush::clear_buffers()`: drop each `PushOp`'s data, omap and attrs; keep what `dump_historic_ops` prints | up to 160 MiB per recovering OSD, for 10 minutes | messages/MOSDPGPush.h | the same change is upstream [PR #72885](https://github.com/ceph/ceph/pull/72885): open, in QA |
+| 2 | Write the RGW head's data before its tag xattrs | one 4 MiB copy and 256 allocations per PUT on the primary | rgw_rados.cc | not posted |
+| 3 | Send push data in the aligned data segment | one copy per push on the target | ReplicatedBackend, MOSDPGPush | not posted |
+| 4 | Check the other messages that keep decoded buffers without `clear_buffers()`: `MOSDECSubOpReadReply` (EC read data on the primary), `MOSDRepScrubMap` | not measured | messages/ | not checked |
+| 5 | PR #73018: a shard that held nothing gets 1/8 of its even share until the next resize. Raise that floor, or resize when a shard fills from empty. | the first fill of a cold shard | BlueStore `_resize_shards()` | not posted; PR #73018 is open |
 
-Takeaway for tracing allocations in a build without frame pointers: one
-uprobe per distinct allocator address, written to tracefs rather than
-through `perf probe`; DWARF stacks; system-wide recording filtered by
-cgroup; one perf thread per CPU writing to tmpfs.
+Tracing allocations in a build without frame pointers, in short:
+
+| Step | Choice |
+|---|---|
+| probes | one uprobe per distinct allocator address, written to tracefs, not through `perf probe` |
+| stacks | DWARF |
+| recording | system-wide, filtered by cgroup |
+| output | one perf reader thread per CPU, writing to tmpfs |
 
 ## Glossary
 
