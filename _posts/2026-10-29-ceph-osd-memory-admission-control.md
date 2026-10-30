@@ -298,10 +298,9 @@ peak (2.98 of 4.72 in the separate run of §2.2); with admission they are
 0.11 GiB counted and 0.34 untracked, and what remains at the peak is
 RocksDB's memtables (0.71 GiB), which the tuner does not control. The GET
 phases keep the OSD near the target for a legitimate reason: the reads fill
-the data cache (2.14 GiB in both GET phases), and read data is admitted by
-the data cache's own 2Q policy (two queues: one for data seen once, one for
-data used again), which allows half of the cache for data seen once
-(`bluestore_2q_cache_kin_ratio`, 0.5). The free lists are much
+the data cache (2.14 GiB in both GET phases) with a working set the
+benchmark reads again and again (2,500 objects, 10 GiB; §6), and the cache
+serves about 30% of the read bytes over the phase, 40% once it is full. The free lists are much
 smaller there too (1.69 → 0.36 GiB in GET 4M), because the onode cache no
 longer churns.
 
@@ -490,14 +489,52 @@ What the two tables say, against the first version in §1:
 
 - **Memtables.** 0.71 GiB in RGW PUT 4K, outside the tuner. They are the
   largest consumer left in that workload.
-- **The data cache for read-once reads.** RGW GETs over a 200 GiB bucket fill
-  it to the budget with data that will not be read again. The data cache is
-  already a 2Q, with `bluestore_2q_cache_kin_ratio` (0.5) as the share for
-  data seen once, but setting it to 0.1 changed nothing (GET 4M 4.19 → 4.12
-  GiB, about 2.1 GiB of data cache either way): when the hot list is below
-  its share, 2Q lends the unused share to the queue for data seen once (the
-  warm-in list), so with no hot data the whole cache is open to it. The data cache needs the same
-  bounded probation as the onode and block caches; that is the next change.
+- **The data cache under RGW GETs is doing its job.** GET 4 MiB is the row
+  the patches change least (4.37 → 4.09 GiB in §1), and the reason is not
+  read-once data. The benchmark reads a working set: warp's `--list-existing`
+  keeps the first `--objects` keys of the bucket, 2,500 by default, and its
+  GET loop picks among them at random. The RGW log of one run shows 2,501
+  distinct keys requested out of 53,774 written, 112 thousand times in
+  180 s, about 45 reads per object. osd.0 holds the primary copy of 55% of
+  them, a 5.4 GiB set; its data cache at the end of the phase, 2.15 GiB, is
+  40% of that set, and 40% of the read bytes hit it in the last ten seconds
+  (31% over the phase, during which the cache grew from nothing). Uniformly
+  random reads hit exactly the resident fraction, whatever the policy. A
+  trace of the 2Q shards during the phase (uprobes on the shard's add,
+  touch and remove) shows the re-reads directly: a third of the inserts are
+  objects evicted seconds earlier and read again, promoted from the ghost
+  list to the hot list, which stays full and cycles.
+
+  The two peaks of the row are different events:
+
+  | osd.0 at its peak | Unchanged, 47 s in | Final patches, 179 s in |
+  |---|---:|---:|
+  | RSS | 4.37 | 3.85 |
+  | data cache | 0.86 | 2.13 |
+  | onodes + untracked heap | 0.32 + 0.42 | 0.11 + 0.19 |
+  | allocator free lists | 2.00 | 0.73 |
+
+  The unchanged build's peak is the residue of PUT 4 KiB, free lists above
+  all, pushing mapped memory over the target until tcmalloc releases it 15 s
+  later; the final build's is the data cache filled to the tuner's budget at
+  the end of the phase, under the target (the §1 figure, 4.09, includes the
+  15 s after warp stops). That budget is 0.85 × target − 768 MiB = 2.65 GiB;
+  the kv and onode caches keep about 0.4 GiB of it, the data cache takes the
+  rest, 64 MiB per five-second round, and RSS ends at 3.6–3.9 GiB. So the
+  patches removed the cause of the old peak, and what is left is the working
+  set filled to the budget, which is what the tuner is for. The gain shows
+  in throughput instead: with the residue holding mapped memory over the
+  target, the unchanged build's tuner cuts its budget twice during the
+  phase, the data cache grows slower, and GET 4 MiB runs 10–12% slower
+  (2187 → 2408 MiB/s in §4.5, 2225 → 2485 in the traced pair) from the same
+  number of drive reads. Admission control for the data cache would not
+  help here; it would cost drive reads. An earlier version of this section
+  said the GETs filled the cache with data that would not be read again and
+  named data-cache probation as the next change; that was wrong about the
+  benchmark. A one-pass scan of a bucket larger than memory would be
+  read-once, and the 2Q warm-in bound does not hold for one (the hot list's
+  unused share is lent to warm-in, and warm-in bytes count as fresh for the
+  tuner); that case is untested here.
 - **Counting the onodes' real cost.** The tuner still budgets the onode cache
   from mempool bytes, half the real heap for small objects. With admission the
   cache is small enough that this matters less, but a workload with a large
