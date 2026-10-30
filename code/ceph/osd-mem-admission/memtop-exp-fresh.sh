@@ -4,7 +4,7 @@
 # into /root/git/ceph/wt/memtop-exp/<tag>; perf counters of both OSDs are saved at the end. Sibling of
 # memtop-exp.sh, which restarts the daemons on the same data.
 #   usage: memtop-exp-fresh.sh <tag> [-o key=value]... [-b binary-name] <step>...
-#   steps: fill-rbd fill-rgw (not recorded)  scrub recovery rbd rgw3 restart (recorded, as in memtop-exp.sh)
+#   steps: fill-rbd fill-rgw (not recorded)  scrub recovery rbd rgw3 get4m get4m-scan restart (recorded, as in memtop-exp.sh)
 set -e
 tag=$1; shift
 opts=()
@@ -21,7 +21,7 @@ elog "start: $* opts=[${opts[*]}] ceph-osd=$(stat -c %y $B/bin/ceph-osd | cut -c
 if [ -n "$bin" ]; then cp --remove-destination /root/git/ceph/wt/memtop-exp/bin/ceph-osd.$bin $B/bin/ceph-osd || { elog "copy of ceph-osd.$bin failed"; exit 1; }; elog "ceph-osd := $bin $(md5sum $B/bin/ceph-osd | cut -c1-8)"; fi
 [ "$($B/bin/ceph-osd --version | head -1)" = "$($B/bin/ceph-mon --version | head -1)" ] || { elog "version check: ceph-osd and ceph-mon differ, abort"; exit 1; }
 setup   # a new cluster: vstart -n, both OSDs formatted, pools and images created
-for o in "${opts[@]}"; do ceph config set osd "${o%%=*}" "${o#*=}"; done   # after setup: vstart -n wipes the config store; takes effect at the restart step
+for o in "${opts[@]}"; do ceph config set --force osd "${o%%=*}" "${o#*=}" || { elog "config set $o failed"; exit 1; }; done   # --force: a mon built without the patches does not know the new options; after setup: vstart -n wipes the config store; takes effect at the restart step
 ceph config dump > $RUN/log/config.dump 2>/dev/null || true
 # warp with its own bucket, kept (--noclear) so the recording ends with the PUTs; purged afterwards, unrecorded
 warp_fresh() { local name=$1; shift; (cd $RUN/log && $RUN/bin/warp "$@" $S3 --noclear --no-color --benchdata $RUN/log/$name.warp > $RUN/log/$name.out 2>&1) || log "warp exit $?"; grep -E "Average|Reqs" $RUN/log/$name.out | head -2 | tee -a $RUN/log/run.log; }
@@ -46,6 +46,7 @@ for s in "$@"; do
               warp_fresh fill-rgw-4k put --bucket small --obj.size 4KiB --concurrent 128 --duration ${DUR}s ;;   # unrecorded
     put4k) rec_start rgw-put-4k; warp_run rgw-put-4k put --bucket small --obj.size 4KiB --concurrent 128 --duration ${DUR}s; rec_stop ;;
     get4m) rec_start rgw-get-4m; warp_run rgw-get-4m get --bucket big --list-existing --concurrent 64 --duration ${DUR}s; rec_stop ;;
+    get4m-scan) rec_start rgw-get-4m; warp_run rgw-get-4m get --bucket big --list-existing --objects 50000 --concurrent 64 --duration ${DUR}s; rec_stop ;;   # §6: near read-once, 50,000 keys instead of 2,500
     rgw) rgw_all ;;
     recovery) recovery ;;
     scrub) scrub ;;

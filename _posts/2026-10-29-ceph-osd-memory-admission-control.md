@@ -501,8 +501,8 @@ Against the first version in §1:
   holding mapped memory over the target until tcmalloc releases it 15 s
   later. The final build's is the data cache filled to the tuner's budget
   (0.85 × target − 768 MiB = 2.65 GiB, of which the kv and onode caches keep
-  about 0.4 GiB; the data cache takes the rest, 64 MiB per five-second
-  round) at the end of the phase, under the target; the §1 figure of 4.09
+  about 0.4 GiB; the data cache takes the rest, round by round) at the end
+  of the phase, under the target; the §1 figure of 4.09
   includes the 15 s after warp stops. The patches removed the cause of the
   old peak; what is left is the working set at the budget, which is what the
   tuner is for. The gain shows as throughput: with the residue over the
@@ -512,10 +512,27 @@ Against the first version in §1:
   number of drive reads. Admission control for the data cache would not
   help here; it would cost drive reads. An earlier version of this section
   called the GET data read-once and named data-cache probation as the next
-  change; that was wrong about the benchmark. A one-pass scan of a bucket
-  larger than memory would be read-once, and the 2Q warm-in bound does not
-  hold for one (the hot list's unused share is lent to warm-in, and warm-in
-  bytes count as fresh for the tuner); that case is untested here.
+  change; that was wrong about the benchmark. The read-once case was then
+  tested on its own: GET 4 MiB over the first 50,000 keys of the bucket,
+  each object read about twice in 180 s, about one percent of the bytes
+  served from the cache. The data cache takes it all the same, in both
+  builds, up to the budget the tuner has left (the unchanged build's is cut
+  by the PUT residue, as above):
+
+  | osd.0, GET 4 MiB over 50,000 keys | Unchanged | Final patches |
+  |---|---:|---:|
+  | data cache hit share, bytes | 0.6% | 1.3% |
+  | data cache at the end of the phase, GiB | 1.18 | 1.97 |
+  | RSS peak, GiB | 4.48, 28 s in | 3.67, 169 s in |
+
+  The 2Q warm-in bound does not hold for a scan: the hot list's unused share
+  is lent to warm-in, and warm-in bytes count as fresh for the tuner, so the
+  cache grows round by round to the budget and holds data no one reads
+  again. Admission control for the data cache, or warm-in bytes at the
+  tuner's lowest priority, would be a fourth change; it is not in this set.
+  In this pair warp ran 8% slower on the patched build (2312 → 2125 MiB/s);
+  with one percent of the bytes from the cache, the cache cannot explain it
+  either way. One pair, not pursued.
 - **Counting the onodes' real cost.** The tuner still budgets the onode
   cache from mempool bytes, half the real heap for small objects. With
   admission the cache is small enough that this matters less, but a large
@@ -523,9 +540,24 @@ Against the first version in §1:
 - **A ghost list.** An onode or block reused with a period longer than its
   stay on probation is never promoted. 2Q's answer is a small list of
   recently evicted keys; neither patch has one.
-- **Ratios.** 0.1 was the first value tried for both probation ratios. The
-  2Q literature suggests about 0.25 for the admission queue; a larger
-  probation costs memory in scans and protects more of the slow-reuse set.
+- **Ratios.** Both probation ratios were swept on new clusters with the final
+  patches (§4.5's recipe), scrub as the scan and RBD as the hot set:
+
+  | ratio | scrub peak, osd.0, GiB | scrub time, s | RBD read 4 KiB, IOPS | onode block cache misses in the RBD run |
+  |---|---:|---:|---:|---:|
+  | unchanged | 4.30 | 420 | 174k | 0.94M |
+  | 0.05 | 1.03 | 410 | 163k | 1.97M |
+  | 0.1, two runs | 1.28 | 404 | 169k, 170k | 1.13M, 1.59M |
+  | 0.25 | 1.87 | 393 | 166k | 0.88M |
+  | 0.5 | 3.04 | 394 | 177k | 0.89M |
+
+  Half the probation saves a quarter GiB in the scan and costs misses on the
+  hot set, twice the unchanged build's. A quarter gets the misses back to the
+  unchanged build's for 0.6 GiB more in the scan, where onodes and their
+  untracked twin grow from 0.38 + 0.35 to 0.46 + 0.59; a half takes the
+  scan's peak to 3.04 for no further gain in time. 0.1 stays. The two runs
+  at 0.1 differ by 1% in IOPS and by a third in misses, so only the ends of
+  the sweep are clear: 0.05 costs the hot set, 0.5 costs the scan.
 
 ## 7. Reproduce
 
@@ -535,7 +567,7 @@ Against the first version in §1:
 | [`0002-os-bluestore-admit-an-onode-to-the-cache-on-its-seco.patch`]({{ site.baseurl }}/code/ceph/osd-mem-admission/0002-os-bluestore-admit-an-onode-to-the-cache-on-its-seco.patch) | §3.2 |
 | [`0003-kv-rocksdb_cache-put-new-blocks-on-probation-before-.patch`]({{ site.baseurl }}/code/ceph/osd-mem-admission/0003-kv-rocksdb_cache-put-new-blocks-on-probation-before-.patch) | §3.3 |
 | [`memtop-exp.sh`]({{ site.baseurl }}/code/ceph/osd-mem-admission/memtop-exp.sh) | one A/B run: optional config, pick the `ceph-osd` binary, restart the cluster, run the phases under memtop. A wrapper over the previous post's [`memtop-workloads.sh`]({{ site.baseurl }}/code/ceph/memtop-workloads.sh), whose functions it sources (edit the path at the top) |
-| [`memtop-exp-fresh.sh`]({{ site.baseurl }}/code/ceph/osd-mem-admission/memtop-exp-fresh.sh) | the same for a new cluster (§4.5): `vstart -n`, unrecorded fill steps, then the recorded phases |
+| [`memtop-exp-fresh.sh`]({{ site.baseurl }}/code/ceph/osd-mem-admission/memtop-exp-fresh.sh) | the same for a new cluster (§4.5): `vstart -n`, unrecorded fill steps, then the recorded phases; `-o key=value` sets an OSD option (the §6 ratio sweep), the step `get4m-scan` is the §6 read-once GET |
 | [`memtop-quick-peaks.py`]({{ site.baseurl }}/code/ceph/osd-mem-admission/memtop-quick-peaks.py) | per phase and OSD: RSS peak and the held peaks of the main rows |
 | [`memtop-ab.py`]({{ site.baseurl }}/code/ceph/osd-mem-admission/memtop-ab.py) | the A/B tables of this post from two runs |
 | [`memtop-rbd-table.py`]({{ site.baseurl }}/code/ceph/osd-mem-admission/memtop-rbd-table.py) | the five-run RBD tables of §4.4: `memtop-rbd-table.py LABEL=RUN...` |
