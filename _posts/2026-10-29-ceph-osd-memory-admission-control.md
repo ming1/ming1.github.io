@@ -54,7 +54,7 @@ RBD is not one of the workloads the changes aim at; it is the check that a
 hot set is still cached and that throughput holds. No throughput figure moved
 by more than 3%, except where the patches made it faster.
 
-![peak RSS per workload, unchanged build against the final patches, each run on a new cluster]({{ site.baseurl }}/assets/images/ceph-osd-mem-admission-peaks-discard.png)
+![peak RSS per workload, unchanged build against the final patches, each run on a new cluster, with the time or throughput of each run]({{ site.baseurl }}/assets/images/ceph-osd-mem-admission-peaks-load.png)
 
 §4.1–§4.4 measured the first version of the patches on one cluster that was
 restarted, not recreated, before each run, on a data set that grew to about
