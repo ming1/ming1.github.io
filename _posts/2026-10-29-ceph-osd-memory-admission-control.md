@@ -650,6 +650,8 @@ OSD instead of 390–560 thousand, almost all on probation, and the scrub is
 | [`memtop-quick-peaks.py`]({{ site.baseurl }}/code/ceph/osd-mem-admission/memtop-quick-peaks.py) | per phase and OSD: RSS peak and the held peaks of the main rows |
 | [`memtop-ab.py`]({{ site.baseurl }}/code/ceph/osd-mem-admission/memtop-ab.py) | the A/B tables of this post from two runs |
 | [`memtop-rbd-table.py`]({{ site.baseurl }}/code/ceph/osd-mem-admission/memtop-rbd-table.py) | the five-run RBD tables of §4.4: `memtop-rbd-table.py LABEL=RUN...` |
+| [`memtop-exp-int.sh`]({{ site.baseurl }}/code/ceph/osd-mem-admission/memtop-exp-int.sh), [`memtop-series-int.sh`]({{ site.baseurl }}/code/ceph/osd-mem-admission/memtop-series-int.sh) | §8: one RGW run on six OSDs with a replicated or EC data pool, and the series of four runs |
+| [`memtop-int-table.py`]({{ site.baseurl }}/code/ceph/osd-mem-admission/memtop-int-table.py) | §8: the peak RSS and IO tables from two runs |
 
 ```
 cp build/bin/ceph-osd bin/ceph-osd.base      # before building the patched one
@@ -671,3 +673,118 @@ The four patches are upstream as PR
 [#73203](https://github.com/ceph/ceph/pull/73203) and
 [#73018](https://github.com/ceph/ceph/pull/73018), which the test build
 included.
+
+## 8. Integration test: seven open PRs together
+
+Patches tested alone can still interact badly. This test merges seven open
+OSD memory and IO PRs into one branch and runs RGW writes and reads on it, on
+a replicated and on an erasure-coded data pool.
+
+The result: every phase has a lower peak RSS, by 8% to 65% on the highest OSD,
+though part of that is memory carried over from an earlier phase (§8.3). In
+this one pair of runs per pool, no phase lost more than 1% of its throughput.
+GET 4 KiB, and perhaps PUT 4 MiB, are limited outside the OSD and could not
+show a small loss. All four runs ended `HEALTH_OK` with no signal or failed
+assert in the daemon logs, no OSD restart and no client error.
+
+### 8.1 What was tested
+
+The branch is
+[`wip-osd-mem-integration`](https://github.com/ming1/ceph/tree/wip-osd-mem-integration),
+commit `3e6cd5f4e58`. It is Ceph main at `0f8fa6b9ce7` with the seven PRs
+merged in this order, without a conflict. The baseline is `0f8fa6b9ce7` itself.
+
+| PR | Change | Exercised by this test? |
+|---|---|---|
+| [#73018](https://github.com/ceph/ceph/pull/73018) | BlueStore buffer cache shard limits weighted by occupancy | Yes, on the GET phases; the data cache stays at zero under PUT |
+| [#73203](https://github.com/ceph/ceph/pull/73203) | Memtable memory reported for all column families | Reporting only |
+| [#73273](https://github.com/ceph/ceph/pull/73273) | This post's four patches | Onode and RocksDB patches yes, the two recovery patches no |
+| [#73282](https://github.com/ceph/ceph/pull/73282) | EC read replies drop their data in `clear_buffers()` | Reached on EC reads, but frees almost nothing: the legacy backend already moves the data out. The case it fixes, `allow_ec_optimizations`, did not run |
+| [#73286](https://github.com/ceph/ceph/pull/73286) | Pushed data sent in the message's data segment | No, there was no recovery |
+| [#72045](https://github.com/ceph/ceph/pull/72045) | Aligned transaction format for EC sub-writes | EC writes only, its alignment not checked directly |
+| [#72964](https://github.com/ceph/ceph/pull/72964) | Uncached limits scaled below a 4 GiB target | No, it changes nothing at the 4 GiB target used here |
+
+Both builds used the same setup:
+
+| Item | Value |
+|---|---|
+| OSDs | six, on three partitions per NVMe, `osd_memory_target` 4 GiB |
+| RGW data pool | replicated size 3, or EC 4+2 on the default (legacy) EC backend |
+| Cluster | new for each run, both NVMes discarded first |
+| Phases | PUT 4 MiB, PUT 4 KiB, GET 4 MiB, GET 4 KiB, 180 s each, in this order |
+
+All four phases run on one cluster with no restart, so a phase starts with the
+memory the last one left.
+
+The runs use six OSDs for both pools, so the replicated numbers here cannot be
+compared directly with the two-OSD numbers of §4.5. Each cell comes from one
+pair of runs.
+
+### 8.2 Results
+
+"Highest" is the largest peak of any of the six OSDs. "Mean" is the mean of
+their six peaks. Peaks include about 15 s after warp stops, as in §6.
+
+Replicated data pool, size 3:
+
+| Phase | Highest peak RSS, GiB | Change | Mean peak RSS, GiB | Change | Objects/s | Change | Mean latency, ms | p99 latency, ms |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| PUT 4 MiB | 1.25 → 1.16 | −7.6% | 1.17 → 1.08 | −7.5% | 265 → 271 | +2.3% | 241.5 → 235.7 | 370.5 → 340.1 |
+| PUT 4 KiB | 4.32 → **1.65** | **−61.6%** | 4.01 → 1.51 | −62.4% | 8505 → 8427 | −0.9% | 14.9 → 15.2 | 32.3 → 35.8 |
+| GET 4 MiB | 4.30 → 3.22 | −25.2% | 4.10 → 2.67 | −34.8% | 656 → 727 | +10.8% | 97.4 → 88.0 | 169.5 → 157.7 |
+| GET 4 KiB | 3.94 → 2.80 | −28.8% | 3.80 → 2.45 | −35.4% | 3090 → 3090 | 0.0% | 41.4 → 41.4 | 43.0 → 43.2 |
+
+EC 4+2 data pool:
+
+| Phase | Highest peak RSS, GiB | Change | Mean peak RSS, GiB | Change | Objects/s | Change | Mean latency, ms | p99 latency, ms |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| PUT 4 MiB | 1.15 → 0.96 | −16.4% | 1.09 → 0.93 | −14.6% | 268 → 272 | +1.7% | 238.8 → 235.1 | 352.7 → 333.6 |
+| PUT 4 KiB | 4.62 → **1.60** | **−65.3%** | 4.52 → 1.57 | −65.3% | 6243 → 6952 | +11.3% | 20.6 → 18.4 | 63.0 → 48.7 |
+| GET 4 MiB | 4.48 → 3.41 | −23.9% | 4.40 → 3.15 | −28.4% | 560 → 562 | +0.4% | 114.3 → 113.7 | 185.3 → 181.6 |
+| GET 4 KiB | 4.26 → 3.26 | −23.4% | 4.16 → 2.89 | −30.5% | 3076 → 3075 | 0.0% | 41.7 → 41.6 | 43.8 → 43.1 |
+
+Stability, in all four runs:
+
+| Check | Result |
+|---|---|
+| Cluster health at the end | `HEALTH_OK`, all 177 PGs `active+clean` |
+| OSD restarts | none, all six up since the start of the run |
+| Signals or failed asserts in daemon logs | none |
+| Errors in the warp reports | none |
+
+### 8.3 What the numbers say
+
+- **Memory.** The largest cut is again PUT 4 KiB, which falls by about 2.5 to
+  3 GiB per OSD on both pools. The EC changes are close to §4.6, which ran the
+  same onode and RocksDB patches on an older main, with #73018 and #73203 in
+  both builds: −16%, −65%, −24% here against −17%, −64%, −22% there. This test
+  merges all the PRs at once, so it cannot split the gain between them.
+- **Carried-over memory.** The GET 4 KiB peak is memory left by GET 4 MiB: in
+  all four runs the first sample is already the peak, so this phase adds nothing
+  of its own. Its −23% differs from §4.6's −28% for the same reason. The
+  replicated baseline's GET 4 MiB peak is also PUT 4 KiB residue, at the first
+  sample, as in §6. These rows repeat part of the PUT 4 KiB saving.
+- **Throughput.** The worst change is −0.9%. EC PUT 4 KiB gained 11.3%, close
+  to the 13% of §4.6. Replicated GET 4 MiB gained 10.8%, the size §6 explains.
+  But EC GET 4 MiB gained 9.8% in §4.6 and only 0.4% here, although its data
+  cache doubled. So a gain on this phase is not reliable from one pair.
+- **Latency.** The one p99 increase beyond 1% is replicated PUT 4 KiB, from
+  32.3 to 35.8 ms (+11%), with its mean up 2%. It is one pair of runs, and it
+  needs a repeat before it means anything.
+- **GET 4 KiB hides small IO changes.** Its latency sits at about 41 ms on both
+  pools and both builds, with a standard deviation under 1 ms, while the fastest
+  request takes 2 to 5 ms. The OSDs' own mean read latency over the whole run is
+  0.5 to 1.9 ms. With 128 clients the fixed wait sets the rate near 3,080
+  objects/s. The wait does not look like OSD work, but its cause was not
+  investigated.
+
+### 8.4 What this test does not cover
+
+- No recovery or scrub ran on the integration builds, by the perf counters
+  (one baseline run recovered 4 objects). So the recovery commits of #73273 and
+  all of #73286 are compile-tested only here.
+- The memory saving of #73282 was not tested, because no pool used
+  `allow_ec_optimizations`.
+- Each run lasts about 15 minutes, so this is a smoke test, not a soak test.
+- #72964 acts below a 4 GiB target, and every OSD here ran at 4 GiB.
+- RGW only. RBD did not run.
