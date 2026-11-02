@@ -652,6 +652,9 @@ OSD instead of 390–560 thousand, almost all on probation, and the scrub is
 | [`memtop-rbd-table.py`]({{ site.baseurl }}/code/ceph/osd-mem-admission/memtop-rbd-table.py) | the five-run RBD tables of §4.4: `memtop-rbd-table.py LABEL=RUN...` |
 | [`memtop-exp-int.sh`]({{ site.baseurl }}/code/ceph/osd-mem-admission/memtop-exp-int.sh), [`memtop-series-int.sh`]({{ site.baseurl }}/code/ceph/osd-mem-admission/memtop-series-int.sh) | §8: one RGW run on six OSDs with a replicated or EC data pool, and the series of four runs |
 | [`memtop-int-table.py`]({{ site.baseurl }}/code/ceph/osd-mem-admission/memtop-int-table.py) | §8: the peak RSS and IO tables from two runs |
+| [`read_fadvise_dontneed.patch`]({{ site.baseurl }}/code/ceph/osd-mem-admission/read_fadvise_dontneed.patch) | §9: the pool flag, on top of the §8 integration branch |
+| [`memtop-series-rdn.sh`]({{ site.baseurl }}/code/ceph/osd-mem-admission/memtop-series-rdn.sh) | §9: the six runs (read caching off on the §8 build, then the flag on and off), with `memtop-exp-int.sh`, which now takes `EXTRA_OPTS` (an OSD option) and `POOL_FLAGS` (flags set on the data pool) |
+| [`memtop-peak-rows.py`]({{ site.baseurl }}/code/ceph/osd-mem-admission/memtop-peak-rows.py) | §9: the rows of the highest OSD at its peak, several runs side by side |
 
 ```
 cp build/bin/ceph-osd bin/ceph-osd.base      # before building the patched one
@@ -788,3 +791,172 @@ Stability, in all four runs:
 - Each run lasts about 15 minutes, so this is a smoke test, not a soak test.
 - #72964 acts below a 4 GiB target, and every OSD here ran at 4 GiB.
 - RGW only. RBD did not run.
+
+## 9. RGW GETs under 3 GiB: a pool flag for read-once data
+
+After §8 the RGW GET phases were the only ones still near 3 GiB: 3.22 and
+2.80 GiB on the replicated pool, 3.41 and 3.26 GiB on the EC pool, at a 4 GiB
+target. Half to 60% of that is the BlueStore data cache, filled by the reads
+themselves (§6); the rest is RocksDB memtables, tcmalloc free lists and heap
+outside the mempools (table in §9.2). The goal of this section was to get every
+RGW phase under 3 GiB on both pools without losing throughput.
+
+The result: a new pool flag, `read_fadvise_dontneed`, set on the RGW data
+pool, cuts the highest GET peak to 1.29 to 1.69 GiB (−44% to −59%), and no RGW
+phase on either pool goes above 1.7 GiB. GET throughput and latency stayed
+within the run-to-run spread. The flag does give something up. In this
+benchmark the data cache was serving 63% to 86% of the read bytes, and the
+OSD's mean read latency rose from 0.3 to 0.8 ms on the replicated pool and
+from 0.1 to 0.4 ms on EC. An RGW GET takes 84 to 116 ms here, so the client
+did not see it. The same memory cut comes from turning
+`bluestore_default_buffered_read` off for every pool. In one pair of runs per
+pool that gave 4% to 5% less GET 4 MiB throughput, which is within the spread
+of this harness; the pool flag is the finer tool, not a measured win.
+
+### 9.1 The change
+
+A pool flag already exists for the write side: `write_fadvise_dontneed` makes
+the primary add `FADVISE_DONTNEED` to every write of the pool, so BlueStore
+does not keep the written data in its cache. This change adds the read side.
+With `read_fadvise_dontneed` set, `PrimaryLogPG::do_osd_ops` adds
+`FADVISE_DONTNEED` to the client's read, sync read, sparse read, checksum,
+cmpext and copy-get ops. The flag then travels the existing path: the
+replicated backend passes the op flags to the store, both EC backends carry
+them in the shard reads, and `BlueStore::_do_read` serves the read without
+inserting the data into the buffer cache. Two things stay as they were: a
+client that hints `FADVISE_WILLNEED` is still cached, because BlueStore checks
+that hint first, and data already in the cache is still served from it.
+
+```
+ceph osd pool set default.rgw.buckets.data read_fadvise_dontneed true
+```
+
+The patch is
+[`read_fadvise_dontneed.patch`]({{ site.baseurl }}/code/ceph/osd-mem-admission/read_fadvise_dontneed.patch)
+(nine files, 57 lines added: the flag, the monitor's get and set, docs, release note,
+and the two test-suite flag lists), on branch
+[`wip-read-fadvise-dontneed`](https://github.com/ming1/ceph/tree/wip-read-fadvise-dontneed)
+on top of the §8 integration branch. It is a per-pool operator choice, off by
+default. Nothing changes for a pool that does not set it.
+
+The six ops are the client reads of `do_osd_ops`, so the reads an object
+class method makes are covered too, as are replica reads and the local reads
+of EC direct reads, which all pass through the same code. Setting the flag on
+a running pool does not evict anything: what is cached stays until the tuner
+drops it, and only new reads stop filling the cache.
+
+Why a pool flag and not a change to the policy: the §6 trace showed that the
+GET 4 MiB cache is not read-once. A third of its inserts are re-reads. A
+heuristic that keeps read-once data out would have to guess which pool is which.
+The operator knows: an RGW data pool behind a backup or file-sharing service is
+read once, an RBD pool is not.
+
+### 9.2 Results
+
+Same harness as §8: six OSDs, 4 GiB target, a new cluster on discarded drives
+for every run, the four RGW phases in order on one cluster. All four runs use
+the §8 integration branch plus the patch, so the only difference within a pair
+is the flag on the data pool. Each cell is one pair of runs.
+
+Replicated data pool, size 3, flag off → on:
+
+| Phase | Highest peak RSS, GiB | Change | Mean peak RSS, GiB | Change | Objects/s | Change | Mean latency, ms | p99 latency, ms |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| PUT 4 MiB | 1.12 → 1.11 | −0.4% | 1.05 → 1.02 | −2.7% | 258 → 250 | −3.0% | 245.9 → 255.4 | 365.0 → 389.4 |
+| PUT 4 KiB | 1.57 → 1.68 | +6.8% | 1.51 → 1.55 | +2.7% | 7709 → 8320 | +7.9% | 16.7 → 15.4 | 49.4 → 38.2 |
+| GET 4 MiB | 2.81 → **1.57** | **−44.2%** | 2.60 → 1.40 | −46.1% | 655 → 767 | +17.0% | 97.1 → 83.7 | 173.0 → 147.9 |
+| GET 4 KiB | 2.81 → **1.33** | **−52.4%** | 2.46 → 1.23 | −50.2% | 3090 → 3077 | −0.4% | 41.5 → 41.6 | 43.5 → 43.4 |
+
+EC 4+2 data pool, flag off → on:
+
+| Phase | Highest peak RSS, GiB | Change | Mean peak RSS, GiB | Change | Objects/s | Change | Mean latency, ms | p99 latency, ms |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| PUT 4 MiB | 0.96 → 0.99 | +3.3% | 0.92 → 0.94 | +2.2% | 267 → 277 | +3.5% | 239.0 → 231.1 | 354.0 → 338.3 |
+| PUT 4 KiB | 1.61 → 1.59 | −1.7% | 1.56 → 1.57 | +0.5% | 6362 → 6486 | +2.0% | 20.2 → 19.8 | 59.7 → 58.0 |
+| GET 4 MiB | 3.16 → **1.69** | **−46.4%** | 2.98 → 1.41 | −52.8% | 549 → 561 | +2.2% | 116.4 → 114.2 | 186.0 → 179.2 |
+| GET 4 KiB | 3.13 → **1.29** | **−58.8%** | 2.90 → 1.25 | −57.0% | 3075 → 3056 | −0.6% | 41.6 → 42.0 | 43.1 → 43.7 |
+
+What the highest OSD holds at its GET 4 MiB peak, GiB:
+
+| Row | Replicated, off | Replicated, on | EC, off | EC, on |
+|---|---:|---:|---:|---:|
+| RSS | 2.81 | 1.57 | 3.16 | 1.69 |
+| data cache | 1.49 | 0.00 | 1.88 | 0.00 |
+| RocksDB memtables | 0.39 | 0.63 | 0.29 | 0.34 |
+| allocator free lists | 0.49 | 0.49 | 0.46 | 0.74 |
+| heap outside the mempools | 0.15 | 0.19 | 0.20 | 0.25 |
+| onode, kv and kv_onode caches | 0.14 | 0.14 | 0.16 | 0.18 |
+| PG log | 0.07 | 0.07 | 0.12 | 0.12 |
+
+The control: read caching off for every pool with
+`bluestore_default_buffered_read = false` on the §8 integration build, which
+has no such flag, so this is the global option alone:
+
+| Pool | Phase | Highest peak RSS, GiB | Change | Objects/s | Change |
+|---|---|---:|---:|---:|---:|
+| replicated | GET 4 MiB | 3.22 → 1.49 | −53.9% | 727 → 696 | −4.2% |
+| replicated | GET 4 KiB | 2.80 → 1.41 | −49.7% | 3090 → 3036 | −1.7% |
+| EC | GET 4 MiB | 3.41 → 1.54 | −54.7% | 562 → 532 | −5.4% |
+| EC | GET 4 KiB | 3.26 → 1.43 | −56.3% | 3075 → 3054 | −0.7% |
+
+Stability, in all six runs of this section: `HEALTH_OK` with all 177 PGs
+`active+clean` at the end, no OSD restart, no signal or failed assert in the
+daemon logs, no error in the warp reports.
+
+### 9.3 What the numbers say
+
+- **The goal is met.** With the flag on, the highest peak of any RGW phase is
+  1.69 GiB (EC GET 4 MiB); the PUT 4 KiB peaks, 1.59 and 1.68 GiB, are now
+  about as high. Every phase on both pools is under half of the 4 GiB target.
+- **The data cache goes to zero, not down.** In the GET phases the data cache
+  no longer takes anything: PUT does not fill it
+  (`bluestore_default_buffered_write` is off) and GET no longer does. What is
+  left at the GET 4 MiB peaks in the table is the §6 list: idle RocksDB
+  memtables from the PUT phases (0.3 to 0.6 GiB), tcmalloc free lists (0.5 to
+  0.7 GiB) and heap outside the mempools (0.2 to 0.25 GiB). Those are the next
+  targets if the peak has to go lower.
+- **Throughput and latency are within the spread.** GET 4 MiB on the
+  replicated pool shows +17%, but one pair cannot tell the flag's effect from
+  the spread: the same code with the flag off gave 655 objects/s here and 727
+  in §8, 11% apart, and the flag-on run gave 767, 5.5% above the better of
+  the two. On the EC pool the change is +2.2%, and the §8 run of the
+  integration build gave the same 562. GET 4 KiB sits at its fixed
+  3,080 objects/s on both pools, as in §8.3. The PUT phases, which the flag
+  does not touch, move by −3% to +8%, and that is the pair-to-pair spread of
+  this harness.
+- **The cache the flag gives up was in use.** By the OSDs' counters, the
+  buffer cache served 63% of the read bytes on the replicated pool and 86% on
+  the EC pool with the flag off, and nothing with it on. The mean BlueStore
+  read latency per OSD over the run rose on the replicated pool from a range of
+  0.07 to 0.58 ms to one of 0.51 to 1.06 ms, and on EC from 0.07 to 0.13 ms
+  to 0.34 to 0.55 ms. So this benchmark is not a read-once workload: warp
+  re-reads a 2,500-object set, the cache was hit most of the time, and the
+  flag made the mean OSD read 2.5 to 5 times slower. The client did not see
+  it because an RGW GET takes 84 to 116 ms end to end here, and the OSD read
+  is about 1% of that. On slower media, or with a client that is bound by OSD
+  read latency, the loss would show. This is why it is a per-pool flag and
+  not a default.
+- **Pool flag or global option.** Both remove the GET peak. The global option
+  gave 4% to 5% less GET 4 MiB throughput than the flag in one pair of runs per
+  pool, on different builds, and that is within the spread of this harness.
+  Caching of the other pools cannot explain it: with the flag on, the buffer
+  cache served under 0.5 MiB of reads in the whole run, about the same as with
+  the global option. The flag's advantage is scope. It changes one pool, and
+  the operator chooses which.
+
+### 9.4 What this does not cover
+
+- One pair of runs per cell, as in §8. The replicated GET 4 MiB spread shows
+  what one pair cannot tell apart.
+- Only RGW GETs of 4 MiB and 4 KiB objects by 64 or 128 clients on NVMe.
+  A workload that re-reads a hot set and is bound by OSD read latency would
+  lose from the flag; it is for the operator to set on pools that are read
+  once.
+- The flag is applied to client reads in `do_osd_ops`. Recovery and scrub
+  reads are separate paths; §3.1 covers recovery.
+- RBD did not run. The flag was set on the RGW data pool only, so it cannot
+  change what an RBD pool caches; the §4.4 hot-set check still stands as the
+  RBD result of the integration branch's patches, not of this one.
+- No functional test of the flag beyond the two flag-list loops in the test
+  suite; a `ceph_test_rados` run with the flag set is the next step before
+  this goes upstream. It is not posted upstream yet.

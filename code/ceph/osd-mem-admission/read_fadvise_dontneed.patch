@@ -1,0 +1,280 @@
+From 14d594537aec1df7cd95be856322d4bc405e2908 Mon Sep 17 00:00:00 2001
+From: Ming Lei <ming.lei@clyso.com>
+Date: Mon, 2 Nov 2026 00:52:50 -0600
+Subject: [PATCH] osd, mon: pool flag read_fadvise_dontneed
+
+Object data a client reads once still goes into the OSD's buffer cache
+(bluestore_default_buffered_read), and the memory tuner then gives that
+cache whatever has been touched recently, up to the memory target.  On
+a pool of large objects that are read in whole and rarely again, such as
+an RGW data pool of a file-sharing or backup service, that is memory
+spent on data with no second use.
+
+A pool flag already exists for the write side: write_fadvise_dontneed
+adds FADVISE_DONTNEED to every write of the pool.  Add the read side,
+read_fadvise_dontneed: the primary adds FADVISE_DONTNEED to the client's
+read, sync read, sparse read, checksum, cmpext and copy-get ops of the
+pool (and so to the reads a class method makes, which go through the
+same code), and the object store serves them without keeping the data.
+The flag reaches BlueStore on every read path: ReplicatedBackend passes
+the op flags to the store, and both EC backends carry them in the shard
+reads.  A client that hints FADVISE_WILLNEED still gets its data cached,
+as BlueStore checks that first.  Buffers already in the cache are still
+used.
+
+The flag is off by default and set per pool by the operator.
+
+Measured with warp against RGW on six NVMe OSDs (osd_memory_target
+4 GiB), 180 s phases of PUT 4 MiB, PUT 4 KiB, GET 4 MiB and GET 4 KiB
+on a replicated size 3 and on an EC 4+2 data pool, the same binary with
+the flag off and on the data pool.  The highest OSD peak RSS of the GET
+phases falls from 2.8-3.2 GiB to 1.3-1.7 GiB, the buffer cache from
+1.5-1.9 GiB to nothing, and GET throughput and latency stay within the
+run-to-run spread (GET 4 MiB: 2622 -> 3066 MiB/s replicated, 2197 ->
+2246 MiB/s EC; GET 4 KiB and both PUT phases within 8%).  The benchmark
+re-reads a set of 2,500 objects, so the cache the flag gives up was
+serving 63% (replicated) and 86% (EC) of the read bytes, and the mean
+BlueStore read latency rose from 0.3 to 0.8 ms (replicated) and from
+0.1 to 0.4 ms (EC); an RGW GET of 84-116 ms end to end does not show
+that.  Setting bluestore_default_buffered_read = false instead gives the
+same peak, and in one pair of runs per pool 4-5% less GET 4 MiB
+throughput, within the spread of the setup; the flag's advantage is that
+it changes one pool and leaves the rest as they are.
+
+The flag is added to the OSDOp's flags in place, as write_fadvise_dontneed
+does, so it is also visible in the ops of the reply.
+
+Signed-off-by: Ming Lei <ming.lei@clyso.com>
+---
+ PendingReleaseNotes            |  7 +++++++
+ doc/man/8/ceph.rst             |  4 ++--
+ doc/rados/operations/pools.rst | 17 +++++++++++++++++
+ qa/standalone/mon/misc.sh      |  2 +-
+ qa/workunits/cephtool/test.sh  |  2 +-
+ src/mon/MonCommands.h          |  6 ++++--
+ src/mon/OSDMonitor.cc          |  6 +++++-
+ src/osd/PrimaryLogPG.cc        | 14 ++++++++++++++
+ src/osd/osd_types.h            |  6 ++++++
+ 9 files changed, 57 insertions(+), 7 deletions(-)
+
+diff --git a/PendingReleaseNotes b/PendingReleaseNotes
+index a3564c23bac..fafa33f7684 100644
+--- a/PendingReleaseNotes
++++ b/PendingReleaseNotes
+@@ -1,5 +1,12 @@
+ >=22.0.0
+ 
++* RADOS: New pool flag ``read_fadvise_dontneed`` (``ceph osd pool set <pool>
++  read_fadvise_dontneed true``). With it set, the OSDs do not keep the pool's
++  object data in their cache after serving a client read, as if every read
++  carried ``LIBRADOS_OP_FLAG_FADVISE_DONTNEED``. For pools whose objects are
++  rarely read twice, such as an RGW data pool, this keeps the OSD's memory for
++  metadata and for pools that benefit from caching.
++
+ * OSD: When ``osd_memory_target`` is below its 4 GiB default, OSDs now scale
+   down limits on memory that the cache autotuner cannot shrink, by
+   ``osd_memory_target`` / 4 GiB, as long as each is still at its default:
+diff --git a/doc/man/8/ceph.rst b/doc/man/8/ceph.rst
+index 74d7a0c2f3d..b8d6e18e7c4 100644
+--- a/doc/man/8/ceph.rst
++++ b/doc/man/8/ceph.rst
+@@ -1240,7 +1240,7 @@ Subcommand ``get`` gets pool parameter <var>.
+ Usage::
+ 
+     ceph osd pool get <poolname> size|min_size|pg_num|pgp_num|crush_rule|hashpspool|
+-    nodelete|nopgchange|nosizechange|write_fadvise_dontneed
++    nodelete|nopgchange|nosizechange|write_fadvise_dontneed|read_fadvise_dontneed
+ 
+ Only for tiered pools::
+ 
+@@ -1303,7 +1303,7 @@ Usage::
+     target_max_bytes|target_max_objects|cache_target_dirty_ratio|
+     cache_target_dirty_high_ratio|
+     cache_target_full_ratio|cache_min_flush_age|cache_min_evict_age|
+-    min_read_recency_for_promote|write_fadvise_dontneed|hit_set_grade_decay_rate|
++    min_read_recency_for_promote|write_fadvise_dontneed|read_fadvise_dontneed|hit_set_grade_decay_rate|
+     hit_set_search_last_n
+     <val> {--yes-i-really-mean-it}
+ 
+diff --git a/doc/rados/operations/pools.rst b/doc/rados/operations/pools.rst
+index 17a93096ec1..aaad7bdd43c 100644
+--- a/doc/rados/operations/pools.rst
++++ b/doc/rados/operations/pools.rst
+@@ -513,6 +513,23 @@ You may set values for the following keys:
+    :Type: Integer
+    :Valid Range: ``1`` sets flag, ``0`` unsets flag
+ 
++.. _read_fadvise_dontneed:
++
++.. describe:: read_fadvise_dontneed
++
++   :Description: Sets or unsets the ``READ_FADVISE_DONTNEED`` flag on a given
++                 pool. With the flag set, the OSDs serve the pool's object
++                 data reads (read, sparse read, checksum, cmpext and the read
++                 side of a copy) as if they carried
++                 ``LIBRADOS_OP_FLAG_FADVISE_DONTNEED``: the data is served but
++                 not kept in the OSD's cache, which leaves the cache to
++                 metadata and to pools whose data is read again. Meant for
++                 pools whose objects are rarely read twice, such as an RGW data
++                 pool of a file-sharing or backup service. A client read that
++                 hints ``FADVISE_WILLNEED`` is still cached.
++   :Type: Integer
++   :Valid Range: ``1`` sets flag, ``0`` unsets flag
++
+ .. _noscrub:
+ 
+ .. describe:: noscrub
+diff --git a/qa/standalone/mon/misc.sh b/qa/standalone/mon/misc.sh
+index 48a07c5c47e..d10db07390d 100755
+--- a/qa/standalone/mon/misc.sh
++++ b/qa/standalone/mon/misc.sh
+@@ -42,7 +42,7 @@ function TEST_osd_pool_get_set() {
+     create_pool $TEST_POOL 8
+ 
+     local flag
+-    for flag in nodelete nopgchange nosizechange write_fadvise_dontneed noscrub nodeep-scrub; do
++    for flag in nodelete nopgchange nosizechange write_fadvise_dontneed read_fadvise_dontneed noscrub nodeep-scrub; do
+ 	ceph osd pool set $TEST_POOL $flag 0 || return 1
+ 	! ceph osd dump | grep 'pool ' | grep $flag || return 1
+ 	ceph osd pool set $TEST_POOL $flag 1 || return 1
+diff --git a/qa/workunits/cephtool/test.sh b/qa/workunits/cephtool/test.sh
+index 90991cc199f..7a22919f8de 100755
+--- a/qa/workunits/cephtool/test.sh
++++ b/qa/workunits/cephtool/test.sh
+@@ -2309,7 +2309,7 @@ function test_mon_osd_pool_set()
+   ceph osd pool get pool_erasure erasure_code_profile
+   ceph osd pool rm pool_erasure pool_erasure --yes-i-really-really-mean-it
+ 
+-  for flag in nodelete nopgchange nosizechange write_fadvise_dontneed noscrub nodeep-scrub bulk; do
++  for flag in nodelete nopgchange nosizechange write_fadvise_dontneed read_fadvise_dontneed noscrub nodeep-scrub bulk; do
+       ceph osd pool set $TEST_POOL_GETSET $flag false
+       ceph osd pool get $TEST_POOL_GETSET $flag | grep "$flag: false"
+       ceph osd pool set $TEST_POOL_GETSET $flag true
+diff --git a/src/mon/MonCommands.h b/src/mon/MonCommands.h
+index 6641aa78cca..a90ca1a420d 100644
+--- a/src/mon/MonCommands.h
++++ b/src/mon/MonCommands.h
+@@ -1266,7 +1266,8 @@ COMMAND("osd pool get "
+           "|target_size_bytes"
+           "|target_size_ratio"
+           "|use_gmt_hitset"
+-          "|write_fadvise_dontneed",
++          "|write_fadvise_dontneed"
++          "|read_fadvise_dontneed",
+ 	"get pool parameter <var>", "osd", "r")
+ COMMAND("osd pool set "
+ 	"name=pool,type=CephPoolname "
+@@ -1332,7 +1333,8 @@ COMMAND("osd pool set "
+           "|target_size_ratio"
+           "|unset_pool_flags"
+           "|use_gmt_hitset"
+-          "|write_fadvise_dontneed "
++          "|write_fadvise_dontneed"
++          "|read_fadvise_dontneed "
+ 	"name=val,type=CephString "
+ 	"name=yes_i_really_mean_it,type=CephBool,req=false",
+ 	"set pool parameter <var> to <val>", "osd", "rw")
+diff --git a/src/mon/OSDMonitor.cc b/src/mon/OSDMonitor.cc
+index baeee33869d..6377f54f4ce 100644
+--- a/src/mon/OSDMonitor.cc
++++ b/src/mon/OSDMonitor.cc
+@@ -5574,7 +5574,7 @@ namespace {
+     SIZE, MIN_SIZE,
+     PG_NUM, PGP_NUM, CRUSH_RULE, HASHPSPOOL, EC_OVERWRITES,
+     NODELETE, NOPGCHANGE, NOSIZECHANGE,
+-    WRITE_FADVISE_DONTNEED, NOSCRUB, NODEEP_SCRUB,
++    WRITE_FADVISE_DONTNEED, READ_FADVISE_DONTNEED, NOSCRUB, NODEEP_SCRUB,
+     HIT_SET_TYPE, HIT_SET_PERIOD, HIT_SET_COUNT, HIT_SET_FPP,
+     USE_GMT_HITSET, TARGET_MAX_OBJECTS, TARGET_MAX_BYTES,
+     CACHE_TARGET_DIRTY_RATIO, CACHE_TARGET_DIRTY_HIGH_RATIO,
+@@ -6370,6 +6370,7 @@ bool OSDMonitor::preprocess_command(MonOpRequestRef op)
+       {"nopgchange", NOPGCHANGE}, {"nosizechange", NOSIZECHANGE},
+       {"noscrub", NOSCRUB}, {"nodeep-scrub", NODEEP_SCRUB},
+       {"write_fadvise_dontneed", WRITE_FADVISE_DONTNEED},
++      {"read_fadvise_dontneed", READ_FADVISE_DONTNEED},
+       {"hit_set_type", HIT_SET_TYPE}, {"hit_set_period", HIT_SET_PERIOD},
+       {"hit_set_count", HIT_SET_COUNT}, {"hit_set_fpp", HIT_SET_FPP},
+       {"use_gmt_hitset", USE_GMT_HITSET},
+@@ -6554,6 +6555,7 @@ bool OSDMonitor::preprocess_command(MonOpRequestRef op)
+ 	  case NOPGCHANGE:
+ 	  case NOSIZECHANGE:
+ 	  case WRITE_FADVISE_DONTNEED:
++	  case READ_FADVISE_DONTNEED:
+ 	  case NOSCRUB:
+ 	  case NODEEP_SCRUB:
+ 	    f->dump_bool(i->first.c_str(),
+@@ -6802,6 +6804,7 @@ bool OSDMonitor::preprocess_command(MonOpRequestRef op)
+ 	  case NOPGCHANGE:
+ 	  case NOSIZECHANGE:
+ 	  case WRITE_FADVISE_DONTNEED:
++	  case READ_FADVISE_DONTNEED:
+ 	  case NOSCRUB:
+ 	  case NODEEP_SCRUB:
+ 	    for (i = ALL_CHOICES.begin(); i != ALL_CHOICES.end(); ++i) {
+@@ -9135,6 +9138,7 @@ int OSDMonitor::prepare_command_pool_set(const cmdmap_t& cmdmap,
+     p.crush_rule = id;
+   } else if (var == "nodelete" || var == "nopgchange" ||
+ 	     var == "nosizechange" || var == "write_fadvise_dontneed" ||
++	     var == "read_fadvise_dontneed" ||
+ 	     var == "noscrub" || var == "nodeep-scrub" || var == "bulk" ||
+ 	     var == "crimson_allow_pg_merge") {
+     uint64_t flag = pg_pool_t::get_flag_by_name(var);
+diff --git a/src/osd/PrimaryLogPG.cc b/src/osd/PrimaryLogPG.cc
+index 6156380787c..8c1f290686e 100644
+--- a/src/osd/PrimaryLogPG.cc
++++ b/src/osd/PrimaryLogPG.cc
+@@ -6212,6 +6212,20 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
+       }
+     }
+ 
++    if (pool.info.has_flag(pg_pool_t::FLAG_READ_FADVISE_DONTNEED)) {
++      // the pool's data is read once: keep it out of the object store's
++      // cache (a client that hints WILLNEED still gets it cached)
++      switch (op.op) {
++      case CEPH_OSD_OP_READ:
++      case CEPH_OSD_OP_SYNC_READ:
++      case CEPH_OSD_OP_SPARSE_READ:
++      case CEPH_OSD_OP_CHECKSUM:
++      case CEPH_OSD_OP_CMPEXT:
++      case CEPH_OSD_OP_COPY_GET:
++	op.flags = op.flags | CEPH_OSD_OP_FLAG_FADVISE_DONTNEED;
++      }
++    }
++
+     // TODO: check endianness (ceph_le32 vs uint32_t, etc.)
+     // The fields in ceph_osd_op are little-endian (according to the definition in rados.h),
+     // but the code in this function seems to treat them as native-endian.  What should the
+diff --git a/src/osd/osd_types.h b/src/osd/osd_types.h
+index c3838bc015b..eaae38e4edb 100644
+--- a/src/osd/osd_types.h
++++ b/src/osd/osd_types.h
+@@ -1215,6 +1215,9 @@ struct pg_pool_t {
+     // Allow decreasing pg_num/pgp_num (PG merge) for crimson pools.
+     // Note: requires that the pool is currently all bluestore.
+     FLAG_CRIMSON_ALLOW_PG_MERGE = 1<<22,
++    // read mode with LIBRADOS_OP_FLAG_FADVISE_DONTNEED: the OSD does not keep
++    // the data it reads for clients in its cache
++    FLAG_READ_FADVISE_DONTNEED = 1<<23,
+   };
+ 
+   static const char *get_flag_name(uint64_t f) {
+@@ -1242,6 +1245,7 @@ struct pg_pool_t {
+     case FLAG_CLIENT_SPLIT_READS: return "split_reads";
+     case FLAG_OMAP: return "supports_omap";
+     case FLAG_CRIMSON_ALLOW_PG_MERGE: return "crimson_allow_pg_merge";
++    case FLAG_READ_FADVISE_DONTNEED: return "read_fadvise_dontneed";
+     default: return "???";
+     }
+   }
+@@ -1300,6 +1304,8 @@ struct pg_pool_t {
+       return FLAG_CRIMSON;
+     if (name == "crimson_allow_pg_merge")
+       return FLAG_CRIMSON_ALLOW_PG_MERGE;
++    if (name == "read_fadvise_dontneed")
++      return FLAG_READ_FADVISE_DONTNEED;
+     if (name == "ec_optimizations")
+       return FLAG_EC_OPTIMIZATIONS;
+     if (name == "split_reads")
+-- 
+2.56.0
+

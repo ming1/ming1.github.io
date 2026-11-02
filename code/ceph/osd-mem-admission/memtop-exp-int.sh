@@ -56,7 +56,7 @@ setup() {   # replaces memrun3.sh's: six OSDs on partitions, EC data pool
         -o "osd_pool_default_pg_autoscale_mode = off" \
         -o "osd_pool_default_pg_num = 8" \
         -o "rocksdb_perf = true" \
-        -o "rocksdb_collect_memory_stats = true" > $RUN/log/vstart.log 2>&1
+        -o "rocksdb_collect_memory_stats = true" ${EXTRA_OPTS:+-o "$EXTRA_OPTS"} > $RUN/log/vstart.log 2>&1
     ceph config set osd osd_debug_op_order false
     ceph config set osd osd_debug_misdirected_ops false
     ceph osd pool create rbd 64 64 replicated
@@ -67,6 +67,7 @@ setup() {   # replaces memrun3.sh's: six OSDs on partitions, EC data pool
     if [ "$pool" = ec ]; then ceph osd pool create default.rgw.buckets.data 64 64 erasure rgwec
     else ceph osd pool create default.rgw.buckets.data 64 64 replicated; fi
     ceph osd pool application enable default.rgw.buckets.data rgw
+    for f in ${POOL_FLAGS:-}; do ceph osd pool set default.rgw.buckets.data $f true || { elog "pool set $f failed"; exit 1; }; done
     ceph osd pool create default.rgw.buckets.index 16 16 replicated
     ceph osd pool application enable default.rgw.buckets.index rgw
     wait_clean 600
@@ -78,7 +79,7 @@ setup() {   # replaces memrun3.sh's: six OSDs on partitions, EC data pool
 }
 E=/root/git/ceph/wt/memtop-exp/exp.log
 elog() { echo "$(date +%F_%T) [$tag] $*" >> $E; }
-elog "start: $tree $pool ceph-osd=$(stat -c %y $B/bin/ceph-osd | cut -c1-19) $(cd $SRC && git log --oneline -1)"
+elog "start: $tree $pool opts=[${EXTRA_OPTS:-}] poolflags=[${POOL_FLAGS:-}] ceph-osd=$(stat -c %y $B/bin/ceph-osd | cut -c1-19) $(cd $SRC && git log --oneline -1)"
 [ "$($B/bin/ceph-osd --version | head -1)" = "$($B/bin/ceph-mon --version | head -1)" ] || { elog "version check: ceph-osd and ceph-mon differ, abort"; exit 1; }
 setup   # a new cluster: vstart -n, both OSDs formatted, pools and images created
 ceph config dump > $RUN/log/config.dump 2>/dev/null || true
