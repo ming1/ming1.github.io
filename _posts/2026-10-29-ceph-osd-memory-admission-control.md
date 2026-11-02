@@ -655,6 +655,8 @@ OSD instead of 390–560 thousand, almost all on probation, and the scrub is
 | [`read_fadvise_dontneed.patch`]({{ site.baseurl }}/code/ceph/osd-mem-admission/read_fadvise_dontneed.patch) | §9: the pool flag, on top of the §8 integration branch |
 | [`memtop-series-rdn.sh`]({{ site.baseurl }}/code/ceph/osd-mem-admission/memtop-series-rdn.sh) | §9: the six runs (read caching off on the §8 build, then the flag on and off), with `memtop-exp-int.sh`, which now takes `EXTRA_OPTS` (an OSD option) and `POOL_FLAGS` (flags set on the data pool) |
 | [`memtop-peak-rows.py`]({{ site.baseurl }}/code/ceph/osd-mem-admission/memtop-peak-rows.py) | §9: the rows of the highest OSD at its peak, several runs side by side |
+| [`memtop-exp-rbd.sh`]({{ site.baseurl }}/code/ceph/osd-mem-admission/memtop-exp-rbd.sh), [`memtop-series-rbd.sh`]({{ site.baseurl }}/code/ceph/osd-mem-admission/memtop-series-rbd.sh) | §9.5: the RBD phases on the six-OSD cluster; `RBD_FLAGS` sets flags on the `rbd` pool; the series of four runs |
+| [`memtop-rbd6-table.py`]({{ site.baseurl }}/code/ceph/osd-mem-admission/memtop-rbd6-table.py) | §9.5: per phase, the highest and mean OSD peak and fio's throughput and latency, runs side by side |
 
 ```
 cp build/bin/ceph-osd bin/ceph-osd.base      # before building the patched one
@@ -813,6 +815,10 @@ did not see it. The same memory cut comes from turning
 pool that gave 4% to 5% less GET 4 MiB throughput, which is within the spread
 of this harness; the pool flag is the finer tool, not a measured win.
 
+The same flag on an RBD pool (§9.5) cuts the read peaks by 42% to 48% and
+likely makes 4 KiB random reads about 14% faster, because over 128 GiB of
+images the data cache was serving under 1% of the read bytes.
+
 ### 9.1 The change
 
 A pool flag already exists for the write side: `write_fadvise_dontneed` makes
@@ -849,7 +855,9 @@ Why a pool flag and not a change to the policy: the §6 trace showed that the
 GET 4 MiB cache is not read-once. A third of its inserts are re-reads. A
 heuristic that keeps read-once data out would have to guess which pool is which.
 The operator knows: an RGW data pool behind a backup or file-sharing service is
-read once, an RBD pool is not.
+read once, an RBD pool whose hot set fits the cache is not. §9.5 shows an RBD
+pool that is read once in effect, because its working set is far larger than
+the cache.
 
 ### 9.2 Results
 
@@ -954,9 +962,91 @@ daemon logs, no error in the warp reports.
   once.
 - The flag is applied to client reads in `do_osd_ops`. Recovery and scrub
   reads are separate paths; §3.1 covers recovery.
-- RBD did not run. The flag was set on the RGW data pool only, so it cannot
-  change what an RBD pool caches; the §4.4 hot-set check still stands as the
-  RBD result of the integration branch's patches, not of this one.
+- RBD ran with the flag on its own pool (§9.5), on one working set that is
+  much larger than the cache. An RBD pool whose hot data fits in the cache
+  would lose from the flag, and that case was not measured.
 - No functional test of the flag beyond the two flag-list loops in the test
   suite; a `ceph_test_rados` run with the flag set is the next step before
   this goes upstream. It is not posted upstream yet.
+
+### 9.5 RBD with the flag on its pool
+
+The flag is per pool, so the RGW runs above say nothing about RBD. This is the
+§4.4 RBD check again, with the §9.2 build and harness on the §8.1 layout: six
+OSDs on two NVMes at the default 4 GiB target, the `rbd` pool replicated
+size 3, four 32 GiB images, fio on librbd. The phases are a 4 MiB sequential
+fill (128 GiB, about 80 s), then 4 KiB random writes, 4 KiB random reads and
+4 MiB sequential reads, 180 s each. Four runs on new clusters: two with the
+flag off and two with it on the `rbd` pool, in the order off, on, off, on, so
+a change can be read against the spread of two identical runs.
+
+Highest peak RSS of the six OSDs, GiB:
+
+| Phase | Off | Off, again | On | On, again | Highest on vs highest off |
+|---|---:|---:|---:|---:|---:|
+| write 4 MiB (fill) | 0.99 | 0.97 | 0.97 | 0.95 | −2% |
+| write 4 KiB | 1.52 | 1.51 | 1.55 | 1.48 | +2% |
+| read 4 KiB | 2.52 | 2.51 | **1.41** | **1.47** | **−42%** |
+| read 4 MiB | 2.98 | 3.05 | **1.50** | **1.58** | **−48%** |
+
+Throughput and latency, fio over the four images:
+
+| Phase | Off | Off, again | On | On, again |
+|---|---:|---:|---:|---:|
+| write 4 MiB, MiB/s | 1668 | 1617 | 1631 | 1633 |
+| write 4 KiB, IOPS | 53.1k | 53.6k | 53.9k | 51.5k |
+| read 4 KiB, IOPS | 171k | 166k | **195k** | **190k** |
+| read 4 KiB, mean / p99 latency, ms | 1.49 / 13.6 | 1.54 / 15.5 | 1.31 / 10.0 | 1.34 / 10.9 |
+| read 4 MiB, MiB/s | 4391 | 4434 | 4554 | 4487 |
+| read 4 MiB, mean / p99 latency, ms | 58.3 / 232 | 57.7 / 234 | 56.2 / 249 | 57.0 / 241 |
+
+What the highest OSD holds at its read 4 MiB peak, GiB:
+
+| Row | Off | Off, again | On | On, again |
+|---|---:|---:|---:|---:|
+| RSS | 2.98 | 3.05 | 1.50 | 1.58 |
+| data cache | 1.08 | 1.10 | 0.00 | 0.00 |
+| onode cache | 0.46 | 0.41 | 0.50 | 0.50 |
+| RocksDB memtables | 0.39 | 0.36 | 0.44 | 0.51 |
+| allocator free lists | 0.66 | 0.75 | 0.12 | 0.18 |
+| heap outside the mempools | 0.21 | 0.20 | 0.19 | 0.18 |
+
+All four runs ended `HEALTH_OK` with 177 PGs `active+clean`, no OSD restart,
+no signal or failed assert in the daemon logs, and fio reported no error.
+
+- **The cache was not helping.** The four images hold 128 GiB, 64 GiB of
+  replicas per OSD, and the data cache held 1.1 GiB of it, 1.7%. By the
+  OSDs' counters, the buffer cache served 0.6% to 0.7% of the read bytes with
+  the flag off. A random 4 KiB read can only hit the 1.7% that is in the
+  cache, and the 4 MiB phase sweeps the 128 GiB six times in 180 s, so almost
+  nothing is left in the cache when it comes round again. In effect this
+  workload is read once, the opposite of the §9.2 RGW benchmark with its 63%
+  to 86% hits. With the flag on, the cache still served 0.03% of the bytes:
+  what was cached before the flag's reads is still used.
+- **Memory.** Read 4 KiB loses 1.1 GiB, the data cache itself. Read 4 MiB
+  loses 1.5 GiB: the data cache plus the 0.5 to 0.6 GiB of allocator free
+  lists it churned. The write phases do not change, as the flag touches reads
+  only and writes are not cached by default. The onode cache keeps its hot
+  set, 0.4 to 0.5 GiB, in every run (§4.4 saw 0.92 GiB, but there two OSDs
+  each held every object; here six OSDs hold a third as many each). So the
+  §4.4 result stands: the hot set is kept, and the flag changes data only.
+- **4 KiB reads got faster, likely.** 195k and 190k IOPS with the flag
+  against 171k and 166k without, and the p99 latency fell from 13.6 and
+  15.5 ms to 10.0 and 10.9 ms (the mean latency follows the IOPS at a fixed
+  queue depth of 256 and adds nothing). Both flag-on runs beat both flag-off
+  runs. The worst pair differs by 11%, which is also the gap §4.4 saw between
+  two identical runs, though those were restarts on the same images and these
+  are new clusters on discarded drives. So the gain is likely, not proven.
+  The OSDs' mean read latency over the whole run fell from 0.186 to 0.157 ms,
+  which fits the explanation that inserting and evicting 28 thousand 4 KiB
+  buffers per OSD per second in the 2Q cache costs time and buys nothing. The
+  size of such a gain depends on the host: six OSDs share one CPU and two
+  NVMes here, and a cache-churn cost shows most where the CPU is the limit.
+  The 4 MiB reads changed by +1% to +4%, within the spread; the writes by −4%
+  to +2%.
+- **Not measured.** An RBD pool whose hot data fits in the cache. There the
+  flag would cost hits, as the RGW benchmark shows, and the operator should
+  measure the hit rate (`buffer_hit_bytes` against `buffer_miss_bytes` in
+  the OSD's perf counters) before setting it. The hit share also depends on
+  the phase order: the 4 KiB random writes ran before the reads here, as in
+  §4.4.

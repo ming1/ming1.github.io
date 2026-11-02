@@ -1,4 +1,4 @@
-From 14d594537aec1df7cd95be856322d4bc405e2908 Mon Sep 17 00:00:00 2001
+From 82e2623d98e764f7951671734b6759ff41c023d2 Mon Sep 17 00:00:00 2001
 From: Ming Lei <ming.lei@clyso.com>
 Date: Mon, 2 Nov 2026 00:52:50 -0600
 Subject: [PATCH] osd, mon: pool flag read_fadvise_dontneed
@@ -40,6 +40,15 @@ that.  Setting bluestore_default_buffered_read = false instead gives the
 same peak, and in one pair of runs per pool 4-5% less GET 4 MiB
 throughput, within the spread of the setup; the flag's advantage is that
 it changes one pool and leaves the rest as they are.
+
+On an RBD pool of four 32 GiB images (fio on librbd, same six OSDs) the
+buffer cache served under 1% of the read bytes, as 1.1 GiB of cache per
+OSD cannot hold 64 GiB of replicas; with the flag on the pool the read
+phases' highest peak RSS falls from 2.5-3.1 GiB to 1.4-1.6 GiB, 4 KiB
+random reads go from 166-171k to 190-195k IOPS (two runs each, the
+OSDs' mean read latency 0.19 -> 0.16 ms, consistent with less cache churn
+for no hits)
+and 4 MiB reads and the writes stay within the spread.
 
 The flag is added to the OSDOp's flags in place, as write_fadvise_dontneed
 does, so it is also visible in the ops of the reply.
