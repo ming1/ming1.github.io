@@ -220,6 +220,11 @@ rotate when the autotuner is off, since promotion needs them.
 The first version of this patch promoted on the first later use. It was
 measured in §4.1–§4.4; the final rule is re-tested in §4.5.
 
+A review of the PR found that the four-bin guarantee is measured with the
+shard's age bins, which count the hot set's touches as well as arrivals, so
+beside a hot set a scan can still push the hot set out; §10 has the
+mechanism and the fix.
+
 ### 3.3 RocksDB block caches: admit on the second later use
 
 Ceph's `binned_lru` block cache gets the same treatment: new blocks go to a
@@ -612,6 +617,10 @@ OSD instead of 390–560 thousand, almost all on probation, and the scrub is
 - **A ghost list.** An onode or block reused with a period longer than its
   stay on probation is never promoted. 2Q's answer is a small list of
   recently evicted keys; neither patch has one.
+- **A scan beside a hot set.** Probation's four-bin guarantee is measured
+  with the age bins, which count the hot set too, so with a hot set and a
+  scan at once the scan's residue is protected and the hot set is evicted.
+  Found in review, not yet measured; §10.
 - **EC recovery reads.** Both erasure-code backends read for a shard
   reconstruction with no fadvise flag, so the sources cache what they read
   (§4.6: 1.9 GiB per source OSD). Patch 1 does not reach them. The fourth
@@ -1050,3 +1059,138 @@ no signal or failed assert in the daemon logs, and fio reported no error.
   the OSD's perf counters) before setting it. The hit share also depends on
   the phase order: the 4 KiB random writes ran before the reads here, as in
   §4.4.
+
+## 10. Review: beside a hot set, a scan can still push the hot set out
+
+Dan van der Ster reviewed PR #73273 on 2 November 2026 and found a gap in the
+§3.2 rule that none of the tests above could show, because every test ran one
+workload at a time. This section documents it: what goes wrong, why the tests
+missed it, how big it is, the fix, and the test that will decide it. The fix
+and the test are not done yet; their numbers will be added here.
+
+**The problem in plain words.** Probation promises every new onode a few
+seconds on the shelf before it can be evicted: "at least what came in during
+the last four age bins" (§3.2). The code measures "what came in" with the
+age bins, and the age bins count every onode stamped in the last four
+seconds, hot onodes touched in the main LRU as much as newcomers on
+probation. So with a hot set being read while a scrub or backfill runs,
+probation's guaranteed size is the hot set *plus* four seconds of scan, and
+probation fills up to that with scan onodes nobody will use again. When the
+tuner's budget is tight the shard is over budget, probation is within its
+guarantee, and the only place the trim can take from is the main LRU: the
+hot set. The scan's leftovers are protected and the hot set is not, which is
+the opposite of what the patch is for.
+
+**Why the tests did not show it.** Each of §4's workloads ran alone, and the
+§6 ratio sweep ran scrub and RBD as separate phases of one run, not at the
+same time. Alone, a scan has no hot set to displace and a hot set has no scan
+to compete with. The lab's hot set is also small per shard: RBD's 32 thousand
+objects over the OSD's 32 onode cache shards (`osd_num_cache_shards`) are a
+thousand onodes per shard, the probation floor, so even a concurrent run
+here would understate it. The dense RGW hosts this work is for carry hot
+sets of millions of objects beside their scrubs and backfills.
+
+### 10.1 The mechanism
+
+```
+ shard over budget, probation within pmax: _trim_to takes the LRU's tail
+
+ ┌───────────── main LRU: the hot set, H ─────────────┬───── probation, ≤ pmax ──────┐
+ │ hot  hot  hot  hot  hot  hot  hot  hot ◄── evicted │ scan scan scan scan scan     │
+ └────────────────────────────────────────────────────┴──────────────────────────────┘
+
+ pmax = max(1024,  ratio × budget,  sum of the newest four age bins)
+                                    └── stamps: the H hot onodes count too, not only arrivals
+```
+
+The code is `LruOnodeCacheShard` in `src/os/bluestore/BlueStore_components.cc`:
+
+- `_probation_max()` returns the largest of three terms: the floor of 1024,
+  the ratio's share of the tuner's budget, and `recent`, the sum of the four
+  newest entries of `age_bins`.
+- `age_bins` is one ring per shard (`CacheShard` in `BlueStore.h`), rotated
+  every `bluestore_cache_age_bin_interval` (1 s). `_link_front()` stamps an
+  onode into the newest bin whichever list it joins, and `_touch()` re-stamps
+  a main-LRU onode that is touched again in a later bin. The bins exist for
+  the tuner, which ranks the shard's memory by age with them
+  (`bluestore_cache_age_bins_meta`, `"1 2 6 24 120 720 ..."`: the newest
+  second at the top priority, the next two at the second, the next six at the
+  third, and so on). They count what is in the cache by the time of its last
+  touch; they were never a count of arrivals.
+- `_trim_to()` takes from probation only while probation is above `pmax` (or
+  the LRU is empty); otherwise it pops the LRU's tail. It runs ten steps per
+  new onode (`_trim_some()`, `bluestore_cache_meta_evict_limit`) and ten more
+  every 50 ms from the tuner's thread (`bluestore_cache_trim_interval`, with
+  `bluestore_cache_meta_evict_in_autotune` on, the default).
+
+Take one shard with H hot onodes, each touched at least once in four
+seconds; a scan bringing R new onodes per second; and M, the budget in onodes
+the tuner gives the shard:
+
+| | Intended | As written |
+|---|---|---|
+| Probation may hold | max(1024, M/10, 4R) | max(1024, M/10, **H + 4R**) |
+| Shard when the budget is tight (M ≈ H + 4R, below) | H + 4R = M: fits | H + (H + 4R) = M + H: over by H |
+| What `_trim_to()` evicts | nothing | H onodes from the LRU's tail: the hot set |
+
+Why M is about H + 4R when memory is tight: the tuner budgets the shard from
+the age bins. The hot onodes, re-stamped whenever they are touched, and the
+newest four seconds of arrivals share the top three priorities; the older
+scan onodes on probation sit at the fourth and below and get memory only
+when nothing else asks for it. With the OSD at its target the data cache and
+the block caches do ask, so the budget shrinks to about the top bins, and the
+shard is over budget by the size of its hot set.
+
+What that does to a hot onode: its next read misses (`onode_misses` + 1, one
+RocksDB get), it is loaded and enters probation at the front, and it needs
+uses in two more bins, about two seconds, before it is promoted again. On
+probation it is still in the map, so its reads in those two seconds hit.
+Then it is back at the LRU's front, the LRU grows toward H again, the shard
+is over budget by H again, and the tail goes again. The steady state is a
+hot set that is never out for long but misses once every few seconds, an LRU
+that holds a rotating part of it, and a probation list that holds a hot
+set's worth of scan onodes beside the four seconds it was meant to keep.
+
+How big H + 4R is against 4R: in this lab, with deep scrub's 6 million
+objects in 404 s over 32 shards, R is about 470 onodes per shard per second,
+4R about 1,900, and H a thousand, so probation may hold 2,900 onodes instead
+of 1,900, and the shard overshoots by a thousand. For a host with a hot set
+of 2 million objects, H is 62 thousand per shard: probation may hold 64
+thousand onodes of scan residue instead of 1,900, and the hot set is what
+pays for them.
+
+### 10.2 The fix
+
+Count arrivals, not stamps. Each shard keeps a second ring of four counters
+that counts only entries into probation and rotates with the age bins, and
+`recent` sums those. The age bins stay as they are, so the tuner's view does
+not change. Arrivals are not decremented when an onode is promoted or
+evicted: the bound is "what came in during the last four seconds", as §3.2
+says, and it is generous by at most what left early.
+
+After the fix, probation may hold max(1024, M/10, 4R), the shard holds
+H + 4R, and nothing is evicted while the tuner's budget covers the hot set
+and the last four seconds of the scan. If the budget is below that, the
+LRU's tail still goes: then the budget is short of the working set, which is
+the tuner's call, and the hot set and the newest arrivals are at the same
+priority in its eyes anyway. The floor and the ratio's share are unchanged,
+so the §4.5 re-tests of the floor stand.
+
+One detail of the implementation: `CacheShard::shift_bins()` is not virtual.
+The onode shard needs a hook to rotate its arrival counters when the mempool
+thread rotates the bins, once a second, with or without the autotuner
+(§3.2).
+
+### 10.3 The test
+
+Both workloads at once: fio 4 KiB random reads on the RBD hot set for the
+whole of a deep scrub of all PGs, and the same again during a backfill
+(osd.1 out and back in while fio runs). Three builds: the unchanged one, PR
+#73273 as reviewed, and the PR with arrival counting. Compared: `onode_hits`
+and `onode_misses` over the phase, `onodes` and `onodes_probation` sampled
+through it, and fio's IOPS and p99 latency. The images get 1 MiB objects
+(`rbd create --object-size 1M`), so the hot set is 131 thousand onodes, four
+thousand per shard, four times the floor, where the gap can show. The
+prediction: on the reviewed build the hot set's misses rise as soon as the
+scan starts and its IOPS fall with them; with the count they stay where
+they are with no scan. The results will be added here.
