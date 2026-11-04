@@ -620,7 +620,8 @@ OSD instead of 390–560 thousand, almost all on probation, and the scrub is
 - **A scan beside a hot set.** Probation's four-bin guarantee is measured
   with the age bins, which count the hot set too, so with a hot set and a
   scan at once the scan's residue is protected and the hot set is evicted.
-  Found in review, not yet measured; §10.
+  Found in review, fixed by counting arrivals instead, measured on a small
+  box; §10.
 - **EC recovery reads.** Both erasure-code backends read for a shard
   reconstruction with no fadvise flag, so the sources cache what they read
   (§4.6: 1.9 GiB per source OSD). Patch 1 does not reach them. The fourth
@@ -1176,21 +1177,481 @@ the tuner's call, and the hot set and the newest arrivals are at the same
 priority in its eyes anyway. The floor and the ratio's share are unchanged,
 so the §4.5 re-tests of the floor stand.
 
-One detail of the implementation: `CacheShard::shift_bins()` is not virtual.
-The onode shard needs a hook to rotate its arrival counters when the mempool
-thread rotates the bins, once a second, with or without the autotuner
-(§3.2).
+The change is in the PR now: a ring of four arrival counters per shard,
+rotated by a `shift_bins()` override, so `CacheShard::shift_bins()` became
+virtual. A unit test drives the case directly: a thousand promoted onodes
+touched in every bin while a scan brings in 400 per bin for six bins, then a
+budget of the hot set plus four bins. Without the fix probation holds 2,400
+onodes, the first hot onode is gone and the oldest scan onode is kept; with
+it probation holds 1,600 and the hot set is intact.
 
-### 10.3 The test
+Nine review passes over the series then settled the rest of the ordering.
+Over budget the promoted onodes come first: probation is capped at what the
+budget leaves after the LRU, so the hot set goes only when it does not fit
+by itself; but newcomers keep half of probation's share all the same, so a
+working set that shifts can still prove itself against a stale LRU, as it
+would in a plain LRU. Only linked onodes count against the budget when
+trimming: the arriving onode is pinned while its own add's trim runs, and
+counting it drained one promoted onode per two arrivals at budget, which
+was the residual churn of §10.3. And both admissions are on only while the
+mempool thread rotates the age bins, because the block cache's rule needs
+them and only BlueStore rotates them: a mon's `binned_lru` cache, or a
+tool that opens the store without the thread, would otherwise never promote
+anything. The same series splits the `maybe_unpin` fix out (§4.5's
+"pre-existing race", tracker 82605) and adds unit tests for both caches'
+probation, which had none.
 
-Both workloads at once: fio 4 KiB random reads on the RBD hot set for the
-whole of a deep scrub of all PGs, and the same again during a backfill
-(osd.1 out and back in while fio runs). Three builds: the unchanged one, PR
-#73273 as reviewed, and the PR with arrival counting. Compared: `onode_hits`
-and `onode_misses` over the phase, `onodes` and `onodes_probation` sampled
-through it, and fio's IOPS and p99 latency. The images get 1 MiB objects
-(`rbd create --object-size 1M`), so the hot set is 131 thousand onodes, four
-thousand per shard, four times the floor, where the gap can show. The
-prediction: on the reviewed build the hot set's misses rise as soon as the
-scan starts and its IOPS fall with them; with the count they stay where
-they are with no scan. The results will be added here.
+### 10.3 The test, scaled to a small box
+
+The blog's lab was busy, so the first run was on an 8-core VM with two 8 GiB
+virtio disks: two OSDs, `osd_num_cache_shards` 8 so that the per-shard hot
+set is well above the 1024 floor, two 1536 MiB RBD images with 64 KiB
+objects as the hot set (about 21 and 30 thousand primary onodes per OSD),
+and a pool of 250 to 320 thousand 4 KiB objects as the scan. Each run: 4 KiB
+random reads over both images to promote the hot set, the same reads alone,
+the same reads during a deep scrub of the scan pool, then alone again, with
+the onode counters of both OSDs taken between phases. Three builds, stock
+main, the PR as reviewed and the PR with the fix, at two memory targets.
+The hot set's misses during the scrub are the scan phase's onode misses
+less the scrub's own loads, one per object per OSD.
+
+| Target | Build | Hot-set misses during the scrub, osd.0 / osd.1 | Onodes held, reads alone → end of scrub (on probation), osd.0 |
+|---|---|---:|---:|
+| 1 GiB | stock main | 22.7k / 43.4k | 52.2k → 82.8k (0) |
+| 1 GiB | PR as reviewed | 41.9k / 75.1k | 21.4k → 27.8k (7.8k) |
+| 1 GiB | PR with the fix | **13.7k / 52.3k** | 21.1k → 23.8k (3.8k) |
+| 1.25 GiB | stock main | 5.0k / 24.6k | 52.4k → 82.5k (0) |
+| 1.25 GiB | PR as reviewed | 43.9k / 88.7k | 21.3k → 26.8k (6.8k) |
+| 1.25 GiB | PR with the fix | **30.7k / 84.0k** | 21.3k → 24.5k (4.4k) |
+
+Reads alone, before and after the scrub, missed between two and seven times
+in every run: the hot set fits at both targets on every build.
+
+- **The fix does what it should.** Against the reviewed build it cuts the
+  hot set's misses in all four comparisons, by two thirds and a third on
+  osd.0 and by a third and a twentieth on osd.1, and probation at the end of
+  the scrub is half the size.
+- **The hot set still misses with the fix.** On this box the tuner's budget
+  dips below the hot set plus four bins of arrivals while the scrub also
+  fills the data and block caches, and then the LRU's tail goes; no bound
+  helps there (§10.2). Stock misses least because it keeps three times the
+  onodes: the replica onodes of the fill and the scan's residue are all
+  admitted, 82 thousand at the end of the scrub against 24 to 28, and the
+  tuner grants that cache the memory it is using. That is the trade the
+  series makes, a cache a third the size for a few thousand extra misses
+  under a scan when memory is this tight. Whether it shows on the blog's
+  hardware at a 4 GiB target is §10.4's question.
+- **Not usable from this box: throughput.** The same code's reads-alone
+  phase varied between 15 and 30 thousand IOPS from run to run, and the
+  scrub's per-PG durations summed to anywhere from 347 to 1354 s, so the
+  IOPS columns are left out. One trap cost a round: `blkdiscard` on these
+  virtio disks leaves them writing at 3 ops/s until the host reallocates
+  them, two hours for one fill.
+
+### 10.4 The blog's pairs, re-run with the final series
+
+The §4.5 pairs again on the blog's host, the unchanged build against the
+series as it stands after the review passes of §10.2 (the tests do not
+reach the daemon), each workload on a new cluster, drives discarded first,
+`osd_memory_target` 4 GiB. Peak RSS, GiB, osd.0 / osd.1:
+
+| Workload | Before | After | Change | Time or throughput, before → after |
+|---|---:|---:|---:|---|
+| Deep scrub, all PGs | 4.31 / 4.31 | **1.29 / 1.29** | −70% | 393 s → 414 s |
+| Recovery, source / target OSD | 4.07 / 1.97 | **2.60 / 1.58** | −36% / −20% | clean after 326 s → 266 s |
+| RGW PUT 4 MiB | 2.07 / 2.07 | **1.58 / 1.57** | −24% | 1130 → 1208 MiB/s |
+| RGW PUT 4 KiB | 4.60 / 4.56 | **2.09 / 2.05** | −55% | 7885 → 8516 obj/s |
+| RGW GET 4 MiB | 4.30 / 4.33 | 4.11 / 3.67 | −4% / −15% | 2293 → 2324 MiB/s |
+| RGW GET 4 KiB | 3.75 / 3.80 | 3.71 / 3.40 | −1% / −11% | 3092 → 3092 obj/s |
+| RBD write 4 MiB | 1.62 / 1.62 | 1.61 / 1.63 | 0% | 1298 → 1255 MiB/s |
+| RBD write 4 KiB | 2.31 / 2.32 | 2.27 / 2.24 | −2% / −4% | 34.0k → 32.7k IOPS |
+| RBD read 4 KiB | 3.53 / 3.70 | 3.50 / 3.68 | −1% | 170k → 177k IOPS |
+| RBD read 4 MiB | 4.42 / 4.61 | 4.38 / 4.56 | −1% | 4374 → 4637 MiB/s |
+
+The same picture as §1, row for row, which is what the review's changes
+were meant to leave alone: on this host the hot set and the scan never meet
+in the same phase, so the budget rules have nothing to do here, and nothing
+to break. Recovery is 18% faster on this pair and the RBD reads 4% to 6%,
+the RBD writes 3% to 4% slower and the scrub 5% longer; all inside the
+spread §4.4 measured between identical runs. A first run of these pairs,
+with the arrival count alone, gave the same table within that spread (scrub
+4.36 → 1.30, RGW PUT 4 KiB 4.61 → 2.08). One number moved against the
+series: RBD onode misses over the whole run, 320 thousand before and 640
+thousand after per OSD, where the arrival-count build had 231 thousand;
+1% of the run's 60 million onode lookups, with the read phases faster, but
+a doubling that the next section runs down.
+
+### 10.5 Where the RBD misses come from
+
+The same `rbd` step again with the onode counters of osd.0 taken between
+its phases, the unchanged build against the final series. Misses in each
+phase, and onodes resident at its end:
+
+| Phase | Unchanged: misses | resident | Final series: misses | resident |
+|---|---:|---:|---:|---:|
+| write 4 MiB (the fill, 32 thousand objects) | 49.2k | 33.4k | 49.2k | 32.6k |
+| write 4 KiB random | 4 | 33.4k | 424 | 33.0k |
+| read 4 KiB random | 197.9k | 29.7k | 624.6k | 21.2k |
+| read 4 MiB | 65.4k | 8.8k | 55.1k | 11.9k |
+
+The writes are a wash: every object's onode is created in the fill, and
+the random 4 KiB writes find all 33 thousand of them cached on both builds
+(four misses in 17 million lookups; 424 with the series, whose probation
+promotes each onode on its second later use). The sequential 4 MiB reads
+are a wash too. The difference is the random 4 KiB reads, where the data
+cache fills with 4 KiB buffers and the tuner squeezes the onode cache below
+the hot set on both builds. The unchanged build keeps 29.7 thousand of the
+33 thousand resident and misses 198 thousand times in 180 s; the series
+keeps 21.2 thousand and misses 625 thousand times, three times as often,
+although its reads were 4% faster (the onode is found in the block cache).
+
+What happens with the series: once the budget is below the hot set, every
+miss brings an onode back onto probation, where it has half of probation's
+share to wait for its second later use; at 3,500 misses a second that is a
+fraction of a second, so it is gone before the next use, and the promoted
+LRU shrinks by the reserve and never regains. The unchanged build admits
+the missed onode into the LRU at once, so its cache holds whatever the
+tuner grants. A re-missed onode that was in the LRU moments ago is a case
+for a ghost list, §6's open item: remember what was evicted, and admit it
+back to the LRU on the miss instead of to probation. The experiment that
+pins it on the onode admission: the same run with
+`bluestore_onode_cache_probation_ratio` set to 0 just before the read 4 KiB
+phase, everything else of the series in place, misses 172 thousand times
+there with 29.3 thousand onodes resident, the unchanged build's numbers.
+The ghost list is the next change; until then the series trades, in this
+one case, three onode-cache misses for one on a hot set the tuner has
+squeezed, at no cost in read throughput here.
+
+## 11. The series as it stands, commit by commit
+
+PR #73273 as of 4 November 2026: eight commits above the `FADVISE_DONTNEED`
+patches (§3.1) and the `maybe_unpin` fix (§10.2). §3 was the design, §10
+the review; this is the code, in short. The ghost list of §10.5 is in.
+
+| # | Commit | What it is |
+|---|---|---|
+| 1 | `os/bluestore: admit an onode to the cache on its second use` | onode probation (§11.2) |
+| 2 | `test/objectstore: unit tests for onode cache admission` | 12 tests (§11.5) |
+| 3 | `kv/rocksdb_cache: factor EvictEntry() and LRU_InsertAfter() out` | refactor + stat fix (§11.3) |
+| 4 | `kv/rocksdb_cache: put new blocks on probation before the LRU` | block probation (§11.3) |
+| 5 | `test/objectstore: unit tests for binned LRU cache probation` | 16 tests, the cache's first (§11.5) |
+| 6 | `os/bluestore: admit a re-missed onode back to the LRU` | ghost list (§11.4) |
+| 7 | `test/objectstore: unit tests for the onode cache ghost list` | 5 tests (§11.5) |
+| 8 | `doc/rados: describe BlueStore cache admission` | docs, release note (§11.6) |
+
+One picture. Both caches get a waiting room, *probation*, in front of the
+main list. Nothing enters the main list by being used once. The onode cache
+also remembers what it evicted from the main list, so a squeezed-out hot
+onode comes straight back:
+
+```
+ an op (client read, scrub, backfill, RGW write) looks an object up
+                         │
+                         ▼
+ ┌─ onode cache shard (one of 32) ───────────────────────────────────────┐
+ │                                                                        │
+ │  miss: load from RocksDB ──► first use ends ──► evicted from the LRU   │
+ │                                   │              lately? (ghost list)  │
+ │                                   │ no                   │ yes         │
+ │                                   ▼                      ▼             │
+ │                         PROBATION (FIFO) ──────────► MAIN LRU ──► out  │
+ │                         used once so far  used in     used again  (key │
+ │                         ≤ its share       two later               kept)│
+ │                                           age bins                     │
+ └────────────────────────────────────────────────────────────────────────┘
+                         │ an onode miss is one RocksDB get
+                         ▼
+ ┌─ RocksDB block cache (binned_lru, one per column family) ─────────────┐
+ │                                                                        │
+ │  block read from disk ──► reader lets go ──► PROBATION (list tail)     │
+ │                                                  │ used in two         │
+ │                                                  ▼ later age bins      │
+ │                                             LOW-PRI POOL (main)        │
+ │  index and filter blocks ─────────────────► HIGH-PRI POOL              │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+### 11.1 The words
+
+| Term | Meaning |
+|---|---|
+| **Onode** | The in-memory record of one object (size, extents, attrs). Loaded from RocksDB on first lookup, kept in the onode cache. |
+| **Shard** | The onode cache is `osd_num_cache_shards` (32) independent pieces, each with its own lock and lists. Everything below is per shard. |
+| **LRU** | Least-recently-used list. Front = last used, tail = evicted first. Before the series, each shard was one LRU. |
+| **Use** | An op *pins* the onode while it holds it. A use ends when the last op lets go (`maybe_unpin`). The cache decides then, not at lookup. |
+| **Age bin** | One counter per second (`bluestore_cache_age_bin_interval`), in a ring the mempool thread rotates. Each cached onode points at the bin of its last touch. The tuner ranks memory by age with them (§2.1). |
+| **Later use** | A use that ends in a newer bin than the onode's stamp. All touches of one op sequence fall in one bin: one use. |
+| **Budget** | Onodes the tuner lets the shard hold, `max` in the code. |
+| **Probation, promotion** | The new FIFO for onodes used once so far; moving to the main LRU is promotion. |
+| **Ghost list** | Keys of entries evicted lately, kept without data. A miss on one means "this was cached a moment ago". |
+| **2Q** | Johnson and Shasha, 1994: a FIFO for newcomers (*A1in*), a ghost list (*A1out*), an LRU for proven entries (*Am*). This series is 2Q with the age bins as the reuse clock. |
+| **binned_lru, block, handle** | Ceph's RocksDB block cache, same age bins. A block is ~4 KiB of a table file (about eight onodes). RocksDB hands a block to a reader through a handle; the block is in the list only while no reader holds it. |
+
+### 11.2 Commit 1: used in two later bins, or not cached for good
+
+The rule: an onode enters probation when its first use ends, and is promoted
+only after uses in two *different later* bins.
+
+```
+ age bin (1 s each):   bin 0        bin 1        bin 2        bin 3
+                       ├────────────┼────────────┼────────────┼───────────►
+ one client op         s r g a                                  one use: enters probation
+ scrub, two strides    r                        r               one later use: stays
+ backfill              list                     push            one later use: stays
+ a hot object          r            r           r               two later uses: promoted
+```
+
+What an onode goes through, and the three new flags on `Onode`:
+
+```
+                        load (miss) or create, pinned by the op
+                                │
+                ┌──── first use ends: maybe_unpin → _touch ────┐
+                │                                              │
+       key on the ghost list (§11.4)                    not remembered
+                ▼                                              ▼
+          ┌───────────┐                               ┌──────────────────┐
+          │ MAIN LRU  │◄──── 2nd later use ───────────│ PROBATION (FIFO) │
+          │ promoted  │                               │ later_hit 0 → 1  │
+          └─────┬─────┘                               └────────┬─────────┘
+                │ tail goes when over budget                   │ tail goes when over
+                ▼                                              ▼ its share
+        out; key remembered                           out; nothing remembered
+```
+
+| Flag | Meaning |
+|---|---|
+| `cache_promoted` | in the main LRU |
+| `cache_later_hit` | on probation, used once in a later bin already |
+| `cache_popped` | a trim unlinked it while pinned; it returns to its list when the op lets go, not as a new arrival |
+
+`_touch()` runs when a use ends:
+
+- Promoted: move to the LRU's front, as before.
+- On probation, same bin as the stamp: nothing. It keeps its FIFO place.
+- On probation, first later bin: set `cache_later_hit`, re-stamp. Still in place.
+- On probation, second later bin: unlink, link to the LRU's front.
+
+How big probation may be:
+
+```
+ pmax = max( floor,                        bluestore_onode_cache_probation_floor, 1024
+             ratio × budget,               bluestore_onode_cache_probation_ratio, 0.1
+             arrivals in the last 4 bins ) a ring of 4 counters, probation_arrivals
+```
+
+- The floor holds one backfill scan: `osd_backfill_scan_max` (512) objects of
+  one PG, read into one shard, pushed over the next seconds.
+- The arrivals term gives every onode a few seconds however fast a scan runs
+  and however small the shard is.
+- Arrivals are counted in the shard's own ring, rotated by a `shift_bins()`
+  override (now virtual). §10 showed the age bins would count the hot set's
+  touches too. The age bins are unchanged; the tuner budgets for probation.
+
+Who goes first when there is too much (`_trim_to()`, ten steps per new onode
+and ten more every 50 ms from the mempool thread):
+
+```
+ newest on the left
+ ┌──── MAIN LRU: promoted ───────────────────┬──── PROBATION: ≤ pmax ───────┐
+ │ hot hot hot hot hot hot hot hot hot ◄─ (2) │ new new new new new ◄─ (1)   │
+ └────────────────────────────────────────────┴──────────────────────────────┘
+
+ over budget: pmax = min(pmax, max(budget − lru.size, ratio × budget / 2))
+
+ (1) probation above pmax?  pop its tail, even when the shard fits
+ (2) lists above budget?    pop probation's tail while it is above pmax,
+                            else the LRU's tail
+```
+
+- Probation over its bound goes first, even under budget: a scan must not
+  grow the cache.
+- Over budget, the promoted onodes come first: probation gets what the
+  budget leaves after the LRU. The hot set goes only when it does not fit
+  by itself.
+- But probation keeps half its share: a shifted working set can still
+  prove itself against a stale LRU.
+- Only *linked* onodes count against the budget. The onode being added is
+  pinned while its own add's trim runs; counting it drained one promoted
+  onode per two arrivals (§10.2).
+
+When admission is on:
+
+```
+ mempool thread starts  ──► cache_bins_rotate = true  ──► ratio, floor applied to shards
+ an option changes      ──► config_changed++          ──► the thread re-applies
+ mempool thread stops   ──► cache_bins_rotate = false ──► ratio 0 applied
+ bluestore_cache_age_bin_interval = 0                 ──► ratio reads as 0
+```
+
+- Promotion needs the bins to move; only the mempool thread moves them. A
+  tool without the thread admits at once, as before. Bins now rotate
+  without the autotuner too.
+- Ratio 0 is the old single LRU. Set to 0 at run time, what is on
+  probation stays until used, then is admitted.
+- New perf counter `onodes_probation`; `onodes_pinned` no longer counts
+  probation onodes.
+
+### 11.3 Commits 3 and 4: the block caches
+
+BlueStore has two `binned_lru` caches: the default column family (omap) and
+the onode column family. An onode miss is a RocksDB get, which is block
+cache lookups. Same rule, two commits.
+
+**Commit 3, refactor.** `EvictFromLRU()` and `EraseUnRefEntries()` each
+carried a copy of the eviction sequence; the second copy did not decrement
+the element count, so `elems` kept what it dropped. One `EvictEntry()`,
+one `LRU_InsertAfter()`, no other change.
+
+**Commit 4, probation.** A shard is one ring list with a sentinel: oldest at
+`lru_.next`, evicted first; newest at `lru_.prev`. Probation is a third
+segment at the old end:
+
+```
+ lru_.next (evicted first)                                        lru_.prev
+ ┌─────────────────────┬─────────────────────────────┬─────────────────────┐
+ │ PROBATION           │ LOW-PRI POOL (main)         │ HIGH-PRI POOL       │
+ │ used once so far    │ used in two later bins      │ index, filter       │
+ │ ≤ 10% of capacity   │                             │ blocks              │
+ │ NOT in the age bins │ in the age bins             │ in the age bins     │
+ └─────────────────────┴─────────────────────────────┴─────────────────────┘
+                     ▲                             ▲
+              lru_probation_                 lru_low_pri_
+         (newest on probation;            (newest low-pri entry)
+          ->next = oldest main)
+```
+
+Probation's bytes are not in the age bins. The tuner sees them at its
+lowest priority and does not grow the cache for them: 1.72 → 0.12 GiB in
+scrub (§3.4).
+
+A block's life:
+
+```
+ Insert(key, block) ──► room made (EvictFromLRU) ──► handle to the reader
+                                                          │ Release
+                                                          ▼
+                                             LRU_Insert, first time (IsNew)
+                                                          │
+                                                          ▼
+                                                  PROBATION, newest end
+                                                          │
+                       Lookup takes the block out of the list; Release puts it back:
+                         same bin as its stamp   ──► probation, unchanged
+                         first later bin         ──► probation, later_hit = 1, re-stamped
+                         second later bin        ──► LOW-PRI POOL: promoted
+```
+
+| Flag bit on the handle | Meaning |
+|---|---|
+| `InProbation` | at the old end, not yet proven |
+| `HasLaterHit` | one later use already |
+| `IsNew` | inserted, never in the list yet; a lookup while the inserter holds it is not a use |
+
+- `LRU_Insert()` is the one place the rule runs: every return to the list
+  follows a use, with the bin of the moment.
+- Skip probation: high-priority blocks, blocks larger than the share,
+  everything at ratio 0. A held block that the share shrank under joins the
+  main pool on release.
+- **Trimmed on every insert.** `MaintainProbationSize()` evicts probation's
+  oldest while it is over its share: on every release and insert, handle
+  or not, and on a capacity cut. Not only at the tuner's balance.
+- **Newcomers keep half the share.** Cache full, room needed for a
+  probation block, probation below half its share: the main pool's oldest
+  goes instead. Else a full main pool would evict every newcomer before its
+  second use. If the new block overflows the share anyway, the oldest
+  probation block goes, once. Room for a block that skips probation, and a
+  capacity cut, take the oldest blocks, probation's first.
+- **A smaller share throws nothing away.** `SetProbationRatio()` moves the
+  newest probation blocks into the main pool as its oldest (oldest bin)
+  until probation fits.
+- **Off until BlueStore turns it on.** `PriorityCache::PriCache` gets
+  `set_probation_ratio()`, a no-op that `BinnedLRUCache` overrides. The
+  mempool thread sets `rocksdb_cache_probation_ratio` on both caches at
+  start and on change, and 0 before it stops and the DB closes. The mon's
+  cache is untouched. The thread rotates all four caches' bins itself
+  (meta, data, kv, kv onode), autotuner or not.
+- New stat `probation` (bytes) in each `rocksdb-cache-*` group.
+
+### 11.4 Commit 6: a squeezed-out hot onode comes straight back
+
+§10.5's case: a hot set bigger than the tuner's budget. A plain LRU holds
+whatever the budget allows. With probation in the way it does not:
+
+```
+ without the ghost list (§10.5):
+
+   hot onode in the LRU ──over budget: tail evicted──► gone
+          ▲                                             │ next read: miss
+          │                                             ▼
+   evicted again from probation ◄──────────── PROBATION: needs two later bins,
+   before its second later use                 pushed out in a fraction of a
+          │                                    second at 3,500 misses/s
+          ▼
+   the LRU shrinks by probation's reserve and never grows back: 3× the misses
+
+ with the ghost list:
+
+   hot onode in the LRU ──tail evicted──► gone, its KEY on the ghost list
+                                                │ next read: miss
+                                                ▼
+                                   key found ──► straight to the LRU's front
+```
+
+This is 2Q's *A1out*. Per shard:
+
+- **Containers.** `ghosts`, a list of 64-bit keys, oldest first; `ghost_pos`,
+  key → place. Both in the `bluestore_cache_other` mempool, so the tuner
+  charges them to the meta cache. Tens of bytes per key.
+- **Remember on eviction.** `_trim_to()` pops an onode from the LRU (not
+  probation), the object exists, admission on: `_ghost_add()` puts the key
+  at the back. A key evicted again moves to the back. Capped at the shard's
+  budget, up to four oldest dropped per add.
+- **Take on arrival.** In `_touch()`, an arrival (first use ended, not
+  linked, not popped): `_ghost_take()`. Found: forget the key, link to the
+  LRU's front, promoted. Not found: probation.
+- **The key.** 64-bit hash of the whole id: name, namespace, locator key,
+  pool, snap, placement hash, generation, shard. `std::hash<ghobject_t>` is
+  the 32-bit placement hash, shared by same-named objects of two pools. A
+  collision promotes a stranger; the LRU ages it out.
+- **Not remembered.** Probation's residue (a scan), deleted objects (name
+  reuse), evictions with admission off. Admission turned off clears the
+  list.
+
+The §10.5 RBD read phase has not been re-run with the ghost list yet; its
+numbers belong here when it has.
+
+### 11.5 Commits 2, 5 and 7: the tests
+
+Each test drives one shard directly and rotates the bins by hand, so none
+depends on the RocksDB version's Cache API or the mempool thread.
+
+| Group | Pinned down |
+|---|---|
+| Onode admission (12) | promotion after two later bins; a shard starts with probation off; ratio 0 admits at once; a scan beside a hot set evicts the scan, not the hot set; a short budget squeezes probation, not the hot set; arrivals at budget do not drain the hot set; a shifted working set is promoted at budget; the floor is an option and keeps the newest arrivals; a popped pinned onode starts over but keeps its later use; ratio set to 0 keeps probation's onodes |
+| Block probation (16) | promotion after two later bins; a block shared before first release starts on probation; ratio 0; trimmed to its share under capacity; eviction spares probation below half, takes it at or above; list pointers after removing the newest entries; `EraseUnRefEntries` keeps the count; high-priority and oversized blocks admitted at once; off until a ratio is set; lowering the ratio keeps the blocks; a held block too big returns to the main pool; no double eviction on overflow; a capacity cut takes probation first; no main-pool eviction for a block that skips probation |
+| Ghost list (5) | a re-missed LRU onode skips probation, an unknown one does not; bounded by the budget; a key records its latest eviction; nothing remembered with admission off; turning it off forgets |
+
+The hot-set test is §10's: 1,000 promoted onodes touched every bin, a scan
+of 400 per bin for six bins, then a budget of hot set plus four bins.
+Without the arrival ring probation holds 2,400 and the first hot onode is
+gone; with it, 1,600 and the hot set is intact.
+
+### 11.6 Commit 8: the knobs
+
+A *Cache Admission* section in the BlueStore configuration reference, and a
+release note.
+
+| Option | Default | 0 means |
+|---|---:|---|
+| `bluestore_onode_cache_probation_ratio` | 0.1 | one LRU per shard, as before |
+| `bluestore_onode_cache_probation_floor` | 1024 | no floor; raise with `osd_backfill_scan_max` |
+| `rocksdb_cache_probation_ratio` | 0.1 | every block to the main pool at once |
+
+- All three change at run time; the mempool thread applies them.
+- Both admissions are on only while that thread rotates the bins: not in
+  tools without it, not in the mon, not with
+  `bluestore_cache_age_bin_interval` 0.
+- Counters: `onodes_probation` (bluestore), `probation` (each
+  `rocksdb-cache-*`). §10.5's method, onode counters between phases, shows
+  what the ghost list does on a workload.
