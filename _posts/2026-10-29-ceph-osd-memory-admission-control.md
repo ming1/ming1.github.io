@@ -1371,7 +1371,77 @@ onode comes straight back:
  └────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 11.1 The words
+### 11.1 Why, why it works, and the words
+
+**The problem.** An OSD at a 4 GiB target ran to 4.3 GiB in deep scrub and
+4.7 GiB in RGW 4 KiB PUTs, and almost nothing it cached was used again
+(§1, §2). Three things add up:
+
+- Every onode loaded and every block read goes to the *front* of its
+  cache. A plain LRU cannot tell a scan's object from a hot one when it
+  comes in; it learns only by evicting.
+- The tuner budgets by recency (the age bins). A scan puts everything in the
+  newest bins, so the tuner hands it the whole budget (§2.1).
+- A cached onode costs twice what the tuner counts (§2.2), and the freed
+  heap stays in tcmalloc's lists (§2.4).
+
+```
+ plain LRU, a scan over many objects:
+   ┌──────────────────── LRU (budget) ───────────────────┐
+   │ scan scan scan scan scan scan scan scan scan scan   │ ◄─ hot set pushed out,
+   └─────────────────────────────────────────────────────┘    cache grown to the target
+
+ admission, the same scan:
+   ┌──────── LRU: hot set ─────────┬── probation ≤ 10% ──┐
+   │ hot hot hot hot hot hot hot   │ scan scan scan      │ ◄─ scan residue cycles
+   └───────────────────────────────┴─────────────────────┘    through a bounded segment
+```
+
+The hosts this is for carry hot sets of millions of objects beside their
+scrubs and backfills (§10). The constraints: no new per-workload tuning, the
+tuner untouched, the scan not slowed, and the client not slowed.
+
+**The idea.** Admit on proof of reuse, not on arrival. The only thing that
+separates a scan's object from a hot one is a second use *later*, so make
+every newcomer wait in a bounded queue and let only that in. This is 2Q
+(§11.4), the simplest of the scan-resistant designs, with Ceph's age bins
+as its clock.
+
+**Why "two later bins" is the right test.** The patterns Ceph has:
+
+| Pattern | Uses, by age bin | Verdict |
+|---|---|---|
+| one client op: stat, read, getattr | all in one bin | one use |
+| backfill: list, then push seconds later | two bins | one later use |
+| scrub: a large object in strides | two bins | one later use |
+| a block that straddles two scrub chunks (8 onodes per block, 15 objects per chunk) | two bins | one later use |
+| a hot object | three or more bins within seconds | two later uses |
+
+One later use is what every scan produces; it is noise. Two, in different
+seconds, is signal, and a hot object earns it within seconds anyway. The
+first version used one later use and let scrub refill the block cache to
+1.15 GiB (§3.3).
+
+**Why it holds up.** Each way the idea could fail has one guard:
+
+| Could go wrong | Guard |
+|---|---|
+| A fast scan flushes a newcomer before its second use | probation keeps at least the last four bins of arrivals, and 1024 per shard (a backfill's scan batch) |
+| The scan's residue is protected over the hot set (§10) | arrivals are counted in their own ring, not the age bins; over budget the promoted onodes come first |
+| A stale LRU keeps a shifted working set out | half of probation's share is reserved for newcomers |
+| A hot set larger than the budget churns through probation (§10.5) | the ghost list sends a re-missed onode straight back to the LRU, as a plain LRU would |
+| The tuner grows the cache for probation anyway | block probation is not binned, so the tuner ranks it last; onode probation is trimmed first, under budget too |
+| Nothing is ever promoted (no bin rotation) | admission is off unless the mempool thread rotates the bins |
+| An operator wants the old behaviour | ratio 0 is the old code path, line for line |
+
+**What it bought.** Measured A/B on the same host, each workload on a new
+cluster (§10.4): deep scrub peak 4.31 → 1.29 GiB, RGW PUT 4 KiB 4.60 →
+2.09, recovery source 4.07 → 2.60, with scrub time, recovery time and
+client throughput inside the run-to-run spread. Where there is no scan (RBD,
+RGW GET) nothing changes, which is the point: the hot set is never the
+thing evicted to make room for read-once data.
+
+**The words.**
 
 | Term | Meaning |
 |---|---|
