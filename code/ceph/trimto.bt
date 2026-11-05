@@ -1,0 +1,47 @@
+// trimto.bt -- who calls TwoQBufferCacheShard::_trim_to() in a running
+// ceph-osd (v21.3.0), for the "Ghost list" section of the PriorityCache post.
+//
+// The build has no frame pointers, so ustack() is useless; instead the
+// return address at function entry is symbolized, which names the function
+// the inlined CacheShard::_trim() / _trim_some() wrapper lives in.
+//
+// bpftrace's DWARF expansion of the symbolic uprobe fails on this
+// RelWithDebInfo build, so rewrite the probes to addresses first:
+//
+//   python3 btaddr.py trimto.bt trimto.addr.bt <build>/bin/ceph-osd
+//   bpftrace trimto.addr.bt <build>/bin/ceph-osd
+//
+// Then, in another shell: 10 s idle, 10 s writes, 8 s random reads --
+//   rados -p p1 bench 10 write --no-cleanup -b 65536 -t 8
+//   rados -p p1 bench 8 rand -t 8
+// Phase buckets in @phase: 0 = idle, 1 = writes, 2 = reads.
+BEGIN { @t0 = nsecs; }
+
+uprobe:$1:_ZN20TwoQBufferCacheShard8_trim_toEm
+{
+  $ra = *(uint64*)reg("sp");
+  @callers[comm, usym($ra)] = count();
+  @phase[comm, (nsecs - @t0) / 10000000000] = count();
+}
+
+uprobe:$1:_ZN9BlueStore13MempoolThread14_resize_shardsEb
+{
+  @resize_shards_ticks[pid] = count();
+}
+
+uprobe:$1:_ZN9BlueStore11BufferSpace13_finish_write*
+{
+  @finish_write_calls[comm] = count();
+}
+
+interval:s:30 { exit(); }
+
+END
+{
+  print(@resize_shards_ticks);
+  print(@finish_write_calls);
+  print(@phase);
+  print(@callers);
+  clear(@t0); clear(@resize_shards_ticks); clear(@finish_write_calls);
+  clear(@phase); clear(@callers);
+}

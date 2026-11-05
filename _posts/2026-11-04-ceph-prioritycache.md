@@ -261,6 +261,34 @@ b->cache_private = BUFFER_WARM_OUT;    // remembers it was evicted
 The `Buffer` stays in its blob's `BufferSpace`, so a later access to the range
 finds it.
 
+**When it runs.** `_trim_to()` has no timer of its own. Three
+[`CacheShard`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1520) wrappers reach it, all under the shard lock:
+
+| Wrapper | Trims to | Called from |
+|---|---|---|
+| [`_trim()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1550) | `max` | The end of every `BufferSpace` mutation: [`did_read()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L514) after a buffered read, [`write()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L491) for every write (an unbuffered write inserts a `FLAG_NOCACHE` buffer that `_finish_write` drops), [`discard()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L481), and [`_finish_write()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1962) when the transaction commits |
+| [`set_max()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1537) → [`_trim_some()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1557) | `max(num − 10, max)` | [`_resize_shards()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L5760) on every `MempoolThread` tick (50 ms), while `bluestore_cache_meta_evict_in_autotune` is on |
+| [`flush()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1569) | 0 | [`_shutdown_cache()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L19557) at unmount |
+
+So ghosts are made on the I/O path, by the thread that just inserted a
+buffer, and a new budget from `balance()` is enforced within one tick.
+`_trim_some()` is written for the onode cache (evict at most
+[`bluestore_cache_meta_evict_limit`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L5135) = 10 entries per call); on
+a buffer shard it compares a buffer count with a byte budget, so it reduces
+to `_trim_to(max)`.
+
+Measured on a v21.3.0 OSD (three OSDs, `osd_num_cache_shards` = 32, a uprobe
+on `_trim_to` keyed by its return address, 30 s: 10 s idle, 10 s of 64 KiB
+`rados bench` writes, 8 s of random reads; script
+[`trimto.bt`]({{ site.baseurl }}/code/ceph/trimto.bt)):
+
+| Thread | Return address in | Calls | Reconciles with |
+|---|---|---|---|
+| `bstore_mempool` | `_resize_shards()` | 19,008 per OSD | 594 ticks × 32 shards; same rate idle or loaded |
+| `tp_osd_tp` | [`_do_alloc_write()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L17547), `_buffer_cache_write()` and `write()` inlined | 7,641 per OSD | one per object written, on every replica |
+| `bstore_kv_final` | `_finish_write()` | 7,641 per OSD | the same writes, at commit |
+| `tp_osd_tp` | [`_generate_read_result_bl()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L13032), `did_read()` inlined | 42,438 in all | 212,518 reads served; the rest were cache hits |
+
 ![A read over a ghost range inherits the WARM_OUT tag and lands in hot]({{ '/assets/images/ceph-prioritycache/ghost-discard-hint.svg' | relative_url }})
 
 **Use: the discard hint.** There is no explicit ghost lookup. Promotion is a
