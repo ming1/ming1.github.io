@@ -1393,6 +1393,9 @@ gave the same picture: 5,643 IOPS with 77 to 253 MiB read from disk per
 OSD, against 106,712 with none. BlueStore's own cache beats the page cache
 on every column once it is allowed to hold the data.
 
+The other side of the change, what the data cache's growth costs the
+other caches, is traced in §17.
+
 ### 13.5 Three more things the tuner does to a small OSD
 
 - It only lets a cache grow by 64 MiB plus one chunk per 5-second round,
@@ -3009,6 +3012,290 @@ Tracing allocations in a build without frame pointers, in short:
 | stacks | DWARF |
 | recording | system-wide, filtered by cgroup |
 | output | one perf reader thread per CPU, writing to tmpfs |
+
+## 17. A case: a cache that can use its budget takes more of it
+
+Section 13.4 let the data cache shards follow the data
+([PR #73018](https://github.com/ceph/ceph/pull/73018)). In review, Adam
+Kupczyk predicted a side effect: once the data cache can fill its budget,
+"this cache would asymptotically adapt to the load in the shards and in
+long term will drain other caches from space". He asked for an on/off
+option. The option is there (`bluestore_cache_data_shard_weighted`, default
+true). This section shows the effect he predicted, with the autotuner's own
+calls traced while the option is switched on and off under load.
+
+### 17.1 The claim, and why the autotuner is in it
+
+The patch only changes how `data_alloc` is split among the 32 shards; the
+limits still add up to `data_alloc`. So why would any other cache notice?
+Because `data_alloc` is not a setting. It is what the autotuner committed
+to the data cache at its last `balance()`, and the autotuner's input is how
+many bytes the cache holds. The split decides how many bytes the cache can
+hold. That closes a loop:
+
+```mermaid
+flowchart LR
+    C["committed size D<br/>(get_committed_size)"] -->|"_resize_shards: limits sum to D"| L["shard limits"]
+    L -->|"trim keeps each shard<br/>under its limit"| H["bytes held H"]
+    H -->|"request_cache_bytes:<br/>what I hold, by age bin"| R["request = H"]
+    R -->|"balance: H granted by age,<br/>+ 64 MiB headroom,<br/>+ ratio share of the leftover"| C
+```
+
+| | even split (stock, option off) | weighted split (option on) |
+|---|---|---|
+| shards with no PG | hold nothing, their part of D is never used | get a floor of 1/8 of the even share |
+| bytes held H | 47 % of D with 17 of 32 shards empty (osd.1 in run 2) | D, if the working set is larger |
+| request next round | 0.47 D | D |
+| the unused 0.53 D | leftover, split 30/30/4/36 between meta, kv, kv_onode and data (this test's ratios) | gone |
+| D next round | 0.47 D + 64 MiB + share of leftover: a fixed point (128 MiB here) | D + 64 MiB + share of leftover: grows |
+
+With the even split the loop has a brake: what the empty shards strand is
+handed back every round, and meta and kv live on it. With the weighted
+split the brake is gone, and D grows every 5 s until the data working set
+is cached or memory runs out at some age priority (§6.2). That is the
+"asymptotic" adaptation and the "drain". Both are real. The rest of this
+section measures how far they go and what stops them.
+
+### 17.2 The test
+
+| Setting | Value |
+|---|---|
+| Host | the c28 VM (8 vCPUs, 32 GiB), shared with another test cluster on other disks |
+| Cluster | vstart: 1 mon, 1 mgr, 2 OSDs on vdc and vdd (virtual disks), pool size 1 |
+| Build | `main` at 515db14d6be plus PR #73018 at ab36bcc2fd0 (the version with the option); RelWithDebInfo |
+| Memory | `osd_memory_target` 2 GiB, `osd_memory_base` 256 MiB, meta and kv ratios 0.30 (so data gets 36 % of the leftover), the §13 settings |
+| Data load | fio 4K random reads, 4 jobs x queue depth 8, over a 3 GiB hot region of a 4 GiB krbd image |
+| Run 1, dense | image in a pool of 128 PGs: 64 per OSD, every one of the 32 data shards has PGs. Metadata load: `rados bench rand`, 16 threads, over 2.1 M 4 KiB objects (pool `smallobj`, 128 PGs); these reads also put the objects' data in the data cache. |
+| Run 2, sparse | image in a pool of 32 PGs: 16 per OSD, 15 and 17 of the 32 data shards have no PG of it. Metadata load: random `stat` of the same 2.1 M objects, 32 in flight, about 18,000 per second alongside the fio load ([`statload.py`]({{ site.baseurl }}/code/ceph/statload.py)); a stat reads the onode and RocksDB, never the data, so those shards stay empty. |
+| Timeline | 1080 s of both loads. The option is off for 360 s, switched on at runtime for 360 s, switched off for 360 s. No restart, so the caches carry their contents across each switch. |
+
+What is traced, with bpftrace uprobes on the OSD binary (the probes are
+placed by address from `nm`, because bpftrace resolves some of these
+exported C++ names to the wrong place):
+
+| Probe | Records |
+|---|---|
+| `PriorityCache::Manager::balance()` | one balance round starts (every 5 s) |
+| `request_cache_bytes()` of the BlueStore caches and the RocksDB caches, return | what each cache asks for at each priority |
+| `commit_cache_size()`, return | what each cache is committed |
+| `DataCache::_get_used_bytes()`, `MetaCache::_get_used_bytes()`, return | bytes held; inlined away in this build, so held bytes come from the `_resize_shards` debug log (`debug_bluestore 5`) and the shard probe below |
+| `TwoQBufferCacheShard::_trim_to(max)` | each data shard's limit and, from the object, its `buffer_bytes` |
+| `_resize_shards(true)` | the pass after a balance; the shard maps are printed here |
+
+Every 5 s a `perf dump` of each OSD adds the per-priority bytes the
+tuner granted, the onode count and the buffer hit and miss bytes. fio logs
+IOPS per 5 s; `rados bench` prints its per-second counts.
+
+### 17.3 Run 1: when every shard is full, the option changes nothing
+
+With 64 PGs per OSD and the small-object reads spreading 4 KiB buffers
+over all shards, every shard sits at its limit under the even split:
+
+| phase | osd | data committed | data held | shards at limit | meta committed | kv committed | onodes | buffer hits | fio IOPS (4 jobs) | rados IOPS |
+|---|---|---|---|---|---|---|---|---|---|---|
+| off | osd.0 | 619 MiB | 618 MiB | 32 of 32 | 197 MiB | 136 MiB | 242 k | 16 % | 29,725 | 10,615 |
+| off | osd.1 | 918 MiB | 916 MiB | 32 of 32 | 174 MiB | 128 MiB | 175 k | 32 % | | |
+| on | osd.0 | 629 MiB | 632 MiB | 32 of 32 | 200 MiB | 136 MiB | 245 k | 17 % | 29,976 | 10,634 |
+| on | osd.1 | 945 MiB | 946 MiB | 32 of 32 | 176 MiB | 128 MiB | 176 k | 32 % | | |
+| off | osd.0 | 642 MiB | 645 MiB | 32 of 32 | 205 MiB | 136 MiB | 253 k | 17 % | 35,090 | 11,970 |
+| off | osd.1 | 931 MiB | 924 MiB | 32 of 32 | 162 MiB | 128 MiB | 168 k | 31 % | | |
+
+Held equals committed in every phase, so the request equals the
+budget, and the weighted limits come out even (a full shard holding its
+even share is the fixed point of §13.4). The data cache is already at the
+point the drain would lead to: it took what age priority gives it, and the
+leftover at `LAST` is zero on both OSDs. The switch moves nothing, within
+the drift of the run. This is the brake-less loop in its end state, and it
+is where stock already is whenever the shards are dense.
+
+### 17.4 Run 2: the drain, one balance at a time
+
+With 16 PGs of the image per OSD, 15 shards of osd.1 hold data and 17
+hold none. Under the even split each of the 15 is capped at 4 MiB, so the
+cache holds 60 MiB of a 128 MiB commit, and the commit is the floor the
+headroom sets (§6.3). This is the stranded state of §13.3 in miniature.
+
+At t = 0 the option is switched on at runtime on both OSDs. One row per
+`balance()` of osd.1, from the trace (MiB; "held" is the sum of the data
+cache's age bins, which is what it asks the tuner for; "total" is the pool
+the tuner hands out, `tuned_mem`; "mapped" is the OSD's heap against a
+2048 MiB target):
+
+| t (s) | data held | data committed | meta committed | kv_onode committed | kv committed | total | mapped |
+|---|---|---|---|---|---|---|---|
+| -3 | 60 | 128 | 456 | 560 | 176 | 1485 | 1987 |
+| +2 | 119 | 184 | 456 | 560 | 176 | 1424 | 2106 |
+| +7 | 172 | 240 | 456 | 424 | 176 | 1424 | 2106 |
+| +12 | 224 | 296 | 432 | 128 | 176 | 1152 | 2159 |
+| +17 | 276 | 344 | 400 | 128 | 144 | 1043 | 2053 |
+| +22 | 321 | 392 | 360 | 128 | 128 | 1033 | 2052 |
+| +27 | 366 | 432 | 324 | 128 | 128 | 1025 | 2052 |
+| +32 | 403 | 468 | 280 | 128 | 128 | 1017 | 2052 |
+| +37 | 437 | 496 | 212 | 128 | 128 | 985 | 2071 |
+| +42 | 416 | 428 | 188 | 128 | 128 | 902 | 2097 |
+| +52 | 343 | 320 | 144 | 128 | 128 | 734 | 2092 |
+| +62 | 265 | 256 | 120 | 128 | 128 | 645 | 2076 |
+| +148 | 198 | 252 | 132 | 128 | 128 | 653 | 2045 |
+| +243 | 347 | 404 | 180 | 128 | 128 | 854 | 2039 |
+| +303 | 430 | 476 | 184 | 128 | 128 | 929 | 2048 |
+
+Three things happen in order.
+
+1. **The ratchet.** Within one trim interval the 15 shards take nearly the whole
+   128 MiB. At the next balance the cache asks for 119 MiB instead of 60
+   and is committed 184: its request plus the 64 MiB headroom. Then 240,
+   296, 344, 392, 432, 468, 496: a step of 56 MiB every 5 s at first (the 64
+   MiB headroom, less the 1/8 floors the 17 empty shards still strand),
+   smaller once the pool itself starts to shrink, for as long as the shards can fill what they are given. That is the loop of §17.1 with the brake removed, and it is
+   the "asymptotic adaptation" of the review comment, measured.
+2. **The other caches pay, oldest bins first.** The RocksDB onode block
+   cache drops from 560 to 128 MiB in two rounds, then the onode cache from
+   456 to 120 MiB over the next ten. Nothing is taken from them directly:
+   each round the tuner grants the youngest age bins of every cache first,
+   and the data cache's bins are young because the cache is far smaller
+   than the stream fio pulls through it: whatever it holds was read in the
+   last few seconds. Memory now runs out at `PRI4`, so the older bins of
+   meta and kv go unfunded (§17.5). The RocksDB onode block cache goes
+   first because its bin table puts all of its entries in `PRI10` (§6.1),
+   behind everything the other caches touched in the last 12 minutes. This is the "drain", and it is also
+   real.
+3. **The memory tuner overshoots.** The stranded 68 MiB had been committed
+   but never allocated; the kv_onode cache's 560 MiB had. As the data cache
+   fills real memory faster than RocksDB returns it, mapped memory crosses
+   the target (2106, then 2159 MiB), and `tune_memory()` (§5) cuts the pool
+   hard, from 1485 to 645 MiB in a minute. Every cache shrinks, the data
+   cache included. The pool then grows back slowly (the §5 loop approaches
+   the target slowly and backs off quickly), and most of what it gives back
+   goes to the data cache again: 476 of 929 MiB at the end of the phase,
+   against 128 of 1485 before.
+
+Switching the option off at +360 s reverses all of it: the shards go back
+to 4 MiB, the data cache asks for 60 MiB again, kv_onode is back at 536
+MiB and the pool at 1424 MiB within 60 s, and meta is back at 448 MiB
+within five minutes.
+
+### 17.5 Where the memory came from
+
+The per-priority view at the end of each phase, osd.1, in MiB
+wanted/granted (`request_cache_bytes()` from the trace, the `pri*_bytes`
+counters from `perf dump`):
+
+| phase | cache | pri1 | pri2 | pri3 | pri4 | pri5 | pri6 | LAST |
+|---|---|---|---|---|---|---|---|---|
+| off | data | 11/3 | 21/7 | 4/22 | 16/21 | 9/7 | 0/0 | 0/0 |
+| off | meta | 2/1 | 6/2 | 18/12 | 78/91 | 216/215 | 71/69 | 390/0 |
+| off | kv | 0/0 | 0/0 | 0/0 | 0/0 | 0/0 | 48/48 | 0/0 |
+| on | data | 35/35 | 50/50 | 158/158 | 209/175 | 0/0 | 0/0 | 0/0 |
+| on | meta | 4/4 | 6/6 | 23/23 | 89/89 | 0/0 | 0/0 | 0/0 |
+| on | kv | 0/0 | 0/0 | 0/0 | 0/0 | 0/0 | 0/0 | 0/0 |
+
+With the option off, the data cache's bins are tiny because its shards are
+capped, and meta is funded down to `PRI6`, bins up to 12 minutes old. With it
+on, the data cache's bins hold 452 MiB and memory runs out while `PRI4` (6
+to 24 s) is being served: data gets 175 of the 209 it asked for there, and
+nothing older than 24 s is funded for anyone. The `LAST` row shows the leftover share of
+§6.2: zero in both phases. There is no spare memory in this OSD; every
+byte the data cache gains, another cache loses.
+
+The onode cache's request also shrinks with its size. The stat storm
+cycles through whatever onodes are cached every few seconds, so all of
+them sit in the youngest bins, and a smaller cache asks for less. The same
+loop that lets the data cache grow keeps a cache that was cut from asking
+for more: the tuner only knows what a cache holds, never what it misses.
+
+### 17.6 The shards
+
+Per data shard of each OSD, from the `_trim_to()` probe, MiB:
+
+| phase | osd | shards with data | sum of limits | sum held | smallest limit | largest limit | committed | committed − held |
+|---|---|---|---|---|---|---|---|---|
+| off | osd.0 | 17 of 32 | 140 | 74 | 4 | 4 | 140 | 66 |
+| off | osd.1 | 15 of 32 | 128 | 60 | 4 | 4 | 128 | 68 |
+| on | osd.0 | 17 of 32 | 312 | 282 | 1 | 17 | 312 | 30 |
+| on | osd.1 | 15 of 32 | 492 | 459 | 2 | 31 | 480 | 21 |
+| off | osd.0 | 17 of 32 | 140 | 74 | 4 | 4 | 140 | 66 |
+| off | osd.1 | 15 of 32 | 128 | 60 | 4 | 4 | 128 | 68 |
+
+The limits sum to the commit in every phase, as the patch promises. What
+changes is how much of that sum can be used: 47 to 53 % with the even split, 90
+to 96 % with the weighted one. The empty shards keep the 1/8 floor (1 to 2
+MiB) and nothing else.
+
+### 17.7 What it cost, and what it did not
+
+Means over the last two minutes of each phase:
+
+| phase | osd | data held | onodes | onode hits | buffer hits | fio IOPS (4 jobs) | stats/s |
+|---|---|---|---|---|---|---|---|
+| off | osd.0 | 73 MiB | 388 k | 76 % | 3 % | 17,680 | 14,963 |
+| off | osd.1 | 60 MiB | 526 k | 89 % | 3 % | | |
+| on | osd.0 | 257 MiB | 209 k | 73 % | 12 % | 24,253 | 18,173 |
+| on | osd.1 | 425 MiB | 210 k | 79 % | 21 % | | |
+| off | osd.0 | 74 MiB | 519 k | 79 % | 3 % | 24,846 | 18,604 |
+| off | osd.1 | 60 MiB | 510 k | 89 % | 3 % | | |
+
+The caches moved as predicted: the data cache held three and a half to
+seven times more and its hit rate went from 3 % to 12 to 21 %; the onode cache lost
+half to 60 % of its onodes and 3 to 10 points of hit rate. Throughput did
+not follow. The lower numbers of the first phase come from a dip that hit
+both loads together at the end of that phase, and the third phase has a
+smaller one at its 120 s mark: the virtual disk, not the caches. Outside
+those minutes, fio ran at 21,000 to 25,500 IOPS and the stats at 17,700
+to 19,000 per second in all three phases. On this VM the virtual disks sit
+behind the hypervisor's cache, so a miss costs little on either side. On the slower disks of the §13 cluster the same
+trade cost small-object reads 13 % (PR #73018 discussion) and on an NVMe
+OSD it gained 7 %: which side wins depends on which bytes are worth more,
+and that is what the option is for.
+
+### 17.8 What bounds the drain
+
+The review comment reads as if the data cache could take everything. The
+trace shows three stops.
+
+| Stop | Where it is in the code | What it did here |
+|---|---|---|
+| The working set | `request_cache_bytes()` asks for held bytes only | the 3 GiB hot region is 1.5 GiB per OSD, more than the pool; this stop was not reached |
+| Age before ratio | `balance_priority()` serves `PRI1` of every cache before `PRI2` of any | every cache kept its bins under 6 s in full and its 6 to 24 s bin in part; everything older went unfunded, and that is where meta's and kv_onode's memory was |
+| The memory target | `tune_memory()` shrinks the pool when mapped memory exceeds the target | the pool fell from 1485 to 645 MiB and recovered to 929; the data cache ended at 476 MiB, not at the 1485 the pool had |
+
+So the end state is not "the data cache has everything". It is "the data
+cache has what its young bins hold, the other caches keep their young
+bins, and the old bins of everyone are gone". That is what the autotuner
+does for any cache that can use its budget; the patch only lets the data
+cache be one of them. Whether that is the right split for a given OSD
+depends on the workload, which is why `bluestore_cache_data_shard_weighted`
+exists.
+
+Two things the comment got wrong, for the record. The tuner does not
+redistribute a cache's "unutilized budget" back to it in proportion; it
+rebuilds every grant from zero each round, and the ratios only touch the
+leftover, which was zero here. And a weighted split cannot freeze at an
+uneven state while every shard is full: a full shard below its even share
+always has limit > held, so it grows at the next trim, and the only fixed
+point with all shards full is the even split (§13.4, and run 1).
+
+### 17.9 Takeaways
+
+- A sharded cache's budget is only a budget if the shards can use it.
+  With the even split, 53 % of the data cache's commit was never held on
+  this OSD. With the weighted split, 95 % was.
+- The autotuner funds occupancy. A cache that can hold what it is given
+  asks for it again, plus 64 MiB. That ratchet is the whole "drain": 56
+  MiB per 5 s here, until memory ran out at a priority.
+- The losers are the oldest bins of the other caches, never the youngest.
+  Here that was the RocksDB onode block cache first and the onode cache
+  second.
+- The memory target is enforced on mapped memory, not on commits. A cache
+  that starts to use a budget it had only on paper can push the OSD over
+  its target, and the tuner then cuts every cache for minutes.
+- The runtime option makes the trade reversible: switching it off returned
+  every cache to its previous size within two minutes.
+
+Scripts: [`drainrun.sh`]({{ site.baseurl }}/code/ceph/drainrun.sh) (the
+run), [`drain-probes.sh`]({{ site.baseurl }}/code/ceph/drain-probes.sh)
+(the bpftrace script, generated from `nm` addresses),
+[`statload.py`]({{ site.baseurl }}/code/ceph/statload.py) (the stat storm),
+[`drainstat.py`]({{ site.baseurl }}/code/ceph/drainstat.py) (the tables).
 
 ## Glossary
 
