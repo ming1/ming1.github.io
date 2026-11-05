@@ -11,10 +11,13 @@ How a Ceph OSD decides what to keep in memory: the BlueStore caches, the
 `PriorityCache` manager that sizes and splits them, age bins, 2Q ghost lists
 and onode pinning.
 
-> Diagrams are SVG files under `assets/images/ceph-prioritycache/`.
->
-> Based on the Quincy–Reef era source (`src/common/PriorityCache.{h,cc}`,
-> `src/os/bluestore/BlueStore.{h,cc}`). Names and defaults move between
+> Code references are pinned to **ceph v21.3.0** (Tentacle):
+> [`src/common/PriorityCache.{h,cc}`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/PriorityCache.cc),
+> [`src/os/bluestore/BlueStore.{h,cc}`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc),
+> [`src/kv/rocksdb_cache/BinnedLRUCache.cc`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/BinnedLRUCache.cc),
+> [`src/common/options/global.yaml.in`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in) for defaults, and cephadm's
+> [`autotune.py`](https://github.com/ceph/ceph/blob/v21.3.0/src/pybind/mgr/cephadm/autotune.py). Every function name links to its definition at that
+> tag; quoted defaults are that tag's. Names and defaults move between
 > releases; check against your tree.
 
 ## Contents
@@ -42,12 +45,13 @@ down level by level until it reaches many small, independent LRU lists:
 | Onode cache (`meta`) | `Onode` | LRU + pinning | `onode_t`, xattrs, lazily loaded extent-map shards |
 | Buffer cache (`data`) | `Buffer` on a blob | 2Q with ghost list | Object data |
 | RocksDB block cache (`kv`) | SST data, index, filter blocks | BinnedLRUCache | KV blocks |
+| RocksDB onode block cache (`kv_onode`) | SST blocks of the `O` (onode) column family | BinnedLRUCache | Onode KV blocks |
 
 | Level | How it's split | Age-aware? |
 |---|---|---|
-| OSD → total cache | `tune_memory()` from tcmalloc heap stats | No |
-| Total → each cache | `balance()` by age window, ratio at the boundary | **Yes** |
-| Cache → its shards | Even split: `limit / num_shards` | No |
+| OSD → total cache | [`tune_memory()`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/PriorityCache.cc#L119) from tcmalloc heap stats | No |
+| Total → each cache | [`balance()`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/PriorityCache.cc#L275) by age window, ratio at the boundary | **Yes** |
+| Cache → its shards | Even split in [`_resize_shards()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L5699): `limit / num_shards` | No |
 | Inside a shard | Local LRU / 2Q trims its tail | Local order only |
 
 ### 1.1 Autotune switches
@@ -59,8 +63,8 @@ OSD's memory target, and the OSD decides whether to size its caches to it.
 
 | Option | Default | Read by | Controls |
 |---|---|---|---|
-| `bluestore_cache_autotune` | `true` | OSD | Whether PriorityCache sizes the total cache to `osd_memory_target` (needs tcmalloc) and splits it by priority and age bins. Off: fixed `bluestore_cache_size*` split by `bluestore_cache_meta_ratio` / `kv_ratio`; `osd_memory_target` is ignored. |
-| `osd_memory_target_autotune` | `true` on cephadm clusters (set at bootstrap) | cephadm | Whether cephadm writes `osd_memory_target` per host: `autotune_memory_target_ratio` (0.7) × RAM, minus non-autotuned daemons, ÷ number of OSDs. Overwrites manual targets. |
+| [`bluestore_cache_autotune`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L5146) | `true` | OSD | Whether PriorityCache sizes the total cache to `osd_memory_target` (needs tcmalloc) and splits it by priority and age bins. Off: fixed `bluestore_cache_size*` split by `bluestore_cache_meta_ratio` / `kv_ratio`; `osd_memory_target` is ignored. |
+| [`osd_memory_target_autotune`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L3940) | `false` in the source; cephadm sets it `true` at bootstrap | cephadm | Whether cephadm writes `osd_memory_target` per host ([`_autotune_host_memory()`](https://github.com/ceph/ceph/blob/v21.3.0/src/pybind/mgr/cephadm/serve.py#L194)): [`autotune_memory_target_ratio`](https://github.com/ceph/ceph/blob/v21.3.0/src/pybind/mgr/cephadm/module.py#L358) (0.7) × RAM, minus non-autotuned daemons, ÷ number of OSDs ([`MemoryAutotuner.tune()`](https://github.com/ceph/ceph/blob/v21.3.0/src/pybind/mgr/cephadm/autotune.py#L32)). Overwrites manual targets. |
 
 | cache autotune | target autotune | Result |
 |---|---|---|
@@ -70,7 +74,8 @@ OSD's memory target, and the OSD decides whether to size its caches to it.
 | off | off | Fixed caches |
 
 - Pin one OSD: `ceph config set osd.N osd_memory_target_autotune false`, then set
-  its own `osd_memory_target`. Exclude a host: add the `_no_autotune_memory` label.
+  its own `osd_memory_target`. Exclude a host: add the
+  [`_no_autotune_memory`](https://github.com/ceph/ceph/blob/v21.3.0/src/pybind/mgr/cephadm/utils.py#L65) label.
 - Hyperconverged hosts: `ceph config set mgr mgr/cephadm/autotune_memory_target_ratio 0.2`.
 - Neither option limits non-cache memory (PG log, osdmaps, op buffers). RSS above
   the target usually means the cache is already at `osd_memory_cache_min`.
@@ -81,9 +86,11 @@ OSD's memory target, and the OSD decides whether to size its caches to it.
 
 ### 2.1 Sharding and the object graph
 
-The caches are split into shards matching the OSD op shards
-(`osd_op_num_shards`). Each shard has an onode cache and a buffer cache with
-their own locks, so op threads don't contend. Each collection (PG) maps to one
+The caches are split into [`osd_num_cache_shards`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/osd.yaml.in#L950)
+shards (default 32, independent of the op shards), created by
+[`set_cache_shards()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L9405). Each shard
+has an onode cache and a buffer cache with their own locks, so op threads
+don't contend. Each collection (PG) maps to one
 shard. The shard lists only order objects for eviction; the objects themselves
 hang off collections and onodes:
 
@@ -94,68 +101,80 @@ cached data.
 
 ### 2.2 Onode cache: LRU and pinning
 
-An onode is either **on the LRU** (evictable) or **pinned** (off the list while
-something outside the cache holds a reference). Pinning is driven by the
-reference count, and unpinning doubles as the LRU touch.
+An onode is **cached** while `OnodeSpace` holds it. Inside the cache it is
+either **on the LRU** or **unlinked** (pinned). Two counters drive this:
+[`nref`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1382) owns the memory, [`pin_nref`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1383) tracks users;
+`pin_nref == 1` means only the `OnodeSpace` map still refers to the onode.
 
 ![Onode cache states: in LRU, pinned, evicted, removed]({{ '/assets/images/ceph-prioritycache/onode-pin-states.svg' | relative_url }})
 
-1. **Miss.** The `OnodeSpace` map's own `OnodeRef` is reference number 1.
+1. **Miss.** [`OnodeSpace::add_onode()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L2064) inserts the onode and
+   calls [`_add()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1105). The caller still holds its `OnodeRef`, so
+   `pin_nref ≥ 2`: the onode is counted in `num` but not linked to the LRU.
    Extent-map shards load later, only for byte ranges an op touches.
-2. **Pin.** The first outside reference calls `_pin()`, which removes the onode
-   from the LRU and counts it in `num_pinned`.
-3. **Unpin.** When the last outside reference drops, `_unpin()` pushes the onode
-   to the LRU **head**. There is no separate touch on lookup, so the LRU is
-   ordered by when each onode was last released.
-4. **Evict.** `_trim_to()` pops unpinned onodes from the tail and removes them
-   from `OnodeSpace`.
-5. **Deleted while pinned.** If `exists == false`, the final `put()` calls
-   `_unpin_and_rm()` and drops the onode right away instead of returning it to
+2. **Use.** [`get()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L4912) only bumps the two counters. An onode
+   already on the LRU stays there while in use; nothing moves it on lookup.
+3. **Release.** When [`put()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L4917) drops `pin_nref` to 1,
+   [`maybe_unpin()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1129) takes the shard lock: an unlinked onode goes
+   to the LRU **head**; one already linked is moved to the head and re-binned.
+   This is the only LRU touch, so the list is ordered by when each onode was
+   last released.
+4. **Trim.** [`_trim_to()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1172) pops from the tail. An onode with
+   `pin_nref == 1` is dropped from `OnodeSpace`; one with users is only
+   unlinked and kept: it is now pinned until its last `put()`.
+5. **Deleted while in use.** If `exists == false` when the last user leaves,
+   `maybe_unpin()` removes the onode right away instead of returning it to
    the LRU.
 
 ```cpp
-void Onode::get() {
-  if (++nref >= 2 && !pinned) {                 // first outside reference
-    OnodeCacheShard* ocs = lock_current_shard(); // re-check: a PG split may move us
-    bool was_pinned = pinned;
-    pinned = nref >= 2;
-    if (!was_pinned && pinned && cached) ocs->_pin(this);
-    ocs->lock.unlock();
-  }
-}
+void Onode::get() { ++nref; ++pin_nref; }              // no lock, no list change
 
 void Onode::put() {
-  if (--nref == 1) {                            // only the cache's ref left
-    OnodeCacheShard* ocs = lock_current_shard();
-    bool need_unpin = pinned;
-    pinned = pinned && nref >= 2;
-    if (cached && need_unpin && !pinned) {
-      if (exists) ocs->_unpin(this);            // back to LRU head
-      else { ocs->_unpin_and_rm(this); c->onode_space._remove(oid); }
-    }
-    ocs->lock.unlock();
-  }
-  if (nref == 0) delete this;                   // simplified
+  if (--pin_nref == 1) c->get_onode_cache()->maybe_unpin(this);
+  if (--nref == 0) delete this;
 }
 
-// LruOnodeCacheShard
-void _pin(Onode* o)   { *(o->cache_age_bin) -= 1; lru.erase(lru.iterator_to(*o)); ++num_pinned; }
-void _unpin(Onode* o) { lru.push_front(*o); o->cache_age_bin = age_bins.front();
-                        *(o->cache_age_bin) += 1; --num_pinned; }
+// LruOnodeCacheShard; bin(o) is shorthand for o->cache_age_bin
+void _add(Onode* o, int level) {                        // under the shard lock
+  o->set_cached();
+  if (o->pin_nref == 1) {                               // nobody else holds it
+    (level > 0) ? lru.push_front(*o) : lru.push_back(*o);
+    bin(o) = age_bins.front(); *bin(o) += 1;
+  }
+  ++num;                                                // counts pinned AND unpinned
+}
 
-void _trim_to(uint64_t new_size) {             // onode COUNT, not bytes
+void maybe_unpin(Onode* o) {
+  lock the shard o->c maps to now;                      // a PG split may have moved it
+  if (o->is_cached() && o->pin_nref == 1) {
+    if (!o->lru_item.is_linked()) {
+      if (o->exists) { lru.push_front(*o); bin(o) = age_bins.front(); *bin(o) += 1; }
+      else           { --num; o->clear_cached(); o->c->onode_space._remove(o->oid); }
+    } else if (o->exists) {                             // touch: head of LRU, newest bin
+      lru.erase(lru.iterator_to(*o)); lru.push_front(*o);
+      if (bin(o) != age_bins.front()) { *bin(o) -= 1; bin(o) = age_bins.front(); *bin(o) += 1; }
+    }
+  }
+  unlock;
+}
+
+void _trim_to(uint64_t new_size) {                      // onode COUNT, not bytes
   if (new_size >= lru.size()) return;
-  uint64_t n = num - new_size;                 // num counts pinned AND unpinned
+  uint64_t n = num - new_size;                          // LRU may empty before n == 0
   while (n-- > 0 && lru.size() > 0) {
     Onode* o = &lru.back(); lru.pop_back();
-    *(o->cache_age_bin) -= 1;
-    o->c->onode_space._remove(o->oid);         // drops the cache's ref
+    *bin(o) -= 1;
+    if (o->pin_nref > 1) continue;                      // in use: unlink only, keep cached
+    --num; o->clear_cached();
+    o->c->onode_space._remove(o->oid);                  // drops the cache's ref
   }
 }
 ```
 
-`get()` and `put()` only take the shard lock on the 1→2 and 2→1 edges; other
-reference changes are plain atomics.
+`get()` never takes the shard lock and `put()` only on the `pin_nref` 2→1
+edge. Pinning is lazy: `_trim_to()` discovers it when it reaches an onode
+that still has users. `onodes_pinned` in `perf dump` is
+[`num − lru.size()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1208).
 
 **Who pins an onode:**
 
@@ -171,7 +190,8 @@ onode with an uncommitted transaction would read stale metadata.
 
 **Accounting:**
 
-- The limit is an onode **count**: `meta_bytes / num_shards / bytes_per_onode`.
+- The limit is an onode **count**: `meta_bytes / num_shards /`
+  [`bytes_per_onode`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2761).
 - Pinned onodes use the limit but can't be trimmed. With many in-flight writes,
   a shard sits above its limit and evicts everything evictable.
 - Age bins count onodes (+1 per LRU onode); the meta cache converts counts to
@@ -181,26 +201,32 @@ onode with an uncommitted transaction would read stale metadata.
 
 | Buffer state | Meaning |
 |---|---|
-| `writing` | Data of an uncommitted transaction. Pinned, tagged with the txc seq |
+| `writing` | Data of an uncommitted transaction. Off the 2Q lists, tagged with its `txc` ([`Buffer`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L320)) |
 | `clean` | Valid data matching disk. On the 2Q lists, evictable |
 | `empty` | No data: a placeholder, or a ghost (see 2.4) |
 
 ```
 READ  _do_read(onode, off, len)
   1. map range → extents → blobs              (may load an extent-map shard)
-  2. BufferSpace::read() → cached pieces       (hit: copy, touch 2Q)
+  2. BufferSpace::read() → cached pieces       (hit: copy, _touch())
   3. missing pieces → device read → csum verify → decompress
   4. if buffered → did_read() inserts clean buffers
 
 WRITE _do_write(...)
   1. data lands in a new or reused blob
-  2. if buffered → Buffer(state=writing, seq=txc.seq)
-  3. txc commits → finish_write(seq): writing → clean (or dropped if NOCACHE)
+  2. if buffered → Buffer(state=writing, txc)
+  3. txc commits → Onode::finish_write(txc) → _finish_write():
+     writing → clean (or dropped if FLAG_NOCACHE)
 ```
 
+Code: [`_do_read()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L13138), [`_do_write()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L17851),
+[`BufferSpace::read()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1861), [`did_read()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L514),
+[`Onode::finish_write()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L5045), [`_finish_write()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1933),
+[`FLAG_NOCACHE`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L347).
+
 **Admission (fadvise):** reads are buffered by default
-(`bluestore_default_buffered_read = true`), writes are not
-(`bluestore_default_buffered_write = false`). `FADVISE_WILLNEED` forces caching;
+([`bluestore_default_buffered_read`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L5655) `= true`), writes are not
+([`bluestore_default_buffered_write`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L5663) `= false`). `FADVISE_WILLNEED` forces caching;
 `FADVISE_DONTNEED` and `NOCACHE` keep data out. The pool flag
 `write_fadvise_dontneed` adds `DONTNEED` to every write on that pool.
 
@@ -214,13 +240,15 @@ WRITE _do_write(...)
 
 ![BlueStore 2Q buffer lifecycle: warm_in, warm_out ghost list, hot]({{ '/assets/images/ceph-prioritycache/buffer-2q.svg' | relative_url }})
 
-A hit in `warm_in` doesn't move the buffer: one quick re-read isn't proof of
-reuse. Only a return after eviction promotes to `hot`.
+A hit in `warm_in` doesn't move the buffer ([`_touch()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1499) only
+re-bins its age): one quick re-read isn't proof of reuse. Only a return after
+eviction promotes to `hot`.
 
 ### 2.4 Ghost list (`warm_out`)
 
-**Creation.** When `warm_in` is over its share, `_trim_to()` turns the tail
-buffer into a ghost in place:
+**Creation.** When `warm_in` is over its share,
+[`TwoQBufferCacheShard::_trim_to()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1521) turns the tail buffer into
+a ghost in place:
 
 ```cpp
 Buffer *b = &*warm_in.rbegin();
@@ -240,11 +268,12 @@ side effect of replacing the ghost with real data:
 
 ```cpp
 // BufferSpace::did_read(), after a device read fills a gap
-Buffer *b = new Buffer(this, STATE_CLEAN, 0, offset, bl);
-b->cache_private = _discard(cache, offset, bl.length()); // highest tag among
-_add_buffer(cache, b, 1, nullptr);                        // overlapped buffers
+uint16_t cache_private = _discard(cache, offset, bl.length());   // highest tag among
+_add_buffer(cache,                                                // overlapped buffers
+            new Buffer(this, Buffer::STATE_CLEAN, 0, offset, std::move(bl), 0),
+            cache_private, 1, nullptr);
 
-// TwoQBufferCacheShard::_add()
+// TwoQBufferCacheShard::_add(), the "hint from discard" branch
 switch (b->cache_private) {
 case BUFFER_NEW:      b->cache_private = BUFFER_WARM_IN; warm_in.push_front(*b); break;
 case BUFFER_WARM_IN:  warm_in.push_front(*b); break;
@@ -254,11 +283,13 @@ case BUFFER_HOT:      hot.push_front(*b); break;
 }
 ```
 
-Tags are ordered `NEW < WARM_IN < WARM_OUT < HOT`, and `_discard()` returns the
-largest one it removes. Writes go through `_discard()` too, so rewriting a
-recently evicted range also counts as a ghost hit when the write is buffered.
+Tags are ordered [`NEW < WARM_IN < WARM_OUT < HOT`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1354), and
+[`_discard()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1781) returns the largest one it removes;
+[`_add_buffer()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1705) passes it to [`_add()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1367). Writes go
+through `_discard()` too, so rewriting a recently evicted range also counts as
+a ghost hit when the write is buffered.
 
-**Sizing** (in `_trim_to(budget)`):
+**Sizing** (in [`_trim_to(budget)`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1521)):
 
 ```cpp
 kin   = budget * bluestore_2q_cache_kin_ratio;     // warm_in byte share, 0.5
@@ -269,7 +300,9 @@ avg   = buffer_bytes / (hot.size() + warm_in.size());
 kout  = (budget / avg) * bluestore_2q_cache_kout_ratio;  // ghost COUNT, 0.5
 ```
 
-The ghost list remembers roughly half as many buffers as the cache can hold.
+The ghost list remembers roughly half as many buffers as the cache can hold
+([`bluestore_2q_cache_kin_ratio`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L5069) and
+[`_kout_ratio`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L5075) both default to 0.5).
 
 | Aspect | Ghost |
 |---|---|
@@ -283,10 +316,16 @@ cache quickly lose their history; promotion is per overlapping range.
 
 ### 2.5 RocksDB block cache
 
-`BinnedLRUCache` is RocksDB's LRU cache with age bins added. It keeps a
-high-priority pool for index and filter blocks (requested at `PRI0`) and has no
-ghost list. Recent releases can give the onode column family its own block
-cache (`kv_onode`).
+[`BinnedLRUCache`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/BinnedLRUCache.cc) is RocksDB's LRU cache with age bins added. Its
+[`request_cache_bytes()`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/BinnedLRUCache.cc#L764) asks at `PRI0` for the high-priority
+pool (index and filter blocks) and it has no ghost list;
+[`commit_cache_size()`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/BinnedLRUCache.cc#L803) applies the grant with `SetCapacity()`.
+
+The `O` (onode) column family has its own `binned_lru` block cache in the
+default [`bluestore_rocksdb_cfs`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L5407), so it joins as a fourth
+participant, `kv_onode`, with ratio
+[`bluestore_cache_kv_onode_ratio`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L5128) (0.04) and its own age bins
+(section 4.2).
 
 ---
 
@@ -298,30 +337,49 @@ cache (`kv_onode`).
 - **Cut the pie:** how to split them, giving recently used data first claim
   whichever cache holds it (`balance`).
 
-The Manager only talks to caches through `PriCache`, so the same code serves
-BlueStore and the monitor's RocksDB cache.
+The [`Manager`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/PriorityCache.h#L118) only talks to caches through
+[`PriCache`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/PriorityCache.h#L66), so the same code serves BlueStore and the monitor's
+RocksDB cache.
 
 | `PriCache` method | Meaning |
 |---|---|
-| `request_cache_bytes(pri, total)` | "At this priority I need N more bytes" |
-| `set/add_cache_bytes(pri, n)` | Manager records grants per priority |
-| `commit_cache_size(total)` | Sum grants, round to a chunk, apply as new size |
-| `get_cache_ratio()` | Tie-breaker weight when a level doesn't fit |
-| `shift_bins()`, `import_bins()`, `get_bins(pri)` | Age-bin bookkeeping |
+| [`request_cache_bytes(pri, total)`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/PriorityCache.h#L72) | "At this priority I need N more bytes" |
+| [`set/add_cache_bytes(pri, n)`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/PriorityCache.h#L81) | Manager records grants per priority |
+| [`commit_cache_size(total)`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/PriorityCache.h#L89) | Sum grants, round to a chunk, apply as new size |
+| [`get_cache_ratio()`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/PriorityCache.h#L97) | Tie-breaker weight when a level doesn't fit |
+| [`shift_bins()`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/PriorityCache.h#L106), [`import_bins()`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/PriorityCache.h#L109), [`get_bins(pri)`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/PriorityCache.h#L115) | Age-bin bookkeeping |
 
 ```cpp
-pcm = make_shared<PriorityCache::Manager>(cct, min, max, target, true, "bluestore-pricache");
-pcm->insert("kv",       binned_kv_cache, true);
-pcm->insert("meta",     meta_cache,      true);
-pcm->insert("data",     data_cache,      true);
-pcm->insert("kv_onode", binned_kv_onode_cache, true);   // if separate
+// BlueStore::MempoolThread::entry()
+uint64_t min = store->osd_memory_cache_min, max = min;
+uint64_t ltarget = (1.0 - store->osd_memory_expected_fragmentation) * store->osd_memory_target;
+if (ltarget > store->osd_memory_base + min) max = ltarget - store->osd_memory_base;
+
+binned_kv_cache       = store->db->get_priority_cache();            // default CF
+binned_kv_onode_cache = store->db->get_priority_cache(PREFIX_OBJ);  // "O" CF, if it has its own
+if (store->cache_autotune && binned_kv_cache != nullptr) {
+  pcm = std::make_shared<PriorityCache::Manager>(store->cct, min, max, target, true, "bluestore-pricache");
+  pcm->insert("kv",   binned_kv_cache, true);
+  pcm->insert("meta", meta_cache,      true);
+  pcm->insert("data", data_cache,      true);
+  if (binned_kv_onode_cache != nullptr) pcm->insert("kv_onode", binned_kv_onode_cache, true);
+}
 ```
+
+[`entry()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L5548), [`Manager::insert()`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/PriorityCache.cc#L160). BlueStore's
+adapters are [`MempoolCache`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2606) with
+[`MetaCache`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2720) and [`DataCache`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2767).
 
 ### 3.2 Control loop
 
-BlueStore's `MempoolThread` drives everything:
+BlueStore's [`MempoolThread`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2595) drives everything:
 
 ![PriorityCache control loop: tune_memory, shift_bins, balance, commit, resize shards]({{ '/assets/images/ceph-prioritycache/prioritycache-loop.svg' | relative_url }})
+
+One tick of [`entry()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L5548), every
+[`bluestore_cache_trim_interval`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L5048) (50 ms): rotate bins if due
+(1 s), `balance()` if due (5 s), `tune_memory()` if due (1 s, tcmalloc only),
+then `_resize_shards()` unconditionally.
 
 ### 3.3 `tune_memory()`: size the pie
 
@@ -335,11 +393,15 @@ else                        // over target: shrink toward min, fast
 tuned_mem = new_size;
 ```
 
-BlueStore's bounds:
+([`Manager::tune_memory()`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/PriorityCache.cc#L119).) BlueStore's bounds, set in
+[`entry()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L5552):
 
-- `min_mem = osd_memory_cache_min` (128 MiB)
+- `min_mem` = [`osd_memory_cache_min`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L3990) (128 MiB)
 - `max_mem = (1 − osd_memory_expected_fragmentation) × target − osd_memory_base`
   = 0.85 × 4 GiB − 768 MiB ≈ **2.65 GiB** with defaults
+  ([`osd_memory_target`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L3913) 4 GiB, [`osd_memory_base`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L3960)
+  768 MiB, [`osd_memory_expected_fragmentation`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L3974) 0.15). If that
+  is not above `min_mem + base`, `max_mem = min_mem`.
 
 ![Cache size and mapped memory over 30 ticks for three non-cache usage levels]({{ '/assets/images/ceph-prioritycache/tune-memory-curves.svg' | relative_url }})
 
@@ -352,18 +414,19 @@ total stays fixed.
 
 ### 3.4 `balance()`: cut the pie
 
-`balance()` subtracts a small reserve (one chunk per cache), then walks
-priorities `PRI0 → LAST`, asking every cache what it wants at each level:
+[`balance()`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/PriorityCache.cc#L275) subtracts a small reserve (one
+[`get_chunk()`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/PriorityCache.cc#L33) per cache), then walks priorities `PRI0 → LAST`,
+asking every cache what it wants at each level:
 
 | Priority | What a cache requests |
 |---|---|
-| `PRI0` | Must-keep bytes (RocksDB high-pri pool); onode and buffer caches request 0 |
+| `PRI0` | Must-keep bytes (RocksDB high-pri pool, [`BinnedLRUCache`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/BinnedLRUCache.cc#L764)); onode and buffer caches request 0 ([`MempoolCache`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2618)) |
 | `PRI1`…`PRI10` | Bytes in that age window (section 4), minus what it already holds there |
 | `LAST` | Bytes older than the whole ring: used bytes minus all ring counters |
 
 ![Budget granted column by column across priority windows; the boundary window is split by ratio]({{ '/assets/images/ceph-prioritycache/allocation-grid.svg' | relative_url }})
 
-Within a level, `balance_priority()` water-fills by ratio:
+Within a level, [`balance_priority()`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/PriorityCache.cc#L332) water-fills by ratio:
 
 ```cpp
 void Manager::balance_priority(int64_t *mem_avail, Priority pri) {
@@ -402,11 +465,14 @@ gets exactly that, and the rest flows to hungrier caches.
 
 | Cache | How the size takes effect |
 |---|---|
-| `kv`, `kv_onode` | `SetCapacity()` plus the high-pri pool ratio; RocksDB evicts internally |
-| `meta` | `_resize_shards()`: `meta_bytes / num_shards / avg_bytes_per_onode` → `set_max()` per shard |
-| `data` | `_resize_shards()`: `data_bytes / num_shards` → `set_max()` per shard |
+| `kv`, `kv_onode` | [`commit_cache_size()`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/BinnedLRUCache.cc#L803) → `SetCapacity()` plus the high-pri pool ratio; RocksDB evicts internally |
+| `meta` | [`commit_cache_size()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2665) rounds the grant to a chunk; [`_resize_shards()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L5699): `meta_bytes / num_shards / avg_bytes_per_onode` → [`set_max()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1537) per shard |
+| `data` | same; `_resize_shards()`: `data_bytes / num_shards` → `set_max()` per shard |
 
-Shards then trim to their new limits.
+Shards trim to their new limits at once: `set_max()` calls
+[`_trim_some()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1557) when
+[`bluestore_cache_meta_evict_in_autotune`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L5156) is on (the default);
+otherwise at their next insert.
 
 ---
 
@@ -414,8 +480,8 @@ Shards then trim to their new limits.
 
 ### 4.1 What a counter is
 
-Each cache keeps a ring of byte counters, **one per interval**
-(`bluestore_cache_age_bin_interval`, 1 s). `c[i]` holds the bytes of entries
+Each cache keeps a ring of byte counters ([`age_bins`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1530)),
+**one per interval** ([`bluestore_cache_age_bin_interval`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L5180), 1 s). `c[i]` holds the bytes of entries
 last added or moved to the head of their list about *i* intervals ago. The ring
 is as long as the largest bin bound: **720 counters** (12 minutes) with
 defaults.
@@ -433,6 +499,11 @@ age_bins.push_front(make_shared<int64_t>(0));   // oldest counter falls off
 sum(age_bins[start .. end))
 ```
 
+[`shift_bins()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1576), [`sum_bins()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1588),
+[`MempoolCache::request_cache_bytes()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2618). The onode cache counts
+onodes, and [`MetaCache::_sum_bins()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2746) multiplies by
+`get_bytes_per_onode()`.
+
 ![Ring of per-interval counters, entries pointing at their counter, and the mapping to PRI1 through LAST]({{ '/assets/images/ceph-prioritycache/age-bins-ring.svg' | relative_url }})
 
 The `shared_ptr` matters: when a counter falls off the ring, entries still hold
@@ -441,7 +512,8 @@ entries end up in `LAST` without anyone walking the cache.
 
 ### 4.2 All bins
 
-Defaults `1 2 6 24 120 720 0 0 0 0`, 1 s interval:
+Defaults for `kv`, `meta` and `data`: `1 2 6 24 120 720 0 0 0 0`
+([options](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L5199)), 1 s interval:
 
 ![All twelve priority levels and the counters each covers]({{ '/assets/images/ceph-prioritycache/age-bins-all.svg' | relative_url }})
 
@@ -455,9 +527,13 @@ ring size = max(bounds)
 
 Spare levels `PRI7`–`PRI10` can be used with a longer list, e.g.
 `1 2 6 24 60 120 300 720 1800 3600` (ring of 3600 counters). Each cache has its
-own list (`bluestore_cache_age_bins_kv`, `_kv_onode`, `_meta`, `_data`); check
-defaults with `ceph config help <option>`. Window length scales with the
-interval: at 2 s, the same 720 counters cover 24 minutes.
+own list ([`bluestore_cache_age_bins_kv`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L5199),
+[`_kv_onode`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L5219), [`_meta`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L5239), [`_data`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L5259)),
+parsed by [`import_bins()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2694). `kv_onode` defaults to
+`0 0 0 0 0 0 0 0 0 720`: one window at `PRI10` covering the whole 12-minute
+ring, so onode KV blocks are served after every other cache's windows and
+before `LAST`. Window length scales with the interval: at 2 s, the same 720
+counters cover 24 minutes.
 
 ### 4.3 Why age bins
 
@@ -691,34 +767,36 @@ a workload shift.
 
 | Option | Default | Role |
 |---|---|---|
-| `osd_memory_target` | 4 GiB | Total memory goal per OSD |
-| `bluestore_cache_autotune` | true | Enable PriorityCache |
-| `osd_memory_cache_min` | 128 MiB | Floor for the total cache |
-| `osd_memory_base` | 768 MiB | Assumed non-cache base usage |
-| `osd_memory_expected_fragmentation` | 0.15 | Assumed allocator fragmentation |
-| `osd_memory_cache_resize_interval` | 1 s | `tune_memory` period |
-| `bluestore_cache_autotune_interval` | 5 s | `balance` period |
-| `bluestore_cache_age_bin_interval` | 1 s | Age-bin rotation |
-| `bluestore_cache_age_bins_*` | `1 2 6 24 120 720 0 0 0 0` (kv, meta, data) | Window bounds per cache |
-| `bluestore_cache_kv_ratio`, `_meta_ratio` | | Tie-breaker ratios; fixed split when autotune is off |
-| `bluestore_cache_size_hdd` / `_ssd` | 1 GiB / 3 GiB | Fixed total, autotune off only |
-| `bluestore_2q_cache_kin_ratio` / `_kout_ratio` | 0.5 / 0.5 | 2Q `warm_in` share / ghost count |
-| `bluestore_default_buffered_read` / `_write` | true / false | Buffer cache admission |
+| [`osd_memory_target`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L3913) | 4 GiB | Total memory goal per OSD |
+| [`bluestore_cache_autotune`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L5146) | true | Enable PriorityCache |
+| [`osd_memory_cache_min`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L3990) | 128 MiB | Floor for the total cache |
+| [`osd_memory_base`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L3960) | 768 MiB | Assumed non-cache base usage |
+| [`osd_memory_expected_fragmentation`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L3974) | 0.15 | Assumed allocator fragmentation |
+| [`osd_memory_cache_resize_interval`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L4005) | 1 s | `tune_memory` period |
+| [`bluestore_cache_autotune_interval`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L5168) | 5 s | `balance` period |
+| [`bluestore_cache_age_bin_interval`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L5180) | 1 s | Age-bin rotation |
+| [`bluestore_cache_trim_interval`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L5048) | 0.05 s | `MempoolThread` tick |
+| [`bluestore_cache_age_bins_*`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L5199) | `1 2 6 24 120 720 0 0 0 0` (kv, meta, data); `0 0 0 0 0 0 0 0 0 720` (kv_onode) | Window bounds per cache |
+| [`bluestore_cache_kv_ratio`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L5120), [`_meta_ratio`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L5112), [`_kv_onode_ratio`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L5128) | 0.45 / 0.45 / 0.04; data gets the rest | Tie-breaker ratios; fixed split when autotune is off |
+| [`bluestore_cache_meta_evict_in_autotune`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L5156) | true | Trim shards right at `set_max()` |
+| [`bluestore_cache_size_hdd`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L5092) / [`_ssd`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L5102) | 1 GiB / 3 GiB | Fixed total, autotune off only |
+| [`bluestore_2q_cache_kin_ratio`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L5069) / [`_kout_ratio`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L5075) | 0.5 / 0.5 | 2Q `warm_in` share / ghost count |
+| [`bluestore_default_buffered_read`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L5655) / [`_write`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L5663) | true / false | Buffer cache admission |
 
 | Check | Command |
 |---|---|
 | Memory by pool | `ceph daemon osd.N dump_mempools` |
 | Heap | `ceph tell osd.N heap stats` |
-| PriorityCache grants | `ceph daemon osd.N perf dump` (`prioritycache` sections) |
-| Onode cache | `bluestore_onodes`, `bluestore_pinned_onodes`, `bluestore_onode_hits` / `misses` |
-| Buffer cache | `bluestore_buffer_hit_bytes` / `miss_bytes` |
+| PriorityCache grants | `ceph daemon osd.N perf dump`: sections `bluestore-pricache:kv`, `:meta`, `:data`, `:kv_onode` with `pri0_bytes` … `committed_bytes` ([names](https://github.com/ceph/ceph/blob/v21.3.0/src/common/PriorityCache.cc#L184)) |
+| Onode cache | `bluestore.onodes`, `onodes_pinned`, `onode_hits` / `onode_misses` ([counters](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L6558)) |
+| Buffer cache | `bluestore.buffer_hit_bytes` / `buffer_miss_bytes` ([counters](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L6590)) |
 | cephadm targets | `ceph orch ps` (`MEM LIMIT` column) |
 
 Reading the signals:
 
 - Large `bluestore_cache_*` mempools are normal. Large `osd_pglog` or
   `buffer_anon` mean non-cache memory is squeezing the cache.
-- High `pinned_onodes` with rising `onode_misses`: in-flight writes are taking
+- High `onodes_pinned` with rising `onode_misses`: in-flight writes are taking
   the onode budget.
 - Low onode hit ratio on RGW or CephFS metadata pools: the target is too small
   for the onode working set.
@@ -747,6 +825,8 @@ Reading the signals:
 
 **Ceph**
 
+- Source for every code link in this post:
+  [ceph v21.3.0](https://github.com/ceph/ceph/tree/v21.3.0).
 - A. Aghayev, S. Weil, M. Kuchnik, M. Nelson, G. Ganger, G. Amvrosiadis.
   *File Systems Unfit as Distributed Storage Backends: Lessons from 10 Years of
   Ceph Evolution.* SOSP 2019.
