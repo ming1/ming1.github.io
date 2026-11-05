@@ -454,9 +454,10 @@ void Manager::balance_priority(int64_t *mem_avail, Priority pri) {
 }
 ```
 
-Worked example: 100 MB at one level, ratios kv 0.45, meta 0.45, data 0.10.
+Worked example: 100 MB at one level, v21.3.0 default ratios kv 0.45, meta
+0.45, kv_onode 0.04, data 0.06. The caches want 12, 60, 3 and 30 MB.
 
-![Water-filling 100 MB across kv, meta and data over three rounds]({{ '/assets/images/ceph-prioritycache/waterfill.svg' | relative_url }})
+![Water-filling 100 MB across kv, meta, kv_onode and data over three rounds]({{ '/assets/images/ceph-prioritycache/waterfill.svg' | relative_url }})
 
 Ratios only matter under contention: a cache that wants less than its share
 gets exactly that, and the rest flows to hungrier caches.
@@ -620,24 +621,28 @@ the caches at each age, take the running sum of the total, and find one
 |---|---|---|---|---|---|---|
 | kv | 2 | 5 | 1 | 4 | 2 | 6 |
 | meta | 1 | 4 | 0 | 3 | 2 | 4 |
-| data | 1 | 3 | 0 | 3 | 4 | 10 |
+| kv_onode | 0 | 1 | 0 | 1 | 1 | 2 |
+| data | 1 | 2 | 0 | 2 | 3 | 8 |
 | **Total** | 4 | 12 | 1 | 10 | 8 | 20 |
 | **Running sum** | 4 | 16 | 17 | 27 | **35** | 55 |
 
 ![Per-cache bytes by age, totals, running sum, and the global boundary at age 4]({{ '/assets/images/ceph-prioritycache/global-boundary.svg' | relative_url }})
 
-Ages 0–3 cost 27 MB; the remaining 3 MB of age 4 is split by ratio
-(0.45 / 0.45 / 0.10):
+Ages 0–3 cost 27 MB; the remaining 3 MB of age 4 is split by the default
+ratios (0.45 / 0.45 / 0.04 / 0.06):
 
 | Cache | Kept (ages 0–3) | Share of age 4 | Limit | Evicted |
 |---|---|---|---|---|
 | kv | 12 | 1.35 | 13.35 | 0.65 of age 4 + all of age 5+ (6.65) |
 | meta | 8 | 1.35 | 9.35 | 0.65 of age 4 + all of age 5+ (4.65) |
-| data | 7 | 0.30 | 7.30 | 3.7 of age 4 + all of age 5+ (13.70) |
+| kv_onode | 2 | 0.12 | 2.12 | 0.88 of age 4 + all of age 5+ (2.88) |
+| data | 5 | 0.18 | 5.18 | 2.82 of age 4 + all of age 5+ (10.82) |
 | **Sum** | 27 | 3.00 | **30.00** | |
 
-The evictions (6.65 / 4.65 / 13.70) are not in a 45:45:10 proportion: **age
-decides almost everything, ratio only breaks the tie at the boundary**. Ratios
+The evictions (6.65 / 4.65 / 2.88 / 10.82) are not in a 45:45:4:6
+proportion: **age decides almost everything, ratio only breaks the tie at the
+boundary**. (`kv_onode` is drawn with the same windows as the others; with
+its default bin list it would request nothing before `PRI10`.) Ratios
 matter in three places only: the boundary window, spare memory at `LAST`, and
 fixed mode with autotune off.
 
@@ -656,9 +661,10 @@ The 30 MB above is `tuned_mem`. With 4 shards:
 
 ```
 30 MB total
- ├─ kv    13.35 MB → RocksDB capacity (its own internal shards)
- ├─ meta   9.35 MB → ÷ 4 = 2.34 MB per shard → onode count
- └─ data   7.30 MB → ÷ 4 = 1.83 MB per shard → 2Q byte limit
+ ├─ kv        13.35 MB → RocksDB capacity (its own internal shards)
+ ├─ meta       9.35 MB → ÷ 4 = 2.34 MB per shard → onode count
+ ├─ kv_onode   2.12 MB → capacity of the O column family's block cache
+ └─ data       5.18 MB → ÷ 4 = 1.30 MB per shard → 2Q byte limit
 ```
 
 The `c[n]` values were already cache-wide (summed over shards). The even shard
