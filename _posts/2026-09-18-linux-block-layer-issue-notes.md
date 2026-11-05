@@ -1,7 +1,7 @@
 ---
 title: "Linux Block Layer Issue Notes"
 category: linux kernel
-tags: [linux kernel, block, blk-mq, ublk, nvme, scsi, dm, loop, io-uring, debugging, regression, race, lore, hung-task, vfork, fd-lifetime, io-wq, scheduler, thread-handoff, signals]
+tags: [linux kernel, block, blk-mq, ublk, nvme, scsi, dm, loop, io-uring, debugging, regression, race, lore, hung-task, vfork, fd-lifetime, io-wq, scheduler, thread-handoff, signals, del-gendisk, global-lock, idr]
 ---
 
 * TOC
@@ -1492,3 +1492,326 @@ without also canceling the file I/O the drain exists to finish.
   state that remains.
 - `kill -9` does not reproduce a hang that `raise()` or `exit()` does: the
   pending set differs, not the signal.
+
+# 5. ublk: one device with a stuck filesystem blocks ADD_DEV and DEL_DEV of every other device
+
+| | |
+|---|---|
+| Report | [\[PATCH 0/2\] ublk: don't let one stuck device block control of all ublk devices](https://lore.kernel.org/linux-block/20261105-ublk-del-gendisk-hang-v1-0-913a91a4314d@gmail.com/), Mark Korenberg, 2026-11-04, with a reproducer; hit with btrfs on a zoned ublk device whose writeback deadlocked |
+| Affects | every ublk since `71f28f3136af` ("ublk_drv: add io_uring based userspace block driver", v6.0): DEL_DEV has always called `del_gendisk()` under the global `ublk_ctl_mutex`, and `del_gendisk()` has always synced the filesystem |
+| Component | ublk control path, `drivers/block/ublk_drv.c` |
+| Fix | patch 2: DEL_DEV takes no `ublk_ctl_mutex`; patch 1 makes that safe: a new device becomes findable by its id only after its char device is added |
+| Status | v1 posted 2026-11-04; reviewed here, A/B verified in a VM; both patches correct, two remarks for the reply (§5.4) |
+| Code base | `05441d697f7f` (v7.4-rc1-132); all `file:line` refer to it, `ublk_drv.c` when no file is given. The series is based on `c339f4010dea` and applies cleanly |
+
+## 5.1 The story in one view
+
+`ublk_ctl_mutex` is global, and DEL_DEV holds it while `del_gendisk()`
+flushes the filesystem on the disk. A filesystem that cannot flush turns
+one stuck device into a stuck ublk: no device can be added or deleted
+until reboot.
+
+```
+ DEL_DEV 0  (fs on ublkb0 cannot write its log)        ADD_DEV 1  (any other device)
+ ─────────────────────────────────────────────         ──────────────────────────────
+#1 ublk_ctrl_del_dev()
+     mutex_lock_killable(&ublk_ctl_mutex) ───────┐
+     ublk_remove() → ublk_stop_dev()             │
+       mutex_lock(&ub->mutex)                    │
+#2     del_gendisk()                             │
+         fs_bdev_mark_dead(surprise = false)     │
+           sync_filesystem(): xlog_wait  D       │      #3 ublk_ctrl_add_dev()
+           forever: the log device is suspended  │           mutex_lock_killable(&ublk_ctl_mutex)  D
+                                                 │           every ADD_DEV / DEL_DEV queues here
+ server of 0 dead instead: the release work      │
+   runs the same del_gendisk() under ub->mutex,  │
+   DEL_DEV sleeps on ub->mutex, mutex held ──────┘
+
+#4 fix, patch 2   DEL_DEV takes no ublk_ctl_mutex: test_and_set_bit(UB_STATE_DELETED) picks the
+                  one deleter, the unprivileged-device counter becomes atomic
+#5 fix, patch 1   ADD_DEV reserves the id with a NULL idr entry and publishes the device only
+                  after ublk_add_chdev() succeeded, so DEL_DEV can never find a half-built device
+```
+
+1. **#1** DEL_DEV holds `ublk_ctl_mutex` across `ublk_remove()`, which
+   stops the disk (`:5028-5037`, `:4506`, `:3040`).
+2. **#2** `del_gendisk()` is a graceful removal: it asks the filesystem to
+   write back everything before the disk goes (`block/genhd.c:724`,
+   `fs/super.c:1477`). If the filesystem is stuck, this never returns.
+   ublk cannot help: the I/O it waits for is not ublk's.
+3. **#3** The mutex has four users, all in ADD_DEV and DEL_DEV. So every
+   ADD_DEV and DEL_DEV of every other device sleeps behind the stuck one.
+   The sleep is killable, but the command never completes: no new ublk
+   device until reboot. A dead server does not help: its release work
+   runs the same `del_gendisk()` under `ub->mutex`, and DEL_DEV then
+   sleeps on `ub->mutex` with `ublk_ctl_mutex` held.
+4. **#4** DEL_DEV needs three things from the mutex: one deleter, a
+   consistent `unprivileged_ublks_added`, and no ADD_DEV still building
+   the device it found. The first two have lock-free replacements.
+5. **#5** The third was never really given: ADD_DEV puts the device into
+   the idr first and builds it afterwards, and DEL_DEV takes its reference
+   before the mutex. Publishing the id last closes that, and lets DEL_DEV
+   drop the mutex.
+
+```
+#1–#3   5.2 report → 5.3 analysis       #4–#5   5.4 fix → 5.5 validation
+```
+
+## 5.2 Report
+
+Mark's reproducer, without btrfs or zoned: XFS on a ublk loop device, its
+external log on dm-linear over null_blk, the log device suspended so the
+next log write never completes. DEL_DEV is sent raw, as libublk does:
+`kublk del` and `ublk del` send STOP_DEV first, which hangs the same way
+but holds only `ub->mutex`.
+
+```
+  dmsetup suspend --nolockfs --noflush <log>
+  write a file; syncfs                  # blocks, as expected
+  kill -9 <ublk server>                 # optional
+  DEL_DEV 0                             # directly, as libublk does
+  ADD_DEV 1                             # null target
+  dmsetup resume <log>                  # everything unwinds
+
+           DEL_DEV 0                         ADD_DEV 1
+  master   D, survives SIGKILL               hangs on ublk_ctl_mutex
+  series   D, survives SIGKILL               ok
+```
+
+Reproduced on `05441d697f7f` with
+[`ublk-del-dev-ctl-mutex.sh`]({{ site.baseurl }}/code/block/ublk-del-dev-ctl-mutex.sh)
+([`ublk-del-dev.c`]({{ site.baseurl }}/code/block/ublk-del-dev.c) sends
+the raw DEL_DEV). Both control commands run on io-wq workers of their
+issuers (§4); `/proc/<tid>/stack` of the two workers, server alive:
+
+```
+DEL_DEV 0   iou-wrk  D  xlog_wait
+  xlog_wait_on_iclog / xfs_fs_sync_fs / sync_filesystem
+  fs_bdev_mark_dead / bdev_mark_dead / blk_report_disk_dead / __del_gendisk / del_gendisk
+  ublk_stop_dev_unlocked / ublk_stop_dev / ublk_remove / ublk_ctrl_del_dev
+  ublk_ctrl_uring_cmd / io_uring_cmd / ... / io_wq_worker
+
+ADD_DEV 1   iou-wrk  D  ublk_ctrl_add_dev          ← mutex_lock_killable(&ublk_ctl_mutex)
+  ublk_ctrl_add_dev / ublk_ctrl_uring_cmd / io_uring_cmd / ... / io_wq_worker
+```
+
+Server killed first (`kill` argument): the release work owns the flush and
+DEL_DEV waits for the device lock, holding the global one (`sysrq-w`):
+
+```
+kworker/0:1   D  xlog_wait ... fs_bdev_mark_dead / __del_gendisk / del_gendisk
+                 ublk_stop_dev_unlocked / ublk_ch_release_work_fn        ← holds ub->mutex
+iou-wrk       D  __mutex_lock / ublk_stop_dev / ublk_remove / ublk_ctrl_del_dev   ← holds ublk_ctl_mutex
+iou-wrk       D  ublk_ctrl_add_dev                                       ← ADD_DEV 1, stock only
+```
+
+After `dmsetup resume` the log write completes, XFS logs "Block device
+removal (0x20) detected at fs_bdev_mark_dead ... Shutting down
+filesystem", and both commands return. On stock the hung ADD_DEV
+completes too and leaves a device behind, created by a server nobody
+waits for any more.
+
+The second bug has no production trace: Mark injected a failure into
+`ublk_add_chdev()` and got an oops in `kill_device()` from
+`cdev_device_del()`. Reproduced the same way, with
+[`ublk-inject-add-chdev-fail.diff`]({{ site.baseurl }}/code/block/ublk-inject-add-chdev-fail.diff)
+(sleep 1 s after `device_initialize()`, then fail) and a DEL_DEV loop on
+the id ([`ublk-add-fail-del-race.sh`]({{ site.baseurl }}/code/block/ublk-add-fail-del-race.sh)):
+
+```
+BUG: kernel NULL pointer dereference, address: 0000000000000108
+RIP: 0010:kill_device+0x33/0x50
+ device_del / cdev_device_del / ublk_remove / ublk_ctrl_del_dev
+ ublk_ctrl_uring_cmd / io_uring_cmd / ... / io_wq_worker
+Kernel panic - not syncing: Fatal exception
+```
+
+## 5.3 Analysis
+
+**The hang**, from the symptom down:
+
+```
+ADD_DEV 1 never returns
+ └─ why?   sleeps in mutex_lock_killable(&ublk_ctl_mutex)                 (:4896)
+ └─ who holds it?
+           DEL_DEV 0: mutex_lock_killable() ... ublk_remove()              (:5028, :5033)
+             ublk_stop_dev() → mutex_lock(&ub->mutex)                      (:3070)
+             ublk_stop_dev_unlocked() → del_gendisk()                      (:3040)
+ └─ why does del_gendisk() not return?
+           __del_gendisk(): blk_report_disk_dead(disk, surprise=false)     (block/genhd.c:724)
+             → bdev_mark_dead() → bd_holder_ops->mark_dead                 (:652, block/bdev.c:1317)
+             → fs_bdev_mark_dead(): sync_filesystem(sb) before ->shutdown  (fs/super.c:1477, :1481)
+           XFS: xfs_fs_sync_fs → xlog_wait_on_iclog: the log device is suspended
+ └─ why does killing the server not help?
+           ublk_ch_release_work_fn(): mutex_lock(&ub->mutex)               (:2598)
+             ublk_nosrv_should_stop_dev() → ublk_stop_dev_unlocked()       (:2608, :2617)
+             the same del_gendisk(), now under ub->mutex
+           DEL_DEV: ublk_stop_dev() blocks on ub->mutex, holding ublk_ctl_mutex   (:3070)
+ └─ what does the mutex protect?
+           :4896/:5007 ADD_DEV, :5028/:5037 DEL_DEV — nothing else
+```
+
+Both variants were seen in the VM (§5.2). Either way DEL_DEV sleeps in D
+with the global mutex held.
+
+**Why the sync is there.** `del_gendisk()` is the *graceful* removal: the
+driver says the disk is going away, and the filesystem gets to write its
+dirty data first (`d8530de5a6e8`, "block: call into the file system for
+bdev_mark_dead"; before v6.6 the same was `fsync_bdev()`). Only a
+*surprise* removal (`blk_mark_disk_dead()`, GD_DEAD set first) skips the
+sync. ublk uses the graceful path on purpose: with a live server the
+flush succeeds and no data is lost. The cost is that the flush can block
+on anything the filesystem depends on, here a dm device that has nothing
+to do with ublk, and `ublk_stop_dev()` holds `ub->mutex` for all of it.
+That part is the same for STOP_DEV and is not what this series fixes. The
+series only stops one device's flush from taking the global lock with it.
+
+**What ublk_ctl_mutex gives DEL_DEV, and what DEL_DEV takes before it.**
+
+```
+ DEL_DEV n                                       ADD_DEV (holds ublk_ctl_mutex)
+ ublk_ctrl_uring_cmd()
+   ublk_get_device_from_id(n)      :5959         ublk_alloc_dev_number(): idr_alloc(ub)        :4411
+     idr_find → ub                 :4523         ... tag set, queues, copy_to_user ...
+     kobject_get_unless_zero       :1243         ublk_add_chdev()
+       0 before device_initialize() → NULL, -ENODEV     device_initialize(): kref = 1          :4457
+       1 after it → reference taken                     dev_set_name() / cdev_device_add() fail :4467
+ ublk_ctrl_del_dev()                                    put_device(): drops the initial ref     :4475
+   mutex_lock_killable(&ublk_ctl_mutex) waits ...     mutex_unlock(&ublk_ctl_mutex)             :5007
+   ublk_remove()                   :5033
+     cdev_device_del() of a device that was never added → device_del() → kill_device():
+       dev->p is NULL                         (fs/char_dev.c:579, drivers/base/core.c:3930, :3901)
+     ublk_put_device(): the initial ref again → freed under the callers that still hold it   :4509
+```
+
+So the mutex serializes DEL_DEV *behind* ADD_DEV, but DEL_DEV already
+holds a reference to a device whose setup may still fail. The window is
+`device_initialize()` to `cdev_device_add()` returning, and it needs a
+failure there, so nobody hit it in production. It matters now because
+dropping the mutex would make the same DEL_DEV run *concurrently* with
+the setup. Patch 1 has to come first.
+
+**Why it usually works.** Three things have to meet: a filesystem that
+cannot flush, a DEL_DEV without STOP_DEV before it (libublk, or a server
+that died with the device in `UBLK_S_DEV_LIVE`), and a second device to
+add. kublk and ublksrv send STOP_DEV first, so their hang holds only
+`ub->mutex` and stays on the one device.
+
+## 5.4 Fix
+
+**Patch 1, publish the id last.** `idr_alloc(..., NULL, ...)` reserves
+the id (`idr_find()` and `idr_for_each_entry()` skip NULL entries), and
+`idr_replace()` installs the device once `ublk_add_chdev()` succeeded.
+`idr_replace()` on a reserved slot returns the old NULL and keeps the
+slot (`lib/idr.c:300-306`); the error paths still `idr_remove()` the
+reserved id.
+
+```c
+	err = idr_alloc(&ublk_index_idr, NULL, i, i + 1, GFP_NOWAIT);	/* was: ub */
+...
+static void ublk_publish_dev_number(struct ublk_device *ub)
+{
+	spin_lock(&ublk_idr_lock);
+	WARN_ON_ONCE(idr_replace(&ublk_index_idr, ub, ub->ub_number) != NULL);
+	spin_unlock(&ublk_idr_lock);
+}
+...
+	ret = ublk_add_chdev(ub);
+	if (!ret)
+		ublk_publish_dev_number(ub);
+```
+
+A control command on an id being added now gets `-ENODEV` instead of a
+reference to a half-built device. A specific id requested twice still
+fails with `-EEXIST`: the reserved slot is occupied.
+
+**Patch 2, no ublk_ctl_mutex in DEL_DEV.**
+
+```c
+	if (!test_and_set_bit(UB_STATE_DELETED, &ub->state)) {
+		ublk_remove(ub);
+		if (unprivileged)
+			atomic_dec(&unprivileged_ublks_added);
+	}
+	*p_ub = NULL;
+	ublk_put_device(ub);
+	if (wait && wait_event_interruptible(ublk_idr_wq, ublk_idr_freed(idx)))
+		return -EINTR;
+```
+
+| guarantee | before: `ublk_ctl_mutex` | after |
+|---|---|---|
+| DEL_DEV never acts on a device ADD_DEV is still building | serialized behind ADD_DEV, but the reference was already taken (§5.3) | not findable until built (patch 1); ADD_DEV touches `ub` no more after publishing |
+| exactly one `ublk_remove()` per device | `test_bit` + `set_bit` under the mutex | `test_and_set_bit()`, an atomic RMW |
+| `unprivileged_ublks_added` limit | `++`/`--` under the mutex | atomic; check and `inc` still under the mutex, `dec` without. A `dec` racing the check only makes the count read high: the limit holds, an ADD_DEV at the limit may get `-EACCES` where it used to wait for the deletion |
+| the id is reusable when DEL_DEV returns | wait for `ublk_idr_freed()` outside the mutex | unchanged; `idr_remove()` in `ublk_cdev_rel()` and `idr_alloc()` both run under `ublk_idr_lock` (`:4429`, `:4411`) |
+| a second DEL_DEV of the same device | blocks on the mutex, then skips | skips at once and waits interruptibly for the id, unless `DEL_DEV_ASYNC` |
+| module exit | `idr_for_each_entry()` → `ublk_remove()` | NULL entries are skipped, and no ADD_DEV can be in flight: `/dev/ublk-control` holds the module |
+
+Nothing else in the file takes `ublk_ctl_mutex`, so STOP_DEV, START_DEV,
+recovery and the release work are not affected: they work on a referenced
+`ub` under `ub->mutex`, as before.
+
+**What the series does not fix**, and says so: the stuck device itself.
+Its DEL_DEV or STOP_DEV still sleeps in `del_gendisk()` until the
+filesystem moves, and a dead server's release work sleeps there too, with
+`ub->mutex` held. A surprise removal (`blk_mark_disk_dead()` first) would
+skip the sync, but `->shutdown()` and the writeback flush in
+`bdi_unregister()` can block the same way, and doing it without
+`ub->mutex` races recovery and a new server attaching. Mark defers that
+to an RFC; it is the same wall as §1.4.
+
+**Alternatives.**
+
+| alternative | why not |
+|---|---|
+| keep the mutex, take it after `ublk_remove()` only for the counter | still serializes the DEL_DEVs on the stuck one; the counter is the easy part |
+| a per-device lock instead of the global one for DEL_DEV | `ub->mutex` already is that lock, taken in `ublk_stop_dev()`; the global one adds nothing for one device |
+| `blk_mark_disk_dead()` before `del_gendisk()` in DEL_DEV | loses the flush for every healthy device deleted without STOP_DEV; the stuck-device RFC, not this fix |
+| `mutex_lock_interruptible()` in ADD_DEV | frees the caller, not the system: still no new device until reboot |
+
+**For the reply.** Both patches are correct and minimal; the ordering is
+right and the commit messages say why. Two remarks:
+
+- Patch 2 has no `Fixes:` tag. The hang is as old as DEL_DEV, so
+  `Fixes: 71f28f3136af`, with patch 1 as its dependency, if it is meant
+  for stable.
+- The `-EACCES`-instead-of-wait change at the unprivileged limit is a
+  visible behaviour change for `DEL_DEV_ASYNC` followed by ADD_DEV. The
+  commit message documents it; worth one line in `Documentation/`?
+  Otherwise fine.
+
+## 5.5 Validation
+
+virtme-ng, 16 vCPUs, `05441d697f7f` stock vs. + series, lockdep on,
+ublk built in, XFS and null_blk modules.
+
+| test | script | stock | + series |
+|---|---|---|---|
+| DEL_DEV of the stuck device, then ADD_DEV 1, server alive | [`ublk-del-dev-ctl-mutex.sh`]({{ site.baseurl }}/code/block/ublk-del-dev-ctl-mutex.sh) | REPRODUCED: ADD_DEV 1 in D in `ublk_ctrl_add_dev()` for 15 s, returns after `dmsetup resume` | ADD_DEV 1 returns at once; DEL_DEV 0 stays in `del_gendisk()` until the resume |
+| same, server killed first (`kill` argument) | same | REPRODUCED: release work in `del_gendisk()`, DEL_DEV on `ub->mutex`, ADD_DEV 1 on `ublk_ctl_mutex` | ADD_DEV 1 returns at once; DEL_DEV 0 waits on `ub->mutex` until the resume |
+| DEL_DEV loop (~200 calls / 4 s) racing an ADD_DEV that fails 1 s into `ublk_add_chdev()`, 3 rounds | [`ublk-add-fail-del-race.sh`]({{ site.baseurl }}/code/block/ublk-add-fail-del-race.sh) + [injection]({{ site.baseurl }}/code/block/ublk-inject-add-chdev-fail.diff) | REPRODUCED in round 1: `BUG: kernel NULL pointer dereference` in `kill_device()`, panic | every DEL_DEV `-ENODEV`, no warning, id reusable afterwards |
+| ublk selftests `run_generic` | `vmtest run ublk_test_grp run_generic` | — | 11 pass, 0 fail, no warnings (`generic_02` runs without a verdict line on both kernels: bpftrace) |
+
+In every run the stuck DEL_DEV itself returned only after the resume
+*and* the unmount: the mounted filesystem holds the disk, the disk holds
+the device (`ublk_free_disk()`, `:1335`), and a sync DEL_DEV waits for the
+id to be freed. That is by design and the same on both kernels.
+
+## 5.6 Takeaways
+
+- **A global lock must never be held across a wait on I/O.**
+  `del_gendisk()` is such a wait: it flushes a filesystem, and the
+  filesystem may depend on another device. Hold it under the device's own
+  lock only.
+- **"Serialized behind X" is not "cannot see X's half-built object".** A
+  lookup that hands out references has to publish the object last, or
+  the lock only orders the crash.
+- **Reserve, then publish.** `idr_alloc(NULL)` + `idr_replace()` is the
+  idiom: the id is taken, the object is invisible until it is whole.
+- **When removing a lock, list what it protected and give each item its
+  own replacement**, as patch 2's message does. The one item it could not
+  replace is what makes patch 1 a dependency, not a cleanup.
+- **A flush-on-remove is a policy, not a property of the lock.** Dropping
+  the mutex fixes the collateral damage; the stuck device needs a surprise
+  removal policy, which is a separate, harder decision.

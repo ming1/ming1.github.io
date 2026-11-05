@@ -1,0 +1,32 @@
+Test-only fault injection for "ublk: publish a new device by its id only
+once it is set up": make ublk_add_chdev() fail 1 s after the struct device
+is initialized, so a concurrent DEL_DEV can find the half-built device.
+
+  echo 1 > /sys/module/ublk_drv/parameters/fail_add_chdev
+
+diff --git a/drivers/block/ublk_drv.c b/drivers/block/ublk_drv.c
+--- a/drivers/block/ublk_drv.c
++++ b/drivers/block/ublk_drv.c
+@@ -885,6 +885,9 @@
+
+ static struct miscdevice ublk_misc;
+
++static bool ublk_fail_add_chdev;
++module_param_named(fail_add_chdev, ublk_fail_add_chdev, bool, 0644);
++
+ static inline u16 ublk_pos_to_hwq(loff_t pos)
+ {
+ 	return ((pos - UBLKSRV_IO_BUF_OFFSET) >> UBLK_QID_OFF) &
+@@ -4460,6 +4463,12 @@
+ 	if (ret)
+ 		goto fail;
+
++	if (READ_ONCE(ublk_fail_add_chdev)) {
++		msleep(1000);
++		ret = -EIO;
++		goto fail;
++	}
++
+ 	if (ublk_dev_support_batch_io(ub))
+ 		cdev_init(&ub->cdev, &ublk_ch_batch_io_fops);
+ 	else
