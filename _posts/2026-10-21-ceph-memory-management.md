@@ -3041,13 +3041,13 @@ flowchart LR
     R -->|"balance: H granted by age,<br/>+ 64 MiB headroom,<br/>+ ratio share of the leftover"| C
 ```
 
-| | even split (stock, option off) | weighted split (option on) |
-|---|---|---|
-| shards with no PG | hold nothing, their part of D is never used | get a floor of 1/8 of the even share |
-| bytes held H | 47 % of D with 17 of 32 shards empty (osd.1 in run 2) | D, if the working set is larger |
-| request next round | 0.47 D | D |
-| the unused 0.53 D | leftover, split 30/30/4/36 between meta, kv, kv_onode and data (this test's ratios) | gone |
-| D next round | 0.47 D + 64 MiB + share of leftover: a fixed point (128 MiB here) | D + 64 MiB + share of leftover: grows |
+| | even split (stock, option off) | weighted split (option on) | where in the code |
+|---|---|---|---|
+| shards with no PG | hold nothing, their part of D is never used | get a floor of 1/8 of the even share | [`_resize_shards()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L5699): `data_alloc / buffer_shards` in stock, the weighted split of PR #73018 with the option on |
+| bytes held H | 47 % of D with 17 of 32 shards empty (osd.1 in run 2) | D, if the working set is larger | [`TwoQBufferCacheShard::_trim_to()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1521) keeps each shard under its limit |
+| request next round | 0.47 D | D | [`MempoolCache::request_cache_bytes()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2618) returns [`DataCache::_sum_bins()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2790) for each priority: what is held, by age |
+| the unused 0.53 D | leftover, split 30/30/4/36 between meta, kv, kv_onode and data (this test's ratios) | gone | [`balance_priority()`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/PriorityCache.cc#L398), the `LAST` branch: the fair share by ratio |
+| D next round | 0.47 D + 64 MiB + share of leftover: a fixed point (128 MiB here) | D + 64 MiB + share of leftover: grows | [`balance()`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/PriorityCache.cc#L275) sums the grants, [`get_chunk()`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/PriorityCache.cc#L33) adds the headroom in [`commit_cache_size()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2665), and the next `_resize_shards()` reads it back with [`get_committed_size()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2670) |
 
 With the even split the loop has a brake: what the empty shards strand is
 handed back every round, and meta and kv live on it. With the weighted
