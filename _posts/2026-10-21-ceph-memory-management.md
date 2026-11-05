@@ -3031,7 +3031,26 @@ limits still add up to `data_alloc`. So why would any other cache notice?
 Because `data_alloc` is not a setting. It is what the autotuner committed
 to the data cache at its last `balance()`, and the autotuner's input is how
 many bytes the cache holds. The split decides how many bytes the cache can
-hold. That closes a loop:
+hold. That closes a loop.
+
+Two quantities run through it, both for the data cache of one OSD:
+
+- **D, the committed size**: the bytes the autotuner assigned to the data
+  cache at its last `balance()`, plus the 64 MiB headroom, rounded up to a
+  chunk (§6.3). `commit_cache_size()` stores it and `get_committed_size()`
+  returns it; `_resize_shards()` reads it into `data_alloc` and hands it
+  out as the 32 shard limits. In the log lines of this section it is
+  `data_alloc`, in the `perf dump` counters `committed_bytes`, in the
+  tables below "data committed". D is a budget: nothing is allocated when
+  it changes.
+- **H, the bytes held**: what the shards actually hold, the sum of
+  `buffer_bytes` over the 32 shards, which is also the sum of the data
+  cache's age bins. H is what the cache asks the autotuner for at the next
+  `balance()`, so it is the input that produces the next D. In the log it
+  is `data_used`, in the tables "data held".
+
+Under stock, H can only reach D when every shard has enough data to fill
+its even share. The loop:
 
 ```mermaid
 flowchart LR
