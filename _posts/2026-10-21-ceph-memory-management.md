@@ -3068,12 +3068,72 @@ flowchart LR
 | the unused 0.53 D | leftover, split 30/30/4/36 between meta, kv, kv_onode and data (this test's ratios) | gone | [`balance_priority()`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/PriorityCache.cc#L398), the `LAST` branch: the fair share by ratio |
 | D next round | 0.47 D + 64 MiB + share of leftover: a fixed point (128 MiB here) | D + 64 MiB + share of leftover: grows | [`balance()`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/PriorityCache.cc#L275) sums the grants, [`get_chunk()`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/PriorityCache.cc#L33) adds the headroom in [`commit_cache_size()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2665), and the next `_resize_shards()` reads it back with [`get_committed_size()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2670) |
 
-With the even split the loop has a brake: what the empty shards strand is
-handed back every round, and meta and kv live on it. With the weighted
-split the brake is gone, and D grows every 5 s until the data working set
-is cached or memory runs out at some age priority (§6.2). That is the
-"asymptotic" adaptation and the "drain". Both are real. The rest of this
-section measures how far they go and what stops them.
+Row by row, with osd.1 of run 2 as the example: 17 of its 32 shards have
+no PG of the image, 15 have, and under the even split D is 128 MiB. The
+weighted split of the patch gives shard *s* the limit `D/256 + (7/8)·D ×
+held_s / Σheld`: a floor of one eighth of the even share, and the other
+seven eighths of D shared by occupancy.
+
+1. **Shards with no PG.** Even: every shard's limit is D/32, 4 MiB here,
+   whether it has anything to put in it or not. The 17 empty shards own 68
+   MiB of the budget, `_trim_to()` finds nothing to trim in them, and
+   those bytes are never held by anyone. Weighted: an empty shard has
+   `held_s = 0`, so its limit is the floor, D/256: 0.5 MiB at D = 128, 1.9
+   MiB at D = 480 (the "smallest limit" column of §17.6). The floor is
+   there so a shard that receives its first PG can take data before the
+   next resize and show up in `held`. What the 17 empty shards strand is
+   now 17·D/256, about D/15, eight times less than before.
+2. **Bytes held H.** Even: each of the 15 shards with data is capped at 4
+   MiB and is full, so H = 15 × 4 = 60 MiB = (15/32)·D, and it stays
+   there however much fio reads: the hot region is 1.5 GiB per OSD. Weighted:
+   the 15 shards share the seven eighths of D among themselves and keep
+   their floors, so together they may hold D − 17·D/256, about 0.93 D, and
+   they do, because the working set is larger than any D the tuner can
+   give. At D = 480 the shards held 459 MiB (§17.6).
+3. **Request next round.** `request_cache_bytes()` answers each priority
+   with the bytes in that age bin, and the bins sum to H. The cache does
+   not ask for D, and it does not ask for what it misses; it asks for what
+   it holds. Even: 60 MiB. Weighted: about 0.93 D. The tuner never learns
+   that 68 MiB of its last commit were unusable; it only sees a smaller
+   request.
+4. **The unused part.** Even: D − H = 68 MiB was committed and is not
+   requested. It is not parked for the data cache: `balance()` rebuilds
+   every grant from zero each round, so at the age priorities the data
+   cache is granted its 60 MiB and nothing more. The 68 MiB stay in
+   `mem_avail` and are consumed by the other caches' older bins as the
+   priorities descend; only what survives to `LAST` is split by the
+   ratios, 36 % of it back to data. In this OSD nothing survived: meta
+   wanted 390 MiB more than it got, so the leftover at `LAST` was zero,
+   and the 68 MiB funded meta's and kv_onode's old bins instead. Weighted:
+   D − H is the floors, about D/15 (21 to 30 MiB in §17.6), and the other
+   caches do not get the rest.
+5. **D next round.** The commit is the request plus the headroom: D' =
+   `get_chunk`(H + leftover share) = H + 64 MiB, rounded up to a chunk,
+   with a leftover share of zero here. Even: D' = (15/32)·D + 64 MiB. That
+   has a fixed point where the strand equals the headroom, (17/32)·D* =
+   64 MiB, so D* = 120 MiB, which the chunk rounding makes 128: (15/32) ×
+   128 + 64 = 124, rounded up, 128. It is also stable: above 128 the data
+   cache is committed less than it had, below it more. The 64 MiB headroom
+   exists to let a cache grow into a bigger working set; under the even
+   split it is spent entirely on the empty shards, and the cache is stuck
+   at 60 MiB with 1.5 GiB of hot data behind it. Weighted: D' = (1 −
+   17/256)·D + 64 MiB. The step is 64 MiB less the floors, 64 − 17·D/256:
+   52 MiB at D = 184, which the chunk rounding shows as 56 in §17.4. The
+   fixed point is where the floors equal the headroom, D* = 64 × 256/17 =
+   964 MiB, eight times the even one, because the floor is one eighth of
+   the even share. Without the floor there would be no fixed point at
+   all. This OSD never got near 964 MiB: the pool ran out first (§17.8).
+
+To `balance()`, the weighted data cache looks like a cache whose working
+set grows by 56 MiB every 5 s, and the tuner funds a growing working set
+by design; it cannot tell the two apart, and it is not meant to. With the
+even split the loop has a brake: what the empty shards strand is handed to
+the other caches every round, and meta and kv live on it. With the
+weighted split the brake is eight times weaker, and D grows every 5 s
+until the data working set is cached or memory runs out at some age
+priority (§6.2). That is the "asymptotic" adaptation and the "drain". Both
+are real. The rest of this section measures how far they go and what
+stops them.
 
 ### 17.2 The test
 
