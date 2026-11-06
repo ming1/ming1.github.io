@@ -353,7 +353,7 @@ The `O` (onode) column family has its own `binned_lru` block cache in the
 default [`bluestore_rocksdb_cfs`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L5407), so it joins as a fourth
 participant, `kv_onode`, with ratio
 [`bluestore_cache_kv_onode_ratio`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L5128) (0.04) and its own age bins
-(section 4.2).
+(section 4.4).
 
 ---
 
@@ -613,16 +613,50 @@ otherwise at their next insert.
 
 ## 4. Age bins
 
-### 4.1 What a counter is
+Age binning is one commit:
+[`5635183`](https://github.com/ceph/ceph/commit/5635183833727b09a645399dd098bc3118ddd4ba)
+"common/PriorityCache: Implement Cache Age Binning" by Mark Nelson, written
+in October 2020 and merged through
+[PR #43299](https://github.com/ceph/ceph/pull/43299) into Quincy (v17.1.0).
+It touches ten files for about 500 lines. This section reads that commit:
+what an age bin is (4.1), why it was needed (4.2), how the commit builds it
+(4.3) and the knobs it added (4.4). Line references are to v21.3.0; where
+the code moved since, the text says so.
 
-Each cache keeps a ring of byte counters ([`age_bins`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1530)),
-**one per interval** ([`bluestore_cache_age_bin_interval`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L5180), 1 s). `c[i]` holds the bytes of entries
-last added or moved to the head of their list about *i* intervals ago. The ring
-is as long as the largest bin bound: **720 counters** (12 minutes) with
-defaults.
+### 4.1 What an age bin is
+
+An age bin is a **one-second bucket**. Every cached entry belongs to the
+bucket of the second in which it was last inserted or touched. The bucket does not hold the entries; it holds one number: how many
+bytes (for the onode cache, how many onodes) currently belong to it. A cache
+can then answer "how much of me was last used 2 to 6 seconds ago" by adding
+four numbers, without walking any list.
+
+```
+time ─────────────────────────────────────────────────────────────►  now
+          │ bin 719 │  ...  │ bin 3 │ bin 2 │ bin 1 │ bin 0 │
+age       │ ~12 min │       │ 3-4 s │ 2-3 s │ 1-2 s │ < 1 s │   of last touch
+bytes     │  3 MB   │       │ 12 MB │  1 MB │  8 MB │ 20 MB │
+          └─────────┴───────┴───────┴───────┴───────┴───────┘
+      falls off ◄──                                   ◄── new empty bin
+      once a second                                       pushed once a second
+
+  entry inserted or touched   → leaves its old bin, joins bin 0
+  entry evicted or resized    → its bin's number changes
+  bin falls off the ring      → the bytes in it stop being counted anywhere
+```
+
+The ring is a `boost::circular_buffer` of counters
+([`age_bins`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1530)),
+one per
+[`bluestore_cache_age_bin_interval`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L5180)
+(1 s), as long as the largest bin bound: **720 counters** (12 minutes) with
+defaults. Each entry keeps a `shared_ptr` to its counter
+([`Onode::cache_age_bin`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1408),
+[`Buffer::cache_age_bin`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L364),
+[`BinnedLRUHandle::age_bin`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/BinnedLRUCache.h#L60)).
 
 ```cpp
-boost::circular_buffer<std::shared_ptr<int64_t>> age_bins;   // c0 = age_bins[0]
+boost::circular_buffer<std::shared_ptr<int64_t>> age_bins;   // bin 0 = age_bins[0]
 
 // insert, or move to head:
 entry->age_bin = age_bins.front(); *entry->age_bin += entry->bytes;
@@ -634,18 +668,203 @@ age_bins.push_front(make_shared<int64_t>(0));   // oldest counter falls off
 sum(age_bins[start .. end))
 ```
 
-[`shift_bins()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1576), [`sum_bins()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1588),
-[`MempoolCache::request_cache_bytes()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2618). The onode cache counts
-onodes, and [`MetaCache::_sum_bins()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2746) multiplies by
-`get_bytes_per_onode()`.
+[`shift_bins()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1576),
+[`sum_bins()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1588).
 
 ![Ring of per-interval counters, entries pointing at their counter, and the mapping to PRI1 through LAST]({{ '/assets/images/ceph-prioritycache/age-bins-ring.svg' | relative_url }})
 
-The `shared_ptr` matters: when a counter falls off the ring, entries still hold
-it, so their bytes simply stop being counted in any window. That is how old
-entries end up in `LAST` without anyone walking the cache.
+The `shared_ptr` is the trick. When a counter falls off the ring, the entries
+that point at it keep it alive, so their bytes simply stop being inside any
+window. No entry carries a timestamp and nothing walks the cache; "older than
+12 minutes" is whatever `_get_used_bytes()` has that the ring does not.
 
-### 4.2 All bins
+### 4.2 Motivation
+
+**Before the commit, age did not exist for the Manager.** The onode and
+buffer caches reported all of their bytes at PRI1, and the RocksDB cache
+everything outside its high-priority pool; the comment the commit deletes
+from `MempoolCache` says it plainly: *"All cache items are currently shoved
+into the PRI1 priority"*.
+With one level there is nothing to prioritise, so `balance()` could only
+split the total by the fixed ratios `bluestore_cache_meta_ratio` /
+`kv_ratio` / `data_ratio`:
+
+```
+before 5635183                           after 5635183
+──────────────────────────────           ──────────────────────────────────────
+cache → Manager:                         cache → Manager:
+  "PRI1: everything I hold"                "PRI1: 20 MB   (touched < 1 s ago)
+                                            PRI2:  8 MB   (1-2 s)
+                                            PRI3: 13 MB   (2-6 s)
+                                            ...
+                                            LAST: everything older than 12 min"
+
+Manager:                                 Manager:
+  split PRI1 by ratio                      fill PRI1 of every cache, then PRI2
+  meta .45 / kv .45 / kv_onode .04 / rest  of every cache, ...; the ratio only
+                                           breaks the tie at the level that
+                                           does not fit (§5)
+```
+
+**The problem a fixed ratio has.** Each cache keeps its own LRU, but nothing
+compares the tail of the onode cache with the tail of the buffer cache. After
+a workload shift the ratio keeps cold bytes in one cache while evicting hot
+bytes from the other:
+
+![Fixed 50/50 split evicts hot onodes and keeps cold data; age bins keep the hot onodes]({{ '/assets/images/ceph-prioritycache/fixed-vs-age-bins.svg' | relative_url }})
+
+Operators tuned `bluestore_cache_meta_ratio` by hand, and onode misses were a
+common performance complaint. The option text the commit adds states the
+goal: group entries by when they were last used so that *"Ceph's priority
+cache balancing code can make better decisions about which caches should
+receive priority based on the relative ages of items in the caches"*.
+
+**Why age is the right currency:**
+
+- It **simulates one global LRU without merging caches**: memory goes first to
+  the most recently used bytes, whichever cache holds them. Each cache keeps its
+  own lists and locks.
+- **Recency predicts hits** under LRU-like access, so allocating by recency
+  approximately maximises total hit rate without measuring miss-ratio curves.
+- It is **cache-agnostic**: any cache that can report bytes per age window can
+  join. RocksDB's block cache, a foreign LRU, joined with the same commit.
+
+**Why bins, not timestamps:**
+
+| Operation | Cost |
+|---|---|
+| Insert or touch | O(1): point at newest counter, adjust two counters |
+| Time passes | O(1): push one counter, drop the oldest |
+| Manager query | O(number of priority levels) |
+
+Bins are 1 s apart while rebalancing runs every 5 s, so finer timing would
+not change decisions.
+
+### 4.3 Design approach: what the commit adds
+
+The commit changes four layers; the two other `PriCache` users get no-op stubs:
+
+```
+ PriCache interface  +shift_bins() +import_bins() +set_bins() +get_bins()     PriorityCache.h
+ Manager             +shift_bins(): fan out to every registered cache          PriorityCache.cc
+        ▲                                   ▲
+        │                                   │ every bin interval (1 s), from MempoolThread
+ ┌──────┴────────────────┬──────────────────┴──────┐
+ │ MempoolCache          │ ShardedCache            │ OSDMemCache, rbd-mirror PriCache:
+ │  bins[LAST+1]         │  bins[LAST+1]           │ four empty stubs, get_bins() = 0
+ │  request_cache_bytes  │  (BinnedLRUCache:       │ (unchanged behaviour)
+ │  rewritten per window │   request rewritten)    │
+ └──────────┬────────────┴───────────┬─────────────┘
+            ▼                        ▼
+ CacheShard (onode, buffer)     BinnedLRUCacheShard          one ring per shard,
+   age_bins ring                  age_bins ring              under the shard's own lock
+   +shift_bins +sum_bins          +shift_bins +sum_bins
+   +get/set_bin_count             +get/set_bin_count
+            ▲                        ▲
+ Onode::cache_age_bin           BinnedLRUHandle::age_bin     entry → its counter
+ Buffer::cache_age_bin
+```
+
+**1. Interface.** Four pure virtuals on
+[`PriCache`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/PriorityCache.h#L106)
+and a
+[`Manager::shift_bins()`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/PriorityCache.cc#L324)
+that forwards to each cache. The Manager does not know what a bin is; it only
+rotates them on request. Caches that do not age (the monitor's OSDMap caches,
+rbd-mirror's journal budgets) implement the four as no-ops and keep working
+as before.
+
+**2. Per-shard ring.** Every
+[`CacheShard`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1520)
+and every
+[`BinnedLRUCacheShard`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/BinnedLRUCache.h#L374)
+gets its own ring, guarded by the lock the shard already has. The constructor
+pushes the first counter; `set_bin_count()` sets the capacity to the largest
+bin bound; `sum_bins(start, end)` adds a window under the lock. The
+`PriCache` adapters fan out over their shard arrays and add the results.
+
+**3. Hooks in every cache.** Each place where an entry enters, leaves, moves
+to the head of its list, or changes size now also updates a counter. The
+table lists the commit's hooks:
+
+| Cache | Counter unit | Hooks |
+|---|---|---|
+| [`LruOnodeCacheShard`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1093) | onodes | `_add` +1 at bin 0, `_rm` −1, `_pin` −1 (a pinned onode leaves the ring), `_unpin` +1 at bin 0, `_trim_to` −1 |
+| [`LruBufferCacheShard`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1235) | bytes | `_add`, `_rm`, `_adjust_size` (±delta), `_touch` (move to bin 0), `_trim_to` |
+| [`TwoQBufferCacheShard`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1343) | bytes | same plus `_move`; only buffers with data count, so `warm_out` ghosts (§2.4) never enter a bin |
+| [`BinnedLRUCacheShard`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/BinnedLRUCache.cc#L224) | charge | `LRU_Insert` / `LRU_Remove` for low-priority blocks only; `MaintainPoolSize` adds a block to its bin when it is demoted out of the high-priority pool |
+
+Index and filter blocks are binned only while outside the high-priority
+pool: after demotion, or when inserted while the pool ratio is still 0.
+Inside the pool they are PRI0.
+
+v21.3.0 replaced `_pin`/`_unpin` with lazy pinning (§2.2): `_trim_to()` unlinks (−1) and
+[`maybe_unpin()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1129)
+links (+1 at bin 0) or re-bins an already linked onode on release.
+
+**4. `request_cache_bytes()` rewritten.** The one-level answer becomes a
+per-window answer. Shown for
+[`MempoolCache`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2618);
+[`BinnedLRUCache`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/BinnedLRUCache.cc#L764)
+is the same with the high-priority pool subtracted:
+
+```cpp
+// before                               // after
+switch (pri) {                          switch (pri) {
+case PRI1:                              case PRI0:  break;             // nothing
+  request = _get_used_bytes();          case LAST:
+  break;                                  request = _get_used_bytes()
+default:                                          - _sum_bins(0, get_bin_count());
+  break;                                  break;
+}                                       default:   // PRI1 .. PRI10
+                                          request = _sum_bins(get_bins(pri-1), get_bins(pri));
+                                        }
+                                        return request > assigned ? request - assigned : 0;
+// PRI0 (and, before, every level but PRI1) falls through to return -EOPNOTSUPP
+```
+
+`LAST` is "used minus everything the ring still sees": the bytes whose
+counter fell off the ring, and for meta also the pinned onodes, which sit in
+no bin (§2.2). For the meta cache the ring counts onodes, so `_sum_bins()`
+multiplies by the average bytes per onode (§3.2).
+Two side changes in the RocksDB cache: PRI0 is now requested as a whole chunk
+so the high-priority pool can grow independently of the binned LRU below it,
+and a "+10 % of reserved bytes" fudge in `commit_cache_size()` is dropped.
+
+**5. Rotation and configuration.**
+[`MempoolThread::entry()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L5610)
+gains one more timer beside balance and resize. Once per bin interval it
+re-imports the four bin lists and calls `pcm->shift_bins()`:
+
+```
+every 50 ms tick of MempoolThread
+  ├─ bin rotation due (1 s)?   import_bins(kv, kv_onode, meta, data); pcm->shift_bins()   ← new
+  ├─ balance due (5 s)?        set ratios; pcm->balance()
+  ├─ resize due (1 s)?         pcm->tune_memory()
+  └─ _resize_shards()
+```
+
+Five options are added: the interval and one 10-element list per cache
+(4.4). [`_set_cache_sizes()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L6155)
+parses the lists once at mount; a short list leaves the remaining priorities
+at 0. The per-interval re-import therefore always imports the same vectors.
+A runtime change is never picked up: the commit registers the tracked keys as
+[`bluestore_cache_kv_age_bins`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L5902)
+and so on, while the options are named `bluestore_cache_age_bins_kv`, and
+`handle_conf_change()` has no branch for them anyway. Still so in v21.3.0.
+
+**Design choices and why:**
+
+| Choice | Why |
+|---|---|
+| A counter per bin, a `shared_ptr` per entry | No timestamp per entry and no cache walk; expiry is free (4.1). |
+| One ring per shard, under the shard lock | No new lock on the hot path. `sum_bins()` takes each shard lock briefly, once per priority level and water-fill round of `balance()`. |
+| Onode ring counts entries, buffer rings count bytes | The onode shard already counts entries; bytes per onode vary with blob and extent size, so the average is applied once at request time. |
+| Bin bounds as end indexes, ten slots | Maps directly onto PRI1–PRI10; a 0 disables a level; ring capacity = largest bound, one pointer per second. |
+| Bin interval (1 s) separate from balance interval (5 s) | Window resolution without more balancing work. |
+| High-priority RocksDB blocks outside the ring | Index and filter blocks keep their own pool at PRI0; a demoted block joins the ring at that moment. |
+
+### 4.4 Bin lists and defaults
 
 Defaults for `kv`, `meta` and `data`: `1 2 6 24 120 720 0 0 0 0`
 ([options](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L5199)), 1 s interval:
@@ -670,45 +889,11 @@ ring, so onode KV blocks are served after every other cache's windows and
 before `LAST`. Window length scales with the interval: at 2 s, the same 720
 counters cover 24 minutes.
 
-### 4.3 Why age bins
-
-**The problem.** Each cache has its own LRU order, but nothing compares the
-tail of the onode cache with the tail of the buffer cache. A fixed ratio
-ignores age, so after a workload shift it keeps cold bytes in one cache while
-evicting hot bytes from another:
-
-![Fixed 50/50 split evicts hot onodes and keeps cold data; age bins keep the hot onodes]({{ '/assets/images/ceph-prioritycache/fixed-vs-age-bins.svg' | relative_url }})
-
-Before age binning (added in **Quincy**), operators tuned
-`bluestore_cache_meta_ratio` by hand and onode misses were a common
-performance problem.
-
-**Why age is the right currency:**
-
-- It **simulates one global LRU without merging caches**: memory goes first to
-  the most recently used bytes, whichever cache holds them. Each cache keeps its
-  own lists and locks.
-- **Recency predicts hits** under LRU-like access, so allocating by recency
-  approximately maximizes total hit rate without measuring miss-ratio curves.
-- It is **cache-agnostic**: any cache that can report bytes per age window can
-  join.
-
-**Why bins, not timestamps:**
-
-| Operation | Cost |
-|---|---|
-| Insert or touch | O(1): point at newest counter, adjust two counters |
-| Time passes | O(1): push one counter, drop the oldest |
-| Manager query | O(number of priority levels) |
-
-Bins are 1 s apart while rebalancing runs every 5 s, so finer timing wouldn't
-change decisions.
-
 **Why growing windows (1, 2, 6, 24, 120, 720 s):** 1 s vs 2 s says a lot about
 the hot working set; 300 s vs 310 s says nothing. Log-like windows give fine
 resolution where it matters and cover 12 minutes with few levels.
 
-**Why per-cache bins:** misses cost differently.
+**Why per-cache lists:** misses cost differently.
 
 | Miss in | Cost |
 |---|---|
@@ -873,9 +1058,9 @@ def balance(mgr):
 def mempool_thread(mgr):
     while running:
         now = clock()
-        if due(now, "resize", 1.0):  mgr.tune_memory()
         if due(now, "bins", 1.0):    [c.shift_bins() for c in mgr.caches]
         if due(now, "balance", 5.0): balance(mgr)
+        if due(now, "resize", 1.0):  mgr.tune_memory()
         sleep(min_interval)
 ```
 
