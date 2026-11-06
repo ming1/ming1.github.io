@@ -438,15 +438,14 @@ PriorityCache::Manager
 
 | Implementation | Where | Meters | `request_cache_bytes(pri)` | `commit_cache_size()` |
 |---|---|---|---|---|
-| [`MetaCache`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2720), [`DataCache`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2767) (base [`MempoolCache`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2606)) | OSD | mempool bytes / buffer bytes, age bins per shard | PRI0: `-EOPNOTSUPP` (treated as 0). PRI1–10: bytes in the bin window `[bins(pri-1), bins(pri))`. LAST: used − all binned | Rounds the sum to a chunk and stores it; the limit is applied later by `_resize_shards()` (3.6) |
+| [`MetaCache`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2720), [`DataCache`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2767) (base [`MempoolCache`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2606)) | OSD | mempool bytes / buffer bytes, age bins per shard | PRI0: none. PRI1–10: one age window each. `LAST`: the remainder (3.2.1) | Rounds the sum to a chunk and stores it; the limit is applied later by `_resize_shards()` (3.6) |
 | [`BinnedLRUCache`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/BinnedLRUCache.h#L377) (base [`ShardedCache`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/ShardedCache.h#L63)) | OSD, MON | RocksDB `GetUsage()`, high-priority pool usage, age bins per shard | PRI0: high-pri pool (index/filter blocks), chunk-rounded. PRI1–10: bin window. LAST: usage − high-pri − binned | **Enforces itself**: `SetCapacity(new)` and `SetHighPriPoolRatio(PRI0 / new)` |
 | [`IncCache`](https://github.com/ceph/ceph/blob/v21.3.0/src/mon/OSDMonitor.cc#L240), [`FullCache`](https://github.com/ceph/ceph/blob/v21.3.0/src/mon/OSDMonitor.cc#L256) (base [`OSDMemCache`](https://github.com/ceph/ceph/blob/v21.3.0/src/mon/OSDMonitor.cc#L166)) | MON | `get_bytes()` of one `osdmap_cache_t` | PRI1: all used bytes. Every other priority: `-EOPNOTSUPP` (treated as 0). No bins | Stores the chunk-rounded sum; `tick()` applies it with `set_bytes()` |
 | [`rbd::mirror::PriCache`](https://github.com/ceph/ceph/blob/v21.3.0/src/tools/rbd_mirror/Mirror.cc#L129) | rbd-mirror | nothing: a fixed `min`/`max` claim | `min` at a sliding base priority (starts PRI10, moves toward PRI0); `max − min` at PRI10 | Never called: the `Manager` only commits caches registered with perf counters. `run_cache_manager()` reads `get_cache_bytes()` and passes it to `handle_cache_rebalanced()` |
 
-**BlueStore** keeps the bin protocol of §4 and §5 in
-[`MempoolCache::request_cache_bytes()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2618)
-and the measurement in two pure virtuals that each leaf fans out over its own
-shard array:
+**BlueStore** keeps the request logic in the base class (3.2.1) and the
+measurement in two pure virtuals that each leaf fans out over its own shard
+array:
 
 | | [`MetaCache`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2720) | [`DataCache`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2767) |
 |---|---|---|
@@ -503,6 +502,64 @@ cache may answer `request_cache_bytes()` with a measurement, a fixed claim, or
 anything in between, and `balance()` treats them alike. And "commit" is a
 contract about a number, not an action: three of the four implementations
 leave enforcement to a caller that runs after `balance()`.
+
+#### 3.2.1 `MempoolCache`: from measurement to request
+
+The whole conversation between a BlueStore cache and the `Manager` is two
+measurements, one ledger, and `request_cache_bytes()`, which turns the first
+into a request by subtracting the second.
+
+```
+measured by the cache (leaf-specific)        written by the Manager (base class)
+──────────────────────────────────────       ───────────────────────────────────
+_get_used_bytes()      total footprint now    cache_bytes[PRI0..LAST]  grants in this
+_sum_bins(start, end)  bytes last touched                              balance() pass
+                       start..end intervals   get_cache_bytes(pri)     read one slot
+                       (1 s each) ago
+                                              get_cache_bytes()        sum of all slots
+```
+
+`cache_bytes[]` is a ledger the cache never writes. `balance()` zeroes the
+slot at the start of each priority level, then `add_cache_bytes()` adds each
+grant of that level's water-fill rounds (3.5). At `LAST` the slot is then
+overwritten with the cache's ratio share of whatever is left
+([`set_cache_bytes`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/PriorityCache.cc#L403)),
+so the `LAST` request only decides how much of the leftover is eaten before
+that split. `get_cache_bytes(pri)` is "what I hold at this level", and the
+no-argument sum is what `commit_cache_size()` rounds up to a chunk.
+
+[`request_cache_bytes()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2618)
+is asked once per cache, per level, per round, and must answer with a delta:
+
+```cpp
+int64_t assigned = get_cache_bytes(pri);              // granted so far at this level
+int64_t request;
+switch (pri) {
+case PRI0:  return -EOPNOTSUPP;                       // no "always keep" class
+case LAST:  request = _get_used_bytes() - _sum_bins(0, get_bin_count()); break;
+default:    request = _sum_bins(get_bins(pri - 1), get_bins(pri));       break;  // PRI1..PRI10
+}
+return request > assigned ? request - assigned : 0;
+```
+
+With the default bins `1 2 6 24 120 720`:
+
+```
+PRI1   _sum_bins(0, 1)       touched < 1 s ago
+PRI2   _sum_bins(1, 2)       1-2 s
+PRI3   _sum_bins(2, 6)       2-6 s           ... PRI6  _sum_bins(120, 720)
+PRI7-10  bound 0             empty window -> 0
+LAST   used - _sum_bins(0, 720)   whatever no ring slot counts: expired bytes,
+                                  pinned onodes, the bytes-per-onode error
+```
+
+Two things are new here. `LAST` is not a window but a remainder, served
+after every cache's every other level and then replaced by the ratio split
+above; the bytes its water-fill took from the pool are not re-granted, which
+is
+[tracker #82836]({{ site.baseurl }}/storage/ceph-tracker-notes#14-prioritycache--memory-granted-at-the-last-priority-is-taken-from-the-pool-but-credited-to-no-cache).
+And `-EOPNOTSUPP` at PRI0 says "this cache has no PRI0 class"; the RocksDB
+cache, which does, returns a real number there.
 
 ### 3.3 Control loop
 
@@ -584,7 +641,7 @@ void Manager::balance_priority(int64_t *mem_avail, Priority pri) {
     *mem_avail -= assigned; cur_ratios = new_ratios;
   }
   if (pri == LAST)                         // leftover goes out by ratio
-    for (auto& c : caches) c.second->add_cache_bytes(LAST, *mem_avail * c.second->get_cache_ratio());
+    for (auto& c : caches) c.second->set_cache_bytes(LAST, *mem_avail * c.second->get_cache_ratio());  // overwrites the LAST water-fill
 }
 ```
 
@@ -802,31 +859,18 @@ v21.3.0 replaced `_pin`/`_unpin` with lazy pinning (§2.2): `_trim_to()` unlinks
 [`maybe_unpin()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1129)
 links (+1 at bin 0) or re-bins an already linked onode on release.
 
-**4. `request_cache_bytes()` rewritten.** The one-level answer becomes a
-per-window answer. Shown for
-[`MempoolCache`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2618);
-[`BinnedLRUCache`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/BinnedLRUCache.cc#L764)
-is the same with the high-priority pool subtracted:
+**4. `request_cache_bytes()` rewritten.** The one-level answer becomes the
+per-window answer of 3.2.1. Before the commit the whole switch was:
 
 ```cpp
-// before                               // after
-switch (pri) {                          switch (pri) {
-case PRI1:                              case PRI0:  break;             // nothing
-  request = _get_used_bytes();          case LAST:
-  break;                                  request = _get_used_bytes()
-default:                                          - _sum_bins(0, get_bin_count());
-  break;                                  break;
-}                                       default:   // PRI1 .. PRI10
-                                          request = _sum_bins(get_bins(pri-1), get_bins(pri));
-                                        }
-                                        return request > assigned ? request - assigned : 0;
-// PRI0 (and, before, every level but PRI1) falls through to return -EOPNOTSUPP
+switch (pri) {
+case PRI1: request = _get_used_bytes(); break;   // everything, at one level
+default:   break;                                // every other level: -EOPNOTSUPP
+}
 ```
 
-`LAST` is "used minus everything the ring still sees": the bytes whose
-counter fell off the ring, and for meta also the pinned onodes, which sit in
-no bin (§2.2). For the meta cache the ring counts onodes, so `_sum_bins()`
-multiplies by the average bytes per onode (§3.2).
+[`BinnedLRUCache`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/BinnedLRUCache.cc#L764)
+gets the same rewrite with the high-priority pool subtracted.
 Two side changes in the RocksDB cache: PRI0 is now requested as a whole chunk
 so the high-priority pool can grow independently of the binned LRU below it,
 and a "+10 % of reserved bytes" fudge in `commit_cache_size()` is dropped.
