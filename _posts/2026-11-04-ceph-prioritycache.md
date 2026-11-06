@@ -398,7 +398,113 @@ if (store->cache_autotune && binned_kv_cache != nullptr) {
 adapters are [`MempoolCache`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2606) with
 [`MetaCache`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2720) and [`DataCache`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2767).
 
-### 3.2 Control loop
+### 3.2 Who implements `PriCache`
+
+[`PriCache`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/PriorityCache.h#L66)
+has four concrete families in v21.3.0. Three of them go through an abstract
+middle class that owns the per-priority bookkeeping (`cache_bytes[]`,
+`cache_ratio`, the bins where used) and leaves only "how many bytes do I use"
+to the leaf:
+
+```
+PriorityCache::PriCache                                  src/common/PriorityCache.h
+├─ BlueStore::MempoolThread::MempoolCache                src/os/bluestore/BlueStore.h
+│   ├─ MetaCache
+│   └─ DataCache
+├─ rocksdb_cache::ShardedCache   (also a rocksdb::Cache) src/kv/rocksdb_cache/ShardedCache.h
+│   └─ BinnedLRUCache
+├─ OSDMemCache                   (anonymous namespace)   src/mon/OSDMonitor.cc
+│   ├─ IncCache
+│   └─ FullCache
+└─ rbd::mirror::PriCache                                 src/tools/rbd_mirror/Mirror.cc
+```
+
+They are registered under three `Manager` instances in three daemons:
+
+```
+PriorityCache::Manager
+├─ ceph-osd   "bluestore-pricache"   BlueStore::MempoolThread   (3.3)
+│   ├─ kv        BinnedLRUCache   RocksDB block cache, default column family
+│   ├─ kv_onode  BinnedLRUCache   RocksDB block cache, "O" column family (if split)
+│   ├─ meta      MetaCache        onode / blob / extent / shared-blob mempools
+│   └─ data      DataCache        BlueStore buffer cache
+├─ ceph-mon   OSDMonitor::pcm        mon_memory_autotune
+│   ├─ kv        BinnedLRUCache   MonitorDBStore's RocksDB block cache
+│   ├─ inc       IncCache         incremental OSDMaps  (inc_osd_cache)
+│   └─ full      FullCache        full OSDMaps         (full_osd_cache)
+└─ rbd-mirror CacheManagerHandler    rbd_mirror_memory_autotune
+    └─ JournalPlayer/<pool>/<prefix>  PriCache   one per replayed journal
+```
+
+| Implementation | Where | Meters | `request_cache_bytes(pri)` | `commit_cache_size()` |
+|---|---|---|---|---|
+| [`MetaCache`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2720), [`DataCache`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2767) (base [`MempoolCache`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2606)) | OSD | mempool bytes / buffer bytes, age bins per shard | PRI0: `-EOPNOTSUPP` (treated as 0). PRI1–10: bytes in the bin window `[bins(pri-1), bins(pri))`. LAST: used − all binned | Rounds the sum to a chunk and stores it; the limit is applied later by `_resize_shards()` (3.6) |
+| [`BinnedLRUCache`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/BinnedLRUCache.h#L377) (base [`ShardedCache`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/ShardedCache.h#L63)) | OSD, MON | RocksDB `GetUsage()`, high-priority pool usage, age bins per shard | PRI0: high-pri pool (index/filter blocks), chunk-rounded. PRI1–10: bin window. LAST: usage − high-pri − binned | **Enforces itself**: `SetCapacity(new)` and `SetHighPriPoolRatio(PRI0 / new)` |
+| [`IncCache`](https://github.com/ceph/ceph/blob/v21.3.0/src/mon/OSDMonitor.cc#L240), [`FullCache`](https://github.com/ceph/ceph/blob/v21.3.0/src/mon/OSDMonitor.cc#L256) (base [`OSDMemCache`](https://github.com/ceph/ceph/blob/v21.3.0/src/mon/OSDMonitor.cc#L166)) | MON | `get_bytes()` of one `osdmap_cache_t` | PRI1: all used bytes. Every other priority: `-EOPNOTSUPP` (treated as 0). No bins | Stores the chunk-rounded sum; `tick()` applies it with `set_bytes()` |
+| [`rbd::mirror::PriCache`](https://github.com/ceph/ceph/blob/v21.3.0/src/tools/rbd_mirror/Mirror.cc#L129) | rbd-mirror | nothing: a fixed `min`/`max` claim | `min` at a sliding base priority (starts PRI10, moves toward PRI0); `max − min` at PRI10 | Never called: the `Manager` only commits caches registered with perf counters. `run_cache_manager()` reads `get_cache_bytes()` and passes it to `handle_cache_rebalanced()` |
+
+**BlueStore** keeps the bin protocol of §4 and §5 in
+[`MempoolCache::request_cache_bytes()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2618)
+and the measurement in two pure virtuals that each leaf fans out over its own
+shard array:
+
+| | [`MetaCache`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2720) | [`DataCache`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2767) |
+|---|---|---|
+| Shards | `onode_cache_shards` | `buffer_cache_shards` |
+| [`_get_used_bytes()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2731) | Sum of the `bluestore_cache_{onode,meta,other,buffer}` and `bluestore_{blob,extent,shared_blob,inline_bl}` mempools | Sum of each shard's [`_get_bytes()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1652) |
+| [`_sum_bins(start, end)`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2746) | Onode **count** in the window × [`get_bytes_per_onode()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2761) (= used bytes / onodes, min 2) | Buffer **bytes** in the window |
+| `shift_bins()`, `set_bin_count()` | Forwarded to every onode shard | Forwarded to every buffer shard |
+| Name | "BlueStore Meta Cache" | "BlueStore Data Cache" |
+
+So a blob or extent never has an age of its own: its bytes ride on the onode
+that owns it, through the average bytes-per-onode.
+
+**RocksDB** [`BinnedLRUCache::request_cache_bytes()`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/BinnedLRUCache.cc#L764)
+uses PRI0 for RocksDB's high-priority pool (index and filter blocks, inserted
+with `Cache::Priority::HIGH`), requested as a full chunk of the tuned total so
+the pool can grow independently of the LRU data below it.
+[`commit_cache_size()`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/BinnedLRUCache.cc#L803)
+then re-derives the high-priority ratio as `PRI0 bytes / new capacity`, so the
+pool's share tracks what `balance()` granted. The OSD gets this cache
+through [`RocksDBStore::get_priority_cache()`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/RocksDBStore.h#L531),
+the monitor through [`MonitorDBStore::get_priority_cache()`](https://github.com/ceph/ceph/blob/v21.3.0/src/mon/MonitorDBStore.h#L68);
+both hold the same object that RocksDB uses as its block cache.
+
+**Monitor** caches skip aging entirely:
+[`OSDMemCache::request_cache_bytes()`](https://github.com/ceph/ceph/blob/v21.3.0/src/mon/OSDMonitor.cc#L176)
+asks for its full usage at PRI1 (minus what that round already granted) and
+`shift_bins()` is empty, so `balance()` is a ratio split of
+`mon_memory_target` across three caches. The ratios are fixed by [`_set_cache_ratios()`](https://github.com/ceph/ceph/blob/v21.3.0/src/mon/OSDMonitor.cc#L1056):
+kv = `rocksdb_cache_size / mon_memory_target`, inc = full = half of the rest.
+[`register_cache_with_pcm()`](https://github.com/ceph/ceph/blob/v21.3.0/src/mon/OSDMonitor.cc#L1006)
+builds the `Manager` with the same `base + fragmentation` arithmetic as
+BlueStore, and every [`OSDMonitor::tick()`](https://github.com/ceph/ceph/blob/v21.3.0/src/mon/OSDMonitor.cc#L5157)
+runs `tune_memory()`, `balance()` and
+[`_set_new_cache_sizes()`](https://github.com/ceph/ceph/blob/v21.3.0/src/mon/OSDMonitor.cc#L5330).
+
+**rbd-mirror** uses the `Manager` as a fair-share allocator, not as a cache
+meter. Each `JournalPlayer` [registers](https://github.com/ceph/ceph/blob/v21.3.0/src/journal/JournalPlayer.cc#L86)
+one `PriCache` with `min = 32 KiB × splay_width` and
+`max = 2 × object size × splay_width`; the daemon-wide
+[`CacheManagerHandler`](https://github.com/ceph/ceph/blob/v21.3.0/src/tools/rbd_mirror/Mirror.cc#L358)
+owns the `Manager` (`reserve_extra = false`, perf counters off). After every
+`balance()`, [`run_cache_manager()`](https://github.com/ceph/ceph/blob/v21.3.0/src/tools/rbd_mirror/Mirror.cc#L436)
+hands the granted bytes to the player, which divides by `splay_width` and
+aligns down to 4 KiB for its per-object fetch size
+([`handle_cache_rebalanced()`](https://github.com/ceph/ceph/blob/v21.3.0/src/journal/JournalPlayer.cc#L827)),
+and calls
+[`prioritize()`](https://github.com/ceph/ceph/blob/v21.3.0/src/tools/rbd_mirror/Mirror.cc#L147),
+which moves the base priority one step toward PRI0. A journal that has been
+replaying longer therefore gets its minimum served earlier than a newcomer:
+seniority instead of recency.
+
+Two things follow from the table. The `Manager` never reads usage itself; a
+cache may answer `request_cache_bytes()` with a measurement, a fixed claim, or
+anything in between, and `balance()` treats them alike. And "commit" is a
+contract about a number, not an action: three of the four implementations
+leave enforcement to a caller that runs after `balance()`.
+
+### 3.3 Control loop
 
 BlueStore's [`MempoolThread`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2595) drives everything:
 
@@ -409,7 +515,7 @@ One tick of [`entry()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluesto
 (1 s), `balance()` if due (5 s), `tune_memory()` if due (1 s, tcmalloc only),
 then `_resize_shards()` unconditionally.
 
-### 3.3 `tune_memory()`: size the pie
+### 3.4 `tune_memory()`: size the pie
 
 ```cpp
 mapped   = heap_size - pageheap_unmapped_bytes;          // from tcmalloc
@@ -440,7 +546,7 @@ collapses toward `min_mem`, and RSS can stay above target: the Manager can't
 shrink PG logs or op buffers. Without tcmalloc this step is skipped and the
 total stays fixed.
 
-### 3.4 `balance()`: cut the pie
+### 3.5 `balance()`: cut the pie
 
 [`balance()`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/PriorityCache.cc#L275) subtracts a small reserve (one
 [`get_chunk()`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/PriorityCache.cc#L33) per cache), then walks priorities `PRI0 → LAST`,
@@ -490,7 +596,7 @@ Worked example: 100 MB at one level, v21.3.0 default ratios kv 0.45, meta
 Ratios only matter under contention: a cache that wants less than its share
 gets exactly that, and the rest flows to hungrier caches.
 
-### 3.5 Commit and enforce
+### 3.6 Commit and enforce
 
 | Cache | How the size takes effect |
 |---|---|
@@ -705,7 +811,7 @@ process: OSDs on one host don't share memory.
 ### 5.4 Pseudocode
 
 The cache side, the Manager's `balance()`, and the driver (`balance_priority`
-is in 3.4):
+is in 3.5):
 
 ```python
 PRI0, PRI1, ..., PRI10, LAST = range(12)
