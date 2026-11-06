@@ -5232,36 +5232,30 @@ natural default for flash, as it is in the kernel.
 ## 14. PriorityCache — memory granted at the last priority is taken from the pool but credited to no cache
 
 Found while reviewing [PR #73018](https://github.com/ceph/ceph/pull/73018)
-(tracker [#82021](https://tracker.ceph.com/issues/82021), the data-cache
-shard split), not from a bug report · affects Quincy v17.1.0 and every later release:
-the overwrite is from `75ed3b09cad` "common/PriorityCache: Implement a
-Cache Manager" (2019, Octopus) but was harmless until `56351838337`
-"common/PriorityCache: Implement Cache Age Binning" (2020-10-13, first in
-v17.1.0) made BlueStore and RocksDB ask at `LAST`; Octopus and Pacific
-carry the line but never hit it · every daemon that runs the autotuner is
-in the code path: OSD (BlueStore onode, buffer, RocksDB caches), mon,
-rbd-mirror · component
-OSD memory autotuner, `src/common/PriorityCache.cc` · fix: one hunk,
-`set_cache_bytes` → `add_cache_bytes` with a zero guard · Status: fix and
-unit test local on `wip-pricache-last-credit` (`e957d328a92`,
-`ac449d4b5be`), A/B-verified on a 4-OSD vstart, tracker and PR pending ·
-Code base: ceph/ceph main `c2158f46763` (v21.3.0-4869); every `file:line`
-below refers to it.
+(tracker [#82021](https://tracker.ceph.com/issues/82021)), not from a bug
+report · affects Quincy v17.1.0 and later: the overwriting line is from
+`75ed3b09cad` "common/PriorityCache: Implement a Cache Manager" (2019) but
+was harmless until `56351838337` "common/PriorityCache: Implement Cache Age
+Binning" (2020-10-13, first in v17.1.0) made BlueStore and RocksDB ask at
+`LAST` · component: the memory autotuner in `src/common/PriorityCache.cc`,
+used by OSD, mon and rbd-mirror · fix: one hunk, `set_cache_bytes` →
+`add_cache_bytes` with a zero guard · status: fix and unit test on
+`wip-pricache-last-credit` (`e957d328a92`, `ac449d4b5be`), A/B-verified on
+a 4-OSD vstart, tracker and PR pending · code base: ceph/ceph main
+`c2158f46763` (v21.3.0-4869); every `file:line` below refers to it.
 
 ### 14.1 The story in one view
 
-The autotuner serves each cache's request at the last priority, then
-overwrites that grant with the ratio split. The memory has left the pool,
-but no cache is allowed to use it. On an OSD with millions of onodes, 12 to
-18 % of the cache pool goes to nobody: the onode cache holds 545 MiB, is
-committed 368, and trims onodes toward a number that leaves out its own
-old content.
+At the last priority the autotuner first grants each cache what it asked
+for, then overwrites that grant with the ratio split. The memory has left
+the pool, but no cache may use it. On an OSD with millions of onodes, 12 to
+18 % of the pool goes to nobody.
 
 ```
       pool (mem_avail)                         meta cache, bytes[LAST]
       ------------------------------------     ------------------------------
- #1   age bins PRI1..PRI6 served, each
-      round: add_cache_bytes(pri, grant),
+ #1   PRI1..PRI10 (age bins), each round:
+      add_cache_bytes(pri, grant),
       mem_avail -= grant                       bins hold what is < 12 min old
  #2   LAST loop: meta asks 391 MiB for its
       content older than 12 min; 88 MiB left
@@ -5269,45 +5263,40 @@ old content.
       round 1: 62 MiB  -> mem_avail 0          bytes[LAST] += 62   -> 88
  #3   ratio split of what is left (0):
       set_cache_bytes(LAST, 0 * 0.30)          bytes[LAST]  = 0    <- erased
-      mem_avail stays 0: the 88 MiB are
-      charged to the pool and owned by none
- #4   commit = get_chunk(sum of bytes[]):
-      meta is trimmed to a commit without its
-      oldest content; the OSD maps 1546 of
-      its 2048 MiB target
+      mem_avail stays 0: 88 MiB charged to
+      the pool, owned by none
+ #4   commit = get_chunk(sum of bytes[]):      meta holds 545 MiB, is committed
+      the OSD maps 1546 of its 2048 MiB        368, trims onodes it was granted
  #5   fix: add_cache_bytes(LAST, share)        bytes[LAST] = 88 + share
 ```
 
-1. **Normal path (#1).** Each priority round adds the grant to the cache's
-   bytes for that priority and takes it from the pool. BlueStore asks by
-   age, and asks at `LAST` for everything older than its last age bin.
-2. **Where it breaks (#2–#3).** At `LAST` the loop adds the grants, then the
-   ratio split *sets* the `LAST` bytes to the share. The loop's grant is
-   erased. The pool was already charged.
-3. **Cost (#4).** The commit is the sum of the bytes, so the onode cache is
-   trimmed to a size that excludes its old content. With 2 M objects: 368
-   instead of 792 MiB, 371k instead of 510k onodes, 93 % instead of 99 %
-   hits, and the OSD stays 200 to 500 MiB under its target.
-4. **The gap.** Nothing checks that pool = reserve + sum of commits. The
-   Manager had no unit test. A small onode cache looks like a tuning choice.
-5. **Fix (#5).** Add the share on top of the grant. Skip the call when the
-   share is zero, because rbd-mirror's cache asserts on a priority it did
-   not ask at.
+1. **Normal path (#1).** Each round adds the grant to the cache's bytes
+   for that priority and takes it from the pool. BlueStore asks by age, and
+   at `LAST` for everything older than its last bin.
+2. **Where it breaks (#2–#3).** At `LAST` the loop adds the grants, then
+   the ratio split *sets* the `LAST` bytes to the share. The grant is
+   erased; the pool was already charged.
+3. **Cost (#4).** The commit is the sum of the bytes, so the onode cache
+   is trimmed to a size without its old content: 368 instead of 792 MiB,
+   371k instead of 510k onodes, 93 instead of 99 % hits, and the OSD stays
+   200 to 500 MiB under its target.
+4. **The gap.** Nothing checks pool = reserve + Σ commits, and the Manager
+   had no unit test. A small onode cache passes for a ratio choice.
+5. **Fix (#5).** Add the share on top of the grant. Skip a zero share,
+   because rbd-mirror's cache asserts on a priority it did not ask at.
 
-Proof: §14.2 shows the log of #2–#3 and the dump arithmetic of #4. §14.3
-walks the code. §14.4 is the fix and why it is safe. §14.5 is the A/B run
-and the unit test that fails on the parent.
+§14.2 shows the log of #2–#3 and the dump arithmetic of #4; §14.3 the
+code; §14.4 the fix and why it is safe; §14.5 the A/B run and the unit
+test that fails on the parent.
 
 ### 14.2 Report
 
 **How it was found.** PR #73018 v5 moved part of the data cache's request
 to `LAST`. On the tracker's hot-set test it then committed *less* than
-stock (584 vs 688 MiB) and lost IOPS, which a sound tuner cannot do. Every
-stock perf dump also had the four commits about 1 % short of the pool.
+stock (584 vs 688 MiB), which a sound tuner cannot do.
 
 **The log.** c28, osd.1, `debug_prioritycache = 10`, one balance at
-2026-11-05T06:22:48Z. Meta asks 391 MiB at `LAST`, 88 MiB are left, the loop
-hands them over in two rounds, then the split sets `LAST` to zero:
+2026-11-05T06:22:48Z:
 
 ```
 balance_priority(LAST):                              meta asked 391 MiB, 88 MiB left
@@ -5316,9 +5305,10 @@ balance_priority(LAST):                              meta asked 391 MiB, 88 MiB 
   split:         set_cache_bytes(LAST, 0 * 0.30 = 0)         <- the 88 MiB are gone
 ```
 
-**The dump.** `cache_bytes` minus the four grants should be the reserve
-the tuner holds back on purpose, `get_chunk(1, cache_bytes) * 4` = 288 MiB
-at a 1484 MiB pool. Anything above that is this bug:
+**The dump.** The pool minus the four grants should equal the reserve the
+tuner holds back on purpose: `get_chunk(1, cache_bytes) * 4` = 4 × 72 =
+288 MiB at a 1484 MiB pool (`get_chunk()` is usage + 64 MiB, rounded up to
+an 8 MiB unit). Anything above that is this bug:
 
 ```sh
 ceph daemon osd.N perf dump | jq '."bluestore-pricache".cache_bytes,
@@ -5337,50 +5327,36 @@ under 4K random reads, last dump of a 6-minute steady state (MiB):
 | osd.2 | 1484 | 1024 | 171 | 344 − 172 = 172 | 231k | 97 % |
 | osd.3 | 1484 | 992 | 204 | 409 − 204 = 205 | 276k | 92 % |
 
-"lost" is `cache_bytes − granted − 288`. The last column is the onode
-cache's `LAST` request, `_get_used_bytes() − Σbins`, from the
-`_resize_shards` log and the dump. The two match to the MiB on every OSD,
-and nobody else asks at `LAST` (c28 log: data, kv, kv_onode `wanted: 0`).
-On the tracker's hot-set test
-(300 onodes per OSD, little asked at `LAST`) it is 9 to 15 MiB, 0.6 to
-1.0 % of the pool. That is why the bug hides on small or young stores.
+"lost" is `cache_bytes − granted − 288`. The next column is the onode
+cache's `LAST` request, `_get_used_bytes() − Σbins` (from the
+`_resize_shards` log and the dump). The two match to the MiB on every OSD,
+and no other cache asks at `LAST` (data, kv, kv_onode log `wanted: 0`). On
+the hot-set test of #82021 (300 onodes per OSD) the loss is 9 to 15 MiB,
+under 1 % of the pool, which is why the bug hides on small or young stores.
 
 **Reproducer.** Any stock OSD: load enough small objects that the onode
 cache holds more than 12 minutes of content (2 M 4 KiB objects at a 2 GiB
-target did it), keep a read load on it for 15 minutes, run the `jq` line.
+target did it), read from it for 15 minutes, run the `jq` line.
 
 ### 14.3 Analysis
 
 ```
 OSD maps 1546 of 2048 MiB; onode cache 371k onodes at 93 % hits
- why?  meta holds 545 MiB but is committed 368: its age bins hold 272, it asks
-       for the other 273 at LAST, and that is the 272 the pool lost; its
-       pri11_bytes shows only the 24 MiB ratio share    [perf dump, tuner log]
+ why?  meta holds 545 MiB, committed 368: the bins hold 272, it asks 273 at LAST,
+       and 272 is what the pool lost; pri11_bytes shows only the 24 MiB ratio
+       share                                               [perf dump, tuner log]
  why?  balance_priority(LAST) runs the request loop (add_cache_bytes, :374/:381),
-       then the ratio split with set_cache_bytes(LAST, fair_share) (:403); set
-       replaces the loop's bytes, *mem_avail was already reduced (:390)   [code]
- why?  the split was written for a tuner where nobody asks at LAST: in 75ed3b09cad
-       BlueStore asked everything at PRI1 and RocksDB at PRI0/PRI1, so the set
-       overwrote nothing. 56351838337 (Cache Age Binning, v17.1.0) made both ask
-       at LAST for used - sum(bins) (BlueStore.h:1172-1175) and left the split
-       as it was; the two paths meet on every OSD with content older than
-       12 minutes                                           [git blame, git show]
- why unseen?  pool - sum(commits) is not a counter, no Manager unit test, and
-       a small onode cache passes for a ratio choice
+       then the ratio split set_cache_bytes(LAST, fair_share) (:403) replaces the
+       loop's bytes; *mem_avail was already reduced (:390)                  [code]
+ why?  the split was written when nobody asked at LAST: in 75ed3b09cad BlueStore
+       asked all at PRI1, RocksDB at PRI0/PRI1. 56351838337 (age binning, v17.1.0)
+       made both ask at LAST for used - sum(bins) (BlueStore.h:1172-1175) and left
+       the split as it was                                 [git blame, git show]
+ why unseen?  pool - sum(commits) is not a counter; no Manager unit test
 ```
 
-**Where the pool goes, one balance, osd.1 (MiB).** The only change between
-the columns is the one hunk of §14.4:
-
-| | stock | fixed |
-|---|---|---|
-| reserve held back on purpose | 288 | 288 |
-| granted and credited | 924 | 1196 |
-| granted and credited to nobody | **272** | 0 |
-| pool | 1484 | 1484 |
-
 **Why the RocksDB block cache shrinks too (288 → 184 MiB).** It is not
-squeezed. Its request was granted in full in both runs and its usage never
+squeezed: its request was granted in full in both runs and its usage never
 reached capacity. Two things changed:
 
 | kv (RocksDB block cache) | stock | fixed |
@@ -5388,12 +5364,12 @@ reached capacity. Two things changed:
 | PRI0 floor | 64 | 64 |
 | asked by age = bytes in use | 130 | 49 |
 | ratio share of the unspent remainder | 24 | 0 |
-| committed (grants + chunk headroom) | 288 | 184 |
+| committed (grants + 64 MiB chunk headroom, rounded) | 288 | 184 |
 | RocksDB lookups in the window | 74k | 16k |
 
 The larger onode cache stops most onode misses before RocksDB, so a fifth
-of the lookups reach it and the block cache has less to hold. The 24 MiB
-share is gone because meta now keeps what it asked for at `LAST`.
+of the lookups reach it. The 24 MiB share is gone because meta now keeps
+what it asked for at `LAST`.
 
 **Code references** (ceph/ceph `c2158f46763`):
 
@@ -5401,12 +5377,13 @@ share is gone because meta now keeps what it asked for at `LAST`.
 |---|---|
 | [`Manager::balance()`](https://github.com/ceph/ceph/blob/c2158f46763/src/common/PriorityCache.cc#L275-L296) | holds back `get_chunk(1, tuned_mem) * caches` (:281), then calls `balance_priority()` for PRI0..LAST (:292-:296) |
 | [`Manager::balance_priority()`](https://github.com/ceph/ceph/blob/c2158f46763/src/common/PriorityCache.cc#L332-L407) | the request loop (:348-:390) and, at LAST, the ratio split that overwrites it (:398-:406) |
+| [`get_chunk()`](https://github.com/ceph/ceph/blob/c2158f46763/src/common/PriorityCache.cc#L33-L67) | usage + 64 MiB rounded up to a unit of pool/256 (8 MiB here); sets the reserve and every cache's commit |
 | [`MempoolCache::request_cache_bytes()`](https://github.com/ceph/ceph/blob/c2158f46763/src/os/bluestore/BlueStore.h#L1162-L1190) | BlueStore's onode and buffer caches ask at LAST for `used − sum(bins)` (:1172-:1175) |
 | [rbd-mirror `PriCache::add_cache_bytes()`](https://github.com/ceph/ceph/blob/c2158f46763/src/tools/rbd_mirror/Mirror.cc#L214-L216) | asserts on any priority it did not ask at; its ratio is 0 (:139), so the fix must skip a zero share |
 
 ### 14.4 Proposed solution
 
-One hunk in `balance_priority()`; the loop's grants stay and the ratio
+One hunk in `balance_priority()`: the loop's grants stay and the ratio
 share is added on top. Patch with the unit test:
 [`pricache-last-credit.patch`]({{ site.baseurl }}/code/ceph/pricache-last-credit.patch).
 
@@ -5426,7 +5403,8 @@ share is added on top. Patch with the unit test:
        *mem_avail -= total_assigned;
 ```
 
-**Why it is safe.**
+**Why it is safe.** The ratios never applied to requested memory; they
+split what nobody asked for, and that split is unchanged.
 
 | Case | Before | After |
 |---|---|---|
@@ -5435,24 +5413,19 @@ share is added on top. Patch with the unit test:
 | several asked more than is left | loop splits the remainder by ratio, then erased | kept; the ratios still govern only the unrequested remainder |
 | ratio-0 cache with strict asserts (rbd-mirror) | `set_cache_bytes(LAST, 0)` has a `bytes == 0` escape | `add_cache_bytes()` has none, so the zero guard skips the call |
 
-The ratios keep their meaning. They never applied to requested memory;
-they split what nobody asked for, and that split is unchanged.
-
-**Alternatives rejected.** Stop BlueStore asking at `LAST`: throws away the
-old content on purpose and fixes the symptom in the wrong layer. Make every
+**Alternatives rejected.** Stop BlueStore asking at `LAST`: drops the old
+content on purpose and fixes the symptom in the wrong layer. Make every
 `PriCache` implementation tolerate the overwrite: four copies of a fix for
 one line.
 
-**Side effect to state in the PR.** The OSD now uses its target. A daemon
-that sat at 1546 MiB of 2048 goes to 1745. A cache that asks a lot at
-`LAST` keeps it, so the remainder the ratios split is smaller; the RocksDB
-block cache numbers above are the measured result. PR #73018 asks for the
+**Side effect to state in the PR.** The OSD now uses its target (osd.1:
+1546 → 1745 MiB mapped of 2048), and a cache that asks a lot at `LAST`
+leaves a smaller remainder for the ratios to split. PR #73018 asks for the
 data cache's surplus at `LAST` and depends on this fix to be credited.
 
 ### 14.5 Validation
 
-**A/B, same load, only this hunk changed.** 4-OSD vstart on NVMe, the
-setup of §14.2 (MiB):
+**A/B, same load, only this hunk changed.** The 4-OSD vstart of §14.2 (MiB):
 
 | OSD | lost, stock → fixed | meta committed / used | onodes | onode hit | mapped of 2048 |
 |---|---|---|---|---|---|
@@ -5464,14 +5437,13 @@ setup of §14.2 (MiB):
 "used" is the onode cache's mempool (`meta_used` in the `_resize_shards`
 log). On stock it sits above the commit on three OSDs: the trimmer chases
 a commit that leaves out content it does not age out. That is observed,
-not explained here. With the fix the commit covers the content and the
-cache keeps 30 to 80 % more onodes.
-
+not explained here. With the fix the cache keeps 30 to 80 % more onodes.
 The hot-set test of #82021 is unchanged (105k IOPS on both), as expected
 from a 1 % loss there.
 
 **Unit test.** `unittest_prioritycache` drives the real `Manager::balance()`
-with fake caches at a 1484 MiB pool and 0.36 / 0.30 / 0.30 / 0.04 ratios:
+with fake caches at a 1484 MiB pool and 0.36 / 0.30 / 0.30 / 0.04 ratios;
+every test also asserts pool − reserve = Σ grants:
 
 | Test | Parent | Fixed |
 |---|---|---|
@@ -5480,22 +5452,17 @@ with fake caches at a 1484 MiB pool and 0.36 / 0.30 / 0.30 / 0.04 ratios:
 | `requests_at_last_share_by_ratio` (two caches over-ask at LAST) | FAILED | OK |
 | `zero_ratio_cache_sees_no_grant_at_last` (rbd-mirror's shape) | OK | OK |
 
-Every test also asserts pool − reserve = sum of grants.
-
 ### 14.6 Takeaways
 
-- **Assert the accounting identity.** Pool = reserve + sum of commits is
-  one line in a test and would have caught this in 2020, when age binning
-  first made a cache ask at `LAST`.
-- **`set` after `add` in one pass is a smell.** Two steps that both write
-  the same bucket must compose; here the second silently undid the first.
+- **Assert the accounting identity.** Pool = reserve + Σ commits is one
+  line in a test and would have caught this in 2020.
+- **`set` after `add` on the same bucket is a smell.** Two writers in one
+  pass must compose; here the second silently undid the first.
 - **A commit is a grant, not demand.** Judge a cache by committed next to
   used. The RocksDB block cache looked squeezed and was not.
-- **A target the daemon never reaches is a signal.** 500 MiB of headroom
-  that nobody configured is a bug, not a safety margin.
-- **An impossible result in a dependent change points at the base.** v5 of
-  PR #73018 committed less than stock. A sound tuner cannot do that, and
-  following that thread found this.
+- **A target the daemon never reaches is a bug, not a safety margin.**
+- **An impossible result in a dependent change points at the base.** PR
+  #73018 v5 committed less than stock; following that found this.
 
 # Part III — Messenger and the cluster network
 
