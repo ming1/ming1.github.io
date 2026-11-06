@@ -5239,9 +5239,12 @@ was harmless until `56351838337` "common/PriorityCache: Implement Cache Age
 Binning" (2020-10-13, first in v17.1.0) made BlueStore and RocksDB ask at
 `LAST` · component: the memory autotuner in `src/common/PriorityCache.cc`,
 used by OSD, mon and rbd-mirror · fix: one hunk, `set_cache_bytes` →
-`add_cache_bytes` with a zero guard · status: fix and unit test on
-`wip-pricache-last-credit` (`e957d328a92`, `ac449d4b5be`), A/B-verified on
-a 4-OSD vstart, tracker and PR pending · code base: ceph/ceph main
+`add_cache_bytes` with a zero guard · status: tracker
+[#82836](https://tracker.ceph.com/issues/82836) filed 2026-11-05 with the
+fix and the unit test attached; fix
+[PR #73570](https://github.com/ceph/ceph/pull/73570) (one hunk, A/B-verified
+on a 4-OSD vstart; the unit test is kept out of the PR and lives in the
+patch linked in §14.4) · code base: ceph/ceph main
 `c2158f46763` (v21.3.0-4869); every `file:line` below refers to it.
 
 ### 14.1 The story in one view
@@ -5254,7 +5257,7 @@ the pool, but no cache may use it. On an OSD with millions of onodes, 12 to
 ```
       pool (mem_avail)                         meta cache, bytes[LAST]
       ------------------------------------     ------------------------------
- #1   PRI1..PRI10 (age bins), each round:
+ #1   PRI1..PRI6 (age bins, 0..720 s), per round:
       add_cache_bytes(pri, grant),
       mem_avail -= grant                       bins hold what is < 12 min old
  #2   LAST loop: meta asks 391 MiB for its
