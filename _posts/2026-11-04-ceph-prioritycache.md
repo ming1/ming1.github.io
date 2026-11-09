@@ -554,10 +554,10 @@ cache, which does, returns a real number there.
 `MempoolCache` only reads. Every bin count it sums is written, under the
 shard lock, by whichever thread holds the onode or buffer at that moment:
 the OSD op thread for lookups, reads and write staging, BlueStore's
-`kv_finalize` thread when a transaction finishes
+[`kv_finalize`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L15564) thread when a transaction finishes
 ([`_finish_write()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1933)
 and the transaction's last `put()`). The mempool thread never promotes or
-re-bins an entry; it only evicts from the tail (`set_max()` → `_trim_some()`,
+re-bins an entry; it only evicts from the tail ([`set_max()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1537) → [`_trim_some()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1557),
 3.3) and samples the rest.
 
 The LRU mechanics are in 2.2 and 2.3 and the per-hook bin updates in 4.3.
@@ -587,16 +587,16 @@ Code:
 Two timings matter for the request path of 3.2.1:
 
 - **Onodes are binned by their last release, not their current use.** A
-  newly loaded onode, or one `_trim_to()` unlinked while pinned, is in no
+  newly loaded onode, or one [`_trim_to()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1172) unlinked while pinned, is in no
   bin until its holder's last `put()`; a cache-hit onode keeps the bin of
-  its previous release until then. `_sum_bins()` therefore ages in-flight
+  its previous release until then. [`_sum_bins()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2616) therefore ages in-flight
   metadata by its last release, and the unbinned part surfaces in the
-  `LAST` remainder, because `_get_used_bytes()` counts the mempool bytes of
+  `LAST` remainder, because [`_get_used_bytes()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2731) counts the mempool bytes of
   every onode.
 - **Buffers are re-binned on the read itself, but written data counts late.**
-  A writing buffer is on no 2Q list and not in `buffer_bytes`, and the
-  `_discard()` inside `write()` frees the old clean bytes at once. So
-  `DataCache::_get_used_bytes()` dips on an overwrite and recovers only when
+  A writing buffer is on no 2Q list and not in [`buffer_bytes`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1635), and the
+  [`_discard()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1781) inside `write()` frees the old clean bytes at once. So
+  [`DataCache::_get_used_bytes()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2778) dips on an overwrite and recovers only when
   the transaction finishes, one transaction lifetime after the write.
 
 #### 3.2.3 `BinnedLRUCache`: request and commit
@@ -618,8 +618,8 @@ usage_                 both + pinned handles
 ```
 
 [`LRU_Insert()`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/BinnedLRUCache.cc#L224)
-runs on `Insert()` and again on every `Release()` of a hit, because
-`Lookup()` unlinks the block while it is referenced. Each time it puts a
+runs on [`Insert()`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/BinnedLRUCache.cc#L422) and again on every [`Release()`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/BinnedLRUCache.cc#L382) of a hit, because
+[`Lookup()`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/BinnedLRUCache.cc#L349) unlinks the block while it is referenced. Each time it puts a
 high-priority block in the pool if the ratio is non-zero, otherwise at the
 head of the low-priority region and in bin 0. That re-run is what makes
 "by last touch" true, and it lets a demoted block return to the pool on its
@@ -629,7 +629,7 @@ only demotes, adding the block's charge to its bin as it leaves the pool.
 High priority itself needs
 [`rocksdb_cache_index_and_filter_blocks_with_high_priority`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L3594)
 (default false), so by default no block qualifies and the pool stays empty,
-even though the ratio is non-zero after the first `balance()` (the 64 MiB
+even though the ratio is non-zero after the first [`balance()`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/PriorityCache.cc#L275) (the 64 MiB
 PRI0 headroom below, divided by the capacity).
 
 [`request_cache_bytes()`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/BinnedLRUCache.cc#L764)
@@ -665,7 +665,7 @@ return new_bytes;                                       // == get_committed_size
 Both calls take each shard's mutex in turn, on the thread that runs
 `balance()` (the mempool thread in the OSD). If the grant shrank below
 usage, blocks are evicted right there, not a moment later in
-`_resize_shards()` as for `MempoolCache` (3.6). The pool ratio is re-derived
+[`_resize_shards()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L5699) as for `MempoolCache` (3.6). The pool ratio is re-derived
 from the PRI0 slot every pass. When that request was granted in full, the
 pool capacity is at least 64 MiB above its usage, which lets it admit new
 index blocks between passes; a short grant demotes the oldest pool blocks on
@@ -860,28 +860,28 @@ BinnedLRUCache → BinnedLRUCacheShard.age_bins → BinnedLRUHandle::age_bin   s
 
 | Layer | Written by | Read by |
 |---|---|---|
-| [`MempoolCache::bins[]`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2608) | `import_bins()` once per second from the option vector (`set_bins()` exists for the `Manager`, but nothing calls it) | `request_cache_bytes()` to pick `[bins[pri-1], bins[pri])` |
-| [`CacheShard::age_bins`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1530) | `set_bin_count(max)` → `set_capacity`; `shift_bins()` → `push_front(make_shared(0))` | `sum_bins(start, end)` under the shard lock |
-| `Onode::cache_age_bin`, `Buffer::cache_age_bin` | re-pointed to `age_bins.front()` by `_add` (onode: only when it links), buffer `_touch`, onode `maybe_unpin` (after `−= n` on the old counter); decremented by `_rm`, `_trim_to`, `_adjust_size` | nothing reads the pointer itself |
+| [`MempoolCache::bins[]`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2608) | [`import_bins()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2694) once per second from the option vector ([`set_bins()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2680) exists for the `Manager`, but nothing calls it) | [`request_cache_bytes()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2618) to pick `[bins[pri-1], bins[pri])` |
+| [`CacheShard::age_bins`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1530) | `set_bin_count(max)` → `set_capacity`; [`shift_bins()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1576) → `push_front(make_shared(0))` | `sum_bins(start, end)` under the shard lock |
+| [`Onode::cache_age_bin`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1408), [`Buffer::cache_age_bin`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L364) | re-pointed to `age_bins.front()` by [`_add`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1105) (onode: only when it links), buffer [`_touch`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1499), onode [`maybe_unpin`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1129) (after `−= n` on the old counter); decremented by [`_rm`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1117), [`_trim_to`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1172), [`_adjust_size`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1486) | nothing reads the pointer itself |
 
 The counter is a heap `int64_t` (`uint64_t` in the RocksDB cache) with two
 kinds of owner, the ring slot and every entry binned there. Entries hold the
 counter, not a position, so rotation never visits an entry. Once the slot is
-gone, a later `_rm` writes into an orphan counter that `sum_bins()` never
+gone, a later `_rm` writes into an orphan counter that [`sum_bins()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1588) never
 reads; without the `shared_ptr` that would be a use-after-free. The counter
 is freed when the slot is overwritten *and* the last entry pointing at it is
 evicted or re-pointed.
 
 Two edges. The ring starts with one slot and grows by one per `shift_bins()`
-(nothing calls `set_bin_count()` before the mempool thread's first tick), so
+(nothing calls [`set_bin_count()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1584) before the mempool thread's first tick), so
 for 12 minutes after mount the old windows read 0 and everything older than
 the ring falls into `LAST`. And after a PG split,
 [`TwoQBufferCacheShard::_move()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1456)
 keeps the buffer's old pointer, so the moved bytes stay counted in the
 *source* shard's ring and are later changed under the destination shard's
-lock. The LRU buffer shard re-points through `_add()`; a moved onode is
-unlinked by `_rm()` and re-binned in the destination ring by the
-`maybe_unpin()` that follows when `split_cache()` drops its references.
+lock. The LRU buffer shard re-points through [`_add()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1246); a moved onode is
+unlinked by [`_rm()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1117) and re-binned in the destination ring by the
+[`maybe_unpin()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1129) that follows when [`split_cache()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L5435) drops its references.
 
 ### 4.2 Motivation
 
