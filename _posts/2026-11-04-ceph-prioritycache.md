@@ -561,6 +561,56 @@ is
 And `-EOPNOTSUPP` at PRI0 says "this cache has no PRI0 class"; the RocksDB
 cache, which does, returns a real number there.
 
+#### 3.2.2 Who feeds the counters: the op path
+
+`MempoolCache` only reads. Every bin count it sums is written, under the
+shard lock, by whichever thread holds the onode or buffer at that moment:
+the OSD op thread for lookups, reads and write staging, BlueStore's
+`kv_finalize` thread when a transaction finishes
+([`_finish_write()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1933)
+and the transaction's last `put()`). The mempool thread never promotes or
+re-bins an entry; it only evicts from the tail (`set_max()` → `_trim_some()`,
+3.3) and samples the rest.
+
+The LRU mechanics are in 2.2 and 2.3 and the per-hook bin updates in 4.3.
+What matters here is *when* each event reaches a bin:
+
+```
+event (code path)                                   bin effect
+──────────────────────────────────────────────────  ──────────────────────────────
+onode hit      lookup() → get()                     none: keeps its last bin
+onode miss     add_onode() → _add()                 none until first put()
+onode release  put(), pin_nref 2→1 → maybe_unpin()  link: +1 bin 0
+                                                    move: −1 old, +1 bin 0
+buffer hit     BufferSpace::read() → _touch()       −len old, +len bin 0
+buffer miss    did_read() → _add()                  +len bin 0
+buffer write   BufferSpace::write()                 none: writing buffers uncounted
+txc finished   _finish_write() → _add()             +len bin 0
+```
+
+Code:
+[`lookup()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L2088),
+[`add_onode()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L2064),
+[`put()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L4917),
+[`BufferSpace::read()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1861),
+[`did_read()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L514),
+[`write()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L491).
+
+Two timings matter for the request path of 3.2.1:
+
+- **Onodes are binned by their last release, not their current use.** A
+  newly loaded onode, or one `_trim_to()` unlinked while pinned, is in no
+  bin until its holder's last `put()`; a cache-hit onode keeps the bin of
+  its previous release until then. `_sum_bins()` therefore ages in-flight
+  metadata by its last release, and the unbinned part surfaces in the
+  `LAST` remainder, because `_get_used_bytes()` counts the mempool bytes of
+  every onode.
+- **Buffers are re-binned on the read itself, but written data counts late.**
+  A writing buffer is on no 2Q list and not in `buffer_bytes`, and the
+  `_discard()` inside `write()` frees the old clean bytes at once. So
+  `DataCache::_get_used_bytes()` dips on an overwrite and recovers only when
+  the transaction finishes, one transaction lifetime after the write.
+
 ### 3.3 Control loop
 
 BlueStore's [`MempoolThread`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2595) drives everything:
