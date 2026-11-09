@@ -76,7 +76,73 @@ OSD's memory target, and the OSD decides whether to size its caches to it.
 
 ## 2. BlueStore caches
 
-### 2.1 Sharding and the object graph
+### 2.1 The cache classes
+
+Two interfaces root everything this post touches. `PriorityCache::PriCache`
+is what the autotuner balances: one object per cache, answering "how much
+do you want at this priority" and "here is your size". `rocksdb::Cache` is
+RocksDB's block-cache interface. Ceph's `ShardedCache` implements both, so
+the RocksDB block cache is a `PriCache` without an adapter. The BlueStore
+caches instead put a thin `PriCache` adapter in front of their shards.
+
+```
+PriorityCache::PriCache                          the Manager's view of one cache
+├─ BlueStore::MempoolThread::MempoolCache        abstract: ledger + request logic
+│   ├─ MetaCache      → mempools; bins from      OnodeCacheShard  → LruOnodeCacheShard
+│   └─ DataCache      → buffer_cache_shards[]    BufferCacheShard → LruBufferCacheShard
+│                                                                 → TwoQBufferCacheShard
+├─ rocksdb_cache::ShardedCache                   ledger + bins[]; also a rocksdb::Cache
+│   └─ BinnedLRUCache → shards_[]                BinnedLRUCacheShard (BinnedLRUHandle)
+├─ OSDMemCache                                   ceph-mon
+│   ├─ IncCache       → inc_osd_cache            incremental OSDMaps
+│   └─ FullCache      → full_osd_cache           full OSDMaps
+└─ rbd::mirror::PriCache                         one per replayed journal; no cache object
+
+rocksdb::Cache                                   RocksDB's block-cache interface
+└─ rocksdb_cache::ShardedCache → BinnedLRUCache  the only implementation in Ceph
+```
+
+The shards are what hold the entries and run the eviction policy. They
+share one base in BlueStore and one in the RocksDB wrapper:
+
+```
+BlueStore::CacheShard                lock, max, num, age_bins ring (4.1)
+├─ OnodeCacheShard
+│   └─ LruOnodeCacheShard            the only onode policy (2.3)
+└─ BufferCacheShard
+    ├─ LruBufferCacheShard           bluestore_cache_type = lru
+    └─ TwoQBufferCacheShard          bluestore_cache_type = 2q, the default (2.4, 2.5)
+
+rocksdb_cache::CacheShard
+└─ BinnedLRUCacheShard               LRU + high-priority pool + age_bins ring (3.2.3)
+```
+
+Index, all at v21.3.0 (the RocksDB row at its submodule commit):
+
+| Class | Role | Source |
+|---|---|---|
+| `PriorityCache::PriCache` | interface the `Manager` balances | [PriorityCache.h#L66](https://github.com/ceph/ceph/blob/v21.3.0/src/common/PriorityCache.h#L66) |
+| `PriorityCache::Manager` | the autotuner: `tune_memory()`, `balance()`, `shift_bins()` | [PriorityCache.h#L118](https://github.com/ceph/ceph/blob/v21.3.0/src/common/PriorityCache.h#L118) |
+| `BlueStore::MempoolThread::MempoolCache` | abstract adapter: ledger, bins, `request_cache_bytes()` | [BlueStore.h#L2606](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2606) |
+| `MetaCache` | the eight BlueStore metadata mempools (3.2) | [BlueStore.h#L2720](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2720) |
+| `DataCache` | buffer cache bytes | [BlueStore.h#L2767](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2767) |
+| `rocksdb_cache::ShardedCache` | `rocksdb::Cache` + `PriCache`, shards by key hash | [ShardedCache.h#L63](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/ShardedCache.h#L63) |
+| `rocksdb_cache::BinnedLRUCache` | the block cache Ceph builds for RocksDB | [BinnedLRUCache.h#L377](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/BinnedLRUCache.h#L377) |
+| `OSDMemCache` | mon base: PRI1 only | [OSDMonitor.cc#L166](https://github.com/ceph/ceph/blob/v21.3.0/src/mon/OSDMonitor.cc#L166) |
+| `IncCache`, `FullCache` | incremental / full OSDMap caches | [OSDMonitor.cc#L240](https://github.com/ceph/ceph/blob/v21.3.0/src/mon/OSDMonitor.cc#L240), [#L256](https://github.com/ceph/ceph/blob/v21.3.0/src/mon/OSDMonitor.cc#L256) |
+| `rbd::mirror::PriCache` | journal replay memory | [Mirror.cc#L129](https://github.com/ceph/ceph/blob/v21.3.0/src/tools/rbd_mirror/Mirror.cc#L129) |
+| `rocksdb::Cache` | RocksDB's block-cache interface (ceph/rocksdb fork) | [cache.h#L366](https://github.com/ceph/rocksdb/blob/24ea35870fe9b3ba15285ec8746ba97ed5d67ff3/include/rocksdb/cache.h#L366) |
+| `BlueStore::CacheShard` | shard base: lock, limits, age bins | [BlueStore.h#L1520](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1520) |
+| `OnodeCacheShard` | onode shard interface | [BlueStore.h#L1610](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1610) |
+| `LruOnodeCacheShard` | onode LRU with lazy pinning | [BlueStore.cc#L1093](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1093) |
+| `BufferCacheShard` | buffer shard interface | [BlueStore.h#L1632](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1632) |
+| `LruBufferCacheShard` | plain LRU buffers | [BlueStore.cc#L1235](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1235) |
+| `TwoQBufferCacheShard` | 2Q buffers: `warm_in`, `hot`, `warm_out` | [BlueStore.cc#L1343](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1343) |
+| `rocksdb_cache::CacheShard` | RocksDB shard interface | [ShardedCache.h#L32](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/ShardedCache.h#L32) |
+| `BinnedLRUCacheShard` | one RocksDB shard: LRU, high-priority pool, bins | [BinnedLRUCache.h#L225](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/BinnedLRUCache.h#L225) |
+| `BinnedLRUHandle`, `Onode`, `Buffer` | the entries the shards order | [BinnedLRUCache.h#L59](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/BinnedLRUCache.h#L59), [BlueStore.h#L1379](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1379), [BlueStore.h#L320](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L320) |
+
+### 2.2 Sharding and the object graph
 
 The caches are split into [`osd_num_cache_shards`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/osd.yaml.in#L950)
 shards (default 32, independent of the op shards), created by
@@ -91,7 +157,7 @@ hang off collections and onodes:
 Buffers hang off blobs, so objects sharing a blob (clones, snapshots) share
 cached data.
 
-### 2.2 Onode cache: LRU and pinning
+### 2.3 Onode cache: LRU and pinning
 
 An onode is **cached** while `OnodeSpace` holds it. Inside the cache it is
 either **on the LRU** or **unlinked** (pinned). Two counters drive this:
@@ -189,13 +255,13 @@ onode with an uncommitted transaction would read stale metadata.
 - Age bins count onodes (+1 per LRU onode); the meta cache converts counts to
   bytes with `bytes_per_onode`. Pinned onodes are in no counter.
 
-### 2.3 Buffer cache
+### 2.4 Buffer cache
 
 | Buffer state | Meaning |
 |---|---|
 | `writing` | Data of an uncommitted transaction. Off the 2Q lists, tagged with its `txc` ([`Buffer`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L320)) |
 | `clean` | Valid data matching disk. On the 2Q lists, evictable |
-| `empty` | No data: a placeholder, or a ghost (see 2.4) |
+| `empty` | No data: a placeholder, or a ghost (see 2.5) |
 
 ```
 READ  _do_read(onode, off, len)
@@ -236,7 +302,7 @@ A hit in `warm_in` doesn't move the buffer ([`_touch()`](https://github.com/ceph
 re-bins its age): one quick re-read isn't proof of reuse. Only a return after
 eviction promotes to `hot`.
 
-### 2.4 Ghost list (`warm_out`)
+### 2.5 Ghost list (`warm_out`)
 
 **Creation.** When `warm_in` is over its share,
 [`TwoQBufferCacheShard::_trim_to()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1521) turns the tail buffer into
@@ -334,7 +400,7 @@ The ghost list remembers roughly half as many buffers as the cache can hold
 Limits: ghosts die with their onode, so objects that drop out of the onode
 cache quickly lose their history; promotion is per overlapping range.
 
-### 2.5 RocksDB block cache
+### 2.6 RocksDB block cache
 
 [`BinnedLRUCache`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/BinnedLRUCache.cc) is RocksDB's LRU cache with age bins added. Its
 [`request_cache_bytes()`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/BinnedLRUCache.cc#L764) asks at `PRI0` for the high-priority
@@ -393,23 +459,10 @@ adapters are [`MempoolCache`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/b
 ### 3.2 Who implements `PriCache`
 
 [`PriCache`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/PriorityCache.h#L66)
-has four concrete families in v21.3.0. Three of them go through an abstract
-middle class that owns the per-priority bookkeeping (`cache_bytes[]`,
-`cache_ratio`, the bins where used) and leaves only "how many bytes do I use"
-to the leaf:
-
-```
-PriorityCache::PriCache                                  src/common/PriorityCache.h
-├─ BlueStore::MempoolThread::MempoolCache                src/os/bluestore/BlueStore.h
-│   ├─ MetaCache
-│   └─ DataCache
-├─ rocksdb_cache::ShardedCache   (also a rocksdb::Cache) src/kv/rocksdb_cache/ShardedCache.h
-│   └─ BinnedLRUCache
-├─ OSDMemCache                   (anonymous namespace)   src/mon/OSDMonitor.cc
-│   ├─ IncCache
-│   └─ FullCache
-└─ rbd::mirror::PriCache                                 src/tools/rbd_mirror/Mirror.cc
-```
+has four concrete families in v21.3.0 (class tree and source index in 2.1).
+Three of them go through an abstract middle class that owns the per-priority
+bookkeeping (`cache_bytes[]`, `cache_ratio`, the bins where used); the request
+logic sits in that base for BlueStore and the monitor, in the leaf for RocksDB.
 
 They are registered under three `Manager` instances in three daemons:
 
@@ -418,7 +471,7 @@ PriorityCache::Manager
 ├─ ceph-osd   "bluestore-pricache"   BlueStore::MempoolThread   (3.3)
 │   ├─ kv        BinnedLRUCache   RocksDB block cache, default column family
 │   ├─ kv_onode  BinnedLRUCache   RocksDB block cache, "O" column family (if split)
-│   ├─ meta      MetaCache        onode / blob / extent / shared-blob mempools
+│   ├─ meta      MetaCache        the BlueStore metadata mempools
 │   └─ data      DataCache        BlueStore buffer cache
 ├─ ceph-mon   OSDMonitor::pcm        mon_memory_autotune
 │   ├─ kv        BinnedLRUCache   MonitorDBStore's RocksDB block cache
@@ -560,7 +613,7 @@ and the transaction's last `put()`). The mempool thread never promotes or
 re-bins an entry; it only evicts from the tail ([`set_max()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1537) → [`_trim_some()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1557),
 3.3) and samples the rest.
 
-The LRU mechanics are in 2.2 and 2.3 and the per-hook bin updates in 4.3.
+The LRU mechanics are in 2.3 and 2.4 and the per-hook bin updates in 4.3.
 What matters here is *when* each event reaches a bin:
 
 ```
@@ -994,13 +1047,13 @@ table lists the commit's hooks:
 |---|---|---|
 | [`LruOnodeCacheShard`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1093) | onodes | `_add` +1 at bin 0, `_rm` −1, `_pin` −1 (a pinned onode leaves the ring), `_unpin` +1 at bin 0, `_trim_to` −1 |
 | [`LruBufferCacheShard`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1235) | bytes | `_add`, `_rm`, `_adjust_size` (±delta), `_touch` (move to bin 0), `_trim_to` |
-| [`TwoQBufferCacheShard`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1343) | bytes | same plus `_move`; only buffers with data count, so `warm_out` ghosts (§2.4) never enter a bin |
+| [`TwoQBufferCacheShard`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1343) | bytes | same plus `_move`; only buffers with data count, so `warm_out` ghosts (§2.5) never enter a bin |
 | [`BinnedLRUCacheShard`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/BinnedLRUCache.cc#L224) | charge | `LRU_Insert` / `LRU_Remove` for low-priority blocks only; `MaintainPoolSize` adds a block to its bin when it is demoted out of the high-priority pool |
 
 Index and filter blocks are binned only while outside the high-priority
 pool; inside it they are PRI0 (membership rules in 3.2.3).
 
-v21.3.0 replaced `_pin`/`_unpin` with lazy pinning (§2.2): `_trim_to()` unlinks (−1) and
+v21.3.0 replaced `_pin`/`_unpin` with lazy pinning (§2.3): `_trim_to()` unlinks (−1) and
 [`maybe_unpin()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1129)
 links (+1 at bin 0) or re-bins an already linked onode on release.
 
