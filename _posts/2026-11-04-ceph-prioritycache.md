@@ -458,14 +458,10 @@ array:
 So a blob or extent never has an age of its own: its bytes ride on the onode
 that owns it, through the average bytes-per-onode.
 
-**RocksDB** [`BinnedLRUCache::request_cache_bytes()`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/BinnedLRUCache.cc#L764)
-uses PRI0 for RocksDB's high-priority pool (index and filter blocks, inserted
-with `Cache::Priority::HIGH`), requested as a full chunk of the tuned total so
-the pool can grow independently of the LRU data below it.
-[`commit_cache_size()`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/BinnedLRUCache.cc#L803)
-then re-derives the high-priority ratio as `PRI0 bytes / new capacity`, so the
-pool's share tracks what `balance()` granted. The OSD gets this cache
-through [`RocksDBStore::get_priority_cache()`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/RocksDBStore.h#L531),
+**RocksDB** [`BinnedLRUCache`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/BinnedLRUCache.h#L377)
+uses PRI0 for RocksDB's high-priority pool (index and filter blocks) and is
+the only implementation whose commit enforces the grant itself (3.2.3). The
+OSD gets this cache through [`RocksDBStore::get_priority_cache()`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/RocksDBStore.h#L531),
 the monitor through [`MonitorDBStore::get_priority_cache()`](https://github.com/ceph/ceph/blob/v21.3.0/src/mon/MonitorDBStore.h#L68);
 both hold the same object that RocksDB uses as its block cache.
 
@@ -610,6 +606,79 @@ Two timings matter for the request path of 3.2.1:
   `_discard()` inside `write()` frees the old clean bytes at once. So
   `DataCache::_get_used_bytes()` dips on an overwrite and recovers only when
   the transaction finishes, one transaction lifetime after the write.
+
+#### 3.2.3 `BinnedLRUCache`: request and commit
+
+RocksDB's block cache keeps three meters per shard and the `Manager` turns
+them into two knobs. A block is in exactly one of the first two, decided
+each time it is inserted or released:
+
+```
+meter (read by request_cache_bytes)         knob (written by commit_cache_size)
+──────────────────────────────────────────  ──────────────────────────────────────
+high_pri_pool_usage_   HIGH blocks placed   capacity_             EvictFromLRU()
+                       while the ratio > 0
+                                            high_pri_pool_ratio_  pool capacity =
+age_bins[i]            every other block,                         capacity × ratio;
+                       by last touch                              MaintainPoolSize()
+                                                                  demotes overflow
+usage_                 both + pinned handles
+```
+
+[`LRU_Insert()`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/BinnedLRUCache.cc#L224)
+runs on `Insert()` and again on every `Release()` of a hit, because
+`Lookup()` unlinks the block while it is referenced. Each time it puts a
+high-priority block in the pool if the ratio is non-zero, otherwise at the
+head of the low-priority region and in bin 0. That re-run is what makes
+"by last touch" true, and it lets a demoted block return to the pool on its
+next hit.
+[`MaintainPoolSize()`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/BinnedLRUCache.cc#L266)
+only demotes, adding the block's charge to its bin as it leaves the pool.
+High priority itself needs
+[`rocksdb_cache_index_and_filter_blocks_with_high_priority`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L3594)
+(default false), so by default no block qualifies and the pool stays empty,
+even though the ratio is non-zero after the first `balance()` (the 64 MiB
+PRI0 headroom below, divided by the capacity).
+
+[`request_cache_bytes()`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/BinnedLRUCache.cc#L764)
+has the same shape as 3.2.1 with two differences:
+
+```cpp
+case PRI0: request = get_chunk(GetHighPriPoolUsage(), total_cache);        break;
+case LAST: request = GetUsage() - GetHighPriPoolUsage()
+                   - sum_bins(0, get_bin_count());                          break;
+default:   request = sum_bins(get_bins(pri - 1), get_bins(pri));            break;
+return request > assigned ? request - assigned : 0;
+```
+
+- **PRI0 is the pool, not a window**, and it is never zero:
+  [`get_chunk()`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/PriorityCache.cc#L33)
+  adds 64 MiB of headroom and rounds up to a chunk (1/256 of the tuned
+  total, clamped to 4–64 MiB), so an empty pool still claims 64 MiB at the
+  top priority. Blocks in the pool are never aged.
+- **`LAST` subtracts the pool too.** What remains is mostly pinned handles
+  (iterators, open table readers), which are in `usage_` but in no bin,
+  plus blocks whose bin rotated off the ring.
+
+[`commit_cache_size()`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/BinnedLRUCache.cc#L803)
+is the only commit that enforces on the spot:
+
+```cpp
+new_bytes = get_chunk(get_cache_bytes(), total_bytes);  // ledger sum, rounded up
+SetCapacity(new_bytes);                                 // per shard: evict tail to fit
+SetHighPriPoolRatio(get_cache_bytes(PRI0) / new_bytes); // per shard: demote overflow
+return new_bytes;                                       // == get_committed_size()
+```
+
+Both calls take each shard's mutex in turn, on the thread that runs
+`balance()` (the mempool thread in the OSD). If the grant shrank below
+usage, blocks are evicted right there, not a moment later in
+`_resize_shards()` as for `MempoolCache` (3.6). The pool ratio is re-derived
+from the PRI0 slot every pass. When that request was granted in full, the
+pool capacity is at least 64 MiB above its usage, which lets it admit new
+index blocks between passes; a short grant demotes the oldest pool blocks on
+the spot. The pool capacity is split evenly across shards, whatever each
+shard holds.
 
 ### 3.3 Control loop
 
@@ -902,8 +971,7 @@ table lists the commit's hooks:
 | [`BinnedLRUCacheShard`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/BinnedLRUCache.cc#L224) | charge | `LRU_Insert` / `LRU_Remove` for low-priority blocks only; `MaintainPoolSize` adds a block to its bin when it is demoted out of the high-priority pool |
 
 Index and filter blocks are binned only while outside the high-priority
-pool: after demotion, or when inserted while the pool ratio is still 0.
-Inside the pool they are PRI0.
+pool; inside it they are PRI0 (membership rules in 3.2.3).
 
 v21.3.0 replaced `_pin`/`_unpin` with lazy pinning (§2.2): `_trim_to()` unlinks (−1) and
 [`maybe_unpin()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1129)
