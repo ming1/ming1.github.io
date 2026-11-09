@@ -7,6 +7,9 @@ date: 2026-11-04
 tags: [ceph, bluestore, memory, cache]
 ---
 
+* TOC
+{:toc}
+
 How a Ceph OSD decides what to keep in memory: the BlueStore caches, the
 `PriorityCache` manager that sizes and splits them, age bins, 2Q ghost lists
 and onode pinning.
@@ -20,17 +23,6 @@ and onode pinning.
 > tag; quoted defaults are that tag's. Names and defaults move between
 > releases; check against your tree.
 
-## Contents
-
-1. [Overview](#1-overview)
-2. [BlueStore caches](#2-bluestore-caches)
-3. [PriorityCache](#3-prioritycache)
-4. [Age bins](#4-age-bins)
-5. [Evicting the globally oldest bytes](#5-evicting-the-globally-oldest-bytes)
-6. [Tuning and observability](#6-tuning-and-observability)
-7. [References](#7-references)
-
----
 
 ## 1. Overview
 
