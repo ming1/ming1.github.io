@@ -854,6 +854,43 @@ that point at it keep it alive, so their bytes simply stop being inside any
 window. No entry carries a timestamp and nothing walks the cache; "older than
 12 minutes" is whatever `_get_used_bytes()` has that the ring does not.
 
+#### 4.1.1 Who owns the ring, who owns a counter
+
+The ring is per **shard**, never per cache. `MempoolCache` owns no ring; it
+owns only the window map that says where each priority's window ends.
+
+```
+MetaCache / DataCache      bins[PRI1..PRI10]       window END indexes (1 2 6 24 120 720)
+  └─ onode / buffer shard  age_bins                 ring of counters, age_bins[0] = newest
+       └─ Onode / Buffer   cache_age_bin            shared_ptr to one counter in a ring
+BinnedLRUCache → BinnedLRUCacheShard.age_bins → BinnedLRUHandle::age_bin   same shape
+```
+
+| Layer | Written by | Read by |
+|---|---|---|
+| [`MempoolCache::bins[]`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2608) | `import_bins()` once per second from the option vector (`set_bins()` exists for the `Manager`, but nothing calls it) | `request_cache_bytes()` to pick `[bins[pri-1], bins[pri])` |
+| [`CacheShard::age_bins`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1530) | `set_bin_count(max)` → `set_capacity`; `shift_bins()` → `push_front(make_shared(0))` | `sum_bins(start, end)` under the shard lock |
+| `Onode::cache_age_bin`, `Buffer::cache_age_bin` | re-pointed to `age_bins.front()` by `_add` (onode: only when it links), buffer `_touch`, onode `maybe_unpin` (after `−= n` on the old counter); decremented by `_rm`, `_trim_to`, `_adjust_size` | nothing reads the pointer itself |
+
+The counter is a heap `int64_t` (`uint64_t` in the RocksDB cache) with two
+kinds of owner, the ring slot and every entry binned there. Entries hold the
+counter, not a position, so rotation never visits an entry. Once the slot is
+gone, a later `_rm` writes into an orphan counter that `sum_bins()` never
+reads; without the `shared_ptr` that would be a use-after-free. The counter
+is freed when the slot is overwritten *and* the last entry pointing at it is
+evicted or re-pointed.
+
+Two edges. The ring starts with one slot and grows by one per `shift_bins()`
+(nothing calls `set_bin_count()` before the mempool thread's first tick), so
+for 12 minutes after mount the old windows read 0 and everything older than
+the ring falls into `LAST`. And after a PG split,
+[`TwoQBufferCacheShard::_move()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1456)
+keeps the buffer's old pointer, so the moved bytes stay counted in the
+*source* shard's ring and are later changed under the destination shard's
+lock. The LRU buffer shard re-points through `_add()`; a moved onode is
+unlinked by `_rm()` and re-binned in the destination ring by the
+`maybe_unpin()` that follows when `split_cache()` drops its references.
+
 ### 4.2 Motivation
 
 **Before the commit, age did not exist for the Manager.** The onode and
@@ -950,14 +987,12 @@ rotates them on request. Caches that do not age (the monitor's OSDMap caches,
 rbd-mirror's journal budgets) implement the four as no-ops and keep working
 as before.
 
-**2. Per-shard ring.** Every
+**2. Per-shard ring.** One ring per
 [`CacheShard`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1520)
-and every
-[`BinnedLRUCacheShard`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/BinnedLRUCache.h#L374)
-gets its own ring, guarded by the lock the shard already has. The constructor
-pushes the first counter; `set_bin_count()` sets the capacity to the largest
-bin bound; `sum_bins(start, end)` adds a window under the lock. The
-`PriCache` adapters fan out over their shard arrays and add the results.
+and per
+[`BinnedLRUCacheShard`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/BinnedLRUCache.h#L374),
+under the lock the shard already has; the `PriCache` adapters fan out over
+their shard arrays and add the results (4.1.1).
 
 **3. Hooks in every cache.** Each place where an entry enters, leaves, moves
 to the head of its list, or changes size now also updates a counter. The
