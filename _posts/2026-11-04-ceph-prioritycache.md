@@ -106,7 +106,7 @@ The shards are what hold the entries and run the eviction policy. They
 share one base in BlueStore and one in the RocksDB wrapper:
 
 ```
-BlueStore::CacheShard                lock, max, num, age_bins ring (4.1)
+BlueStore::CacheShard                lock, max, num, age_bins ring (4.2)
 ├─ OnodeCacheShard
 │   └─ LruOnodeCacheShard            the only onode policy (2.3)
 └─ BufferCacheShard
@@ -840,103 +840,11 @@ Age binning is one commit:
 in October 2020 and merged through
 [PR #43299](https://github.com/ceph/ceph/pull/43299) into Quincy (v17.1.0).
 It touches ten files for about 500 lines. This section reads that commit:
-what an age bin is (4.1), why it was needed (4.2), how the commit builds it
+why it was needed (4.1), what an age bin is (4.2), how the commit builds it
 (4.3) and the knobs it added (4.4). Line references are to v21.3.0; where
 the code moved since, the text says so.
 
-### 4.1 What an age bin is
-
-An age bin is a **one-second bucket**. Every cached entry belongs to the
-bucket of the second in which it was last inserted or touched. The bucket does not hold the entries; it holds one number: how many
-bytes (for the onode cache, how many onodes) currently belong to it. A cache
-can then answer "how much of me was last used 2 to 6 seconds ago" by adding
-four numbers, without walking any list.
-
-```
-time ─────────────────────────────────────────────────────────────►  now
-          │ bin 719 │  ...  │ bin 3 │ bin 2 │ bin 1 │ bin 0 │
-age       │ ~12 min │       │ 3-4 s │ 2-3 s │ 1-2 s │ < 1 s │   of last touch
-bytes     │  3 MB   │       │ 12 MB │  1 MB │  8 MB │ 20 MB │
-          └─────────┴───────┴───────┴───────┴───────┴───────┘
-      falls off ◄──                                   ◄── new empty bin
-      once a second                                       pushed once a second
-
-  entry inserted or touched   → leaves its old bin, joins bin 0
-  entry evicted or resized    → its bin's number changes
-  bin falls off the ring      → the bytes in it stop being counted anywhere
-```
-
-The ring is a `boost::circular_buffer` of counters
-([`age_bins`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1530)),
-one per
-[`bluestore_cache_age_bin_interval`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L5180)
-(1 s), as long as the largest bin bound: **720 counters** (12 minutes) with
-defaults. Each entry keeps a `shared_ptr` to its counter
-([`Onode::cache_age_bin`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1408),
-[`Buffer::cache_age_bin`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L364),
-[`BinnedLRUHandle::age_bin`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/BinnedLRUCache.h#L60)).
-
-```cpp
-boost::circular_buffer<std::shared_ptr<int64_t>> age_bins;   // bin 0 = age_bins[0]
-
-// insert, or move to head:
-entry->age_bin = age_bins.front(); *entry->age_bin += entry->bytes;
-// evict:
-*entry->age_bin -= entry->bytes;
-// shift_bins(), once per interval, O(1):
-age_bins.push_front(make_shared<int64_t>(0));   // oldest counter falls off
-// Manager asks for PRIn:
-sum(age_bins[start .. end))
-```
-
-[`shift_bins()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1576),
-[`sum_bins()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1588).
-
-![Ring of per-interval counters, entries pointing at their counter, and the mapping to PRI1 through LAST]({{ '/assets/images/ceph-prioritycache/age-bins-ring.svg' | relative_url }})
-
-The `shared_ptr` is the trick. When a counter falls off the ring, the entries
-that point at it keep it alive, so their bytes simply stop being inside any
-window. No entry carries a timestamp and nothing walks the cache; "older than
-12 minutes" is whatever `_get_used_bytes()` has that the ring does not.
-
-#### 4.1.1 Who owns the ring, who owns a counter
-
-The ring is per **shard**, never per cache. `MempoolCache` owns no ring; it
-owns only the window map that says where each priority's window ends.
-
-```
-MetaCache / DataCache      bins[PRI1..PRI10]       window END indexes (1 2 6 24 120 720)
-  └─ onode / buffer shard  age_bins                 ring of counters, age_bins[0] = newest
-       └─ Onode / Buffer   cache_age_bin            shared_ptr to one counter in a ring
-BinnedLRUCache → BinnedLRUCacheShard.age_bins → BinnedLRUHandle::age_bin   same shape
-```
-
-| Layer | Written by | Read by |
-|---|---|---|
-| [`MempoolCache::bins[]`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2608) | [`import_bins()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2694) once per second from the option vector ([`set_bins()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2680) exists for the `Manager`, but nothing calls it) | [`request_cache_bytes()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2618) to pick `[bins[pri-1], bins[pri])` |
-| [`CacheShard::age_bins`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1530) | `set_bin_count(max)` → `set_capacity`; [`shift_bins()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1576) → `push_front(make_shared(0))` | `sum_bins(start, end)` under the shard lock |
-| [`Onode::cache_age_bin`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1408), [`Buffer::cache_age_bin`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L364) | re-pointed to `age_bins.front()` by [`_add`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1105) (onode: only when it links), buffer [`_touch`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1499), onode [`maybe_unpin`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1129) (after `−= n` on the old counter); decremented by [`_rm`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1117), [`_trim_to`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1172), [`_adjust_size`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1486) | nothing reads the pointer itself |
-
-The counter is a heap `int64_t` (`uint64_t` in the RocksDB cache) with two
-kinds of owner, the ring slot and every entry binned there. Entries hold the
-counter, not a position, so rotation never visits an entry. Once the slot is
-gone, a later `_rm` writes into an orphan counter that [`sum_bins()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1588) never
-reads; without the `shared_ptr` that would be a use-after-free. The counter
-is freed when the slot is overwritten *and* the last entry pointing at it is
-evicted or re-pointed.
-
-Two edges. The ring starts with one slot and grows by one per `shift_bins()`
-(nothing calls [`set_bin_count()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1584) before the mempool thread's first tick), so
-for 12 minutes after mount the old windows read 0 and everything older than
-the ring falls into `LAST`. And after a PG split,
-[`TwoQBufferCacheShard::_move()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1456)
-keeps the buffer's old pointer, so the moved bytes stay counted in the
-*source* shard's ring and are later changed under the destination shard's
-lock. The LRU buffer shard re-points through [`_add()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1246); a moved onode is
-unlinked by [`_rm()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1117) and re-binned in the destination ring by the
-[`maybe_unpin()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1129) that follows when [`split_cache()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L5435) drops its references.
-
-### 4.2 Motivation
+### 4.1 Motivation
 
 **Before the commit, age did not exist for the Manager.** The onode and
 buffer caches reported all of their bytes at PRI1, and the RocksDB cache
@@ -998,6 +906,98 @@ receive priority based on the relative ages of items in the caches"*.
 Bins are 1 s apart while rebalancing runs every 5 s, so finer timing would
 not change decisions.
 
+### 4.2 What an age bin is
+
+An age bin is a **one-second bucket**. Every cached entry belongs to the
+bucket of the second in which it was last inserted or touched. The bucket does not hold the entries; it holds one number: how many
+bytes (for the onode cache, how many onodes) currently belong to it. A cache
+can then answer "how much of me was last used 2 to 6 seconds ago" by adding
+four numbers, without walking any list.
+
+```
+time ─────────────────────────────────────────────────────────────►  now
+          │ bin 719 │  ...  │ bin 3 │ bin 2 │ bin 1 │ bin 0 │
+age       │ ~12 min │       │ 3-4 s │ 2-3 s │ 1-2 s │ < 1 s │   of last touch
+bytes     │  3 MB   │       │ 12 MB │  1 MB │  8 MB │ 20 MB │
+          └─────────┴───────┴───────┴───────┴───────┴───────┘
+      falls off ◄──                                   ◄── new empty bin
+      once a second                                       pushed once a second
+
+  entry inserted or touched   → leaves its old bin, joins bin 0
+  entry evicted or resized    → its bin's number changes
+  bin falls off the ring      → the bytes in it stop being counted anywhere
+```
+
+The ring is a `boost::circular_buffer` of counters
+([`age_bins`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1530)),
+one per
+[`bluestore_cache_age_bin_interval`](https://github.com/ceph/ceph/blob/v21.3.0/src/common/options/global.yaml.in#L5180)
+(1 s), as long as the largest bin bound: **720 counters** (12 minutes) with
+defaults. Each entry keeps a `shared_ptr` to its counter
+([`Onode::cache_age_bin`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1408),
+[`Buffer::cache_age_bin`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L364),
+[`BinnedLRUHandle::age_bin`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/BinnedLRUCache.h#L60)).
+
+```cpp
+boost::circular_buffer<std::shared_ptr<int64_t>> age_bins;   // bin 0 = age_bins[0]
+
+// insert, or move to head:
+entry->age_bin = age_bins.front(); *entry->age_bin += entry->bytes;
+// evict:
+*entry->age_bin -= entry->bytes;
+// shift_bins(), once per interval, O(1):
+age_bins.push_front(make_shared<int64_t>(0));   // oldest counter falls off
+// Manager asks for PRIn:
+sum(age_bins[start .. end))
+```
+
+[`shift_bins()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1576),
+[`sum_bins()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1588).
+
+![Ring of per-interval counters, entries pointing at their counter, and the mapping to PRI1 through LAST]({{ '/assets/images/ceph-prioritycache/age-bins-ring.svg' | relative_url }})
+
+The `shared_ptr` is the trick. When a counter falls off the ring, the entries
+that point at it keep it alive, so their bytes simply stop being inside any
+window. No entry carries a timestamp and nothing walks the cache; "older than
+12 minutes" is whatever `_get_used_bytes()` has that the ring does not.
+
+#### 4.2.1 Who owns the ring, who owns a counter
+
+The ring is per **shard**, never per cache. `MempoolCache` owns no ring; it
+owns only the window map that says where each priority's window ends.
+
+```
+MetaCache / DataCache      bins[PRI1..PRI10]       window END indexes (1 2 6 24 120 720)
+  └─ onode / buffer shard  age_bins                 ring of counters, age_bins[0] = newest
+       └─ Onode / Buffer   cache_age_bin            shared_ptr to one counter in a ring
+BinnedLRUCache → BinnedLRUCacheShard.age_bins → BinnedLRUHandle::age_bin   same shape
+```
+
+| Layer | Written by | Read by |
+|---|---|---|
+| [`MempoolCache::bins[]`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2608) | [`import_bins()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2694) once per second from the option vector ([`set_bins()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2680) exists for the `Manager`, but nothing calls it) | [`request_cache_bytes()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L2618) to pick `[bins[pri-1], bins[pri])` |
+| [`CacheShard::age_bins`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1530) | `set_bin_count(max)` → `set_capacity`; [`shift_bins()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1576) → `push_front(make_shared(0))` | `sum_bins(start, end)` under the shard lock |
+| [`Onode::cache_age_bin`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1408), [`Buffer::cache_age_bin`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L364) | re-pointed to `age_bins.front()` by [`_add`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1105) (onode: only when it links), buffer [`_touch`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1499), onode [`maybe_unpin`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1129) (after `−= n` on the old counter); decremented by [`_rm`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1117), [`_trim_to`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1172), [`_adjust_size`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1486) | nothing reads the pointer itself |
+
+The counter is a heap `int64_t` (`uint64_t` in the RocksDB cache) with two
+kinds of owner, the ring slot and every entry binned there. Entries hold the
+counter, not a position, so rotation never visits an entry. Once the slot is
+gone, a later `_rm` writes into an orphan counter that [`sum_bins()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1588) never
+reads; without the `shared_ptr` that would be a use-after-free. The counter
+is freed when the slot is overwritten *and* the last entry pointing at it is
+evicted or re-pointed.
+
+Two edges. The ring starts with one slot and grows by one per `shift_bins()`
+(nothing calls [`set_bin_count()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.h#L1584) before the mempool thread's first tick), so
+for 12 minutes after mount the old windows read 0 and everything older than
+the ring falls into `LAST`. And after a PG split,
+[`TwoQBufferCacheShard::_move()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1456)
+keeps the buffer's old pointer, so the moved bytes stay counted in the
+*source* shard's ring and are later changed under the destination shard's
+lock. The LRU buffer shard re-points through [`_add()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1246); a moved onode is
+unlinked by [`_rm()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1117) and re-binned in the destination ring by the
+[`maybe_unpin()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L1129) that follows when [`split_cache()`](https://github.com/ceph/ceph/blob/v21.3.0/src/os/bluestore/BlueStore.cc#L5435) drops its references.
+
 ### 4.3 Design approach: what the commit adds
 
 The commit changes four layers; the two other `PriCache` users get no-op stubs:
@@ -1037,7 +1037,7 @@ as before.
 and per
 [`BinnedLRUCacheShard`](https://github.com/ceph/ceph/blob/v21.3.0/src/kv/rocksdb_cache/BinnedLRUCache.h#L374),
 under the lock the shard already has; the `PriCache` adapters fan out over
-their shard arrays and add the results (4.1.1).
+their shard arrays and add the results (4.2.1).
 
 **3. Hooks in every cache.** Each place where an entry enters, leaves, moves
 to the head of its list, or changes size now also updates a counter. The
@@ -1099,7 +1099,7 @@ and so on, while the options are named `bluestore_cache_age_bins_kv`, and
 
 | Choice | Why |
 |---|---|
-| A counter per bin, a `shared_ptr` per entry | No timestamp per entry and no cache walk; expiry is free (4.1). |
+| A counter per bin, a `shared_ptr` per entry | No timestamp per entry and no cache walk; expiry is free (4.2). |
 | One ring per shard, under the shard lock | No new lock on the hot path. `sum_bins()` takes each shard lock briefly, once per priority level and water-fill round of `balance()`. |
 | Onode ring counts entries, buffer rings count bytes | The onode shard already counts entries; bytes per onode vary with blob and extent size, so the average is applied once at request time. |
 | Bin bounds as end indexes, ten slots | Maps directly onto PRI1–PRI10; a 0 disables a level; ring capacity = largest bound, one pointer per second. |
