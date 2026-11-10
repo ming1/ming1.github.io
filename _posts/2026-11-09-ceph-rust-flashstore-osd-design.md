@@ -154,6 +154,48 @@ run-to-completion loop per core (§4.3):
   means reading many files (§6).
 
 
+### 3.2 Optional RocksDB omap engine
+
+RocksDB is an optional engine for **omap only**, not a second object
+store. Read from the code; the feature was not built or run here.
+
+```
+                 PG core (owner of the shard)              worker thread
+                 ----------------------------              "omap-rocks-{shard}"
+ omap write -->  native memtable + FlashStore WAL
+                   (authority for durability)
+                 frozen memtable, already durable  --ring-->  RocksDB WriteBatch
+                                                    (rtrb)    + RocksDB WAL, sync on
+ omap read  -->  memtable hit? else request        --ring-->  DB get / iterate
+                                                   <--ring--  result pages
+```
+
+| Topic | How | Where |
+|---|---|---|
+| Scope | Only where omap key-values are persisted. Objects, extents, xattrs, allocator and the main WAL stay in the B+tree + WAL | `store/rocks_omap.rs` header |
+| Build | Cargo feature `rocksdb`: the `rocksdb` crate 0.25 (real C++ library via `librocksdb-sys`); off by default | `services/osd/store/Cargo.toml:32,43` |
+| Selection | At mkfs: `MkfsParams::omap_rocksdb` sets superblock bit `FEAT_OMAP_ROCKSDB`; mkfs refuses it without the feature | `store/layout.rs:130,877` |
+| Data location | A directory on a filesystem, `flashstore_rocksdb_dir`, one DB per shard (`<dir>/<name>/shard-N`); not on the raw FlashStore device | `rocks_omap.rs:151`, `osd/config.rs:289` |
+| Durability | FlashStore's WAL and memtables stay the authority; only a natively durable frozen memtable is handed over | `rocks_omap.rs` header |
+| Threading | Blocking DB calls, reads included, run on a per-shard worker thread, never on a PG core | `rocks_omap.rs:1459` |
+| Tuning | `flashstore_rocksdb_*`: worker CPU placement, thread counts, background jobs, write buffers | `osd/config.rs:289-299` |
+
+It is the one place where the thread-per-core rule is bent on purpose: a
+blocking library is kept behind a ring on its own thread.
+
+### 3.3 No BlueStore support
+
+The repo has no BlueStore code and cannot read a BlueStore device.
+
+| Question | Answer |
+|---|---|
+| Convert a BlueStore OSD in place? | No. Add FlashStore OSDs, remove classic ones; data moves by backfill (`docs/how-to/migrate-from-classic.md`) |
+| Share a cluster, pool and PG with BlueStore OSDs? | Yes. §12 ran the Rust `osd.1` against a classic BlueStore `osd.0` |
+| Why does `ceph osd metadata` say `bluestore`? | Name only: `flashstore_report_objectstore` defaults to `bluestore` for tooling compatibility |
+| `ceph tell osd.N bluestore ...` commands? | Answered with FlashStore's own data, refused, or no-ops |
+| Store backends that exist | FlashStore on NVMe, and a lab-only in-RAM / directory store (`osd/backend.rs`) |
+
+
 ## 4. Startup and threads
 
 ### 4.1 Boot order
