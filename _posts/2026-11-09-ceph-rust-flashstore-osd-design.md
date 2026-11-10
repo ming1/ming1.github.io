@@ -20,7 +20,7 @@ designed, laid out on disk and used.
 > (2026-11-09, upstream `893fa6a2`). The snapshot has code and an operator
 > manual, but **no design documents**: the code cites `doc/design/*.md` and
 > ADRs (0021, 0031, 0639) that are not included. Where this post says "why",
-> it is my reading of code comments. §9 lists what a live run confirmed.
+> it is my reading of code comments. §12 lists what a live run confirmed.
 
 Short path names used below:
 
@@ -67,8 +67,8 @@ makes four claims. This post checks each one:
 | # | Claim | Verdict from the code |
 |---|---|---|
 | 1 | msgr2 on every core | True. Each core has its own listeners (`SO_REUSEPORT`), sockets and io_uring. No network threads. |
-| 2 | One core per PG | One **owner core per PG**, many PGs per core (§4). |
-| 3 | B+tree + WAL per core | Per **store shard**; a core owns one or more shards (§6-§8). |
+| 2 | One core per PG | One **owner core per PG**, many PGs per core (§5). |
+| 3 | B+tree + WAL per core | Per **store shard**; a core owns one or more shards (§7-§9). |
 | 4 | io_uring or SPDK per core | True. One device queue per shard, polled by the owner core. |
 
 
@@ -111,9 +111,52 @@ Numbers are lines of Rust, tests included.
   and non-NVMe devices, test only).
 
 
-## 3. Startup and threads
+## 3. Features
 
-### 3.1 Boot order
+### 3.1 No async/.await
+
+There is not a single `async fn`, `async` block or `.await` in the
+workspace: daemon, store and client libraries (`rustyrados`, `rustyrbd`)
+included. `Cargo.lock` has no tokio, async-std, smol, futures or mio; the
+only I/O crate is `io-uring`.
+
+Every component is a hand-written sans-IO state machine, driven by one
+run-to-completion loop per core (§4.3):
+
+```
+   async style (not used)                 ceph-rust style
+   ----------------------                 ---------------
+   let page = tree.get(k).await;          match tree.get(k) {
+   let lsn  = shard.commit(txn).await;      Err(Miss) => park op; record "want";
+   reply(lsn).await;                                     loop reads the page,
+                                                         install(), run op again
+   state lives in a compiler-             }
+   generated future; an executor          lsn = shard.submit(txn);   // returns at once
+   and wakers resume it                   ... later, same loop:
+                                          shard.poll(now, &mut events);  // Acked(lsn)
+                                          state lives in plain structs and enums
+```
+
+| What async would give | What the code does instead | Example |
+|---|---|---|
+| `.await` on I/O | Submit, then poll | `Shard::submit` / `Shard::poll`, `queue_txn` / `poll_commits`, `send_message` / `poll_event` |
+| `.await` on a cache miss | Park and retry | Tree returns `StoreError::Miss` + a "want"; the op is parked and run again after `install` |
+| Future state | Explicit continuations | peering `Action` list, `Pending::LocalWrite` / `RepOpReply`, op engine `Inflight` and waiter queues |
+| Executor + wakers | One loop per core | `KCore::step` (`rt/knet/kcore.rs`) |
+
+- **Win**: no wakers, no boxed tasks, no executor scheduling between a
+  completion and its handler. Each stage of an op is a plain function call,
+  which is what the built-in op tracer timestamps (§12.3).
+- **Win**: the same OSD and store code runs on a simulated disk and clock
+  in tests (`SimDisk`, `SimClock`); there is no runtime to mock.
+- **Cost**: control flow that `.await` would write top to bottom is split
+  across `submit`/`poll` pairs and re-entry points. Following one write
+  means reading many files (§6).
+
+
+## 4. Startup and threads
+
+### 4.1 Boot order
 
 ```
 main()                         fs/main.rs:149     args; --check -> hwcheck
@@ -127,12 +170,12 @@ main()                         fs/main.rs:149     args; --check -> hwcheck
       mount_dev_core                              replay WAL of this core's shards
       core 0: Osd::control     osd/osd.rs:684     identity, superblock, stored osdmap
       core N: Osd::worker                         waits for core 0's identity
-      KCore::run_osd_x         rt/knet/kcore.rs   the loop (3.3)
+      KCore::run_osd_x         rt/knet/kcore.rs   the loop (4.3)
        core 0: mon client start; workers: XMsg::MapsReq to core 0
        Initializing -> Preboot -> Booting -> Active   (MOSDBoot sent)
 ```
 
-### 3.2 Threads
+### 4.2 Threads
 
 | Thread | Count | Job |
 |---|---|---|
@@ -148,9 +191,9 @@ main()                         fs/main.rs:149     args; --check -> hwcheck
   store shards), at most 64 (`fs/args.rs:142-162`, `osd/xcore.rs:88`).
 - CPU choice is by L3/NUMA domain and avoids the NIC IRQ CPUs.
 
-### 3.3 The loop of one core
+### 4.3 The loop of one core
 
-No async runtime: no `async`, no tokio. One run-to-completion loop
+One run-to-completion loop per core (§3)
 (`rt/knet/kcore.rs:359-686`):
 
 ```
@@ -170,14 +213,14 @@ loop:
 Idle mode is `--idle spin` or `--idle sleep` (default sleep).
 
 
-## 4. "One core per placement group"
+## 5. "One core per placement group"
 
 **One owner core per PG, many PGs per core.** A PG never has two cores; a
 core does not serve just one PG.
 
 ![Three cores, each with its own connections, PGs, store shards and NVMe queue]({{ site.baseurl }}/assets/images/ceph-rust-flashstore/core-model.png)
 
-### 4.1 The mapping
+### 5.1 The mapping
 
 ```
 core  = shard % cores
@@ -197,7 +240,7 @@ Limits: cores <= shards <= 256, cores <= 64. Shard count is fixed at mkfs;
 core count can change between runs. A core owns whole shards, so a PG's
 data always sits in a shard of its owner core.
 
-### 4.2 Who owns what
+### 5.2 Who owns what
 
 | Owned by one core | Shared between cores |
 |---|---|
@@ -207,7 +250,7 @@ data always sits in a shard of its owner core.
 | Its store shards: WAL ring, B+tree, allocator | Page pool and DMA buffer budget (atomics) |
 | One NVMe queue per shard | Log tail mutex, taken on each log line |
 
-### 4.3 How cores talk
+### 5.3 How cores talk
 
 ```
  core i                                              core j
@@ -239,18 +282,18 @@ data always sits in a shard of its owner core.
 | any core -> core 0 | `Mon`, `UpThru`, `ReqMap`, `Stats` |
 | core 0 -> workers | `Map`, `Conf`, `Keys`, `Gate`, `Release` |
 
-### 4.4 Cost and limits of the model
+### 5.4 Cost and limits of the model
 
 - Win: a PG op touches PG state, WAL, tree and allocator with no lock; all
   four belong to one thread.
 - Cost: one ring hop when the connection lands on a core that does not own
   the PG, and one hop back for the reply.
 - Not strictly shared-nothing: helper threads exist, a few atomics and
-  mutexes are shared (4.2), and cores can help each other with send/receive
+  mutexes are shared (5.2), and cores can help each other with send/receive
   work and compaction (`rt/knet/spread.rs`, `XMsg::CompactWork`).
 
 
-## 5. I/O path of a client write
+## 6. I/O path of a client write
 
 ```
  connection core                         PG core                         replica
@@ -295,7 +338,7 @@ data always sits in a shard of its owner core.
   (`peering/pg.rs:2689`).
 
 
-## 6. Storage engine overview
+## 7. Storage engine overview
 
 FlashStore cuts the device into shards. Each shard has its own WAL ring,
 its own B+tree and its own allocator, and one core owns it
@@ -341,12 +384,12 @@ Omap has more engines than the plain tree: WAL-logged omap runs
 whole story.
 
 
-## 7. B+tree
+## 8. B+tree
 
 One tree per shard: a plain ordered key-value map holding every kind of
 metadata, split by the first key byte (`store/obj/keys.rs:6-24`).
 
-### 7.1 What is stored
+### 8.1 What is stored
 
 | Tag | Key | Value |
 |---|---|---|
@@ -368,7 +411,7 @@ metadata, split by the first key byte (`store/obj/keys.rs:6-24`).
 - Read path: object offset -> `e` key `(id, lblk)` by predecessor scan ->
   device block -> LBA.
 
-### 7.2 How it works
+### 8.2 How it works
 
 | Topic | Design | Where |
 |---|---|---|
@@ -386,7 +429,7 @@ Checkpoint triggers (`shard.rs:5508-5535`): WAL 50 % full, 2048 dirty
 pages, low space, 5 s, or on request. The freeze is sliced
 (`freeze_begin` / `freeze_step` / `freeze_end`) so it does not stall I/O.
 
-### 7.3 Interface (`store/tree.rs`)
+### 8.3 Interface (`store/tree.rs`)
 
 | Call | Meaning |
 |---|---|
@@ -403,11 +446,11 @@ Nobody above the shard calls the tree. The shard applies WAL records to it
 through `state.rs`; the object layer reads it through the shard.
 
 
-## 8. On-disk layout
+## 9. On-disk layout
 
 ![Device, one shard region and one tree page]({{ site.baseurl }}/assets/images/ceph-rust-flashstore/device-layout.png)
 
-### 8.1 Device level
+### 9.1 Device level
 
 | Item | Place | Notes |
 |---|---|---|
@@ -430,7 +473,7 @@ One shard region (`store/layout.rs:941-960`):
  +--------+--------+----------------+---------------------------+-----------------+
 ```
 
-### 8.2 Root slot: the commit point
+### 9.2 Root slot: the commit point
 
 A checkpoint writes slot `seq & 1`. On mount the valid slot with the
 highest `seq` wins (`layout.rs:1750-1763`). A torn root write loses only
@@ -445,7 +488,7 @@ the newest checkpoint, never the tree.
 | `meta_bitmap` addr, len, crc | Which meta pages are in use |
 | `next_onode_id`, `used_blocks` | Counters |
 
-### 8.3 Tree page
+### 9.3 Tree page
 
 The page in RAM is the same bytes as on disk. Size is `node_size`: a power
 of two from 4 to 32 KiB, default **8 KiB** (`page.rs:10-50`).
@@ -484,12 +527,12 @@ of two from 4 to 32 KiB, default **8 KiB** (`page.rs:10-50`).
   fragments or moved to data blocks.
 
 
-## 9. WAL
+## 10. WAL
 
 One ring of 4 KiB blocks per shard. It logs logical KV ops; never page
 images, never object data (`store/wal.rs:6-28`, `store/shard.rs:6-23`).
 
-### 9.1 Format
+### 10.1 Format
 
 ```
  unit = one device write
@@ -518,7 +561,7 @@ Ops: `PUT`, `DEL`, `DELR` (range), plus the omap forms `RUN`, `RMERGE`,
 `ODEL`, `OPUT`, `LPUT`, `LDEL`, `LRANGE`. Object data up to 2048 bytes
 rides inline as a value; bigger data goes straight to new data blocks.
 
-### 9.2 Commit, checkpoint, replay
+### 10.2 Commit, checkpoint, replay
 
 ```
  commit (Shard::commit, shard.rs:4583)          checkpoint (shard.rs:6409)
@@ -553,7 +596,7 @@ Replay on mount (`shard.rs:1615-2087`, `wal.rs:607-866`):
    mount fails with `WalLost` unless `--accept-wal-loss` is given.
 6. Bump the epoch, force a checkpoint.
 
-### 9.3 Interface
+### 10.3 Interface
 
 The WAL has no `append()` or `sync()` of its own; the shard drives it.
 
@@ -566,7 +609,7 @@ The WAL has no `append()` or `sync()` of its own; the shard drives it.
 | Tools | `wal::inspect` | Dump the log |
 
 
-## 10. Interfaces among core components
+## 11. Interfaces among core components
 
 Every boundary is a trait, a struct with methods, or a message enum. The
 pattern repeats: the upper side calls `submit` / `queue`, then `poll`.
@@ -587,8 +630,8 @@ pattern repeats: the upper side calls `submit` / `queue`, then `poll`.
 | `peering` | store | trait `PgStoreOps` (`peering/store.rs:365`), implemented by `StoreAdapter` | `queue`, `poll_commits`, `end_pass` |
 | `storeadapt` | `store` | struct `store::obj::Store` | `queue(&OTxn, token)`, `poll(&mut acked)`, `read`, `getattr`, `omap_iter`, `list` |
 | Object layer | Shard | struct `Shard` | `submit(Txn) -> lsn`, `poll(now, events)` |
-| Shard | B+tree | struct `Tree` | §7.3 |
-| Shard | WAL | functions in `wal.rs` | §9.3 |
+| Shard | B+tree | struct `Tree` | §8.3 |
+| Shard | WAL | functions in `wal.rs` | §10.3 |
 | `store` | Device | trait `nvme::BlockDev` (`crates/nvme/src/lib.rs:438`) | `submit_write`, `submit_read`, `submit_deallocate`, `poll`, `alloc_buf` |
 
 `OTxn` ops (`store/obj/txn.rs:72-207`): MkColl, RmColl, Touch, Write, Zero,
@@ -600,14 +643,14 @@ few internal ones.
 NVMe passthrough on `/dev/ngXnY`), `SpdkDev`, `FileDev` (lab only).
 
 
-## 11. Run and trace
+## 12. Run and trace
 
 The Rust OSD ran as `osd.1` next to a classic `osd.0` in a Ceph v20.2.2
 (tentacle) vstart cluster, in a VM (kernel 6.19, 8 vCPU). All 32 PGs went
 active+clean, I/O worked in both roles, and a `kill -9` was recovered by
 WAL replay with no data loss.
 
-### 11.1 What it took to run
+### 12.1 What it took to run
 
 | Problem | Fix |
 |---|---|
@@ -628,7 +671,7 @@ croit-flashstore-osd run --id 1 --conf ceph.conf --data-dir ./rust-osd1 \
     --set flashstore_trace_sample=1 -f
 ```
 
-### 11.2 What the run confirmed
+### 12.2 What the run confirmed
 
 | Claim from the code | Evidence |
 |---|---|
@@ -645,7 +688,7 @@ croit-flashstore-osd run --id 1 --conf ceph.conf --data-dir ./rust-osd1 \
 | WAL replay after a crash | After `kill -9`: cores replayed 2, 5, 6, 7 txns; 20 of 20 objects written just before read back identical; omap intact |
 | Drop-in for classic Ceph | `ceph versions`: `21.2.0 umbrella (dev - croit-flashstore-osd)`; primary for 8 PGs, replica for 24; cephx worked |
 
-### 11.3 One traced write
+### 12.3 One traced write
 
 64 KiB `writefull`, Rust OSD primary (`ceph tell osd.1 dump_op_traces`):
 
@@ -676,7 +719,7 @@ Useful knobs: `flashstore_trace_sample=N`, `dump_op_traces`,
 `trace_summary`, `dump_pgs`, `perf dump flashstore_core_<n>`, `status`.
 
 
-## 12. Open questions
+## 13. Open questions
 
 - **Not run on real NVMe.** NVMe passthrough (`/dev/ngXnY`) and SPDK were
   not exercised; only io_uring O_DIRECT on a loop device.
