@@ -337,9 +337,9 @@ data always sits in a shard of its owner core.
 
 ### 5.5 An op arrives on core m, its PG lives on core n
 
-Neither side moves: a connection stays on the core that accepted it, a PG
-stays on its owner core. So the op is handed over once, and the reply is
-handed back once.
+Neither side moves: a connection stays on the core that accepted it, and a
+PG stays on its owner core (a merge is the one exception, see the table).
+So the op is handed over once, and the reply is handed back once.
 
 ```
  core m (owns the connection)                        core n (owns the PG)
@@ -362,9 +362,9 @@ handed back once.
 |---|---|---|
 | Who decides? | The connection core: `core_of(pgid) != me` | `osd/pgs.rs:2151` |
 | What crosses the ring? | Ownership of the boxed `MOSDOp`, payload buffer included. No copy: "message buffers move with the envelope" | `osd/xcore.rs:317-327`, `rt/mesh.rs:8` |
-| Which ring? | The lane of the PG's store shard, so one shard's ops cannot starve another's | `osd/xcore.rs:1217` |
+| Which ring? | The lane of the PG's store shard: one lane per shard for each core pair | `osd/xcore.rs:1217` |
 | Is order kept? | Yes. Each lane is FIFO, and a new op is held behind older held ops of the same shard | `osd/pgs.rs:2103` (`HoldWhy::Fifo`) |
-| What if core n is slow? | Three brakes: ingress credit per shard; at 8192 queued messages (`XOUT_MAX`) ops wait in `xout_wait` in arrival order; while any wait, new input of every link is held | `osd/pgs.rs:2103-2175`, `osd/xcore.rs:93` |
+| What if core n is slow? | Three brakes: ingress credit per shard; at 8192 queued messages (`XOUT_MAX`) ops wait in `xout_wait` in arrival order; while any wait, new input of every link is held. The limit counts the core's whole out queue, all destinations together, so one slow core holds input meant for every core | `osd/pgs.rs:2103-2175`, `osd/xcore.rs:93`, `crates/ingress/src/order.rs:147` |
 | How is n woken? | One eventfd per core, written only if n announced it sleeps | `rt/wake.rs:6-23` |
 | How does the reply find m? | The link id carries its core in bits 48..56; the PG core sends the encoded reply as `XMsg::Wire` | `osd/xcore.rs:195-198`, `osd/osd.rs:2432` |
 | Who shares a newer osdmap with the client? | The connection core, once per client, not once per PG core | `osd/pgs.rs:2162` |
@@ -384,8 +384,8 @@ How often, and what it costs:
   not PG-aware and one connection carries ops for many PGs, so with N cores
   about (N-1)/N of the ops should take the hop (my estimate, not measured).
 - Measured (§12): 4K reads, median 29 us in the OSD, 7 us of it the hop
-  in. A sparse write pays 30-58 us for the hop because core n has to be
-  woken first.
+  in. A sparse write paid 30-58 us for the hop, probably because core n
+  had to be woken first (not checked).
 - A one-core OSD skips all of this (`run_single`).
 
 
