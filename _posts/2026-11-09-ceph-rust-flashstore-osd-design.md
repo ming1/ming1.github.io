@@ -650,6 +650,9 @@ The Rust OSD ran as `osd.1` next to a classic `osd.0` in a Ceph v20.2.2
 active+clean, I/O worked in both roles, and a `kill -9` was recovered by
 WAL replay with no data loss.
 
+Three passes: a 4 KiB loop device (12.1-12.3), the real NVMe path (12.4),
+and a comparison with BlueStore on the same device (12.5).
+
 ### 12.1 What it took to run
 
 | Problem | Fix |
@@ -713,17 +716,90 @@ primary core 2 pg 1.1a write writefull size 65536 total 29759.3 us
 - Everything outside `durable` and `rep_ack` adds up to about 0.5 ms, ring
   hops included. Small reads: median 29 us total, 7 us of it the ring hop.
 - `durable` is not a FlashStore number: the loop device reports a volatile
-  write cache, so every write is forced with FUA/DSYNC onto a file.
+  write cache, so every write is forced with FUA/DSYNC onto a file. On
+  NVMe it is about 2.4 ms (12.4).
 
 Useful knobs: `flashstore_trace_sample=N`, `dump_op_traces`,
 `trace_summary`, `dump_pgs`, `perf dump flashstore_core_<n>`, `status`.
 
 
+### 12.4 Rerun on NVMe passthrough
+
+The emulated NVMe namespace was reformatted to 4096-byte LBAs
+(`nvme format /dev/nvme0n1 --lbaf=4`) and the OSD recreated on
+`kernel:/dev/ng0n1`.
+
+| Item | Result |
+|---|---|
+| Backend | `store backend kernel (cmd) /dev/ng0n1`: NVMe passthrough through io_uring, `fixed-buffer NVMe passthrough probe ok (IORING_URING_CMD_FIXED on)` |
+| Join | 32 PGs recovered from `osd.0`, placed 8 / 8 / 8 / 8 again |
+| Crash | `kill -9`: cores replayed 10, 12, 17, 11 txns; 20 of 20 objects intact |
+| 64 KiB write, `durable` stage | about 2.4 ms (loop device: 17-35 ms) |
+| 4 KiB replica write, store time (p50) | 2.9 ms (loop device: 25.9 ms) |
+
+The device still reports a volatile write cache (`vwc=true`), so FlashStore
+sets FUA on every write. That matters for 12.5.
+
+### 12.5 FlashStore vs BlueStore
+
+Same VM, same 8 GiB emulated NVMe namespace, one after the other.
+
+| | FlashStore | BlueStore |
+|---|---|---|
+| OSD | this snapshot, `--cores 4`, passthrough | `ceph-osd` v20.2.2 Release, defaults, `lockdep` off |
+| Device use | whole namespace, 4 shards | data + DB + WAL on the same namespace |
+| Pool | size 1, 32 PGs, CRUSH rule pinned to `osd.1` | same |
+| Client | one `rados bench` on the same VM | same |
+| Runs | 2 | 2 |
+
+Each cell is the range over the two runs:
+
+| Test | FlashStore | BlueStore | Reading |
+|---|---|---|---|
+| 4K write, 16 threads (IOPS) | 2,709 - 5,196 | 299 - 576 | FlashStore 5-17x |
+| 4K write, 64 threads (IOPS) | 3,838 - 6,334 | 554 - 1,522 | FlashStore 2.5-11x |
+| 64K write, 16 threads (IOPS) | 2,004 - 2,288 | 396 - 430 | FlashStore about 5x |
+| 4K random read, 16 threads (IOPS) | 53,491 - 65,146 | 59,835 - 61,487 | Same |
+| 4K random read, 64 threads (IOPS) | 83,600 - 86,966 | 77,886 - 82,402 | Same within noise |
+| 4M write, 8 threads (MB/s) | 112 - 160 | 165 - 177 | BlueStore slightly ahead |
+| 4M sequential read, 8 threads (MB/s) | 484 - 873 | 1,018 - 1,110 | BlueStore 1.3-2x |
+| OSD CPU per 4K read (us) | 14 - 27 | 20 - 29 | FlashStore a little lower |
+
+**The small-write gap is mostly the durability method on this device, not
+the engine.** Raw `fio` on the namespace, 4K random write, queue depth 16:
+
+| How the write is made durable | IOPS |
+|---|---|
+| no sync | 8,727 |
+| FUA on every write (`--sync=dsync`) | 5,149 |
+| `fdatasync` every 16 writes | 1,810 |
+| `fsync` after every write | 621 |
+
+```
+ FlashStore:  write(FUA) ------------------------------> durable     ~5k IOPS ceiling
+ BlueStore:   write ---> flush (per kv sync batch) ----> durable     flush is the slow op
+```
+
+- On this emulated NVMe a flush costs far more than a FUA write.
+  FlashStore's 4K write rate sits at the raw FUA ceiling; BlueStore pays
+  for flushes.
+- On a real PLP NVMe, flush is nearly free and FlashStore skips FUA too, so
+  this gap should shrink a lot. These numbers do not predict that case.
+- Run-to-run variance is up to 2x on both sides. Only the large
+  differences mean anything.
+- The 4K read rates are probably limited by the single `rados bench`
+  client, not by either OSD.
+- FlashStore's 4M writes had a worse latency tail: max 3-5 s against
+  0.4-0.6 s.
+
+
 ## 13. Open questions
 
-- **Not run on real NVMe.** NVMe passthrough (`/dev/ngXnY`) and SPDK were
-  not exercised; only io_uring O_DIRECT on a loop device.
-- **No performance numbers.** The traces show the path, not the speed.
+- **Emulated NVMe only.** Passthrough ran on a QEMU NVMe namespace with a
+  volatile write cache; SPDK and a real PLP drive were not exercised.
+- **Performance numbers are indicative.** §12.5 is one VM, an 8 GiB
+  emulated device, one client and two runs; it says more about FUA versus
+  flush on that device than about the two engines.
 - **Elastic chunks.** Devices of 256 GiB and more use a chunked data layout
   with a pool shared between shards; the 12 GiB test device did not.
 - **Omap engines.** The run used tree keys and WAL omap runs; the native
