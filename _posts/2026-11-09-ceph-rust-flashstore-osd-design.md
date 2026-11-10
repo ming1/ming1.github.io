@@ -542,6 +542,193 @@ Nobody above the shard calls the tree. The shard applies WAL records to it
 through `state.rs`; the object layer reads it through the shard.
 
 
+### 8.4 In memory: a slab of pages, linked by disk address
+
+Pages hold no pointers. An interior entry stores the child's **disk
+address + crc**; the child is found through a hash map from address to
+cache slot. A clean page can therefore be evicted and reloaded without
+touching its parent.
+
+```
+ Tree
+ |- root_addr, root_crc, height           where the tree starts
+ |- map:  page address -> slot            resident pages only
+ |- slab: Vec<Page>                       the page cache; slot = index
+ |    Page { buf      the on-disk image, edited in place
+ |           addr     disk address, or virtual (bit 63) if never written
+ |           flags    DIRTY, MOD, REF (CLOCK), INFLIGHT, FRZ ...
+ |           dcrc     crc of the on-disk base image
+ |           touched  keys changed since the last checkpoint (leaf deltas) }
+ |- path:  [(slot, child index)]          root .. parent of the last located leaf
+ |- hints: 32 x (key range -> leaf, path) recently located leaves
+ |- wants: [Want { addr, crc, level }]    pages a failed op needs from disk
+ `- prune list, merge list                work deferred to finish_txn
+```
+
+```
+                   interior page, level 1
+      slot 0             slot 1              slot 2
+ [ -inf | A1,crc ]  [ "k30" | A2,crc ]  [ "k70" | A3,crc ]     slot i covers
+        |                  |                   |               [key_i, key_i+1)
+    map.get(A1)        map.get(A2)         map.get(A3)   ->  slot, or Miss
+        v                  v                   v
+  leaf k01..k29      leaf k30..k69       leaf k70..            no sibling links
+```
+
+### 8.5 Finding a leaf
+
+Every operation starts with `locate(key)` (`tree.rs:1702`).
+
+```
+ locate(key)
+ |- hints: 8-byte key prefix reject test, then full compare with the range
+ |     hit  -> leaf + stored path, no page is searched
+ `- locate_full (tree.rs:1752), from the root:
+       loop until level 0:
+          idx   = int_route(page, key)            binary search
+          path.push((slot, idx))
+          child = lookup(addr, crc, level - 1)    (tree.rs:1401)
+                    |- in map     -> slot, set REF
+                    `- not in map -> wants.push(Want), return Miss
+       keep the upper fence (next separator key) in keybuf; store a hint
+```
+
+- A hint is valid while `epoch` is unchanged. Every change that can make a
+  hint stale bumps it: a split, a root change, a page removal, an eviction,
+  an address change at checkpoint.
+- **Miss safety**: a single op descends before it changes anything. A
+  multi-op txn probes all its keys first (`State::prepare`); after that
+  `apply` cannot miss. So a miss never leaves a half-done change.
+
+### 8.6 get, put, del
+
+| Op | Steps | Where |
+|---|---|---|
+| `get` | locate, binary search in the leaf (page prefix + entry suffix), copy the value | `tree.rs:1834` |
+| `put` | size check; locate; mark leaf and path dirty; log the key for leaf deltas; same-length value is overwritten in place; else insert | `tree.rs:2253`, `put_inner` `:2546` |
+| `del` | locate; binary search; remove the entry; the key range of an emptied leaf goes on the prune list, a leaf less than 1/3 full on the merge list | `tree.rs:2579`, `del_slot` `:2605` |
+
+`put` has three ways to find its leaf: a walk, a cursor for ascending keys
+(omap run merges), or the position the txn's probe already found
+(`put_at`).
+
+Insert and split (`insert_leaf` `tree.rs:2626`, `propagate` `:2723`):
+
+```
+ insert into leaf
+ |- fits in the page (free space is compacted in place if needed)  -> done
+ |- fits after a rebuild with a new common prefix                  -> done
+ `- no room -> split:
+       m     = split point, balanced by bytes
+               append at the right end of the tree -> left page stays full
+               append at the end of a key run      -> the run's page stays full
+       sep   = shortest key that separates entry m-1 and entry m
+       left  = same slot, rebuilt with entries [0, m)
+       right = new slot with a virtual address, entries [m, n)
+       epoch += 1
+ propagate: insert (sep -> right) into the parent; the parent may split too
+            split of the root -> grow_root: new interior root, 2 children, height += 1
+```
+
+### 8.7 scan
+
+There are no sibling links, so a scan walks through the parent
+(`tree.rs:1980`).
+
+```
+ scan(cursor { next, end }, max_entries, max_bytes, f)
+ loop:
+    leaf = locate(cursor.next)        Miss -> queue readahead of the next leaves, return Miss
+    i    = lower_bound(leaf, cursor.next)
+    emit f(key, value) from i on
+       reached end        -> Done
+       budget used up     -> cursor.next = last key + 0x00, return More
+    leaf finished         -> cursor.next = fence (first key right of this leaf)
+    next leaf = step_leaf (tree.rs:2093):
+                   next child of the same parent, if resident and not the last child
+                   else: locate again (hints, then a descent)
+```
+
+- The cursor carries the next key. A scan stops on a miss or when its
+  budget is used up, and resumes from that key later.
+- Readahead: after a miss up to 32 sibling leaves are requested in the same
+  round; a deep rolling window is optional (`with_readahead`).
+- Listings (`cursor.listing()`) set no REF bit on leaves, and the leaves a
+  listing loaded are evicted first, so a long listing does not push the hot
+  pages out.
+
+### 8.8 del_range and finish_txn
+
+```
+ del_range(a, b)                                          (tree.rs:3094)
+    walk only the two edge paths: the route of a and the route of b
+    edge leaves:              remove the entries in [a, b)
+    children fully inside:    unlinked from the parent at once
+         leaf                    freed by address, never read
+         interior, resident      freed with its subtree
+         interior, not resident  put on the Dead list; read back and freed later (lazy free)
+    remember (a, b) on the prune list
+
+ finish_txn()                                             (tree.rs:3425)
+  #1 prune     remove the pages left empty along the remembered ranges
+  #2 merge     each underfull leaf joins a sibling under the same parent if the
+               sibling is resident, one of the two is already dirty, and both
+               together fill at most 65 % of a page;
+               a cold or clean sibling -> background compaction queue (between txns)
+  fix_root     after each of the two steps:
+               root with one resident child -> the child becomes root, height -= 1
+               empty root                   -> an empty leaf
+```
+
+Removing empty pages is deferred to the end of the txn, so a later op of
+the same txn is never routed to a page that is not loaded. Splits and
+range unlinks happen at once. Without lazy free, the interior pages inside
+a range are loaded by the txn's probe first and freed at once.
+
+### 8.9 install and eviction
+
+`install(want, data)` feeds a page read from disk into the cache
+(`tree.rs:1520`):
+
+| # | Step |
+|---|---|
+| 1 | A `dead` want is a detached subtree page: free its children and itself, do not cache it |
+| 2 | Already resident: nothing to do |
+| 3 | Validate the image: crc, magic, kind and level, size, own address (`page::validate`) |
+| 4 | Stored crc must equal the crc in the parent's reference, else "lost/stale write" |
+| 5 | Level must be the one the parent expects |
+| 6 | Copy into a cache slot; `map[addr] = slot`. A page read for a listing gets no REF and is queued for early eviction |
+| 7 | Leaf with deltas: apply the delta chain of earlier checkpoints, so the page is in its last durable state |
+
+Eviction is CLOCK (`evict_to`, `tree.rs:1602`):
+
+```
+ never evicted:  dirty, in-flight, pinned, or installed very recently
+ first:          listing leaves, oldest first
+ then the hand:  REF set -> clear it and move on;  REF clear -> evict
+```
+
+### 8.10 Checkpoint: sliced freeze
+
+```
+ freeze_begin(lsn)      mark every dirty page pending (FRZ)          (tree.rs:3761)
+ freeze_step(budget)    bottom-up, a few pages per call:
+      leaf, small change          -> delta entry (base addr, crc, key ops)
+      path page, no child moved   -> clean again, not written
+      anything else               -> fresh meta address, crc set, image copied to the write arena
+                        then, also in slices: live parents take the new (addr, crc)
+                        of their children; old addresses are dropped
+ freeze_end()           seal the delta segment, root reference + meta image
+```
+
+- Txns keep running between steps. Before a pending page changes
+  (`fz_touch`, `tree.rs:4010`), a leaf is frozen at once and an interior
+  page is copied aside. Each page is frozen exactly as it was at `lsn`.
+- A leaf delta avoids rewriting a whole page for a small change; the base
+  page plus its delta chain is the durable state (8.9 step 7). Old delta
+  segments are cleaned by re-logging their live entries.
+
+
 ## 9. On-disk layout
 
 ![Device, one shard region and one tree page]({{ site.baseurl }}/assets/images/ceph-rust-flashstore/device-layout.png)
