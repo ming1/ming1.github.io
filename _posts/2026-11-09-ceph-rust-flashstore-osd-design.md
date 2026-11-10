@@ -1139,7 +1139,71 @@ the engine.** Raw `fio` on the namespace, 4K random write, queue depth 16:
   0.4-0.6 s.
 
 
-## 13. Open questions
+## 13. Compared with Crimson
+
+Crimson is upstream Ceph's own thread-per-core OSD (Seastar), and SeaStore
+is its native object store. The core model is the same idea; the store is
+built very differently.
+
+> Crimson facts are read from **ceph v21.3.0**,
+> [`src/crimson`](https://github.com/ceph/ceph/tree/v21.3.0/src/crimson).
+> This is a reading of the source, not a run: no Crimson OSD was started.
+
+### 13.1 Core model: the same idea
+
+| Topic | ceph-rust | Crimson |
+|---|---|---|
+| PG ownership | One owner core per PG, many PGs per core | Same |
+| PG to core | Placement table per PG, hash as fallback (§5.1) | Table from PG to core, `PGShardMapping` (`osd/pg_map.h`) |
+| Who decides | Core 0 | Core 0: updates are proxied to it, then sent to all cores |
+| Placing a new PG | Least loaded core | Core with the fewest PGs, then the least loaded store shard or sibling core (`std::min_element`, `osd/pg_map.cc`). PGs loaded at boot and split children go where the store says |
+| Lookup | Local copy of the table on each core | Local copy on each core |
+| Op lands on the wrong core | `XMsg::Op` over an SPSC ring (§5.5) | `shard_services.invoke_on(core, ...)`, a Seastar cross-core call (`osd/pg_shard_manager.h`) |
+| Order across cores | FIFO lanes + ordered-message stamps | Per-connection sequence, `crosscore_ordering` |
+| PG and store shard | A PG lives on one store shard; core = shard % cores | The mapping also returns a store index per PG |
+| Runtime | Hand-written state machines, no async (§3.1) | Seastar futures and continuations, one reactor per core |
+| Running BlueStore | Not possible (§3.3) | Possible through AlienStore: BlueStore runs in a thread pool outside the reactors (`os/alienstore`) |
+
+### 13.2 Store: one generic tree vs several special trees
+
+```
+ FlashStore, per shard                     SeaStore
+ ---------------------                     --------
+ WAL: logical KV ops                       journal: new blocks + deltas to existing blocks
+        |                                          |
+ one B+tree, keys split by tag             LBA tree      logical addr -> physical addr
+   C N n a h o e d p r f                   backref tree  physical addr -> owner
+        |                                  onode tree    object -> onode   (staged layout)
+ bitmap allocator                          omap tree     omap key -> value
+                                           collection node (flat, not a tree)
+                                                   |
+                                           cleaner (segmented devices) / journal trimming
+```
+
+| Topic | FlashStore | SeaStore |
+|---|---|---|
+| Trees | One per shard, for nearly all metadata. Outside it: the tree-page bitmap, omap runs kept in the WAL, the optional omap engines (§3.2) | One per kind: LBA, backref, onode, omap. Collections are one flat node, and pgmeta omap uses a log of linked nodes instead of the B-tree |
+| Key and value | Variable-length bytes, prefix compressed per page | LBA and backref: fixed-size keys and values (`btree/fixed_kv_btree.h`). Onode: the object key is cut into three stages: shard/pool/crush, namespace/oid, snap/gen (`staged-fltree`) |
+| Node size | One size, default 8 KiB | Per tree: LBA and backref 4 KiB; onode inner 8 KiB, leaf 16 KiB; omap inner 8 KiB, leaf 64 KiB |
+| Links in memory | None; child found by disk address through a hash map (§8.4) | Parent and child pointers between cached nodes (`linked_tree_node.h`; the onode tree has its own tracking) |
+| Addressing | Parent holds the child's physical address + crc | Two kinds: LBA and backref nodes are addressed physically; onode, omap and collection nodes are logical extents that go through the LBA tree (`lba_manager.h`) |
+| What is logged | Logical KV ops, never page changes (§10) | A txn is new blocks plus mutations to existing blocks; each extent type implements `get_delta` / `apply_delta` (`cache.h`, `cached_extent.h`) |
+| Tree pages reach disk | Only at checkpoint: whole page to a new address, or a leaf delta (§8.10) | With the transaction: a change to an existing node as a delta in the journal record; a new node inline in the record or written separately (always separately on random-block devices) |
+| Space reclaim | Bitmap; old pages freed after the checkpoint | Segmented devices: a background cleaner. Random-block devices: an allocator. Journal trimming on both (`async_cleaner.h`) |
+| Cache miss | Call returns `Miss`; the op is parked and run again (§8.5) | The future waits for the read |
+| Conflicts | None: txns are applied to the in-memory tree one by one, in order; there is no read set that can go stale | Optimistic: a txn whose read set went stale fails and is retried (`cache.h`) |
+
+- **FlashStore** keeps the tree simple and generic and puts the work in the
+  WAL and the checkpoint. Replay re-applies logical ops, so log format and
+  page format are independent.
+- **SeaStore** is extent based: tree nodes are extents like any other, and
+  the journal records changes to extents. That makes moving and cleaning
+  extents general, and it needs the extra LBA and backref trees.
+- FlashStore's leaf deltas (§8.10) are close to SeaStore's extent deltas in
+  spirit, but they are written only at checkpoint and only for leaves.
+
+
+## 14. Open questions
 
 - **Emulated NVMe only.** Passthrough ran on a QEMU NVMe namespace with a
   volatile write cache; SPDK and a real PLP drive were not exercised.
