@@ -527,20 +527,83 @@ pages, low space, 5 s, or on request. The freeze is sliced
 
 ### 8.3 Interface (`store/tree.rs`)
 
-| Call | Meaning |
+Common rules for every call:
+
+| Item | Rule |
 |---|---|
-| `get(key, out) -> Result<bool>` | Point lookup |
-| `put(key, val) -> Result<()>` | Insert or replace |
-| `del(key) -> Result<bool>` | Delete one key |
-| `del_range(a, b)` | Delete a key range |
-| `scan(cursor, max_entries, max_bytes, f)` | Ordered scan with a resumable cursor |
-| `finish_txn()` | End of one transaction: prune and merge |
-| `install(want, data)` | Feed a page read from disk into the cache |
-| `freeze_begin / freeze_step / freeze_end` | Snapshot dirty pages for a checkpoint |
+| Key | `&[u8]`, any bytes. Order is plain byte order (memcmp); the tree knows nothing about tags or ids (8.1) |
+| Value | `&[u8]`, any bytes, opaque to the tree |
+| Size limit | One entry is `4 + key + value` bytes and must be <= `page/2 - 256`. Key alone <= that limit minus 517 |
+| Limits at 8 KiB pages | entry <= 3840 bytes, key <= 3323 bytes, so value <= 3836 - key length |
+| Range | Always half-open: `[a, b)`, `a` included, `b` excluded |
+| Result | Most calls return `Result<T, StoreError>`. `Err(Miss)` means a page is not cached: load the wanted pages and call again. `get`, `put`, `del` and `scan` change nothing on a miss. `del_range` can stop half way, which is why a txn probes first |
+| Caller | One thread, the shard's owner core. No call blocks or does I/O |
+
+Calls, grouped by use:
+
+| Call | Arguments | Returns | Notes |
+|---|---|---|---|
+| `get(key, out)` | `key`: exact key. `out: &mut Vec<u8>`: the value is **appended** to it | `true` found, `false` not found | No range lookup; use `scan` for that |
+| `put(key, val)` | `key`, `val` within the size limit | `()` | Insert or replace. `Invalid` if too large |
+| `del(key)` | `key`: exact key | `true` if the key existed | Deleting a missing key is not an error |
+| `del_range(a, b)` | `a`, `b`: range `[a, b)` | `()` | No-op if `a >= b`. Needs a successful `probe_range(a, b)` first; then it cannot miss |
+| `scan(cur, max_entries, max_bytes, f)` | `cur: &mut ScanCursor`; two budgets; `f(key, value)` callback | `Done` range finished, `More` budget used up | See below |
+| `finish_txn()` | none | `()` | Call once after the last op of a txn (8.8) |
+| `probe_key(key)`, `probe_range(a, b)` | the key or range a txn will touch | `()` / upper bound of pages rewritten | Loads nothing itself: queues wants and returns `Miss` until all pages are cached. `TxnTooLarge` if a range needs too many pages. The write path uses the batch form `probe_sorted` for puts and deletes |
+| `take_wants(out)` | `out: &mut Vec<Want>` | nothing; appends to `out` | Drains every queued page request: misses of earlier calls, scan readahead, lazy-free reads. `Want { addr, crc, level, dead, scan }` |
+| `install(want, data)` | `want`: one taken want. `data: &[u8]`: the page image read from `want.addr`, exactly one page long | `()` | `Corrupt` if the image fails the checks of 8.9 |
+| `freeze_begin(lsn)` | `lsn`: the checkpoint covers all records up to this LSN | `()` | Starts a checkpoint. `NoSpace` if the meta area has no room for it. Starting a second one while one runs is a bug (assert) |
+| `freeze_step(budget)` | `budget`: units of work for this call (a page is one unit) | `(done, units_used)`, no `Result` | Call until `done` is true |
+| `freeze_end()` | none | `Frozen`, no `Result` | See below |
+
+`scan` in detail:
+
+| Part | Meaning |
+|---|---|
+| `ScanCursor::new(start, end)` | Scan `[start, end)`. `start >= end` gives an empty scan |
+| `cur.next` | Next key to emit, inclusive. The tree moves it forward; the caller keeps the cursor between calls |
+| `max_entries` | Stop after this many entries |
+| `max_bytes` | Stop once this many bytes of `key + value` were emitted. The check is before each entry, so the entry that crosses the limit is still emitted |
+| `f(key, value)` | Called once per entry, in key order, with the full key (prefix already joined) |
+| `Ok(More)` | A budget was used up; call again with the same cursor |
+| `Ok(Done)` | The range is finished; `cur.done` is true |
+| `Err(Miss)` | A page on the way to the next leaf is not cached. Entries before it were already given to `f` and are not emitted again. Install the wants, call again with the same cursor |
+| `.with_readahead(n)`, `.listing()` | Optional: deep readahead window; scan-resistant caching (8.7) |
+
+`freeze_end()` returns what the checkpoint writer must put on disk:
+
+| `Frozen` field | Content |
+|---|---|
+| `arena` + `pages` | The page images, and `(new address, index in arena)` for each |
+| `root`, `height` | `(address, crc)` of the frozen root (`None` for an empty tree), and the tree height |
+| `bitmap` or `blob` | Which meta pages are in use: a bitmap, or the address of the meta image on an elastic store |
+| `free_after` | Old pages this checkpoint replaces; free them only after the new root slot is durable |
+
+Errors a caller sees:
+
+| Error | Meaning | What to do |
+|---|---|---|
+| `Miss` | A needed page is not in the cache | `take_wants`, read, `install`, retry |
+| `Invalid` | Key or value too large for a page | Caller bug, or split the value into fragments (`p` keys, 8.1) |
+| `TxnTooLarge` | A range touches more pages than the walk limit, or a txn needs more than half the cache | Split the work into smaller txns |
+| `NoSpace` | `freeze_begin` found no meta space for the checkpoint | Free or grow meta space, then checkpoint again |
+| `Io` | The read of a wanted page failed; every later call that reaches that page returns the same error | Not retryable by the tree |
+| `Corrupt` | A page or a delta chain failed a check (crc, level, format), or the structure is inconsistent | Not retryable; treat as store corruption |
+
+How the shard drives the tree for one write txn (`state.rs`):
+
+```
+ State::prepare(record)    probe every op: probe_sorted (puts, deletes), probe_range (range deletes)
+                           Miss -> shard: take_wants -> device read -> install -> prepare again
+ State::apply(record)      put_at / del_at / del_range / write_sorted_batch: cannot miss now
+                           ends with finish_txn()
+```
+
+A record with one simple op skips the probe: that op descends before it
+changes anything, so a miss is still clean.
 
 Nobody above the shard calls the tree. The shard applies WAL records to it
 through `state.rs`; the object layer reads it through the shard.
-
 
 ### 8.4 In memory: a slab of pages, linked by disk address
 
