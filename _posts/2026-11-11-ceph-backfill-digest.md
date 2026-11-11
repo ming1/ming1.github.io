@@ -896,6 +896,82 @@ Opinion: a good cheap step, and stateless. It fits best as the fallback path
 when digest leaves are dirty or lost (crash, split, first run), where the
 range must be listed anyway. It does not replace the digest.
 
+### 12.2 Brainstorm: cutoff scan, and one-pass listing
+
+Another stateless idea. Every write stamps its object with a new, larger
+version. So "changed since the target left" is "version above a cutoff V".
+The primary sends only those objects, plus one hash per range to catch deletes.
+
+```
+ for each hash range (both sides walk the same range):
+
+ primary                                    target
+ -------                                    ------
+ walk keys, read versions
+   NEW = items with version > V
+   OLD = the rest
+        NEW list + hash(names of OLD)  -->  walk keys only (no version reads)
+                                            hash(own names not in NEW)
+                                            equal?  -> NEW is the push list
+        <-- "differ"                        differ? -> stock scan for this range
+```
+
+For the example of section 4 (100,000 objects, 500 changed), computed:
+
+| | Stock | Cutoff scan |
+|---|---|---|
+| Bytes on the wire | 8.9 MB | ~46 KB |
+| Version reads on the target | 100,000 | ~500 |
+| Version reads on the primary | 100,000 | 100,000 |
+| Key walk | Both sides | Both sides |
+| State kept, work per write | None | None in steady state |
+
+**Review against the code** (upstream main, read only, nothing measured):
+
+| Finding | Effect on the idea |
+|---|---|
+| Every write path gives the object a new, larger version (writes, clones, snap trim, cache tier, watch, rollback, revert of a lost object) | The rule holds |
+| The target applies a write on receipt, before all copies have it. Its own "last update" can include writes that were never agreed | V must be the target's **log tail**; every object in the target's kept log is compared exactly |
+| When backfill starts, the target's log and version markers are overwritten on both sides | V and that object list must be saved first, in new persisted fields |
+| Target was mid-backfill, or the PG was merged | Fall back to stock |
+| Scrub repair can move a version backward with no log entry | Stock would fix the target; a cutoff would not |
+| Erasure-coded pools keep per-shard versions | Replicated only |
+| Stock backfill already skips the push when versions match | The gain is scan work and bytes only, never data |
+
+Verdict: it can be made correct, but it is **not easy**. It adds persisted
+state at the most delicate step of peering, to save one side's version reads.
+
+**What the same review found instead: one-pass listing.**
+
+```
+ today, per object                        one-pass
+ -----------------                        --------
+ 1. walk the key (value ignored)          1. walk the key,
+ 2. look the object up again                 decode the first 3 fields of the value,
+    decode the whole record                  take the version
+    put it in the metadata cache
+    (pushes out hot entries)
+ 3. take the version
+```
+
+- In BlueStore the version (the `_` attribute) is stored **inside the value**
+  at the key the listing already walks. The listing reads only keys today.
+- A listing call that also returns the attribute removes the second lookup,
+  the full decode and the cache churn, **on both sides**.
+- The comparison stays the stock one, so correctness does not change. No
+  message change, no new state.
+
+| | Cutoff scan | One-pass listing |
+|---|---|---|
+| Version reads saved | Target only | Both sides |
+| Reply bytes | Much smaller | Same (combine with 12.1) |
+| New persisted state | Yes | No |
+| Protocol / peering change | Yes | No |
+| Risk to correctness | New invariants | None: same comparison |
+
+Order of work: measure a stock scan first (listing time against version-read
+time), then one-pass listing, then 12.1. The cutoff stays a note.
+
 ## 13. Review
 
 Questions raised while reading the branch, with answers.
