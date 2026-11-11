@@ -947,30 +947,151 @@ state at the most delicate step of peering, to save one side's version reads.
  today, per object                        one-pass
  -----------------                        --------
  1. walk the key (value ignored)          1. walk the key,
- 2. look the object up again                 decode the first 3 fields of the value,
+ 2. look the object up again                 decode the header of the value,
     decode the whole record                  take the version
     put it in the metadata cache
-    (pushes out hot entries)
  3. take the version
 ```
 
-- In BlueStore the version (the `_` attribute) is stored **inside the value**
-  at the key the listing already walks. The listing reads only keys today.
-- A listing call that also returns the attribute removes the second lookup,
-  the full decode and the cache churn, **on both sides**.
-- The comparison stays the stock one, so correctness does not change. No
-  message change, no new state.
+In BlueStore the version (the `_` attribute) is stored **inside the value** at
+the key the listing already walks. The listing reads only keys today. The
+comparison stays the stock one: no message change, no new state.
 
-| | Cutoff scan | One-pass listing |
+### 12.3 Measured: what a stock scan costs, and what helps
+
+Test: one PG with ~103,000 objects of 4 KiB, 3 copies, file-backed BlueStore on
+a virtual disk (fast random reads, **not a real HDD**). One OSD is stopped, one
+object is overwritten 700 times so the PG log passes it, then it is restarted.
+Nothing but one object needs a push, so the time is the scan. Caches are cold
+(all OSDs restarted). Single runs. The target has just restarted and varies:
+the default case ranged from 3.4 s to 11.5 s over five runs.
+
+Scan of the whole PG, first scan start to last scan end:
+
+| Scheduler | Objects per round | Rounds | Wall time | PG lock per round |
+|---|---|---|---|---|
+| mclock (default) | 512 (default) | 201 | 4.8 s | ~5 ms |
+| mclock (default) | 8,192 | 13 | 1.4 s | ~50 ms |
+| wpq | 512 (default) | 201 | 22.5 s | ~5 ms |
+| wpq | 8,192 | 13 | 2.7 s | ~50 ms |
+
+With the one-pass listing (prototype, mclock):
+
+| Objects per round | | Stock | One-pass |
+|---|---|---|---|
+| 512 | Time in scans, primary | 1.02 s | 0.30 s |
+| 8,192 | Time in scans, primary | 0.70 s | 0.24 s |
+| 8,192 | Time in scans, target | 0.64 s | 0.20 s |
+| 8,192 | PG lock per round | ~50 ms | ~17 ms |
+| 8,192 | Wall time, whole PG | 1.4 s | 1.0 s |
+
+The prototype was also run with a check that reads every version the old way
+and asserts both agree: no mismatch.
+
+What the numbers say:
+
+- **The scan is cheap on this kind of disk.** About 9 microseconds of CPU per
+  object per side. 100,000 objects take seconds, not minutes.
+- **Most of the wall time is between rounds.** Under `wpq`, the 0.1 s sleep per
+  round is 20 of the 22.5 s.
+- **Bigger rounds are the effective, easy fix:** 3.4x faster under mclock, 8.3x
+  under `wpq`. It is one option (`osd_backfill_scan_max`), no code.
+- **One-pass listing cuts scan CPU and lock time about 3x.** It does not change
+  disk reads: the second lookup was already served from blocks the listing had
+  just read. Its use is to keep the PG lock short when rounds get bigger.
+- **Pushes dominate when objects really changed.** In a run with 2,899 changed
+  objects, the pushes took ~125 s; the scan took under 5 s.
+- **A third per-object cost showed up.** For every object it keeps, the primary
+  loads the full object state to update the target's statistics. That is about
+  as much work as its scan, and it stays in every variant above.
+
+Disk reads on the primary for the whole PG (BlueStore counters):
+
+| Objects per round | Random disk reads | Sequential reads |
 |---|---|---|
-| Version reads saved | Target only | Both sides |
-| Reply bytes | Much smaller | Same (combine with 12.1) |
-| New persisted state | Yes | No |
-| Protocol / peering change | Yes | No |
-| Risk to correctness | New invariants | None: same comparison |
+| 512 | 4,700 to 5,500 | 1,200 to 1,800 |
+| 8,192 | 1,100 to 2,400 | 230 to 350 |
 
-Order of work: measure a stock scan first (listing time against version-read
-time), then one-pass listing, then 12.1. The cutoff stays a note.
+On a real HDD each random read is a seek (~8 ms), so the default would cost
+roughly 40 s per 100,000 objects on the primary, and bigger rounds 2x to 4x
+less. That is an estimate from the counts, not a measurement.
+
+| Option | Scan wall time, 100,000 objects | Effort | Risk |
+|---|---|---|---|
+| Stock | 4.8 s (22.5 s under wpq) | | |
+| Bigger rounds | 1.4 s (2.7 s under wpq) | One option | Longer PG lock per round |
+| Bigger rounds + one-pass listing | 1.0 s | Small store change | None to correctness |
+| Digest (this branch) | Near 0 for unchanged ranges | Large | New state to keep correct |
+
+Takeaway: on fast metadata devices, bigger rounds already remove most of the
+scan time, and what the digest can still save is about one second per 100,000
+objects. The digest earns its cost on very large PGs, on real HDDs, or as a
+step toward a smaller PG log (section 11), not for scan time alone.
+
+### 12.4 The simple approach: bigger rounds, then one-pass listing
+
+The outcome of 12.1 to 12.3 in one place.
+
+**Idea:** do not avoid the scan. Make it cheap: fewer rounds, and less work per
+object.
+
+```
+ stock:        201 rounds x (list 512, look up 512, round trip, wait)
+ step 1:        13 rounds x (list 8,192, look up 8,192, round trip, wait)
+ step 2:        13 rounds x (list 8,192 with versions, round trip, wait)
+```
+
+**Step 1: bigger rounds. No code.**
+
+```
+ceph config set osd osd_backfill_scan_max 8192
+ceph config set osd osd_backfill_scan_min 8192
+```
+
+| | Stock (512) | 8,192 |
+|---|---|---|
+| Rounds for 100,000 objects | 201 | 13 |
+| Scan wall time, mclock | 4.8 s | 1.4 s |
+| Scan wall time, wpq | 22.5 s | 2.7 s |
+| Random disk reads, primary | 4,700 to 5,500 | 1,100 to 2,400 |
+| PG lock held per round | ~5 ms | ~50 ms |
+
+- Why it works: the cost between rounds (queueing, round trip, the `wpq`
+  sleep) is paid 13 times, not 201.
+- The price: the PG lock is held ten times longer per round, so client I/O on
+  that PG can wait up to ~50 ms. A middle value (2,048) trades some of the
+  gain for a shorter hold.
+- Memory and message size are not a limit: a full round is ~0.7 MB on the wire.
+
+**Step 2: one-pass listing. Small store change.**
+
+- The listing returns the version from the value it already walks; the scan
+  stops looking each object up again.
+- Measured with a prototype: scan CPU and PG lock time drop about 3x
+  (~50 ms to ~17 ms per round of 8,192). Wall time 1.4 s to 1.0 s.
+- It pays back the lock time that step 1 costs.
+- Same comparison as stock, no message change, no new state. The prototype
+  agreed with the old read path on every object.
+
+**What is left after both:**
+
+| Cost | Size | Possible next step |
+|---|---|---|
+| Primary loads full object state for each kept object (statistics) | About as much as its scan | Take size and flags from the one-pass listing |
+| Reply bytes | ~0.7 MB per round | Compress the reply (12.1) |
+| Key walk of the whole PG, both sides | Sequential, cheap | Only a maintained digest removes it |
+
+**Why this is the easy and reliable choice:**
+
+| | Bigger rounds + one-pass | Cutoff scan (12.2) | Digest |
+|---|---|---|---|
+| Work per write | None | None | 1-2 hashes |
+| State to keep correct | None | New persisted fields | Leaves, dirty flags |
+| Changes to peering or messages | None | Yes | Yes |
+| Can it skip an object wrongly? | No: stock comparison | New invariants | Hash collision, missed update |
+| Scan time, 100,000 objects (this test) | 1.0 s | not built | near 0 for unchanged ranges |
+
+Not checked: client latency during the bigger rounds, and a real HDD.
 
 ## 13. Review
 
@@ -1027,7 +1148,7 @@ choose object names:
 - Damage is limited to that leaf on the returning OSD(s): stale copies,
   objects created during the outage missing, deleted ones still there.
 - Fix: mix a secret (per cluster or per PG) into the item hash. Already listed
-  in section 9.
+  in section 9; details in 13.2.
 
 **If a wrong "equal" happens.** The stale copy stays until scrub. Even a
 shallow scrub compares the object-info attribute across copies and reports
@@ -1037,6 +1158,92 @@ Until then it matters if that OSD becomes primary or serves replica reads.
 **Takeaway.** Collisions are not the main risk. A bug that forgets to update
 or dirty a leaf has the same effect and is far more likely. That is why the
 branch has the dirty rules of section 6.2 and the verify mode (section 6.6).
+
+### 13.2 Solutions for the leaf hash concern
+
+Proposals. None is in the branch, none is prototyped.
+
+Three ways to get a wrong "equal", three kinds of fix:
+
+| Cause | Fix | Cost |
+|---|---|---|
+| Forged | Keyed item hash | Same CPU; one key per PG |
+| Missed update (a bug) | Check leaves during scrub; scrub after a digest backfill | Almost none: scrub reads the versions anyway |
+| Accident | 128-bit leaves (optional) | 16 KB per exchange instead of 8 KB |
+
+**1. Forged: use a keyed hash.**
+
+```
+ today:     item hash = XXH64(name, ..., version, seed = 0)      anyone can compute it
+ proposed:  item hash = SipHash(key, name, ..., version)         only the OSDs can
+```
+
+- With a secret key a client cannot compute any item hash, so it cannot build
+  a set that cancels someone else's change. What is left is a blind guess:
+  2^-64 per try.
+- Use a hash designed to be keyed (SipHash-2-4, or HMAC-SHA256 cut to 64 bits,
+  which is already in the tree). XXH64 with a secret seed is not designed for
+  this.
+- XOR can stay. Its weakness needs known item hashes.
+
+Where the key lives:
+
+| Question | Answer |
+|---|---|
+| Who makes it | The primary, when the digest is first built: 128 random bits per PG |
+| Where it is stored | In the PG metadata on every copy, next to the digest |
+| How copies get it | In the exchange message, OSD to OSD only. Never in the OSD map, never to clients |
+| Key differs on a copy | Its leaves are useless: mark all dirty, rebuild by listing once |
+| Rotation | New key = rebuild. No need in normal operation |
+
+**2. Missed update: let scrub check the leaves.**
+
+Scrub already reads every object's version on every copy, range by range.
+That is the input of a leaf hash.
+
+```
+ scrub of a range, on each copy:
+   read (object, version) for every object        <- done today
+   hash them into a scratch leaf                  <- new, nearly free
+   leaf fully covered and not written meanwhile?
+       scratch leaf == maintained leaf ?  ok
+       else  -> count it, raise a health warning, replace the leaf
+```
+
+- Every leaf is checked once per scrub cycle, on every copy, with no extra I/O.
+- A leaf written during its scrub is skipped this time (a per-leaf change
+  counter tells).
+- Any mismatch is a bug report with a PG and a range, and it turns digest
+  skipping off for that PG until the next clean check.
+
+**3. Missed update and accident: scrub after a digest backfill.**
+
+```
+ backfill with skipped leaves  ->  PG clean fast  ->  queue a shallow scrub of this PG
+```
+
+- The full comparison still happens, by existing code, in the background. The
+  digest moves it off the critical path instead of removing it.
+- A wrong "equal" then lives for hours, not until some later scrub, and it is
+  reported ("object info inconsistent", missing or extra object).
+- Until that scrub ends, a stale copy counts as a good copy.
+
+**4. Smaller additions.**
+
+| Addition | What it catches |
+|---|---|
+| Spot check: list a few random "equal" leaves anyway (for example 16 of 1,024) | A systematic bug, soon, at ~1.6% of the scan cost |
+| Object count per leaf (4 bytes) | An add without its remove, and the reverse |
+| 128-bit leaves | Makes an accidental match 2^-128. Not needed with 1 to 3 |
+
+**With 1 to 3 in place:**
+
+| | Today's branch | With the fixes |
+|---|---|---|
+| Forged "equal" | Possible | Blind guess only, 2^-64 |
+| Wrong leaf from a bug | Found only by verify mode (debug) | Found within one scrub cycle, in production |
+| Wrong "equal" at backfill | Stays until some later scrub | Reported by the scrub queued right after |
+| Exact, like stock? | No | Still no. Only listing is exact (section 12.4) |
 
 ## 14. Takeaways
 
