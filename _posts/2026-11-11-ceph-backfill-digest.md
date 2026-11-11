@@ -852,7 +852,9 @@ Two open questions decide how far to go:
 - Is a persisted leaf update cheaper than the log entry it would replace?
 - After step 3, is the remaining per-write entry worth steps 4 to 6?
 
-## 12. Brainstorm: compress the scan reply
+## 12. Brainstorm
+
+### 12.1 Brainstorm: compress the scan reply
 
 A simpler idea than the digest: **compress the whole scan reply and raise the
 default `osd_backfill_scan_max`**, so one round carries many more objects.
