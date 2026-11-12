@@ -262,6 +262,21 @@ Both scan functions then seek past skipped leaves:
  scan:       seek --------> list ------> seek -------------> list
 ```
 
+What a skip saves. A stock scan does two RocksDB operations per object: walk
+its key, then look the object up again for its version.
+
+| Leaf at backfill | Key walk | Version read per object |
+|---|---|---|
+| Clean and equal on all sides (skipped) | None: one seek | None |
+| Clean but different | Whole leaf | Every object in the leaf |
+| Dirty | Whole leaf, to rebuild the hash | Every object in the leaf |
+| All dirty (after a crash) | Whole PG | Every object in the PG |
+
+- The unit is the leaf, not the object. One changed object makes its leaf
+  "different": about 100 objects are read for it (100,000 objects, 1,024
+  leaves).
+- A pushed object dirties its leaf, which is re-read before the next exchange.
+
 ### Keeping the skip safe
 
 Skipping changes an old rule of backfill: *"an object the target lists but the
