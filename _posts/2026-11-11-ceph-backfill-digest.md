@@ -199,7 +199,18 @@ XOR makes updates cheap. Only the old and new version are needed:
                                                 read versions, recompute
 ```
 
-EC pools are not supported.
+When the dirty flag is set and cleared:
+
+| | When |
+|---|---|
+| One leaf set | The events in the right column above: an object changed and its old version is not reliably known |
+| All leaves set | The digest is created without knowing the store: start after a crash, a stale saved copy, PG split or merge, leaf count changed |
+| All leaves set, always | EC pools: not supported, every log entry only marks its leaf dirty |
+| Not set | A PG that never logged a write starts with all leaves clean and zero. A normal client write updates the hash in place |
+| Cleared | Only by a rebuild of that leaf, before an exchange |
+
+A dirty leaf is never reported "equal", even if its value happens to match:
+the test is "not dirty and same value". Dirty is the safe default.
 
 ### The state it keeps, and where
 
