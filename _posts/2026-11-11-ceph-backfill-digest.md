@@ -512,6 +512,73 @@ change. Whether that is enough depends on how often backfill runs:
 So: this section is the answer to "make today's occasional backfill cheaper
 with no new risk". It is not an answer to "recover by backfill always".
 
+### Brainstorm: a cutoff, and one max version per leaf
+
+An idea to close that gap without hashes. Not built. It was reviewed against
+the code (upstream `main`), and the review changed it: see below.
+
+**The cutoff.** Every write stamps its object with a new, larger version. So
+"changed since the OSD left" is "version above a cutoff V".
+
+| Candidate for V | Verdict |
+|---|---|
+| The OSD's `last_update` | Wrong: it can include writes no other copy has, and entries for objects not yet recovered |
+| The OSD's `last_complete` | Wrong: fixes only the second problem |
+| The PG log tail | Safe (trim never passes the committed point) but 250 to 10,000 entries old |
+| Last version committed on all copies while this OSD was clean | Right. Not stored anywhere today: a new persisted value |
+
+A cutoff alone does not help: to find "newer than V" the primary still reads
+every object's version.
+
+**The max version per leaf.** Same leaves as the digest. Each OSD keeps one
+number per leaf: the highest version of any log entry, deletes included, for
+an object in that leaf.
+
+```
+ primary:  leaf_max[i]       returning OSD:  V, and its own leaf_max[i]
+
+ skip leaf i  if   primary leaf_max[i] <= V     nothing changed here since V
+              and  own     leaf_max[i] <= V     and I wrote nothing here after V
+
+ else: list leaf i on both sides, stock comparison
+```
+
+This is how ZFS resilver and the md / DRBD write-intent bitmap work: remember
+*where* something changed, not *what*.
+
+| | XOR digest | Max version + cutoff |
+|---|---|---|
+| Wrong "equal" by collision or forgery | Possible | Not possible: no hash, a maximum cannot be cancelled |
+| Compares | The two copies as they are | The history since V |
+| Finds damage older than V | Yes | No, same as log recovery. Scrub does |
+| Crash of either side | Leaves lost, re-read the PG | Rebuilt from the PG log at start, or persisted per write |
+| Hooks | Every path that changes an object | Where log entries are appended |
+
+**What the code review found:**
+
+| Finding | Effect |
+|---|---|
+| A returning OSD's old log is replaced during activation, before any backfill message | It cannot use its log to tell what it wrote after V. It needs its **own persisted `leaf_max`** |
+| The committed point lives only in memory | V must be written by each replica, in the write's own transaction, only while it is clean |
+| `osd lost`, `ignore_history_les`, `ceph-objectstore-tool mark-complete` can drop history at or below V | V must be dropped then. Needs a new "history was lost" marker in the PG history |
+| PG merge mixes two version sequences | V = 0 after a merge. Split is fine |
+| Scrub repair and offline tools change objects with no new version | Scrub repair must mark the leaf "never skip" |
+| A write or delete after the exchange lands in a leaf already marked skip | Decide each skip when the scan reaches the leaf, or keep the digest branch's rules for it |
+| A primary that was backfilled without an exchange has an incomplete `leaf_max` | Start it at `last_update` (skip nothing) |
+
+Two of these broke the first version of the idea: the replaced log, and the
+lost-history operations.
+
+**Size.** About the same as the digest branch: ~900 lines, one new message, a
+feature bit, new PG metadata keys, one change to the PG history encoding.
+Replicated pools only.
+
+**Verdict.** It removes the hash questions of section 6 and survives a crash
+without re-reading the PG. It pays with a new rule that must never be wrong:
+*V is valid*. If V is wrong, copies stay different silently, and a later
+scrub can repair toward the wrong copy. The riskiest code is the same as in
+the digest branch: seeking past leaves while writes and restarts race.
+
 ## 8. Where this leads: a smaller PG log
 
 The speed-up is not the end goal. This work is preparation for a bigger one:
@@ -525,7 +592,7 @@ The speed-up is not the end goal. This work is preparation for a bigger one:
 ```
 
 **What the log costs today.** One client write, on every copy of the PG
-(upstream `main` at `0f8fa6b9ce7`; sizes computed from the encoders):
+(upstream `main` at `0f8fa6b9ce7`):
 
 ```
  client            primary OSD                              replica OSD
@@ -540,16 +607,41 @@ The speed-up is not the end goal. This work is preparation for a bigger one:
  reply      <---  all committed
 ```
 
-| Item | Cost per write, per copy |
-|---|---|
-| Log entry key + value | ~224 bytes + object name |
-| PG info key (`_fastinfo`) | ~212 bytes |
-| Trim | One delete per entry, in batches of 100 or more |
-| Sync | None extra: same batch as the object metadata |
-| Memory | One entry until trimmed; up to 10,000 entries per PG, plus 3,000 duplicate records |
+Measured on a test cluster: 4 KiB writes, 3 copies, BlueStore, about 60,000
+writes, PG log of ~1,500 entries. Per write, per copy:
 
-About 450 bytes of key-value data per write per copy. For a 4 KiB write that
-is real; for a 4 MiB write it is noise.
+| What goes into the RocksDB batch | Bytes | Share |
+|---|---|---|
+| Object metadata (onode) | 1,207 | 62% |
+| PG log entry, and later its delete | 318 | 16% |
+| PG info (`_fastinfo`) | 208 | 11% |
+| Duplicate-op record, and later its delete | 149 | 8% |
+| Other | 70 | 3% |
+| **PG log and info together** | **697** | **36%** |
+
+| Other cost | Measured |
+|---|---|
+| CPU | ~4% of OSD CPU in the log path; the resent-op lookup is 0.05% |
+| Memory | ~1.2 MB per PG (1,500 entries + 3,000 duplicate records) |
+| Extra sync | None: same batch as the object metadata |
+
+When the 4 KiB of data also goes through the RocksDB log (deferred write), the
+batch grows to 5.8 KB and the PG log share drops to 10%. For a 4 MiB write it
+is noise.
+
+**Why the PG log gets called a bottleneck.** Not because one entry is
+expensive. The usual reasons, with what this test can say about each:
+
+| Reason | Why | In this test |
+|---|---|---|
+| Write volume on small writes | A third of the key-value bytes. Every entry is written, then deleted: tombstones and compaction work | Measured: 36% of the batch |
+| Memory | Entries x PGs. Up to 10,000 entries and 3,000 duplicate records per PG | 1.2 MB per PG; a few hundred MB per OSD at 200 PGs |
+| One order per PG | One log = one version sequence = writes to a PG run one after another under the PG lock | Not measured. A design limit, not a byte count |
+| Start and peering | An OSD reads every log entry of every PG at start; peering sends logs around | Not measured |
+| EC pools | Entries also carry rollback data | Not measured |
+
+So: on CPU the log is small. On bytes written and on memory it is a real
+share for small writes. The ordering limit is the one no tuning removes.
 
 **The log does more than recovery.** The digest covers the first job only:
 
