@@ -1093,6 +1093,75 @@ ceph config set osd osd_backfill_scan_min 8192
 
 Not checked: client latency during the bigger rounds, and a real HDD.
 
+### 12.5 Brainstorm: compact tuples and even bigger rounds
+
+**Idea:** shrink one item to a small `(id, version)` tuple, then put many more
+items in one round.
+
+Sizes here are computed from the field layout, not measured. Nothing in this
+section is built.
+
+**The compact tuple.** Most of an item is constant or predictable inside one
+PG scan:
+
+| Field | Today | Compact | How |
+|---|---|---|---|
+| pool, namespace, key, snap, max | ~31 B | 0 to 1 B | Pool once per message; a flag byte for the rare non-empty cases |
+| hash (32-bit) | 4 B | 1 to 2 B | Items are sorted by hash: send the delta |
+| name | 4 + 38 B | 8 B | 64-bit fingerprint of the name |
+| version | 12 B | ~4 B | Epoch as a delta from a base; version as distance from `last_update` |
+| **Total** | **~89 B** | **~14 B** | |
+
+**What it fixes, and what it does not:**
+
+| Concern | Digest | Compact tuples |
+|---|---|---|
+| Forged cancellation (13.1) | Possible | Gone: items are compared one by one |
+| Missed update bug (13.1) | Possible | Gone: nothing is maintained |
+| Persisted state, crash safety | Needed | None |
+| Bytes per 100,000 objects | ~9 KB | ~1.4 MB (stock: ~8.9 MB) |
+| Scan time | Skipped for equal leaves | Same as stock: both sides list everything |
+
+- The digest's two risks come from its shape: XOR over many items, and an
+  update on every write. A tuple built at scan time has neither.
+- A version is issued once per write in a PG, so it already nearly names the
+  object. The fingerprint guards the cases where that breaks, such as PG merge.
+
+**Two catches:**
+
+- Plain compression is almost as small and stays exact: zstd on the stock
+  reply is ~16 B per item (12.1), with no new comparison code.
+- An object that only the target has must be removed by full name. That needs
+  a second round trip, or a new "remove by fingerprint" message.
+
+**Bigger rounds.** The reply size is not the limit. The PG lock is:
+
+| | 512 | 8,192 | 65,536 (extrapolated) |
+|---|---|---|---|
+| Reply, stock | 45 KB | 729 KB | ~5.8 MB |
+| Reply, zstd | 8 KB | 129 KB | ~1 MB |
+| Reply, compact tuple | ~7 KB | ~115 KB | ~0.9 MB |
+| PG lock per round, stock | ~5 ms | ~50 ms | ~400 ms |
+| PG lock per round, one-pass | | ~17 ms | ~135 ms |
+| Rounds for 100,000 objects | 201 | 13 | 2 |
+
+- Client writes to the PG wait while a round is scanned. 400 ms is too long;
+  135 ms is borderline.
+- Little is left to gain: 13 rounds to 2 saves about 0.1 to 0.2 s per 100,000
+  objects. The rest of the 1.0 s is the listing itself.
+
+**To go bigger anyway:** scan in chunks, drop the PG lock between chunks, send
+one reply.
+
+| Side | Why a chunked scan may be safe | Status |
+|---|---|---|
+| Target | Client writes are not applied past `last_backfill`; only backfill changes that range | Not confirmed in code |
+| Primary | `update_range` already patches a stale scan from the PG log | Not confirmed; and it leans on the PG log |
+
+**Verdict:** stay with 12.4: 8,192 per round, one-pass listing, zstd on the
+stock items. Compact tuples and bigger rounds add code for about 0.2 s per
+100,000 objects.
+
 ## 13. Review
 
 Questions raised while reading the branch, with answers.
