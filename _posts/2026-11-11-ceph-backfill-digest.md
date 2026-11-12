@@ -1216,8 +1216,8 @@ choose object names:
   - the crafted names hash into the same PG and the same leaf.
 - Damage is limited to that leaf on the returning OSD(s): stale copies,
   objects created during the outage missing, deleted ones still there.
-- Fix: mix a secret (per cluster or per PG) into the item hash. Already listed
-  in section 9; details in 13.2.
+- Fix: mix a per-PG secret into the item hash. Already listed in section 9.
+  It is not a small change: see 13.2.
 
 **If a wrong "equal" happens.** The stale copy stays until scrub. Even a
 shallow scrub compares the object-info attribute across copies and reports
@@ -1230,17 +1230,99 @@ branch has the dirty rules of section 6.2 and the verify mode (section 6.6).
 
 ### 13.2 Solutions for the leaf hash concern
 
-Proposals. None is in the branch, none is prototyped.
+Proposals. None is in the branch, none is prototyped. The costs come from
+reading the branch code, not from building the fixes.
 
-Three ways to get a wrong "equal", three kinds of fix:
+**Facts in the branch that decide what is easy:**
 
-| Cause | Fix | Cost |
-|---|---|---|
-| Forged | Keyed item hash | Same CPU; one key per PG |
-| Missed update (a bug) | Check leaves during scrub; scrub after a digest backfill | Almost none: scrub reads the versions anyway |
-| Accident | 128-bit leaves (optional) | 16 KB per exchange instead of 8 KB |
+| Fact | Effect |
+|---|---|
+| The digest lives in memory. It is saved only on clean shutdown and deleted when loaded | Nothing stored "next to the digest" survives a crash |
+| Every copy builds its own digest, on its own | There is no shared state to put a key in |
+| Only backfill targets receive the exchange | Other replicas never see what the primary sends |
+| A leaf that must be rebuilt costs one read per object, in one pass under the PG lock | A full rebuild is the stock target scan again, without rounds |
+| One function computes the item hash | Swapping the hash is a small change |
+| Scrub works in chunks of 5 to 100 objects | A leaf of a large PG never fits in one chunk |
 
-**1. Forged: use a keyed hash.**
+**The fixes, by cost:**
+
+| Fix | Catches | Code | Format change |
+|---|---|---|---|
+| 1. Scrub after a digest backfill | Forged, missed update, accident | ~30 lines | None |
+| 2. Spot check of a few leaves | Missed update | ~20 lines | None |
+| 3. Add instead of XOR | An update applied twice | ~10 lines | None |
+| 4. Leaf check during scrub | Missed update | ~150 lines | None |
+| 5. Keyed item hash | Forged | ~200 lines | Message, digest encoding, PG metadata |
+| 6. Object count per leaf, 128-bit leaves | Little that 1 to 3 do not | 50 to 80 lines each | Message, digest encoding |
+
+**1. Scrub after a digest backfill. Easy, and the widest net.**
+
+```
+ backfill with skipped leaves  ->  PG clean  ->  queue a shallow scrub of this PG
+```
+
+- The hook exists: recovery completion already calls into the scrubber.
+- It is the only fix that compares real objects across copies, so it covers
+  all three causes.
+- Cost: one full shallow scrub on every copy. The digest moves the comparison
+  off the critical path. It does not remove it.
+- Limits:
+  - the scrub obeys `noscrub`, scrub hours, load limits, and waits until the
+    OSD has no recovery left. No fixed deadline;
+  - it reports, it does not repair. A bad leaf holds many objects, so the fix
+    is usually `ceph pg repair`;
+  - the "scrub wanted" flag is in memory: lost if the primary restarts or
+    changes;
+  - until the scrub ends, a stale copy counts as a good copy.
+
+**2. Spot check. Easy.**
+
+```
+ at each exchange, on each side:
+   rebuild 16 random clean leaves from the store
+   rebuilt leaf != maintained leaf  ->  count it, log it, use the rebuilt one
+```
+
+- This is the branch's verify mode (section 6.6) for a sample, not for the
+  whole PG. About 1.6% of the scan cost.
+- It must be a local check, or done on the target. If only the primary lists
+  an "equal" leaf, the target still skips it, and the primary pushes every
+  object of that leaf. That copies data and checks nothing.
+
+**3. Add instead of XOR. Easy.**
+
+```
+ today:     leaf ^= item hash                 apply twice = no change
+ proposed:  leaf += / -= item hash (mod 2^64)   apply twice = visible
+```
+
+- Catches an update applied twice, which XOR hides.
+- Does not catch a fully missed update. Nothing but a comparison with the
+  store does.
+
+**4. Leaf check during scrub. Moderate.**
+
+Scrub reads every object's version on every acting copy, chunk by chunk.
+That is the input of a leaf hash.
+
+```
+ scrub chunk accepted (writes to the chunk are blocked):
+   add its (object, version) hashes to a scratch value for the current leaf
+ a write to an object the scrub already passed, same leaf:
+   apply it to the scratch value too
+ scrub passes the end of the leaf:
+   scratch == maintained leaf ?  ok
+   else -> count it, log it, replace the leaf, stop skipping for this PG
+```
+
+- A leaf has to be collected across many chunks. Checking only "leaf fully
+  inside one chunk" works for small PGs only.
+- No extra I/O. As a bonus it cleans dirty leaves, for example after a crash.
+- Backfill targets are not scrubbed, so this checks acting copies only.
+- A health warning needs new plumbing. A cluster log line and a counter are
+  easy.
+
+**5. Keyed item hash. The hash is easy, the key is not.**
 
 ```
  today:     item hash = XXH64(name, ..., version, seed = 0)      anyone can compute it
@@ -1250,69 +1332,38 @@ Three ways to get a wrong "equal", three kinds of fix:
 - With a secret key a client cannot compute any item hash, so it cannot build
   a set that cancels someone else's change. What is left is a blind guess:
   2^-64 per try.
-- Use a hash designed to be keyed (SipHash-2-4, or HMAC-SHA256 cut to 64 bits,
-  which is already in the tree). XXH64 with a secret seed is not designed for
-  this.
-- XOR can stay. Its weakness needs known item hashes.
+- SipHash is not in the tree (about 70 lines to add). HMAC-SHA256 is, but it
+  costs far more per item, and the digest is updated on every write.
 
-Where the key lives:
+The key is the hard part:
 
-| Question | Answer |
+| Question | Problem |
 |---|---|
-| Who makes it | The primary, when the digest is first built: 128 random bits per PG |
-| Where it is stored | In the PG metadata on every copy, next to the digest |
-| How copies get it | In the exchange message, OSD to OSD only. Never in the OSD map, never to clients |
-| Key differs on a copy | Its leaves are useless: mark all dirty, rebuild by listing once |
-| Rotation | New key = rebuild. No need in normal operation |
+| Where is it stored | Not next to the digest (lost on a crash). It needs real PG metadata, written when the key is set |
+| Who knows it | Only backfill targets get the exchange. Acting replicas need a new message, or a new primary has another key |
+| Key differs on a copy | All its leaves are useless. Rebuild = read every object in one pass under the PG lock. That backfill saves nothing on that copy |
+| One key per cluster | No safe place: the config database is readable with ordinary client caps |
 
-**2. Missed update: let scrub check the leaves.**
+Without durable storage and without telling all copies, the rebuild repeats
+after every crash and every primary change.
 
-Scrub already reads every object's version on every copy, range by range.
-That is the input of a leaf hash.
+**6. Object count per leaf, 128-bit leaves. Low value.**
 
-```
- scrub of a range, on each copy:
-   read (object, version) for every object        <- done today
-   hash them into a scratch leaf                  <- new, nearly free
-   leaf fully covered and not written meanwhile?
-       scratch leaf == maintained leaf ?  ok
-       else  -> count it, raise a health warning, replace the leaf
-```
+- An unmatched add or remove already changes the leaf. The count adds nothing
+  for a missed update or a double apply.
+- 128 bits only helps against an accident, which is already 2^-64.
 
-- Every leaf is checked once per scrub cycle, on every copy, with no extra I/O.
-- A leaf written during its scrub is skipped this time (a per-leaf change
-  counter tells).
-- Any mismatch is a bug report with a PG and a range, and it turns digest
-  skipping off for that PG until the next clean check.
+**With 1 to 3 in place (about 60 lines, no format change):**
 
-**3. Missed update and accident: scrub after a digest backfill.**
-
-```
- backfill with skipped leaves  ->  PG clean fast  ->  queue a shallow scrub of this PG
-```
-
-- The full comparison still happens, by existing code, in the background. The
-  digest moves it off the critical path instead of removing it.
-- A wrong "equal" then lives for hours, not until some later scrub, and it is
-  reported ("object info inconsistent", missing or extra object).
-- Until that scrub ends, a stale copy counts as a good copy.
-
-**4. Smaller additions.**
-
-| Addition | What it catches |
-|---|---|
-| Spot check: list a few random "equal" leaves anyway (for example 16 of 1,024) | A systematic bug, soon, at ~1.6% of the scan cost |
-| Object count per leaf (4 bytes) | An add without its remove, and the reverse |
-| 128-bit leaves | Makes an accidental match 2^-128. Not needed with 1 to 3 |
-
-**With 1 to 3 in place:**
-
-| | Today's branch | With the fixes |
+| | Today's branch | With 1 to 3 |
 |---|---|---|
-| Forged "equal" | Possible | Blind guess only, 2^-64 |
-| Wrong leaf from a bug | Found only by verify mode (debug) | Found within one scrub cycle, in production |
-| Wrong "equal" at backfill | Stays until some later scrub | Reported by the scrub queued right after |
+| Forged "equal" | Possible | Still possible. Reported by the scrub that follows |
+| Wrong leaf from a bug | Found only by verify mode (debug) | Sampled at every exchange; double apply always seen |
+| Wrong "equal" at backfill | Stays until some later scrub | Reported by the scrub queued after it |
 | Exact, like stock? | No | Still no. Only listing is exact (section 12.4) |
+
+Fix 5 is the only one that stops a forged "equal" before it happens. It is
+worth its cost only if hostile clients are in scope.
 
 ## 14. Takeaways
 
