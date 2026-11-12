@@ -199,14 +199,42 @@ XOR makes updates cheap. Only the old and new version are needed:
                                                 read versions, recompute
 ```
 
-| Event | What happens to the digest |
-|---|---|
-| Clean shutdown | Saved, stamped with `last_update` |
-| Start | Loaded only if the stamp matches; the saved copy is always deleted |
-| Crash / `kill -9` | Nothing saved: all leaves dirty, first exchange re-reads the whole PG |
-| PG split or merge | Reset |
-
 EC pools are not supported.
+
+### The state it keeps, and where
+
+A stock scan keeps nothing: it reads versions from the store at scan time, so
+it cannot be out of date. The digest is a second copy of that information. It
+is only useful while it stays equal to the store.
+
+| State | What it is | Lives for |
+|---|---|---|
+| Leaf array | One 64-bit hash per leaf, on every copy of the PG | As long as the PG is loaded |
+| Dirty flags | One per leaf: "not trusted, rebuild before use" | Same |
+| Layout | Pool, PG, split bits, leaf count. A mismatch (split, merge) resets the digest | Same |
+| Skip mask (primary) | Leaves every target reported equal | One backfill |
+| Skip set (target) | The target's own "equal" answer | The peering interval |
+| Changed set (primary) | Objects written since the exchange | One backfill |
+
+All of it is in memory. Only the leaf array is ever written to disk, in one
+case:
+
+```
+ clean shutdown  ->  saved in the OSD's meta collection, one object per PG,
+                     stamped with last_update
+ start           ->  loaded only if the stamp equals the PG's last_update;
+                     the saved object is deleted either way
+ crash / kill -9 ->  nothing was saved: all leaves start dirty
+```
+
+What follows from that:
+
+- **Every write path must update it.** A path that forgets leaves a leaf that
+  is wrong but looks clean (section 6).
+- **A crash loses it.** The next exchange re-reads every object, in one pass
+  under the PG lock.
+- **The returning OSD is often the cold side.** If it was killed, its digest
+  is gone exactly when backfill needs it.
 
 ### The exchange and the scan
 
