@@ -484,6 +484,34 @@ PG log.
 
 Not checked: client latency during the bigger rounds, and a real HDD.
 
+### Where this stops
+
+A cheap scan is still a full scan. Its cost follows the PG size, not the
+change. Whether that is enough depends on how often backfill runs:
+
+| Case | Scan cost | Enough? |
+|---|---|---|
+| Backfill is rare (today), fast metadata device | ~1 s per 100,000 objects | Yes |
+| Same, real HDD | Roughly 10 to 20 s per 100,000 objects (estimate) | Borderline |
+| Backfill replaces log recovery: every OSD restart scans every PG | 100 PGs x 100,000 objects = 10 million objects per restart, on both sides | No |
+
+```
+ OSD restarts after 30 s, 500 objects changed
+
+ log recovery:        work ~ 500
+ cheap scan:          work ~ 10,000,000
+ digest (persisted):  work ~ the leaves those 500 objects are in
+```
+
+- The third row is the goal of section 8. No tuning of the scan closes that
+  gap. Only skipping unchanged ranges does.
+- The branch's digest does not close it yet either: a killed OSD has lost its
+  digest and reads every object once. It needs leaf updates persisted with
+  each write (section 8, step 1) and the fixes of section 6.
+
+So: this section is the answer to "make today's occasional backfill cheaper
+with no new risk". It is not an answer to "recover by backfill always".
+
 ## 8. Where this leads: a smaller PG log
 
 The speed-up is not the end goal. This work is preparation for a bigger one:
@@ -553,7 +581,8 @@ question: is a persisted leaf update cheaper than the log entry it replaces?
 - The digest is a summary both sides already have: an XOR per hash range, updated from the PG log. Leaves follow **listing order**, so "equal" turns into "seek past".
 - Most of the branch is not the digest. It is the rules that keep skipping safe.
 - The digest is not exact. A scrub right after a digest backfill is the cheap way to catch a wrong "equal".
-- For scan time alone, bigger rounds and one-pass listing get most of the gain with no new state. The digest matters as a step toward a smaller PG log.
+- For today's occasional backfill, bigger rounds and one-pass listing get most of the gain with no new state.
+- A cheap scan is still a full scan. Recovering by backfill always needs work that follows the change: a digest that is persisted and trusted.
 
 ## References
 
