@@ -343,7 +343,7 @@ per-object check.
 | Wrong "equal" | Stock | Digest |
 |---|---|---|
 | By accident | Impossible | 2^-64 per leaf that differs: negligible |
-| Forged | Impossible | Possible: the hash has no key |
+| Forged | Impossible | Possible on the branch as first read: the hash has no key. Closed later, see the update below |
 | From a missed update (a bug) | Nothing is maintained | Possible; the larger practical risk |
 
 **Forged.** XOR is linear: with 70 to 80 candidate items, simple algebra finds
@@ -373,7 +373,7 @@ reading the code.
 | 2. Spot check: rebuild 16 random leaves at each exchange | Missed update | ~20 lines | None |
 | 3. Add instead of XOR | An update applied twice | ~10 lines | None |
 | 4. Check leaves during normal scrub | Missed update | ~150 lines | None |
-| 5. Keyed item hash | Forged | ~200 lines | Message, encoding, PG metadata |
+| 5. Keyed item hash | Forged | ~200 lines | Message, encoding, a place for the key |
 
 - **Fix 1 is the widest net.** It is the only one that compares real objects
   across copies. The digest then moves the comparison off the critical path;
@@ -381,18 +381,120 @@ reading the code.
   reports, it does not repair.
 - **Fix 2 must be local.** If only the primary lists an "equal" leaf, the
   target still skips it and the primary pushes every object in it.
-- **Fix 5 is the only one that prevents a forged "equal"**, and the key is the
-  hard part:
-
-| Question | Problem |
-|---|---|
-| Where is the key stored | The digest does not survive a crash. The key needs real PG metadata |
-| Who knows it | Only backfill targets get the exchange. Other replicas need a new message |
-| Key differs on a copy | Rebuild all leaves = read every object. That backfill saves nothing there |
-| One key per cluster | No safe place: the config database is readable with ordinary client caps |
+- **Fix 5 is the only one that prevents a forged "equal"**. It is now done:
+  see the update.
 
 With fixes 1 to 3 (about 60 lines) a wrong "equal" is found and reported soon
-after. It is still not prevented, and the digest is still not exact.
+after. The digest is still not exact.
+
+### Update: the item hash is now keyed
+
+The review follow-up [clyso/ceph PR 253](https://github.com/clyso/ceph/pull/253)
+closes the forged case with three commits: `40fcf798327` (add SipHash-2-4),
+`81b6787574f` (the monitors create a secret key), `865fda5db25` (the OSD keys
+the digest with it). Read from the commits, not built or tested here.
+
+**The hash.** Same input bytes, a keyed function:
+
+```diff
+ item hash of (object, version):
+-  XXH64(bytes, seed = 0)              anyone can compute it
++  SipHash-2-4(bytes, k0, k1)          only who holds the key can
+```
+
+XOR stays. Its weakness needs known item hashes, and a client can no longer
+compute one.
+
+**Where the key comes from.** One key for the whole cluster, kept by the
+monitors:
+
+```text
+ monitor (leader)
+   key "osd/backfill_digest_key" missing?
+     make 16 random bytes, store them through paxos   (once per cluster)
+
+ OSD start
+   read the key cached in its own meta collection     (works before the mons answer)
+   ask the mons once: config-key get osd/backfill_digest_key
+     no key yet    -> ask again every minute
+     same key      -> done
+     another key   -> save it, use it after the next restart
+
+ PG
+   no key on this OSD -> no digest at all: not kept, not saved, not exchanged
+   key present        -> leaves = XOR of SipHash(key, object, version)
+```
+
+**Who can read the key:**
+
+| Caller | `config-key get osd/backfill_digest_key` |
+|---|---|
+| OSD (`profile osd`) | Allowed, for this one key only |
+| Admin, mgr | Allowed |
+| Client with `mon 'allow r'` | Denied (`EACCES`); a test checks it |
+
+**How two sides agree on the key.** Every digest and every exchange message
+carries a key id (a hash of the key, never the key):
+
+```text
+ load a saved digest or checkpoint
+   key id differs from this OSD's key, or is missing  -> drop it, all leaves dirty
+
+ target gets a digest request
+   key id differs from its own, or is missing          -> answer "no leaf is equal"
+```
+
+So a mismatch always falls back to the full scan, never to a wrong skip.
+
+**What I got wrong above.** I listed "one key per cluster" as having no safe
+home. That was about the config database. The monitors' config-key store is a
+different thing: plain read caps do not reach it. A cluster key also avoids
+the per-PG key problems I listed:
+
+| My concern with a per-PG key | With the cluster key |
+|---|---|
+| Where is it stored | In the monitors; each OSD caches it |
+| Who knows it | Every OSD, with no new OSD-to-OSD message |
+| Key differs on a copy | Only during a key change; then the full scan runs once |
+
+**What it does not change:**
+
+- A missed or doubled update still leaves a wrong leaf that looks clean.
+  Fixes 1 to 3 still apply.
+- An accidental match is still 2^-64.
+- Whoever holds an OSD's key or admin rights can read the digest key. That is
+  the trust Ceph already puts in OSDs.
+- Formats: the digest encoding and the exchange message both go to version 2.
+
+**Review of the three commits.** Read, not run.
+
+| Checked | Result |
+|---|---|
+| SipHash code against the reference | Matches: same constants, rounds and length byte. The test has the 64 reference vectors |
+| Key is random | 16 bytes from the monitor's crypto random source, agreed through paxos |
+| Plain client caps cannot read the key | Holds. The monitor refuses the config-key service to blanket caps; `profile osd` gets `config-key get` for this one key |
+| No unkeyed fallback | Holds. No key on the OSD means no digest, no checkpoint, no exchange |
+| Old and new builds mixed | Safe. A version 1 digest or message has key id 0, which matches no key: nothing is equal |
+| Two OSDs with different keys | Safe. Ids differ, nothing is equal, full scan |
+| Key id leaks the key | No. It is a SipHash of a fixed label under the key; a label can never equal an item's hash input |
+
+Suggestions, none blocking:
+
+| Point | Why | Suggestion |
+|---|---|---|
+| A decoded digest has the key id but a zero key until the OSD's key is attached | If any path hashed in between, leaves would be built with a zero key and look clean | Assert in the hash function that the key is attached |
+| Leaf values are as sensitive as the key | Watching a leaf before and after one write gives that item's hash; enough of them brings the linear attack back | Never show leaf values to clients. On the cluster network they travel in clear unless it runs in secure mode |
+| The key is cached in clear on every OSD disk | A discarded disk carries the cluster key | Say so in the docs; rotate after losing a disk |
+| No rotation procedure | Changing the key works (OSDs pick it up at restart) but nothing describes it | A short doc note |
+| Hash input joins name, key and namespace with NUL bytes | Ambiguous if a name contains NUL. Not exploitable, since versions differ | Length-prefix the strings |
+| One key for the whole cluster | Any OSD can forge in any pool | Accept: OSDs are trusted cluster-wide already |
+
+Verdict: it closes the forged case as intended.
+
+The same follow-up work also added a crash-safe checkpoint of the digest
+([PR 252](https://github.com/clyso/ceph/pull/252), merged), so "a crash loses
+the digest" in sections 4 and 5 describes the branch as first read
+(`7fb25bf380f`), not its current state.
 
 ## 7. A simpler way: make the scan cheap
 
