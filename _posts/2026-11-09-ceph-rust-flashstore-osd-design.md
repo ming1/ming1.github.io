@@ -892,22 +892,20 @@ Why the tree never blocks:
 
 One checkpoint, in time order:
 
-```mermaid
-sequenceDiagram
-    participant S as Shard
-    participant T as B+tree
-    participant D as Device
-    S->>T: freeze_begin(lsn)
-    loop until done, txns run in between
-        S->>T: freeze_step(budget)
-    end
-    S->>T: freeze_end()
-    T-->>S: Frozen {pages, root, free_after}
-    S->>D: write pages, delta segment, meta bitmap
-    Note over S,D: wait: these writes done, WAL durable up to lsn
-    S->>D: write root slot (seq & 1)
-    Note over S,D: commit point: the old tree is valid until here
-    S->>T: ckpt_complete(free_after)
+```text
+ Shard                         B+tree                        Device
+   |                              |                             |
+   |-- freeze_begin(lsn) -------->|                             |
+   |-- freeze_step(budget) ------>|   repeated until done;      |
+   |-- freeze_step(budget) ------>|   txns run in between       |
+   |-- freeze_end() ------------->|                             |
+   |<- Frozen {pages, root, ------|                             |
+   |           free_after}        |                             |
+   |-- write pages, delta segment, meta bitmap ---------------->|
+   |      wait: these writes done, WAL durable up to lsn        |
+   |-- write root slot (seq & 1) ------------------------------>|
+   |      commit point: the old tree is valid until here        |
+   |-- ckpt_complete(free_after)->|                             |
 ```
 
 What changes on disk when one leaf is rewritten:
@@ -1348,5 +1346,3 @@ built very differently.
   libraries (`rustyrados`, `rustyrbd`).
 - **Docs that disagree with the code**: `docs/reference/configuration.md`
   says `flashstore_cores` defaults to 8; the code uses min(CPUs, shards).
-
-{% include mermaid.html %}
