@@ -389,112 +389,56 @@ after. The digest is still not exact.
 
 ### Update: the item hash is now keyed
 
-The review follow-up [clyso/ceph PR 253](https://github.com/clyso/ceph/pull/253)
-closes the forged case with three commits: `40fcf798327` (add SipHash-2-4),
-`81b6787574f` (the monitors create a secret key), `865fda5db25` (the OSD keys
-the digest with it). Read from the commits, not built or tested here.
+The follow-up [clyso/ceph PR 253](https://github.com/clyso/ceph/pull/253)
+closes the forged case. Read from the commits, not built or tested here.
 
-**The hash.** Same input bytes, a keyed function:
+**Core idea:** make the item hash secret. A client that cannot compute it
+cannot pick objects whose hashes cancel out. XOR stays.
 
 ```diff
- item hash of (object, version):
--  XXH64(bytes, seed = 0)              anyone can compute it
-+  SipHash-2-4(bytes, k0, k1)          only who holds the key can
+ leaf = XOR of item hashes
+-  item hash = XXH64(object, version)            anyone can compute it
++  item hash = SipHash(key, object, version)     only who holds the key can
 ```
 
-XOR stays. Its weakness needs known item hashes, and a client can no longer
-compute one.
-
-**Where the key comes from.** One key for the whole cluster, kept by the
-monitors:
-
-```text
- monitor (leader)
-   key "osd/backfill_digest_key" missing?
-     make 16 random bytes, store them through paxos   (once per cluster)
-
- OSD start
-   read the key cached in its own meta collection     (works before the mons answer)
-   ask the mons once: config-key get osd/backfill_digest_key
-     no key yet    -> ask again every minute
-     same key      -> done
-     another key   -> save it, use it after the next restart
-
- PG
-   no key on this OSD -> no digest at all: not kept, not saved, not exchanged
-   key present        -> leaves = XOR of SipHash(key, object, version)
-```
-
-**Who can read the key:**
-
-| Caller | `config-key get osd/backfill_digest_key` |
-|---|---|
-| OSD (`profile osd`) | Allowed, for this one key only |
-| Admin, mgr | Allowed |
-| Client with `mon 'allow r'` | Denied (`EACCES`); a test checks it |
-
-**How two sides agree on the key.** Every digest and every exchange message
-carries a key id (a hash of the key, never the key):
-
-```text
- load a saved digest or checkpoint
-   key id differs from this OSD's key, or is missing  -> drop it, all leaves dirty
-
- target gets a digest request
-   key id differs from its own, or is missing          -> answer "no leaf is equal"
-```
-
-So a mismatch always falls back to the full scan, never to a wrong skip.
-
-**What I got wrong above.** I listed "one key per cluster" as having no safe
-home. That was about the config database. The monitors' config-key store is a
-different thing: plain read caps do not reach it. A cluster key also avoids
-the per-PG key problems I listed:
-
-| My concern with a per-PG key | With the cluster key |
-|---|---|
-| Where is it stored | In the monitors; each OSD caches it |
-| Who knows it | Every OSD, with no new OSD-to-OSD message |
-| Key differs on a copy | Only during a key change; then the full scan runs once |
-
-**What it does not change:**
-
-- A missed or doubled update still leaves a wrong leaf that looks clean.
-  Fixes 1 to 3 still apply.
-- An accidental match is still 2^-64.
-- Whoever holds an OSD's key or admin rights can read the digest key. That is
-  the trust Ceph already puts in OSDs.
-- Formats: the digest encoding and the exchange message both go to version 2.
-
-**Review of the three commits.** Read, not run.
-
-| Checked | Result |
-|---|---|
-| SipHash code against the reference | Matches: same constants, rounds and length byte. The test has the 64 reference vectors |
-| Key is random | 16 bytes from the monitor's crypto random source, agreed through paxos |
-| Plain client caps cannot read the key | Holds. The monitor refuses the config-key service to blanket caps; `profile osd` gets `config-key get` for this one key |
-| No unkeyed fallback | Holds. No key on the OSD means no digest, no checkpoint, no exchange |
-| Old and new builds mixed | Safe. A version 1 digest or message has key id 0, which matches no key: nothing is equal |
-| Two OSDs with different keys | Safe. Ids differ, nothing is equal, full scan |
-| Key id leaks the key | No. It is a SipHash of a fixed label under the key; a label can never equal an item's hash input |
-
-Suggestions, none blocking:
-
-| Point | Why | Suggestion |
+| Commit | Piece | Idea |
 |---|---|---|
-| A decoded digest has the key id but a zero key until the OSD's key is attached | If any path hashed in between, leaves would be built with a zero key and look clean | Assert in the hash function that the key is attached |
-| Leaf values are as sensitive as the key | Watching a leaf before and after one write gives that item's hash; enough of them brings the linear attack back | Never show leaf values to clients. On the cluster network they travel in clear unless it runs in secure mode |
-| The key is cached in clear on every OSD disk | A discarded disk carries the cluster key | Say so in the docs; rotate after losing a disk |
-| No rotation procedure | Changing the key works (OSDs pick it up at restart) but nothing describes it | A short doc note |
-| Hash input joins name, key and namespace with NUL bytes | Ambiguous if a name contains NUL. Not exploitable, since versions differ | Length-prefix the strings |
-| One key for the whole cluster | Any OSD can forge in any pool | Accept: OSDs are trusted cluster-wide already |
+| `40fcf798327` | The function | Add SipHash-2-4, a small keyed hash |
+| `81b6787574f` | The secret | The monitors create one random key per cluster. Only OSDs and admins can read it; a client with `mon 'allow r'` is refused |
+| `865fda5db25` | The use | Each OSD fetches the key, caches it on disk, and hashes with it |
 
-Verdict: it closes the forged case as intended.
+```text
+ monitors:  create the key once  ->  hand it to OSDs only
+ OSD:       fetch + cache        ->  leaves = XOR of SipHash(key, object, version)
+            no key               ->  no digest at all (no unkeyed fallback)
+ exchange:  both sides send a key id, never the key
+            ids differ or missing (other key, old build)  ->  "nothing is equal"  ->  full scan
+```
 
-The same follow-up work also added a crash-safe checkpoint of the digest
-([PR 252](https://github.com/clyso/ceph/pull/252), merged), so "a crash loses
-the digest" in sections 4 and 5 describes the branch as first read
-(`7fb25bf380f`), not its current state.
+One key for the whole cluster is what keeps it simple: nothing to store per
+PG, no new OSD-to-OSD message, and every OSD has the key before backfill
+starts. I had listed a cluster key as having no safe home. That was wrong:
+the monitors' config-key store is not reachable with plain read caps.
+
+**Review.** The SipHash code matches the reference (64 test vectors), the key
+comes from the monitor's crypto random source, and every mismatch falls back
+to the full scan. No defect found. Suggestions:
+
+| Point | Suggestion |
+|---|---|
+| A decoded digest has a zero key until the OSD's key is attached | Assert in the hash function that the key is attached |
+| Leaf values are as sensitive as the key: a leaf before and after one write gives that item's hash | Never show leaves to clients. They cross the cluster network in clear unless it runs in secure mode |
+| The key sits in clear on every OSD disk; no rotation procedure is written down | A doc note: rotate after losing a disk |
+| Name, key and namespace are joined with NUL bytes | Length-prefix them. Not exploitable today |
+
+**Not changed by it:** a missed or doubled update still gives a wrong leaf
+that looks clean, so fixes 1 to 3 still apply. Any OSD can read the key; that
+is the trust Ceph already puts in OSDs.
+
+The same work also added a crash-safe checkpoint of the digest
+([PR 252](https://github.com/clyso/ceph/pull/252), merged). "A crash loses the
+digest" in sections 4 and 5 describes the branch as first read
+(`7fb25bf380f`).
 
 ## 7. A simpler way: make the scan cheap
 
