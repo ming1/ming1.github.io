@@ -521,8 +521,9 @@ metadata, split by the first key byte (`store/obj/keys.rs:6-24`).
 | Range delete | Cuts off whole subtrees, frees them lazily | `tree.rs:146-153` |
 | Locking | None; one core owns the tree | `lib.rs:6` |
 
-Checkpoint triggers (`shard.rs:5508-5535`): WAL 50 % full, 2048 dirty
-pages, low space, 5 s, or on request. The freeze is sliced
+Checkpoint triggers (`shard.rs:5508-5535`): WAL 50 % full, dirty pages
+over a soft mark (2048 by default, cache/8 when sized from memory), many
+dirty bitmap chunks, low space, 5 s, or on request. The freeze is sliced
 (`freeze_begin` / `freeze_step` / `freeze_end`) so it does not stall I/O.
 
 ### 8.3 Interface (`store/tree.rs`)
@@ -790,6 +791,52 @@ Eviction is CLOCK (`evict_to`, `tree.rs:1602`):
 - A leaf delta avoids rewriting a whole page for a small change; the base
   page plus its delta chain is the durable state (8.9 step 7). Old delta
   segments are cleaned by re-logging their live entries.
+
+### 8.11 The B+tree in four pictures
+
+The same design again, as pictures. Each one sums up the subsections named
+next to it.
+
+**1. Structure: pages are linked by disk address** (8.4, 8.5)
+
+![A root slot, an interior page and three leaves linked by disk address; the leaf that is not cached gives a Miss and a Want]({{ site.baseurl }}/assets/images/ceph-rust-flashstore/btree-pages.png)
+
+- An interior entry holds `(key, child addr, child crc)`, never a pointer.
+  The address is on disk, or virtual until the page is first written.
+- `map[addr]` gives the cache slot. No entry means `Err(Miss)` plus a
+  queued `Want`; the tree itself never reads the device.
+- So a clean page can be evicted without touching its parent.
+
+**2. Read-in: a write txn never blocks in the tree** (8.3, 8.9)
+
+![Sequence between shard, B+tree and device: probe, Miss, take_wants, read, install, probe again, apply, finish_txn]({{ site.baseurl }}/assets/images/ceph-rust-flashstore/btree-miss.png)
+
+- A multi-op txn takes all its misses in the probe loop, before anything
+  is changed. After a clean probe `apply` cannot miss.
+- A txn with one put or delete skips the probe. Its `apply` may miss, but
+  it descends before it changes anything, so it is simply retried.
+- Either way a txn is never half done.
+- The shard owns the I/O. The tree is a pure state machine: calls in,
+  wants out.
+
+**3. Persist: copy-on-write up to the root slot** (8.2, 9.2)
+
+![Before and after one checkpoint: the dirty leaf and the root page are rewritten at new addresses, the other leaves are shared, and root slot B commits]({{ site.baseurl }}/assets/images/ceph-rust-flashstore/btree-cow.png)
+
+- A rewritten page gets a new address, so its parent must change too, up
+  to the root. Untouched pages are shared by the old and the new tree.
+- The root slot write is the commit. It flips A/B by `seq & 1`.
+- A small leaf change skips all this: it is logged as a leaf delta and no
+  page moves.
+
+**4. Checkpoint: the life of one freeze** (8.10)
+
+![State machine of a checkpoint: Idle, Freezing with repeated freeze_step, Frozen, Written, Committed, then back to Idle after old pages are freed]({{ site.baseurl }}/assets/images/ceph-rust-flashstore/btree-checkpoint.png)
+
+- `freeze_step` runs in small slices; txns run in between.
+- Until the root slot is durable, a crash falls back to the old tree plus
+  WAL replay.
+- Old pages (`free_after`) are freed only after the commit.
 
 
 ## 9. On-disk layout
