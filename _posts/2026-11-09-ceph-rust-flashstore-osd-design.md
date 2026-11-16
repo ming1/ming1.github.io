@@ -838,6 +838,89 @@ next to it.
   WAL replay.
 - Old pages (`free_after`) are freed only after the commit.
 
+The same four points as code shapes.
+
+Where the code lives (`services/osd/store/src/`):
+
+```text
+ tree.rs     the B+tree: locate, get/put/del, scan, install, freeze_*
+ page.rs     the page image: 40-byte header, slots, search, validate
+ delta.rs    leaf deltas: a small change without a page rewrite
+ state.rs    prepare (probe) + apply: how a txn changes the tree
+ shard.rs    owns the I/O: take_wants -> read -> install; drives checkpoints
+ layout.rs   on-disk layout; the A/B root slot (the commit point)
+```
+
+One `put`, as a call tree:
+
+```text
+ State::apply(record)
+   put_at -> put_inner
+     locate_at                  the leaf the probe found, if no split or
+                                removal happened since; else locate(key):
+       hints (32)               hit: leaf + path, no interior page is searched
+       locate_full              from the root
+         int_route              binary search in an interior page
+         lookup(addr, crc)      map hit, or Want + Miss
+     mark_path                  leaf .. root become dirty
+     touch_key                  remember the key for a leaf delta
+     same-length value          overwritten in place, done
+     insert_leaf                fits | rebuild with a new prefix | split
+     propagate                  separator -> parent; the parent may split
+       grow_root                height += 1
+   finish_txn
+     finish_prune               remove the pages left empty, fix_root
+     merge_pass                 join underfull leaves
+```
+
+Why the tree never blocks:
+
+```text
+ on(txn)                              shard.rs submit
+   prepare(record)                    always checks the record; probes every key if:
+                                        more than one op, a range delete or run merge,
+                                        data blocks to write or free, or a key the
+                                        omap runs still hold
+   apply(record)                      cannot miss after a probe; a lone put/del
+                                      can, but it descends before it changes anything
+   on Miss (from either step)
+     take_wants -> queue the reads    nothing waits
+     hand the txn back                the caller resubmits it on Wake
+   on read completion
+     install(want, data)
+```
+
+One checkpoint, in time order:
+
+```mermaid
+sequenceDiagram
+    participant S as Shard
+    participant T as B+tree
+    participant D as Device
+    S->>T: freeze_begin(lsn)
+    loop until done, txns run in between
+        S->>T: freeze_step(budget)
+    end
+    S->>T: freeze_end()
+    T-->>S: Frozen {pages, root, free_after}
+    S->>D: write pages, delta segment, meta bitmap
+    Note over S,D: wait: these writes done, WAL durable up to lsn
+    S->>D: write root slot (seq & 1)
+    Note over S,D: commit point: the old tree is valid until here
+    S->>T: ckpt_complete(free_after)
+```
+
+What changes on disk when one leaf is rewritten:
+
+```diff
+-root slot A  seq N    -> R  @A10
++root slot B  seq N+1  -> R' @A11
+   L1  @A1                  shared, not written
+-  L2  @A2
++  L2' @A12
+   L3  @A3                  shared, not written
+```
+
 
 ## 9. On-disk layout
 
@@ -1265,3 +1348,5 @@ built very differently.
   libraries (`rustyrados`, `rustyrbd`).
 - **Docs that disagree with the code**: `docs/reference/configuration.md`
   says `flashstore_cores` defaults to 8; the code uses min(CPUs, shards).
+
+{% include mermaid.html %}
