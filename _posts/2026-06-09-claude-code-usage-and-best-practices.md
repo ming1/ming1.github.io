@@ -7,7 +7,7 @@ tags: [claude code, ai, best practice, productivity, skills, workflow]
 * TOC
 {:toc}
 
-# Overview
+# 1. Overview
 
 Notes on using Anthropic's Claude Code CLI for day-to-day engineering work:
 how to configure it (`CLAUDE.md`, tool allowlist, MCP servers, custom slash
@@ -24,7 +24,7 @@ authority for anything that changes.
 > - [Claude Code Spec Workflow](https://github.com/pimzino/claude-code-spec-workflow#readme)
 > - [How to Build Your Own Claude Code Plugin (Complete Guide)](https://agnost.ai/blog/claude-code-plugins-guide/)
 
-# Usages
+# 2. Usages
 
 Concrete recipes that come up often. Each one names the exact files,
 flags, and prompt patterns rather than gesturing at the idea.
@@ -35,7 +35,7 @@ flags, and prompt patterns rather than gesturing at the idea.
 (`/brainstorm`, `/tldr`), not built-in Claude Code slash commands —
 only a few (`/clear`, `/memory`, `/review`, …) ship with the CLI.*
 
-## Subagents: use cases and exact commands
+## 2.1 Subagents: use cases and exact commands
 
 A subagent is a separate Claude invocation with its own context window,
 its own tool allowlist, and its own system prompt. The main session
@@ -109,7 +109,7 @@ emit findings as JSON" \
   --output-format stream-json
 ```
 
-## Use Claude Code with git worktrees
+## 2.2 Use Claude Code with git worktrees
 
 Worktrees let you run several Claude sessions on the same repository
 at the same time, each on its own branch, sharing one `.git`
@@ -156,7 +156,7 @@ accepts `isolation: "worktree"` to spawn a subagent into a fresh
 temporary worktree — useful when a subagent's edits should not race
 the main session's working tree.
 
-## Agent teams: multi-agent orchestration
+## 2.3 Agent teams: multi-agent orchestration
 
 > Official references:
 > - [Orchestrate teams of Claude Code sessions](https://code.claude.com/docs/en/agent-teams) — Claude Code docs: the *native, experimental* Agent teams feature (lead + teammates, shared task list, mailbox messaging, in-process vs. split-pane display, dedicated hooks). Requires `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` and Claude Code v2.1.32+.
@@ -164,7 +164,7 @@ the main session's working tree.
 > - [How we built our multi-agent research system](https://www.anthropic.com/engineering/multi-agent-research-system) — Anthropic engineering write-up on the deep-research multi-agent system; the closest thing to a production orchestration case study.
 > - [Claude Code Advanced Patterns: Subagents, MCP, and Scaling to Real Codebases](https://www.anthropic.com/webinars/claude-code-advanced-patterns) — Anthropic webinar covering subagent + MCP composition at scale (deck linked from the page).
 
-### Motivation
+### 2.3.1 Motivation
 
 An *agent team* is a set of specialized subagents — planner,
 explorer, implementer, reviewer — that one coordinator dispatches and
@@ -179,7 +179,7 @@ independent investigations run in parallel rather than serially.
 The coordinator stays small because it sees digests, not raw tool
 transcripts.
 
-### How to start the agents
+### 2.3.2 How to start the agents
 
 Three mechanisms, ordered from most autonomous to most manual.
 
@@ -322,7 +322,7 @@ worker by its exact pane id, so one rename breaks the pipeline —
 problems the native feature avoids by managing pane identity and
 teammate lifecycle for you.
 
-### How the agents communicate
+### 2.3.3 How the agents communicate
 
 The transport differs by mechanism, but one rule spans all three:
 hand off digests, never raw transcripts. The whole point of the
@@ -375,7 +375,7 @@ agree on (`/tmp/claude/<run-id>/handoff-N.md`) and pass only the
 This also makes the hand-off resumable: the file survives if a pane
 crashes.
 
-## Unattended runs: `/loop` and `/goal`
+## 2.4 Unattended runs: `/loop` and `/goal`
 
 Both turn a one-shot session into something that keeps running on its
 own. `/loop` repeats work on a schedule; `/goal` keeps a single run
@@ -443,7 +443,7 @@ reliable. `/goal clear` cancels it.
 - Division of labour: `/loop` decides *when* the next iteration fires,
   `/goal` decides *whether* there should be one at all.
 
-## Hooks: shell commands wired into the agent loop
+## 2.5 Hooks: shell commands wired into the agent loop
 
 > Official reference:
 > - [Hooks reference](https://docs.anthropic.com/en/docs/claude-code/hooks) — Claude Code docs: full event list, matcher syntax, JSON I/O schema, decision-control fields.
@@ -561,11 +561,11 @@ post-mortems into enforceable rules.
   where to enforce constraints. Style guidance still belongs in
   `CLAUDE.md`. Treat hooks as the guardrail, not the manual.
 
-# Plugin
+# 3. Plugin
 
 > Source: condensed from agnost.ai's [How to Build Your Own Claude Code Plugin (Complete Guide)](https://agnost.ai/blog/claude-code-plugins-guide/).
 
-## What a plugin is
+## 3.1 What a plugin is
 
 A plugin is a git repo that lives at `~/.claude/plugins/<name>/` and
 bundles custom slash commands, subagents, hooks, and/or MCP servers
@@ -587,7 +587,7 @@ Everything is markdown + JSON. No build step, no plugin SDK to
 learn — write the files, drop them under `.claude-plugin/`, and the
 CLI picks them up.
 
-## Sharing plugins across an org
+## 3.2 Sharing plugins across an org
 
 A *marketplace* is a git repo that wraps multiple plugins. Layout:
 
@@ -628,11 +628,11 @@ Team members add the marketplace once, then install plugins by name:
 /plugin install api-generator@acme-tools
 ```
 
-# Best practice
+# 4. Best practice
 
 > Source: this section is a condensed digest, in the author's voice, of Anthropic's [Claude Code: Best practices for agentic coding](https://www.anthropic.com/engineering/claude-code-best-practices). The original is authoritative — for any tip that matters, read it there.
 
-## Customize your setup
+## 4.1 Customize your setup
 
 - *`CLAUDE.md` at the repo root* is the primary lever — project
   conventions, build/test commands, gotchas. Loaded into every
@@ -646,7 +646,7 @@ Team members add the marketplace once, then install plugins by name:
   operation; without it, the workflow degrades to scraping the
   web UI.
 
-## Slash commands
+## 4.2 Slash commands
 
 Custom slash commands live in `.claude/commands/<name>.md` (project,
 checked into git) or `~/.claude/commands/<name>.md` (personal).
@@ -672,7 +672,7 @@ bash command's `--help` once and documenting it in `CLAUDE.md`,
 (b) wiring an MCP server, or (c) using the *Hooks* mechanism above
 to enforce constraints around tools rather than just describe them.
 
-## Workflows that work
+## 4.3 Workflows that work
 
 - *Explore → plan → code → commit.* First ask Claude to read the
   relevant files (`read logging.py`) but *not* to write code. Then
@@ -700,7 +700,7 @@ to enforce constraints around tools rather than just describe them.
   issue triage. Many engineers route 90%+ of their git
   interactions through it.
 
-## Optimization tips
+## 4.4 Optimization tips
 
 - *Be specific.* Vague prompts get vague output.
 - *Images.* Paste screenshots, drag-and-drop, or pass file paths.
@@ -716,7 +716,7 @@ to enforce constraints around tools rather than just describe them.
   asking Claude to fetch/read directly. The pipe is best for
   large logs and CSVs.
 
-## Headless mode for automation
+## 4.5 Headless mode for automation
 
 `claude -p "<prompt>"` runs Claude non-interactively. Add
 `--output-format stream-json` for machine-parsable streaming
@@ -724,7 +724,7 @@ output. Useful for CI, pre-commit hooks, build scripts, and
 one-shot automation. Each invocation is independent — no session
 state carries over, so configuration has to be passed every time.
 
-## Multi-Claude workflows
+## 4.6 Multi-Claude workflows
 
 The Anthropic post's "Uplevel with multi-Claude workflows" section
 covers patterns already documented above:
@@ -736,9 +736,9 @@ covers patterns already documented above:
 - *Headless mode with a custom harness* → headless mode above,
   composed with whatever orchestrator your CI uses.
 
-## tmux practices with Claude Code
+## 4.7 tmux practices with Claude Code
 
-### Persistent sessions across SSH drops
+### 4.7.1 Persistent sessions across SSH drops
 
 A long Claude run — large refactor, codebase crawl, heavy test sweep —
 dies the moment the terminal does. SSH timeout, laptop sleep, network
@@ -769,7 +769,7 @@ session detached and inject the command:
 ssh server 'tmux new -d -s claude && tmux send-keys -t claude "claude" Enter'
 ```
 
-### Cross-process agent orchestration with `send-keys`
+### 4.7.2 Cross-process agent orchestration with `send-keys`
 
 A second use of tmux: running multiple `claude` processes in
 parallel panes and orchestrating them with `tmux send-keys` (manager
@@ -781,7 +781,7 @@ all live in the *Agent teams: multi-agent orchestration* section
 above — the tmux mechanics are just the transport for that pattern,
 not a separate technique.
 
-### Multi-pane development dashboard
+### 4.7.3 Multi-pane development dashboard
 
 Split one tmux window into three panes so Claude's actions and their
 side-effects are visible without window-switching:
@@ -794,7 +794,7 @@ side-effects are visible without window-switching:
   `cargo watch -x test`, or `htop` for resource pressure during heavy
   builds.
 
-### Asynchronous background execution
+### 4.7.4 Asynchronous background execution
 
 Kick off a long task (mass refactor, bulk syntax update, repo-wide
 audit), detach with `Ctrl-b d`, and keep working in the foreground
@@ -818,7 +818,7 @@ A second hook on session start (or the next user prompt) resets the
 colour. Same trick works for "waiting for permission" prompts via
 the `Notification` hook.
 
-### Remote and mobile workflows
+### 4.7.5 Remote and mobile workflows
 
 Run Claude on a beefy workstation or cloud VM, attach from anywhere:
 tablet SSH client, lightweight laptop, phone. Because tmux decouples
@@ -828,12 +828,12 @@ from the laptop. (`/commit` is not a built-in slash command; either
 ask Claude to commit in plain prose or define a custom
 `.claude/commands/commit.md`.)
 
-# Workflows from the community
+# 5. Workflows from the community
 
 The sections above list single habits. This one collects whole workflows
 built from skills.
 
-## The delivery chain: Grilling → Spec → Tickets → Implement → Code Review
+## 5.1 The delivery chain: Grilling → Spec → Tickets → Implement → Code Review
 
 Source: [mattpocock/skills][mp-skills] ("Skills For Real Engineers").
 
@@ -933,7 +933,7 @@ claude plugin install mattpocock-skills@claude-plugins-official
 /setup-matt-pocock-skills
 ```
 
-## Stop micromanaging: attention at both ends only
+## 5.2 Stop micromanaging: attention at both ends only
 
 Source: Carl Lindberg's daily workflow (cloud consultant, Terraform on
 Azure). Tools: [grill-me][mp-grill-me], [shipit][shipit],
@@ -1057,7 +1057,7 @@ Limits, as the author says himself: this fits internal tools with a
 small blast radius. And one question stays open — how much code a human
 should read before merge.
 
-## loop-me: turn repeated work into a workflow spec
+## 5.3 loop-me: turn repeated work into a workflow spec
 
 Source: [`loop-me`][mp-loop-me] in mattpocock/skills (`in-progress/`,
 still experimental).
@@ -1107,7 +1107,7 @@ npx skills@latest add mattpocock/skills --skill=loop-me   # not in the plugin
 *Push right* is the same rule as the workflow above: one late, well-prepared
 question is better than many early ones.
 
-## Three skill authors to learn from
+## 5.4 Three skill authors to learn from
 
 Matt Pocock (author of `grill-me`) named his three favorite skill
 authors.
@@ -1145,13 +1145,13 @@ authors.
 experience down as documents, then organizes the documents into skills.
 A skill is written-down judgment, not a prompt trick.
 
-# Useful blogs
+# 6. Useful blogs
 
-## The Map Is Not the Territory: Finding Your Unknowns with Claude Fable 5
+## 6.1 The Map Is Not the Territory: Finding Your Unknowns with Claude Fable 5
 
 [The Map Is Not the Territory: Finding Your Unknowns with Claude Fable 5](https://explainx.ai/blog/map-is-not-territory-fable-5-thariq-unknowns-2026) 
 
-### Help Claude help you
+### 6.1.1 Help Claude help you
 
 The most important part of this process is to give Claude context about  
 your starting point. For example, tell it where you are in your thought  
@@ -1159,7 +1159,7 @@ process; disclose your experience with the problem and codebase; and let
 it work with you like a thought partner.
 
 
-### Pre-implementation
+### 6.1.2 Pre-implementation
 
 #### Blind Spot Pass
 
@@ -1253,7 +1253,7 @@ Example prompts:
 This Rust crate in vendor/rate-limiter implements the exact backoff behavior I  
 want. Read it and reimplement the same semantics in our TypeScript API client.
 
-### Implementation Plans
+### 6.1.3 Implementation Plans
 
 When I think I’m ready to implement, I tend to ask Claude to put together  
 an implementation plan for me to review that focuses on the parts that might   
@@ -1267,7 +1267,7 @@ likely to tweak with: data model changes, new type interfaces, and anything
 user-facing. Bury the mechanical refactoring at the bottom, I trust you on   
 that part."
 
-### During implementation
+### 6.1.4 During implementation
 
 #### Implementation notes
 
@@ -1289,7 +1289,7 @@ Example prompts:
 you to deviate from the plan, pick the conservative option, log it under   
 'Deviations', and keep going."
 
-### Post implementation
+### 6.1.5 Post implementation
 
 #### Pitches and explainers
 
@@ -1306,7 +1306,7 @@ Example prompts:
 "Package the prototype, the spec, and the implementation notes into a single doc   
 I can drop in Slack to get buy-in. Lead with the demo GIF."
 
-### Quizzes
+### 6.1.6 Quizzes
 
 After a long working session, Claude might have accomplished a lot more than I   
 realized. Reading the code diffs can only give me a light understanding of what   
@@ -1321,10 +1321,10 @@ Example prompts:
 me a HTML report on the changes for me to read and understand with context,   
 intuition, what was done, etc. and a quiz at the bottom on the changes that I must pass.”
 
-### How this comes together: launching Fable
+### 6.1.7 How this comes together: launching Fable
 
 
-### discipline
+### 6.1.8 discipline
 
 The most durable part of the field guide isn't a specific tactic — it's a  
 **discipline**. A few practices worth adopting directly:
@@ -1350,7 +1350,7 @@ regression. Re-verify your map against the new model before assuming the territo
 
 
 
-# Summary
+# 7. Summary
 
 **Main advantages**
 
