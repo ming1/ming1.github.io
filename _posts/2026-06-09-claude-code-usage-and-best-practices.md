@@ -933,6 +933,58 @@ claude plugin install mattpocock-skills@claude-plugins-official
 /setup-matt-pocock-skills
 ```
 
+**Example: add a `--json` output mode to a CLI tool.** The tool name
+`diskstat` and the file names are made up; the flow is the real one.
+Tracker here is "local files" (chosen in `/setup-matt-pocock-skills`).
+
+```
+ session A: align, spec, tickets        (one conversation: /to-spec reads it)
+ ─────────────────────────────────────────────────────────────────────────
+ > /grill-with-docs add a --json output mode to the diskstat CLI
+     agent: rounds of questions, each with a recommended answer
+     you:   answer, then confirm the shared understanding          exit #1
+ > /to-spec
+     agent: proposes the test seam, you confirm it
+     agent: writes the spec, publishes it as ready-for-agent        exit #2
+ > /to-tickets
+     agent: numbered list: title / blocked by / what it delivers
+     you:   approve, or ask to split / merge                        exit #3
+     files: .scratch/diskstat-json/issues/01-json-one-device.md
+            .scratch/diskstat-json/issues/02-json-all-devices.md
+            .scratch/diskstat-json/issues/03-json-errors.md
+
+ session B: one ticket                   (/clear, or start a new `claude`)
+ ─────────────────────────────────────────────────────────────────────────
+ > /implement .scratch/diskstat-json/issues/01-json-one-device.md
+     agent: states the ticket title
+            /tdd at the agreed seam: failing test, then code
+            type check + single test files often, full suite at the end
+            /code-review: Standards and Spec, two parallel subagents
+            commit to the current branch                         exit #4, #5
+
+ session C: next unblocked ticket        (fresh context again)
+ ─────────────────────────────────────────────────────────────────────────
+ > /implement .scratch/diskstat-json/issues/02-json-all-devices.md
+```
+
+| Step | You type | You decide |
+|------|----------|------------|
+| 1 | `/grill-with-docs <goal>` | Every open question: fields, units, what is out of scope |
+| 2 | `/to-spec` | Is the test seam right? |
+| 3 | `/to-tickets` | Is each ticket small enough, and are the blockers real? |
+| 4 | `/implement <ticket>` | Nothing, unless a premise fails |
+| 5 | `/code-review main` (also run by `/implement`) | Which findings to fix |
+
+- The first four skills are user-invoked only (`disable-model-invocation:
+  true`). The chain never moves to the next stage by itself. You type
+  each step, so each exit condition is your decision.
+- Ticket 01 is a full vertical slice: one device, real JSON on stdout,
+  one test. Not *"add a JSON helper"*.
+- Fall back, in the same example: in session B the agent finds that two
+  code paths print sizes in different units. That was never decided. It
+  stops, shows the two paths, and you go back to `/grill-with-docs` —
+  the agent does not pick a unit itself.
+
 ## 5.2 Stop micromanaging: attention at both ends only
 
 Source: Carl Lindberg's daily workflow (cloud consultant, Terraform on
