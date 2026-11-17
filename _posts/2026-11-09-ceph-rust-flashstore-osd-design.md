@@ -322,6 +322,8 @@ one owner core, and the B+tree needs no lock, atomic or `Arc`.
 | Its store shards: WAL ring, B+tree, allocator | Page pool and DMA buffer budget (atomics) |
 | One NVMe queue per shard | Log tail mutex, taken on each log line |
 
+The full list of shared state, with how often each is touched, is in 5.6.
+
 ### 5.3 How cores talk
 
 ```
@@ -417,6 +419,62 @@ How often, and what it costs:
   in. A sparse write paid 30-58 us for the hop, probably because core n
   had to be woken first (not checked).
 - A one-core OSD skips all of this (`run_single`).
+
+### 5.6 What the cores share
+
+Each core owns its PGs, connections and shards (5.2). What is left is
+small, and almost all of it is either read-only or a counter.
+
+```
+   core 0            core 1            core 2
+ +---------+       +---------+       +---------+
+ | PGs     | <---> | PGs     | <---> | PGs     |    mesh rings: messages,
+ | conns   |       | conns   |       | conns   |    buffers move with them
+ | shards  |       | shards  |       | shards  |
+ +----+----+       +----+----+       +----+----+
+      |                 |                 |
+ -----+-----------------+-----------------+-----   shared, no lock:
+  osdmap (read-only) | credits and budgets (atomics)
+ ------------------------------------------------
+  one NVMe device, one queue per shard
+```
+
+| Shared | What it is for | Touched | Where |
+|---|---|---|---|
+| **Read-only** |  |  |  |
+| osdmap (`Arc<OsdMap>`) | Decoded once on core 0, then one pointer per worker | Per map epoch | [`osd/xcore.rs:1628-1654`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/osd/src/xcore.rs#L1628-L1654) |
+| Client identity (`Arc<ConnInfo>`) | Lets the PG core check the caps of a client that lives on another core | Per forwarded op | [`osd/xcore.rs:200-210`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/osd/src/xcore.rs#L200-L210) |
+| Payload buffers (`Bytes`) | Write data, replies and read data cross cores without a copy; only the reference count is shared | Per op | [`rt/mesh.rs:8`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/crates/rt/src/mesh.rs#L8) |
+| **Lock-free (atomics)** |  |  |  |
+| Mesh rings | Messages between cores (5.3) | Per op | [`spsc/lib.rs:15-31`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/crates/spsc/src/lib.rs#L15-L31) |
+| Wake: eventfd + "asleep" flag | Wake a sleeping core | Per message to a sleeping core | [`rt/wake.rs:29-113`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/crates/rt/src/wake.rs#L29-L113) |
+| Ingress credits | Limit the bytes and frames the OSD takes in, per shard | Per frame | [`ingress/lib.rs:642-649`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/crates/ingress/src/lib.rs#L642-L649) |
+| Page pool | One B+tree cache budget for the device: a hot shard may use pages idle shards leave | Every 1 ms per shard | [`store/pagepool.rs:1-133`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/pagepool.rs#L1-L133) |
+| Run pool | One omap run memory budget for the device | Per txn that changes it | [`store/runs.rs:1968-1997`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/runs.rs#L1968-L1997) |
+| Device idle table | Busy/idle state of every shard's NVMe queue, the checkpoint write budget, the trim turn, write admission | Per queue busy/idle change | [`store/devidle.rs:1-22`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/devidle.rs#L1-L22) |
+| Buffer return stacks | A read buffer freed on the connection core goes home to the core that allocated it | Per zero-copy read reply | [`nvme/shelf.rs:1-14`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/crates/nvme/src/shelf.rs#L1-L14) |
+| Pre-write segment | The connection core still fills the buffer while the PG core reads the part already filled (5.5) | Large writes | [`msgr2/segbuf.rs:4-16`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/crates/msgr2/src/segbuf.rs#L4-L16) |
+| Peer clock slots | Heartbeat core writes, all cores read (seqlock) | Per replica lease | [`peering/types.rs:63-72`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/peering/src/types.rs#L63-L72) |
+| Stop flag, liveness beats | Shutdown; watchdog | Per loop pass; per second | [`rt/multi.rs:14-32`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/crates/rt/src/multi.rs#L14-L32), [`osd/liveness.rs:19-30`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/osd/src/liveness.rs#L19-L30) |
+| **Mutex** |  |  |  |
+| Crash log tail | Last log lines kept for a crash dump | Per log line | [`osd/crash.rs:54-64`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/osd/src/crash.rs#L54-L64) |
+| Ingress wait queue | Frames and cores that wait for credit | Only under back-pressure | [`ingress/lib.rs:133-143`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/crates/ingress/src/lib.rs#L133-L143) |
+| **Kernel and device** |  |  |  |
+| NVMe controller handle | One device fd (or SPDK controller); each shard has its own queue | Per I/O, in the kernel or SPDK | [`osd/nvmestore.rs:1216-1237`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/osd/src/nvmestore.rs#L1216-L1237) |
+| Listen port | One `SO_REUSEPORT` group per port; each core has its own socket | Per accept | [`rt/knet/listen.rs:212-266`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/crates/rt/src/knet/listen.rs#L212-L266) |
+| Memory allocator | One global allocator (mimalloc; SPDK builds add a shared hugepage payload pool) | Per alloc/free | [`fs/main.rs:13-20`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/croit-flashstore-osd/src/main.rs#L13-L20) |
+
+- On the op path cores share only rings, reference counts and atomic
+  counters. An op takes no lock another core can hold, unless ingress
+  back-pressure makes it wait.
+- The one mutex every core takes in normal work is the crash log tail,
+  once per log line.
+- Not shared, though they may look so: cephx keys and config are copied
+  to each worker (`XMsg::Keys`, `XMsg::Conf`); NVMe queues and compaction
+  jobs are moved, not shared (5.1).
+- A few process-wide debug counters in the store are atomics that every
+  core bumps on reads ([`store/lib.rs:69-148`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/lib.rs#L69-L148)); they cost cache-line
+  traffic, not correctness.
 
 
 ## 6. I/O path of a client write
