@@ -280,7 +280,8 @@ shard = placement table entry            # normal case
 
 Limits: cores <= shards <= 256, cores <= 64. Shard count is fixed at mkfs;
 core count can change between runs. A core owns whole shards, so a PG's
-data always sits in a shard of its owner core.
+data always sits in a shard of its owner core. A shard never has two
+cores (5.6).
 
 ### 5.2 Who owns what
 
@@ -387,6 +388,60 @@ How often, and what it costs:
   in. A sparse write paid 30-58 us for the hop, probably because core n
   had to be woken first (not checked).
 - A one-core OSD skips all of this (`run_single`).
+
+### 5.6 Can two cores touch the same shard?
+
+No. One might expect it on a machine with more CPUs than shards, but the
+OSD never runs more cores than shards, so a shard always has exactly one
+owner core. The B+tree has no code for a cross-core race because that race
+cannot happen: the tree has no lock, no atomic and no `Arc`.
+
+```
+ 4 shards, 16 CPUs  ->  4 cores run, no core on the other 12 (warning)
+ 8 shards,  4 cores ->  core c owns shards {c, c+4}; still one owner each
+
+ shard:   0   1   2   3   4   5   6   7
+ core:    0   1   2   3   0   1   2   3        core = shard % cores
+```
+
+How this is enforced, layer by layer:
+
+| Layer | Rule | Where |
+|---|---|---|
+| Core count | Default is min(CPUs, shards). An explicit `--cores` above the shard count is cut down to it, with a warning: "a core owns at least one shard" | [`fs/args.rs:133-163`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/croit-flashstore-osd/src/args.rs#L133-L163), [`osd/xcore.rs:128-141`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/osd/src/xcore.rs#L128-L141) |
+| Core spec | `CoreSpec::new` fails if cores > shards | [`osd/xcore.rs:109-123`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/osd/src/xcore.rs#L109-L123) |
+| Mount | Each core mounts its own `Store` with only the shards `s % cores == core`. The other shards do not exist in that core's `Store`; an op routed to one fails with `ObjError::NotMounted` | [`osd/nvmestore.rs:1244-1287`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/osd/src/nvmestore.rs#L1244-L1287), [`store/obj/store.rs:696-707`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/obj/store.rs#L696-L707) |
+| Routing | An op for a PG of another core is never run locally; it is sent over the mesh (5.5) | [`osd/pgs.rs:2151`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/osd/src/pgs.rs#L2151) |
+| Tree API | Every call takes `&mut self`, reads included (`get` queues a page read on a miss). The compiler rejects two users at once | [`store/tree.rs:1834`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/tree.rs#L1834), [`store/tree.rs:2253`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/tree.rs#L2253) |
+
+The mismatch that can happen is the other way: more shards than cores. Then
+a core owns several shards, each with its own tree, WAL ring and NVMe
+queue, and the core polls them one after another in its loop (4.3).
+
+Cases that look like sharing, and are not:
+
+- **Compaction help** (`XMsg::CompactWork`). A core may send an omap
+  run compaction or an omap LSM round to another core. What crosses is a
+  job that owns its immutable input; the comment in the code says "no
+  Store/Tree/device handle is transferred". The helper computes, sends the
+  job back, and the owner core applies the result to its own tree
+  ([`store/shard.rs:1201-1215`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/shard.rs#L1201-L1215)).
+- **PG merge.** The source PG's data is copied to the target's core as
+  messages; the target core writes it into its own shard (5.1).
+- **Budgets.** The page pool is shared by all cores, but it holds only
+  counters (atomics). It decides how many pages a tree may cache, not
+  which pages; no page is ever visible to two cores.
+- **The device.** All cores write to one NVMe namespace, but each shard
+  has its own region and its own queue (§9.1).
+
+What the tree does have to handle is interleaving on its one core, since
+a run-to-completion loop still switches between ops at I/O waits:
+
+| Interleaving on one core | How the tree handles it | See |
+|---|---|---|
+| An op needs a page that is not cached | The op returns `Miss` before it changes anything; the shard reads the page, `install`s it, and the op runs again from the start. No half-done mutation is ever visible to the next op | §8.5, [`store/tree.rs:6-9`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/tree.rs#L6-L9) |
+| A txn has several ops | It probes all its pages first, then mutates. Empty pages are removed only at `finish_txn`, so routing does not change in the middle | §8.8 |
+| A checkpoint runs while txns go on | The freeze is done in slices; a page a txn wants to change is copied aside first | §8.10 |
 
 
 ## 6. I/O path of a client write
