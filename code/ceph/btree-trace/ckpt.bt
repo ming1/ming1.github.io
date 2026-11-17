@@ -1,0 +1,8 @@
+uprobe:/path/to/croit-flashstore-osd:_RNvMs4_NtCskevyDAiU9B9_5store4treeNtB5_4Tree12freeze_begin { @t0[tid]=nsecs; @steps[tid]=0; @touch[tid]=0; printf("%-6d %8s freeze_begin lsn=%lu\n", tid, "0", arg1); }
+uprobe:/path/to/croit-flashstore-osd:_RNvMs4_NtCskevyDAiU9B9_5store4treeNtB5_4Tree11freeze_step /@t0[tid]/ { @steps[tid]++; }
+uprobe:/path/to/croit-flashstore-osd:_RNvMs4_NtCskevyDAiU9B9_5store4treeNtB5_4Tree8fz_touch /@t0[tid]/ { @touch[tid]++; }
+uprobe:/path/to/croit-flashstore-osd:_RNvMs3_NtCskevyDAiU9B9_5store5stateNtB5_5State5apply /@t0[tid]/ { @txns[tid]++; }
+uprobe:/path/to/croit-flashstore-osd:_RNvMs4_NtCskevyDAiU9B9_5store4treeNtB5_4Tree10freeze_end /@t0[tid]/ { printf("%-6d %6luus freeze_end   after %d freeze_step calls, %d txns applied meanwhile, %d fz_touch\n", tid, (nsecs-@t0[tid])/1000, @steps[tid], @txns[tid], @touch[tid]); }
+uprobe:/path/to/croit-flashstore-osd:_RNvMs4_NtCskevyDAiU9B9_5store4treeNtB5_4Tree6retire /@t0[tid]/ { @ret[tid]++; }
+uprobe:/path/to/croit-flashstore-osd:_RNvMs4_NtCskevyDAiU9B9_5store4treeNtB5_4Tree9take_gone /@t0[tid]/ { printf("%-6d %6luus take_gone    (old pages handed back after the root slot write), %d txns applied since freeze_begin\n", tid, (nsecs-@t0[tid])/1000, @txns[tid]); delete(@t0[tid]); delete(@txns[tid]); }
+interval:s:12 { exit(); }

@@ -1,0 +1,3 @@
+uprobe:/path/to/croit-flashstore-osd:_RNvMs4_NtCskevyDAiU9B9_5store4treeNtB5_4Tree9put_inner { @put[ustack(perf,5)] = count(); }
+uprobe:/path/to/croit-flashstore-osd:_RNvMs4_NtCskevyDAiU9B9_5store4treeNtB5_4Tree7install { @install[ustack(perf,4)] = count(); }
+interval:s:5 { exit(); }
