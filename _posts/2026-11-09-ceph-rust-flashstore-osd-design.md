@@ -674,12 +674,12 @@ Calls, grouped by use:
 
 | Call | Arguments | Returns | Notes |
 |---|---|---|---|
-| `get(key, out)` | `key`: exact key. `out: &mut Vec<u8>`: the value is **appended** to it | `true` found, `false` not found | No range lookup; use `scan` for that |
+| `get(key, out)` | `key`: exact key. `out: &mut Vec<u8>`: the value is **appended** to it | `true` found, `false` not found | Exact match only. `get_le` returns the greatest key <= `key` if it is in the same leaf; else use `scan` |
 | `put(key, val)` | `key`, `val` within the size limit | `()` | Insert or replace. `Invalid` if too large |
 | `del(key)` | `key`: exact key | `true` if the key existed | Deleting a missing key is not an error |
 | `del_range(a, b)` | `a`, `b`: range `[a, b)` | `()` | No-op if `a >= b`. Needs a successful `probe_range(a, b)` first; then it cannot miss |
 | `scan(cur, max_entries, max_bytes, f)` | `cur: &mut ScanCursor`; two budgets; `f(key, value)` callback | `Done` range finished, `More` budget used up | See below |
-| `finish_txn()` | none | `()` | Call once after the last op of a txn (8.8) |
+| `finish_txn()` | none | `Result<()>` | Call once after the last op of a txn (8.8) |
 | `probe_key(key)`, `probe_range(a, b)` | the key or range a txn will touch | `()` / upper bound of pages rewritten | Loads nothing itself: queues wants and returns `Miss` until all pages are cached. `TxnTooLarge` if a range needs too many pages. The write path uses the batch form `probe_sorted` for puts and deletes |
 | `take_wants(out)` | `out: &mut Vec<Want>` | nothing; appends to `out` | Drains every queued page request: misses of earlier calls, scan readahead, lazy-free reads. `Want { addr, crc, level, dead, scan }` |
 | `install(want, data)` | `want`: one taken want. `data: &[u8]`: the page image read from `want.addr`, exactly one page long | `()` | `Corrupt` if the image fails the checks of 8.9 |
@@ -869,7 +869,7 @@ There are no sibling links, so a scan walks through the parent
                sibling is resident, one of the two is already dirty, and both
                together fill at most 65 % of a page;
                a cold or clean sibling -> background compaction queue (between txns)
-  fix_root     after each of the two steps:
+  fix_root     after each step that did work:
                root with one resident child -> the child becomes root, height -= 1
                empty root                   -> an empty leaf
 ```
@@ -965,8 +965,8 @@ next to it.
 
 - "Dirty pages in RAM" does not mean an acked write can be lost. A txn is
   acked only after its WAL unit and its data writes are on disk
-  ([`store/shard.rs:7076-7080`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/shard.rs#L7076-L7080), §10.2). What waits for the checkpoint, 5 s at
-  most when idle, is only the tree's copy of that txn; after a crash the
+  ([`store/shard.rs:7076-7080`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/shard.rs#L7076-L7080), §10.2). What waits for the checkpoint, about 5 s
+  when idle (up to 10 s for the first one after mount), is only the tree's copy of that txn; after a crash the
   WAL replay builds it again. BlueStore has the same shape: the ack
   follows the RocksDB WAL sync, and the memtable is flushed later.
 - `freeze_step` runs in small slices; txns run in between.
@@ -1083,7 +1083,7 @@ A data block has three bits and is free only when all three are clear:
 - Finding a run: 1 MiB windows keep their longest free run, and a 16-way
   tree over them finds the first fit. Runs up to 64 KiB fill holes first.
   One run is at most 256 KiB, so a 4 MiB write takes 16 runs
-  ([`store/alloc.rs:981-1010`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/alloc.rs#L981-L1010)). No per-PG or per-object placement.
+  ([`store/alloc.rs:981-1010`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/alloc.rs#L981-L1010), [`store/obj/onode.rs:226-227`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/obj/onode.rs#L226-L227), [`store/shard.rs:2773-2776`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/shard.rs#L2773-L2776)). No per-PG or per-object placement.
 
 **When the bitmap reaches the disk.** Only at a checkpoint, never per
 write. Between checkpoints the WAL is enough: every record lists the
@@ -1121,9 +1121,9 @@ A checkpoint starts on the first of these ([`store/shard.rs:5508-5536`](https://
 |---|---|
 | A request, or an allocation that got `Busy` | at once |
 | Low free space, if held blocks would be released | at once |
-| WAL ring in use | 50 % |
-| Dirty tree pages | 2048 |
-| Dirty bitmap chunks | 1024 (16 GiB of data area touched) |
+| WAL ring in use | 50 %, not counting blocks held by omap runs |
+| Dirty tree pages | 2048 by default (`dirty_soft_pages`) |
+| Dirty bitmap chunks | Half of the above: 1024 (16 GiB of data area touched) |
 | Time since the last checkpoint started | 5 s |
 
 - Mount: root slot -> tree-page image -> scan the `f` keys -> replay the
@@ -1132,6 +1132,99 @@ A checkpoint starts on the first of these ([`store/shard.rs:5508-5536`](https://
 - Free space is kept usable by a background sweep that empties sparse
   windows ([`store/obj/defrag.rs:6-25`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/obj/defrag.rs#L6-L25)); whole free windows are
   deallocated (TRIM) when the shard is idle ([`store/trim.rs:4-9`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/trim.rs#L4-L9)).
+
+### 8.13 Review: strong and weak points
+
+A code review of the tree at this snapshot (`tree.rs`, `page.rs`,
+`delta.rs` and their callers). The two tables come from reading the code,
+and their numbers are quoted from code comments. The third table checks
+the main points with traces on a test box.
+
+**Strong points**
+
+| Point | Why | Where |
+|---|---|---|
+| Changes to hot leaves are cheap to persist | Many txns share one page write per checkpoint, and a leaf with few changes is written as a leaf delta that keeps its address. Without deltas one shard wrote 2.5x the checkpoint pages | [`store/tree.rs:1301-1303`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/tree.rs#L1301-L1303) |
+| A write never waits for a read and never tears | An op looks up all its pages before it changes one (8.5, 8.8) | [`store/tree.rs:6-9`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/tree.rs#L6-L9) |
+| The checkpoint runs beside the txns | The freeze runs in slices between txns (8.10). Not free: single pauses of 30 to 51 ms were measured | [`store/tree.rs:11-13`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/tree.rs#L11-L13) |
+| Deleting a range is cheap | Only the two end paths are read; pages inside the range are dropped by address, unread. Good for PG removal | [`store/tree.rs:634-637`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/tree.rs#L634-L637) |
+| Bad pages are caught on load | Every parent keeps the child's crc; `install` checks crc, own address and level | [`store/tree.rs:1520-1542`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/tree.rs#L1520-L1542) |
+| Simple to reason about | One owner thread, no latch, no `unsafe` in the three files; 32 unit tests and about 95 integration tests, with crash tests at every I/O step | [`store/tests/crash.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/tests/crash.rs) |
+
+**Weak points**
+
+| Point | What the code does about it | Where |
+|---|---|---|
+| Many small-key inserts (omap) are costly: each key probes a path and dirties a leaf. A 1024-key omap txn means 1024 probes, and retries once took 58 % of a core | Three engines were added beside the tree: omap runs, an omap LSM, optional RocksDB (§3.2). The cost is three read paths | [`store/shard.rs:4109-4112`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/shard.rs#L4109-L4112), [`store/runs.rs:4-8`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/runs.rs#L4-L8) |
+| Dirty pages cannot be evicted | At 6144 dirty pages a txn gets `Busy` and a checkpoint is forced. One such case held every op of a PG for 110 ms. Not reached in my traces | [`store/shard.rs:4113-4116`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/shard.rs#L4113-L4116), [`store/shard.rs:5345-5347`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/shard.rs#L5345-L5347) |
+| A miss means work is done twice | The op is run again after the page loads. In the cold trace this showed in the reads before the txn (48 lookups per txn against 27 warm), not in the store queue, which never parked | [`store/tree.rs:1685-1688`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/tree.rs#L1685-L1688) |
+| One object's keys sit in several leaves: `N`, `n`, `e`, `o` sort by tag first | None; it is the price of one generic tree (compare §13.2) | [`store/obj/keys.rs:8-24`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/obj/keys.rs#L8-L24) |
+| Space comes back only on a best effort | Only leaves merge, under one parent, below 1/3 full. The background queue drops entries when full; interior pages go only when empty | [`store/tree.rs:3183-3186`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/tree.rs#L3183-L3186), [`store/tree.rs:45-48`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/tree.rs#L45-L48) |
+| A dropped subtree can leak | If a detached page cannot be read, its subtree stays allocated until fsck. At 16384 waiting subtrees, range deletes get `Busy` | [`store/tree.rs:3081-3089`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/tree.rs#L3081-L3089), [`store/tree.rs:37-38`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/tree.rs#L37-L38) |
+| A broken tree page has no second copy | Ops on its key range fail; offline repair refuses structural and checksum damage. The data then has to come back from another replica | [`store/obj/repair.rs:4-6`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/obj/repair.rs#L4-L6) |
+
+**Checked by tracing.** One OSD, 8 cores, 24 GiB memory target, on one
+consumer NVMe behind a loop device, with 10 M 4 KiB objects already
+stored. Each load ran once for 30 s with four clients; the store's own
+counters and `bpftrace` call counts were read before and after. The
+numbers show ratios, not speed. "Tree bytes" is checkpoint bytes divided
+by WAL payload bytes.
+
+| Point | Load | Result |
+|---|---|---|
+| Hot leaves are cheap | 4 KiB overwrite of 20,000 objects, warm cache | 404,759 txns, 36,089 checkpoint pages: 11 txns per page. Tree bytes 1.07x |
+| A wide working set is not | Same, uniform over 10 M objects, cold cache | 225,278 txns, 217,893 pages: one page per txn. Tree bytes 11.3x. Deltas: 183,254 written, 186,842 refused, most for lack of delta room |
+| Omap inserts are costly | 16 random keys per op | 77,505 txns wrote 349,299 leaves: 4.5 pages per txn. Tree bytes 32x |
+| | 1024 random keys per op | Went through omap runs (14,463 run puts). 12.9 M probes, 642,779 pages, tree bytes 2.5x; one checkpoint took 7.7 s |
+| Range delete is cheap | Remove 4 objects holding 14.8 M omap keys | 0.9 s, 7 txns, 56 node visits. 325,161 pages freed, 3,936 read |
+| One object's keys are spread | 4 KiB overwrite | 3.1 keys changed per txn; the leaves written were attr, extent, omap and bitmap leaves |
+| A miss costs a re-run | Cold run above, 395,042 page loads | Probes = txns and no txn parked. Lookups per txn: 48 cold, 27 warm |
+| Checkpoint pauses | All loads | Longest single piece on the core: 30 ms (overwrite), 44 ms (omap), 51 ms (after the delete) |
+| `Busy` at the dirty limit | All loads | Never hit |
+| Idle to checkpoint | One write on an idle OSD, four samples | 5.4, 5.4, 6.7, 7.3 s |
+| Lint | `cargo clippy -p store -- -D clippy::allow_attributes` | 17 hits in the crate; the 2 in `tree.rs` are the ones named below |
+
+**Where the design could improve.** My proposals, ranked by how much
+the traces support them. None is built or tested; the gains are estimates.
+
+| # | Now | Proposal | Gain / cost |
+|---|---|---|---|
+| 1 | Keys sort by tag, then object id, so one object's attrs, extents and onode sit in different leaves ([`store/obj/keys.rs:8-24`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/obj/keys.rs#L8-L24)) | Sort by object id first, then record type. The sub-type byte after the id is already there | One leaf per small write instead of two or three; fewer cold reads; object removal is one range. Cost: a format change |
+| 2 | Every delta chain must stay in RAM, under 16 MiB per shard scaled with memory; when it is full the leaf is written whole ([`store/tree.rs:1287-1296`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/tree.rs#L1287-L1296)) | Keep only an index in RAM (leaf -> chain place) and read the chain with the leaf | Far more leaves can use deltas with the same RAM. Cost: a second read for a cold leaf that has a chain |
+| 3 | Small omap writes go straight into the tree; omap runs take only large batches, and the omap LSM is off at mkfs ([`store/layout.rs:810-811`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/layout.rs#L810-L811)) | Turn the LSM on above some key count, or let small omap writes join runs too | Removes the 4.5 pages per 16-key txn. Cost: a second read path, which the code already has |
+| 4 | After a miss the op starts again. Lookups per txn doubled when cold | Collect all missing pages in one pass, or keep the path found so far | Less repeated work on a cold cache. That the read phase stops at the first miss is my guess, not checked in the code |
+| 5 | Single checkpoint pieces held the core for 30 to 51 ms; one checkpoint ran 7.7 s, longer than the 5 s interval | Find the step that holds the core and budget it by time, not by page count | Shorter worst-case op latency. The step was not traced |
+| 6 | Any eviction drops all 32 leaf hints ([`store/tree.rs:1685-1688`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/tree.rs#L1685-L1688)) | A generation number per cache slot | Only the hints of the evicted page are lost |
+| 7 | A tree page has one copy | Write interior pages twice; they are few (11,601 against 196,198 leaves in the cold trace) | Most of the tree stays reachable after one bad page |
+| 8 | `install` does not check key order or an empty interior page | Check both when a page loads | Wrong content gives `Corrupt`, not an abort |
+| 9 | "Probe before change" is a rule the callers keep | Every changing call takes the path set the probe returned, as `put_at` does | The compiler keeps the rule |
+| 10 | `Tree` is one type with plain `u64` addresses | Split cache, write path, freeze and deltas; give addresses a type | Easier to review and test each part |
+
+Items 1 and 2 aim at the same cost, one page per txn on a wide working
+set, which is the largest measured weakness outside omap.
+
+**Code notes**
+
+- `Tree` is one type of about 90 fields and 190 methods: cache, write
+  path, range delete, lazy free, merge, freeze, deltas and the page image.
+  Addresses are plain `u64` with marker values (`0` = none, bit 63 =
+  virtual), not types of their own.
+- "No partial change on a miss" is kept by the probe that runs first, not
+  by the tree. Some paths change a page and then look up another one
+  ([`store/tree.rs:3143-3148`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/tree.rs#L3143-L3148)); a miss there is reported as `Corrupt`.
+- Release builds abort on panic, and the tree has about 45 `assert!` and
+  `expect` sites. Most guard its own invariants. A page with a valid crc
+  but wrong content (a writer bug, not bit rot) could reach a few of them;
+  `validate` checks neither key order nor an empty interior page.
+- Two `#[allow]` attributes ([`store/tree.rs:2870`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/tree.rs#L2870), [`store/tree.rs:4360`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/tree.rs#L4360)) break
+  the workspace rule `allow_attributes = "deny"`. Nothing reports them,
+  because the store crate has its own lint block with a TODO to drop it
+  ([`store/Cargo.toml:13-19`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/Cargo.toml#L13-L19)).
+
+**Fits best:** block and object workloads that change a few keys of hot
+leaves, with the metadata mostly in the cache. **Fits worst:** very large
+omap objects with random small keys (RGW bucket index, CephFS
+directories) on the plain tree, and metadata far larger than the cache.
 
 
 ## 9. On-disk layout
@@ -1199,19 +1292,20 @@ the newest checkpoint, never the tree.
 | `ckpt_lsn` | Tree on disk holds all records up to this LSN |
 | `wal_tail_pos`, `wal_tail_lsn`, `wal_tail_prev_crc` | Where replay starts in the ring |
 | `meta_bitmap` addr, len, crc | Which meta pages are in use: the image's first page and page count (elastic), or bitmap slot A or B (legacy) |
-| `next_onode_id`, `used_blocks` | Counters |
+| `next_onode_id`, `used_blocks`, `meta_pages_used` | Counters |
+| `shard`, `run_floor` | Owner shard (checked at mount); oldest LSN replay needs to rebuild omap runs |
 
 ### 9.3 Tree page
 
 The page in RAM is the same bytes as on disk. Size is `node_size`: a power
-of two from 4 to 32 KiB, default **8 KiB** ([`page.rs:10-50`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/page.rs#L10-L50)).
+of two from 4 to 32 KiB, default **8 KiB** ([`store/layout.rs:828`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/layout.rs#L828); layout: [`store/page.rs:10-50`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/page.rs#L10-L50)).
 
 ```
- 0        4      6     7      8       10     12       14     16        24         32     36   40
- +--------+------+-----+------+-------+------+--------+------+---------+----------+------+----+
- | crc    | magic| kind| level| nslots| plen | heap_lo| frag | gen_lsn | self_addr| shard| fmt|
- | u32    | B7EE | u8  | u8   | u16   | u16  | u16    | u16  | u64     | u64      | u32  | u8 |
- +--------+------+-----+------+-------+------+--------+------+---------+----------+------+----+
+ 0        4      6     7      8       10     12       14     16        24         32     36   37    40
+ +--------+------+-----+------+-------+------+--------+------+---------+----------+------+----+-----+
+ | crc    | magic| kind| level| nslots| plen | heap_lo| frag | gen_lsn | self_addr| shard| fmt| rsvd|
+ | u32    | B7EE | u8  | u8   | u16   | u16  | u16    | u16  | u64     | u64      | u32  | u8 | 3 B |
+ +--------+------+-----+------+-------+------+--------+------+---------+----------+------+----+-----+
  40
  +-------------+---------------------+ ... free ... +--------------------------------------+
  | prefix[plen]| slots[nslots] u16 ->|              |<- entry heap (grows down from page end)|
@@ -1236,8 +1330,9 @@ of two from 4 to 32 KiB, default **8 KiB** ([`page.rs:10-50`](https://github.com
 - **Prefix compression**: the shared key prefix is stored once per page.
 - **Compact interior pages** (`fmt` 1): front-coded, a restart point every
   16 entries, 5-byte child addresses; about 13 bytes per child instead of 21.
-- **Entry limit**: `page/2 - 256` bytes. Bigger values are split into `p`
-  fragments or moved to data blocks.
+- **Entry limit**: the tree takes entries up to `page/2 - 256` bytes, but
+  the object layer keeps them under `page/4` (2 KiB): a bigger value is
+  split into `p` fragments or moved to data blocks ([`store/tree.rs:613-616`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/tree.rs#L613-L616)).
 
 
 ## 10. WAL
