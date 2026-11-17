@@ -1049,6 +1049,69 @@ What changes on disk when one leaf is rewritten:
    L3  @A3                  shared, not written
 ```
 
+### 8.12 How disk space is allocated
+
+Each shard has two allocators. Both are bitmaps, both belong to the
+shard's core, and neither takes a lock.
+
+| | Data allocator (`Alloc`) | Tree-page allocator (`MetaAlloc`) |
+|---|---|---|
+| Unit | 4 KiB block | One tree page (8 KiB by default) |
+| Search | Next-fit from a cursor | First-fit, lowest page first |
+| Who allocates | A write txn, while it is staged | Only the checkpoint freeze |
+| Saved on disk | Inside the tree: `f` keys, 512 B of bits per 16 MiB; only changed chunks are written | One image, written whole at each checkpoint; the root slot points at it |
+| Grows by | Borrowing 1 GiB chunks from the device pool (elastic stores) | Taking ~1 MiB cells from the data allocator; empty cells go back |
+| Where | [`store/alloc.rs:8-27`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/alloc.rs#L8-L27) | [`store/alloc.rs:1746-1749`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/alloc.rs#L1746-L1749) |
+
+**Life of a data block.** The data bitmap has three bits per block, and
+a block is free only when all three are clear:
+
+```
+          reserve            txn applied          txn frees it         checkpoint durable,
+  free ------------> reserved ------------> alloc ------------> held --------------------> free
+                    (RAM only)            (in the WAL)        (in the WAL)  no older reader
+                                                                                 |
+                                               shard idle: whole free 1 MiB windows -> deallocate
+```
+
+| Step | What happens | Where |
+|---|---|---|
+| Admission | The txn is charged blocks and pages; it is not admitted if the shard would go under its floor (about 3 % of data for client writes) | [`store/space.rs:71-88`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/space.rs#L71-L88), [`store/shard.rs:1829-1831`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/shard.rs#L1829-L1831) |
+| Reserve | While the txn is staged, runs are reserved in RAM. A crash loses nothing: reservations are never written | [`store/shard.rs:2773-2780`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/shard.rs#L2773-L2780) |
+| Apply | reserved -> alloc for new blocks, alloc -> held for the blocks they replace. Overwrite is copy-on-write | [`store/state.rs:795-809`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/state.rs#L795-L809) |
+| Log | The WAL record lists every new run with a crc per block, and every free. Data and WAL go out in parallel (§6) | [`store/wal.rs:194-215`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/wal.rs#L194-L215) |
+| Checkpoint | Changed bitmap chunks are put into the tree before the freeze. After the root slot is durable, held blocks become free once no older reader is left | [`store/shard.rs:6549-6556`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/shard.rs#L6549-L6556) |
+
+Why a freed block waits for the checkpoint: replay checks the data crc
+of every record still in the WAL, so the block must not be reused while
+its record is there ([`store/shard.rs:19-21`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/shard.rs#L19-L21)).
+
+**Finding a free run** ([`store/alloc.rs:981-1010`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/alloc.rs#L981-L1010)):
+
+- The region is cut into 1 MiB windows. Each keeps its longest free run,
+  and a 16-way tree over the windows finds the first window that fits.
+  Cost: a few tree nodes plus one window scan.
+- Runs up to 64 KiB fill holes in partly used windows first, so whole
+  windows stay free for large writes and for tree cells.
+- One run is at most 64 blocks (256 KiB); a 4 MiB write takes 16 runs.
+  If no run is long enough, the longest free run is used and the write
+  goes on in further runs.
+- There is no per-PG or per-object placement.
+
+**Life of a tree page.** A new or split page has a virtual address (bit
+63) while it is dirty. The freeze gives it a real page from `MetaAlloc`;
+the page it replaces goes to `free_after` and is reusable only after the
+root slot is durable (§8.10). If pages run short, the checkpoint first
+takes one more cell from the data allocator.
+
+| Topic | Rule | Where |
+|---|---|---|
+| Mount | Root slot -> page image -> scan the `f` keys -> replay the WAL. The bitmap is not rebuilt by walking the tree; the used count must match the root slot | [`store/state.rs:1072-1104`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/state.rs#L1072-L1104) |
+| Full | `NoSpace` (ENOSPC). If a checkpoint would free space, the allocator answers `Busy` and a checkpoint starts early | [`store/shard.rs:2849-2881`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/shard.rs#L2849-L2881) |
+| Fragmentation | A background sweep moves live runs out of the emptiest windows, with normal WAL txns | [`store/obj/defrag.rs:6-25`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/obj/defrag.rs#L6-L25) |
+| Deallocate (TRIM) | Whole free windows only, when the shard is idle, one command per device at a time | [`store/trim.rs:4-9`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/trim.rs#L4-L9) |
+| Elastic pool | On devices of 256 GiB and more a shard starts with 25 % of its region; the rest is a pool of 1 GiB chunks. Core 0 owns the lending table; a chunk is used only after the table write is durable | [`store/lend.rs:6-18`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/lend.rs#L6-L18) |
+
 
 ## 9. On-disk layout
 
