@@ -1226,6 +1226,46 @@ leaves, with the metadata mostly in the cache. **Fits worst:** very large
 omap objects with random small keys (RGW bucket index, CephFS
 directories) on the plain tree, and metadata far larger than the cache.
 
+### 8.14 Is anything synchronous?
+
+Not in the tree. `tree.rs`, `page.rs` and `delta.rs` have no device call,
+no lock, no sleep and no wait: a missing page is always answered with
+`Miss` (8.5). The blocking code is in the layers that drive the tree.
+
+```
+ object layer / shard          B+tree
+ --------------------          ------
+ op --------------------------> get / put / probe
+     <-- Miss ----------------- (never waits)
+     |
+     +-- non-blocking mode: submit the read, return WouldBlock, park the op
+     +-- blocking mode:     submit the read, spin on poll until it is done
+```
+
+| What blocks | How | When | Where |
+|---|---|---|---|
+| `Sio` | Submit I/O, spin on `poll` until done | mkfs, mount, WAL replay, the mount checkpoint | [`store/sio.rs:6-7`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/sio.rs#L6-L7) |
+| `apply_blocking`, `fill_blocking` | On a tree miss, read the page and wait | Replay; loading the bitmap at mount | [`store/state.rs:1060-1070`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/state.rs#L1060-L1070) |
+| `ShardStore::wait` | Pump the device until a condition holds. Used by `miss_wait`, `wait_durable` and synchronous data reads | Only in blocking mode, which is the shard's default; the OSD turns reads to non-blocking | [`store/obj/shardio.rs:818-832`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/obj/shardio.rs#L818-L832), [`store/obj/shardio.rs:886-890`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/obj/shardio.rs#L886-L890) |
+| `Store::commit` | Queue a txn, then wait until it is durable | The OSD's own records: osdmaps, superblock (`commit_maps`, `put_now`, `trim_maps`) | [`store/obj/store.rs:2996-3002`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/obj/store.rs#L2996-L3002), [`osd/nvmestore.rs:681`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/osd/src/nvmestore.rs#L681) |
+| Checkpoint start | Bitmap flush and freeze begin run on the shard's core | Every checkpoint. "A long start stalls every op of the core" | [`store/shard.rs:1381-1384`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/shard.rs#L1381-L1384) |
+| Forced checkpoint | The txn path waits inside `queue`: "the core stalls" | Only when allocation reaches the space floor | [`store/shard.rs:5665-5669`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/shard.rs#L5665-L5669) |
+| Synchronous data read | The read waits for its completion | A fallback when the prefetch table cannot take the read | [`store/obj/shardio.rs:1454-1456`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/obj/shardio.rs#L1454-L1456) |
+
+Traced on the test box of 8.13: 20 s of 662,496 random 4 KiB reads mixed
+with 365,253 overwrites over 10 M objects.
+
+| Probe | Result |
+|---|---|
+| `pump_bounded`, the round every blocking wait spins in | Never entered |
+| `Sio` read and write | Never called |
+| `wait_durable` | 682,046 calls, nearly all back within 1 to 4 us: none waited |
+
+So normal serving did not block on this load. Not traced: `commit` on
+core 0 at an osdmap change, the forced checkpoint at the space floor, and
+the synchronous read fallback. The one synchronous piece that was
+measured is the checkpoint start: 30 to 51 ms (8.13).
+
 
 ## 9. On-disk layout
 
