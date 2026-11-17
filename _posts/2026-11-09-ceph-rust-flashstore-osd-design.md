@@ -1097,6 +1097,16 @@ blocks it took and freed, and replay applies them again.
               #4 write the root slot  <- both bitmaps become valid here
 ```
 
+The bitmap bits are never logged; the WAL holds only the changes that
+produce them:
+
+| What | In the WAL? | After a crash |
+|---|---|---|
+| Blocks a txn took or freed | Yes, in the txn's record | Replay sets and clears the bits again |
+| The bitmap chunks (`f` keys) | No; put straight into the tree at checkpoint start ([`store/state.rs:1016-1047`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/state.rs#L1016-L1047)) | Last checkpoint's bitmap + replay |
+| Reserved blocks | No, RAM only | They are free again |
+| Tree-page bitmap, tree cells | No ([`store/state.rs:937-942`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/state.rs#L937-L942)) | The old image is valid until the new root slot is durable |
+
 On disk both bitmaps are copy-on-write; only the RAM copy is changed in
 place. The `f` keys are normal tree entries, so a changed leaf goes to a
 fresh page or to a leaf delta ([`store/tree.rs:11-14`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/tree.rs#L11-L14)), and the
