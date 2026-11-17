@@ -142,7 +142,7 @@ run-to-completion loop per core (§4.3):
 | `.await` on I/O | Submit, then poll | `Shard::submit` / `Shard::poll`, `queue_txn` / `poll_commits`, `send_message` / `poll_event` |
 | `.await` on a cache miss | Park and retry | Tree returns `StoreError::Miss` + a "want"; the op is parked and run again after `install` |
 | Future state | Explicit continuations | peering `Action` list, `Pending::LocalWrite` / `RepOpReply`, op engine `Inflight` and waiter queues |
-| Executor + wakers | One loop per core | `KCore::step` (`rt/knet/kcore.rs`) |
+| Executor + wakers | One loop per core | `KCore::step` ([`rt/knet/kcore.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/crates/rt/src/knet/kcore.rs)) |
 
 - **Win**: no wakers, no boxed tasks, no executor scheduling between a
   completion and its handler. Each stage of an op is a plain function call,
@@ -172,13 +172,13 @@ store. Read from the code; the feature was not built or run here.
 
 | Topic | How | Where |
 |---|---|---|
-| Scope | Only where omap key-values are persisted. Objects, extents, xattrs, allocator and the main WAL stay in the B+tree + WAL | `store/rocks_omap.rs` header |
+| Scope | Only where omap key-values are persisted. Objects, extents, xattrs, allocator and the main WAL stay in the B+tree + WAL | [`store/rocks_omap.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/rocks_omap.rs) header |
 | Build | Cargo feature `rocksdb`: the `rocksdb` crate 0.25 (real C++ library via `librocksdb-sys`); off by default | `services/osd/store/Cargo.toml:32,43` |
 | Selection | At mkfs: `MkfsParams::omap_rocksdb` sets superblock bit `FEAT_OMAP_ROCKSDB`; mkfs refuses it without the feature | `store/layout.rs:130,877` |
-| Data location | A directory on a filesystem, `flashstore_rocksdb_dir`, one DB per shard (`<dir>/<name>/shard-N`); not on the raw FlashStore device | `rocks_omap.rs:151`, `osd/config.rs:289` |
-| Durability | FlashStore's WAL and memtables stay the authority; only a natively durable frozen memtable is handed over | `rocks_omap.rs` header |
-| Threading | Blocking DB calls, reads included, run on a per-shard worker thread, never on a PG core | `rocks_omap.rs:1459` |
-| Tuning | `flashstore_rocksdb_*`: worker CPU placement, thread counts, background jobs, write buffers | `osd/config.rs:289-299` |
+| Data location | A directory on a filesystem, `flashstore_rocksdb_dir`, one DB per shard (`<dir>/<name>/shard-N`); not on the raw FlashStore device | [`rocks_omap.rs:151`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/rocks_omap.rs#L151), [`osd/config.rs:289`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/osd/src/config.rs#L289) |
+| Durability | FlashStore's WAL and memtables stay the authority; only a natively durable frozen memtable is handed over | [`rocks_omap.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/rocks_omap.rs) header |
+| Threading | Blocking DB calls, reads included, run on a per-shard worker thread, never on a PG core | [`rocks_omap.rs:1459`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/rocks_omap.rs#L1459) |
+| Tuning | `flashstore_rocksdb_*`: worker CPU placement, thread counts, background jobs, write buffers | [`osd/config.rs:289-299`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/osd/src/config.rs#L289-L299) |
 
 It is the one place where the thread-per-core rule is bent on purpose: a
 blocking library is kept behind a ring on its own thread.
@@ -189,11 +189,11 @@ The repo has no BlueStore code and cannot read a BlueStore device.
 
 | Question | Answer |
 |---|---|
-| Convert a BlueStore OSD in place? | No. Add FlashStore OSDs, remove classic ones; data moves by backfill (`docs/how-to/migrate-from-classic.md`) |
+| Convert a BlueStore OSD in place? | No. Add FlashStore OSDs, remove classic ones; data moves by backfill ([`docs/how-to/migrate-from-classic.md`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/docs/how-to/migrate-from-classic.md)) |
 | Share a cluster, pool and PG with BlueStore OSDs? | Yes. §12 ran the Rust `osd.1` against a classic BlueStore `osd.0` |
 | Why does `ceph osd metadata` say `bluestore`? | Name only: `flashstore_report_objectstore` defaults to `bluestore` for tooling compatibility |
 | `ceph tell osd.N bluestore ...` commands? | Answered with FlashStore's own data, refused, or no-ops |
-| Store backends that exist | FlashStore on NVMe, and a lab-only in-RAM / directory store (`osd/backend.rs`) |
+| Store backends that exist | FlashStore on NVMe, and a lab-only in-RAM / directory store ([`osd/backend.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/osd/src/backend.rs)) |
 
 
 ## 4. Startup and threads
@@ -227,16 +227,16 @@ main()                         fs/main.rs:149     args; --check -> hwcheck
 | `osd-log`, `sighup`, `liveness`, `smart` | 1 each | Log writer, signal, watchdog, device health. |
 | `asok-*` | 6 | Admin socket. |
 
-- Core threads are pinned with `sched_setaffinity` (`rt/lib.rs:46-71`).
+- Core threads are pinned with `sched_setaffinity` ([`rt/lib.rs:46-71`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/crates/rt/src/lib.rs#L46-L71)).
   Helpers are moved to the CPUs the cores do not use.
 - Core count: `--cores` / `flashstore_cores`; default min(allowed CPUs,
-  store shards), at most 64 (`fs/args.rs:142-162`, `osd/xcore.rs:88`).
+  store shards), at most 64 ([`fs/args.rs:142-162`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/croit-flashstore-osd/src/args.rs#L142-L162), [`osd/xcore.rs:88`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/osd/src/xcore.rs#L88)).
 - CPU choice is by L3/NUMA domain and avoids the NIC IRQ CPUs.
 
 ### 4.3 The loop of one core
 
 One run-to-completion loop per core (§3)
-(`rt/knet/kcore.rs:359-686`):
+([`rt/knet/kcore.rs:359-686`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/crates/rt/src/knet/kcore.rs#L359-L686)):
 
 ```
 loop:
@@ -272,11 +272,11 @@ shard = placement table entry            # normal case
 
 | Event | What happens | Where |
 |---|---|---|
-| PG first maps to this OSD | Core 0 puts it on the least loaded core and records it | `osd/mig.rs:8-15`, `peering/place.rs` |
-| PG is already here | Never moves for balance | `osd/mig.rs` |
-| PG split | Children keep the parent's shard | `peering/pgset/mod.rs:1626-1638` |
-| PG merge | Source may be copied to the target's core over the mesh | `osd/mig.rs:16-33` |
-| Restart | Table rebuilt from where the PG collections are on disk | `osd/mig.rs:8-11` |
+| PG first maps to this OSD | Core 0 puts it on the least loaded core and records it | [`osd/mig.rs:8-15`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/osd/src/mig.rs#L8-L15), [`peering/place.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/peering/src/place.rs) |
+| PG is already here | Never moves for balance | [`osd/mig.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/osd/src/mig.rs) |
+| PG split | Children keep the parent's shard | [`peering/pgset/mod.rs:1626-1638`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/peering/src/pgset/mod.rs#L1626-L1638) |
+| PG merge | Source may be copied to the target's core over the mesh | [`osd/mig.rs:16-33`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/osd/src/mig.rs#L16-L33) |
+| Restart | Table rebuilt from where the PG collections are on disk | [`osd/mig.rs:8-11`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/osd/src/mig.rs#L8-L11) |
 
 Limits: cores <= shards <= 256, cores <= 64. Shard count is fixed at mkfs;
 core count can change between runs. A core owns whole shards, so a PG's
@@ -309,13 +309,13 @@ data always sits in a shard of its owner core.
 ```
 
 - **Mesh**: a full N x N set of SPSC rings is the only cross-core data path
-  (`rt/mesh.rs:6-7`). Ring indexes are padded to 128 bytes
-  (`crates/spsc/src/lib.rs`).
+  ([`rt/mesh.rs:6-7`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/crates/rt/src/mesh.rs#L6-L7)). Ring indexes are padded to 128 bytes
+  ([`crates/spsc/src/lib.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/crates/spsc/src/lib.rs)).
 - **Order**: an ordered message waits until everything its sender sent
-  earlier on other lanes is delivered (`rt/mesh.rs:212-223`).
+  earlier on other lanes is delivered ([`rt/mesh.rs:212-223`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/crates/rt/src/mesh.rs#L212-L223)).
 - **Full ring**: the sender never blocks. It keeps a local backlog and is
   woken when space is free.
-- **Messages**: one enum, `XMsg` (`osd/xcore.rs:317-689`):
+- **Messages**: one enum, `XMsg` ([`osd/xcore.rs:317-689`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/osd/src/xcore.rs#L317-L689)):
 
 | Direction | Variants |
 |---|---|
@@ -332,7 +332,7 @@ data always sits in a shard of its owner core.
   the PG, and one hop back for the reply.
 - Not strictly shared-nothing: helper threads exist, a few atomics and
   mutexes are shared (5.2), and cores can help each other with send/receive
-  work and compaction (`rt/knet/spread.rs`, `XMsg::CompactWork`).
+  work and compaction ([`rt/knet/spread.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/crates/rt/src/knet/spread.rs), `XMsg::CompactWork`).
 
 
 ### 5.5 An op arrives on core m, its PG lives on core n
@@ -360,27 +360,27 @@ So the op is handed over once, and the reply is handed back once.
 
 | Question | Answer | Where |
 |---|---|---|
-| Who decides? | The connection core: `core_of(pgid) != me` | `osd/pgs.rs:2151` |
-| What crosses the ring? | Ownership of the boxed `MOSDOp`, payload buffer included. No copy: "message buffers move with the envelope" | `osd/xcore.rs:317-327`, `rt/mesh.rs:8` |
-| Which ring? | The lane of the PG's store shard: one lane per shard for each core pair | `osd/xcore.rs:1217` |
-| Is order kept? | Yes. Each lane is FIFO, and a new op is held behind older held ops of the same shard | `osd/pgs.rs:2103` (`HoldWhy::Fifo`) |
-| What if core n is slow? | Three brakes: ingress credit per shard; at 8192 queued messages (`XOUT_MAX`) ops wait in `xout_wait` in arrival order; while any wait, new input of every link is held. The limit counts the core's whole out queue, all destinations together, so one slow core holds input meant for every core | `osd/pgs.rs:2103-2175`, `osd/xcore.rs:93`, `crates/ingress/src/order.rs:147` |
-| How is n woken? | One eventfd per core, written only if n announced it sleeps | `rt/wake.rs:6-23` |
-| How does the reply find m? | The link id carries its core in bits 48..56; the PG core sends the encoded reply as `XMsg::Wire` | `osd/xcore.rs:195-198`, `osd/osd.rs:2432` |
-| Who shares a newer osdmap with the client? | The connection core, once per client, not once per PG core | `osd/pgs.rs:2162` |
-| Connection closes while ops are on n? | The link keeps a bitmask of cores it forwarded to; the close is told there | `osd/mig.rs:1130` (`l.fwd`) |
-| PG is being moved (merge)? | Its messages are held or queued until the move is released, never dropped | `osd/mig.rs:1087` (`pg_item`) |
+| Who decides? | The connection core: `core_of(pgid) != me` | [`osd/pgs.rs:2151`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/osd/src/pgs.rs#L2151) |
+| What crosses the ring? | Ownership of the boxed `MOSDOp`, payload buffer included. No copy: "message buffers move with the envelope" | [`osd/xcore.rs:317-327`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/osd/src/xcore.rs#L317-L327), [`rt/mesh.rs:8`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/crates/rt/src/mesh.rs#L8) |
+| Which ring? | The lane of the PG's store shard: one lane per shard for each core pair | [`osd/xcore.rs:1217`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/osd/src/xcore.rs#L1217) |
+| Is order kept? | Yes. Each lane is FIFO, and a new op is held behind older held ops of the same shard | [`osd/pgs.rs:2103`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/osd/src/pgs.rs#L2103) (`HoldWhy::Fifo`) |
+| What if core n is slow? | Three brakes: ingress credit per shard; at 8192 queued messages (`XOUT_MAX`) ops wait in `xout_wait` in arrival order; while any wait, new input of every link is held. The limit counts the core's whole out queue, all destinations together, so one slow core holds input meant for every core | [`osd/pgs.rs:2103-2175`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/osd/src/pgs.rs#L2103-L2175), [`osd/xcore.rs:93`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/osd/src/xcore.rs#L93), [`crates/ingress/src/order.rs:147`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/crates/ingress/src/order.rs#L147) |
+| How is n woken? | One eventfd per core, written only if n announced it sleeps | [`rt/wake.rs:6-23`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/crates/rt/src/wake.rs#L6-L23) |
+| How does the reply find m? | The link id carries its core in bits 48..56; the PG core sends the encoded reply as `XMsg::Wire` | [`osd/xcore.rs:195-198`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/osd/src/xcore.rs#L195-L198), [`osd/osd.rs:2432`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/osd/src/osd.rs#L2432) |
+| Who shares a newer osdmap with the client? | The connection core, once per client, not once per PG core | [`osd/pgs.rs:2162`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/osd/src/pgs.rs#L2162) |
+| Connection closes while ops are on n? | The link keeps a bitmask of cores it forwarded to; the close is told there | [`osd/mig.rs:1130`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/osd/src/mig.rs#L1130) (`l.fwd`) |
+| PG is being moved (merge)? | Its messages are held or queued until the move is released, never dropped | [`osd/mig.rs:1087`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/osd/src/mig.rs#L1087) (`pg_item`) |
 
 Large writes do not wait for the whole payload. The connection core
 forwards whole-block pieces of a still-arriving payload as
 `XMsg::PrePiece` on the same lane; the PG core writes them into reserved
 blocks at once, and the op that follows claims those blocks instead of
-writing again (`store/pre.rs`).
+writing again ([`store/pre.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/pre.rs)).
 
 How often, and what it costs:
 
 - Connections are spread by `SO_REUSEPORT` hash, then handed to the core
-  with the fewest connections at accept time (`rt/place.rs`). Placement is
+  with the fewest connections at accept time ([`rt/place.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/crates/rt/src/place.rs)). Placement is
   not PG-aware and one connection carries ops for many PGs, so with N cores
   about (N-1)/N of the ops should take the hop (my estimate, not measured).
 - Measured (§12): 4K reads, median 29 us in the OSD, 7 us of it the hop
@@ -415,30 +415,30 @@ How often, and what it costs:
 
 | # | Code |
 |---|---|
-| 1-3 | `rt/knet/mod.rs:1458`, `crates/msgr2/src/conn.rs:1597`, `crates/opwire/src/msgs.rs:923` |
-| 4-5 | `osd/pgs.rs:2103`, `osd/pgs.rs:2151` |
-| 6 | `osd/pgs.rs:2449`, `osd/ops.rs:959`: OSD active, map epoch, primary, PG state. Op is parked if the map is too old. |
-| 7-8 | `opexec/engine.rs:994`, `opexec/exec.rs`: per-object ordering, dup detection by request id |
-| 9-10 | `peering/primary.rs:2008`; `osd/ops.rs:209-228` holds the local persist so the repops leave first |
-| 11-13 | `storeadapt/lib.rs:417`, `osd/pgs.rs:3314`, `osd/pgs.rs:3332` |
-| 14-16 | `peering/primary.rs:2322`, `:2342`; `osd/ops.rs:1472` |
+| 1-3 | [`rt/knet/mod.rs:1458`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/crates/rt/src/knet/mod.rs#L1458), [`crates/msgr2/src/conn.rs:1597`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/crates/msgr2/src/conn.rs#L1597), [`crates/opwire/src/msgs.rs:923`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/crates/opwire/src/msgs.rs#L923) |
+| 4-5 | [`osd/pgs.rs:2103`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/osd/src/pgs.rs#L2103), [`osd/pgs.rs:2151`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/osd/src/pgs.rs#L2151) |
+| 6 | [`osd/pgs.rs:2449`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/osd/src/pgs.rs#L2449), [`osd/ops.rs:959`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/osd/src/ops.rs#L959): OSD active, map epoch, primary, PG state. Op is parked if the map is too old. |
+| 7-8 | [`opexec/engine.rs:994`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/opexec/src/engine.rs#L994), [`opexec/exec.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/opexec/src/exec.rs): per-object ordering, dup detection by request id |
+| 9-10 | [`peering/primary.rs:2008`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/peering/src/primary.rs#L2008); [`osd/ops.rs:209-228`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/osd/src/ops.rs#L209-L228) holds the local persist so the repops leave first |
+| 11-13 | [`storeadapt/lib.rs:417`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/storeadapt/src/lib.rs#L417), [`osd/pgs.rs:3314`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/osd/src/pgs.rs#L3314), [`osd/pgs.rs:3332`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/osd/src/pgs.rs#L3332) |
+| 14-16 | [`peering/primary.rs:2322`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/peering/src/primary.rs#L2322), `:2342`; [`osd/ops.rs:1472`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/osd/src/ops.rs#L1472) |
 
 - If #5 finds `core_of(pg)` is this core, steps 6-16 run in place.
 - A tree page miss in #7/#8 parks the op, reads the page, runs the op
   again. Nothing waits inside the engine.
 - **Read**: no PG log entry, no store txn, no replica traffic. Needs a read
   lease, waits behind in-flight writes of the same object, and returns data
-  by reference with its stored crc (`storeadapt/view.rs:64`).
+  by reference with its stored crc ([`storeadapt/view.rs:64`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/storeadapt/src/view.rs#L64)).
 - **Replica**: `MOSDRepOp` arrives on the peer-link core, goes to the PG
   core as `XMsg::Pg`, and `ACK_ONDISK` is sent after its own commit
-  (`peering/pg.rs:2689`).
+  ([`peering/pg.rs:2689`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/peering/src/pg.rs#L2689)).
 
 
 ## 7. Storage engine overview
 
 FlashStore cuts the device into shards. Each shard has its own WAL ring,
 its own B+tree and its own allocator, and one core owns it
-(`store/lib.rs:6`: "Sans-IO, single-threaded per shard, no locks").
+([`store/lib.rs:6`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/lib.rs#L6): "Sans-IO, single-threaded per shard, no locks").
 
 ```
  storeadapt        StoreTxn (one PG transaction)
@@ -472,18 +472,18 @@ Three rules explain most of the design:
    go to fresh blocks; old ones are freed only after the next checkpoint.
 
 The engine has no threads and no blocking calls: the caller drives it with
-`submit()` and `poll(now)` (`store/shard.rs:23`).
+`submit()` and `poll(now)` ([`store/shard.rs:23`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/shard.rs#L23)).
 
 Omap has more engines than the plain tree: WAL-logged omap runs
-(`runs.rs`), a native LSM (`olsm/`) and an optional RocksDB engine
-(`rocks_omap.rs`, feature `rocksdb`). "B+tree + WAL" is the core, not the
+([`runs.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/runs.rs)), a native LSM (`olsm/`) and an optional RocksDB engine
+([`rocks_omap.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/rocks_omap.rs), feature `rocksdb`). "B+tree + WAL" is the core, not the
 whole story.
 
 
 ## 8. B+tree
 
 One tree per shard: a plain ordered key-value map holding every kind of
-metadata, split by the first key byte (`store/obj/keys.rs:6-24`).
+metadata, split by the first key byte ([`store/obj/keys.rs:6-24`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/obj/keys.rs#L6-L24)).
 
 ### 8.1 What is stored
 
@@ -503,7 +503,7 @@ metadata, split by the first key byte (`store/obj/keys.rs:6-24`).
 
 - Object names are encoded so byte order equals Ceph object order.
 - A PG is one collection. PG log and PG info are omap keys of the PG meta
-  object (`storeadapt/meta.rs:6-20`), so they are `o` keys too.
+  object ([`storeadapt/meta.rs:6-20`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/storeadapt/src/meta.rs#L6-L20)), so they are `o` keys too.
 - Read path: object offset -> `e` key `(id, lblk)` by predecessor scan ->
   device block -> LBA.
 
@@ -511,17 +511,17 @@ metadata, split by the first key byte (`store/obj/keys.rs:6-24`).
 
 | Topic | Design | Where |
 |---|---|---|
-| In RAM | Bounded CLOCK page cache; default 16384 pages = 128 MiB per shard; dirty pages pinned | `tree.rs:6-9`, `shard.rs:336` |
-| Cache miss | `get` returns `StoreError::Miss` and records a "want"; caller reads the page, calls `install`, retries. The tree never blocks. | `tree.rs:6-9` |
-| Update | Pages are changed in place, in RAM only | `page.rs:8` |
-| Persist | At checkpoint each dirty page goes to a new address (shadow paging) or as a small leaf delta | `tree.rs:11-16`, `delta.rs` |
-| Commit point | The A/B root slot; the old tree stays valid until the new slot is on disk | `layout.rs:464-488` |
-| New pages | Virtual address (bit 63) until the checkpoint gives a real one | `page.rs` `VIRT` |
-| Shrink | Empty pages pruned at end of txn; underfull leaves merge with a dirty neighbour | `tree.rs:17-21` |
-| Range delete | Cuts off whole subtrees, frees them lazily | `tree.rs:146-153` |
-| Locking | None; one core owns the tree | `lib.rs:6` |
+| In RAM | Bounded CLOCK page cache; default 16384 pages = 128 MiB per shard; dirty pages pinned | [`tree.rs:6-9`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/tree.rs#L6-L9), [`shard.rs:336`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/shard.rs#L336) |
+| Cache miss | `get` returns `StoreError::Miss` and records a "want"; caller reads the page, calls `install`, retries. The tree never blocks. | [`tree.rs:6-9`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/tree.rs#L6-L9) |
+| Update | Pages are changed in place, in RAM only | [`page.rs:8`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/page.rs#L8) |
+| Persist | At checkpoint each dirty page goes to a new address (shadow paging) or as a small leaf delta | [`tree.rs:11-16`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/tree.rs#L11-L16), [`delta.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/delta.rs) |
+| Commit point | The A/B root slot; the old tree stays valid until the new slot is on disk | [`layout.rs:464-488`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/layout.rs#L464-L488) |
+| New pages | Virtual address (bit 63) until the checkpoint gives a real one | [`page.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/page.rs) `VIRT` |
+| Shrink | Empty pages pruned at end of txn; underfull leaves merge with a dirty neighbour | [`tree.rs:17-21`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/tree.rs#L17-L21) |
+| Range delete | Cuts off whole subtrees, frees them lazily | [`tree.rs:146-153`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/tree.rs#L146-L153) |
+| Locking | None; one core owns the tree | [`lib.rs:6`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/lib.rs#L6) |
 
-Checkpoint triggers (`shard.rs:5508-5535`): WAL 50 % full, dirty pages
+Checkpoint triggers ([`shard.rs:5508-5535`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/shard.rs#L5508-L5535)): WAL 50 % full, dirty pages
 over a soft mark (2048 by default, cache/8 when sized from memory), many
 dirty bitmap chunks, low space, 5 s, or on request. The freeze is sliced
 (`freeze_begin` / `freeze_step` / `freeze_end`) so it does not stall I/O.
@@ -591,7 +591,7 @@ Errors a caller sees:
 | `Io` | The read of a wanted page failed; every later call that reaches that page returns the same error | Not retryable by the tree |
 | `Corrupt` | A page or a delta chain failed a check (crc, level, format), or the structure is inconsistent | Not retryable; treat as store corruption |
 
-How the shard drives the tree for one write txn (`state.rs`):
+How the shard drives the tree for one write txn ([`state.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/state.rs)):
 
 ```
  State::prepare(record)    probe every op: probe_sorted (puts, deletes), probe_range (range deletes)
@@ -604,7 +604,7 @@ A record with one simple op skips the probe: that op descends before it
 changes anything, so a miss is still clean.
 
 Nobody above the shard calls the tree. The shard applies WAL records to it
-through `state.rs`; the object layer reads it through the shard.
+through [`state.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/state.rs); the object layer reads it through the shard.
 
 ### 8.4 In memory: a slab of pages, linked by disk address
 
@@ -641,7 +641,7 @@ touching its parent.
 
 ### 8.5 Finding a leaf
 
-Every operation starts with `locate(key)` (`tree.rs:1702`).
+Every operation starts with `locate(key)` ([`tree.rs:1702`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/tree.rs#L1702)).
 
 ```
  locate(key)
@@ -668,15 +668,15 @@ Every operation starts with `locate(key)` (`tree.rs:1702`).
 
 | Op | Steps | Where |
 |---|---|---|
-| `get` | locate, binary search in the leaf (page prefix + entry suffix), copy the value | `tree.rs:1834` |
-| `put` | size check; locate; mark leaf and path dirty; log the key for leaf deltas; same-length value is overwritten in place; else insert | `tree.rs:2253`, `put_inner` `:2546` |
-| `del` | locate; binary search; remove the entry; the key range of an emptied leaf goes on the prune list, a leaf less than 1/3 full on the merge list | `tree.rs:2579`, `del_slot` `:2605` |
+| `get` | locate, binary search in the leaf (page prefix + entry suffix), copy the value | [`tree.rs:1834`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/tree.rs#L1834) |
+| `put` | size check; locate; mark leaf and path dirty; log the key for leaf deltas; same-length value is overwritten in place; else insert | [`tree.rs:2253`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/tree.rs#L2253), `put_inner` `:2546` |
+| `del` | locate; binary search; remove the entry; the key range of an emptied leaf goes on the prune list, a leaf less than 1/3 full on the merge list | [`tree.rs:2579`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/tree.rs#L2579), `del_slot` `:2605` |
 
 `put` has three ways to find its leaf: a walk, a cursor for ascending keys
 (omap run merges), or the position the txn's probe already found
 (`put_at`).
 
-Insert and split (`insert_leaf` `tree.rs:2626`, `propagate` `:2723`):
+Insert and split (`insert_leaf` [`tree.rs:2626`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/tree.rs#L2626), `propagate` `:2723`):
 
 ```
  insert into leaf
@@ -697,7 +697,7 @@ Insert and split (`insert_leaf` `tree.rs:2626`, `propagate` `:2723`):
 ### 8.7 scan
 
 There are no sibling links, so a scan walks through the parent
-(`tree.rs:1980`).
+([`tree.rs:1980`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/tree.rs#L1980)).
 
 ```
  scan(cursor { next, end }, max_entries, max_bytes, f)
@@ -752,7 +752,7 @@ a range are loaded by the txn's probe first and freed at once.
 ### 8.9 install and eviction
 
 `install(want, data)` feeds a page read from disk into the cache
-(`tree.rs:1520`):
+([`tree.rs:1520`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/tree.rs#L1520)):
 
 | # | Step |
 |---|---|
@@ -764,7 +764,7 @@ a range are loaded by the txn's probe first and freed at once.
 | 6 | Copy into a cache slot; `map[addr] = slot`. A page read for a listing gets no REF and is queued for early eviction |
 | 7 | Leaf with deltas: apply the delta chain of earlier checkpoints, so the page is in its last durable state |
 
-Eviction is CLOCK (`evict_to`, `tree.rs:1602`):
+Eviction is CLOCK (`evict_to`, [`tree.rs:1602`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/tree.rs#L1602)):
 
 ```
  never evicted:  dirty, in-flight, pinned, or installed very recently
@@ -786,7 +786,7 @@ Eviction is CLOCK (`evict_to`, `tree.rs:1602`):
 ```
 
 - Txns keep running between steps. Before a pending page changes
-  (`fz_touch`, `tree.rs:4010`), a leaf is frozen at once and an interior
+  (`fz_touch`, [`tree.rs:4010`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/tree.rs#L4010)), a leaf is frozen at once and an interior
   page is copied aside. Each page is frozen exactly as it was at `lsn`.
 - A leaf delta avoids rewriting a whole page for a small change; the base
   page plus its delta chain is the durable state (8.9 step 7). Old delta
@@ -935,7 +935,7 @@ What changes on disk when one leaf is rewritten:
 | WAL ring | per shard | Total min(4 GiB, device/64), split over shards, each 64 MiB to 4 GiB |
 | Meta area | per shard | `[bitmap A][bitmap B][tree pages]`; grows by taking 1 MiB cells from data |
 
-One shard region (`store/layout.rs:941-960`):
+One shard region ([`store/layout.rs:941-960`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/layout.rs#L941-L960)):
 
 ```
  region_start
@@ -950,7 +950,7 @@ One shard region (`store/layout.rs:941-960`):
 ### 9.2 Root slot: the commit point
 
 A checkpoint writes slot `seq & 1`. On mount the valid slot with the
-highest `seq` wins (`layout.rs:1750-1763`). A torn root write loses only
+highest `seq` wins ([`layout.rs:1750-1763`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/layout.rs#L1750-L1763)). A torn root write loses only
 the newest checkpoint, never the tree.
 
 | Field | Use |
@@ -965,7 +965,7 @@ the newest checkpoint, never the tree.
 ### 9.3 Tree page
 
 The page in RAM is the same bytes as on disk. Size is `node_size`: a power
-of two from 4 to 32 KiB, default **8 KiB** (`page.rs:10-50`).
+of two from 4 to 32 KiB, default **8 KiB** ([`page.rs:10-50`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/page.rs#L10-L50)).
 
 ```
  0        4      6     7      8       10     12       14     16        24         32     36   40
@@ -1004,7 +1004,7 @@ of two from 4 to 32 KiB, default **8 KiB** (`page.rs:10-50`).
 ## 10. WAL
 
 One ring of 4 KiB blocks per shard. It logs logical KV ops; never page
-images, never object data (`store/wal.rs:6-28`, `store/shard.rs:6-23`).
+images, never object data ([`store/wal.rs:6-28`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/wal.rs#L6-L28), [`store/shard.rs:6-23`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/shard.rs#L6-L23)).
 
 ### 10.1 Format
 
@@ -1051,21 +1051,21 @@ rides inline as a value; bigger data goes straight to new data blocks.
 ```
 
 - **No flush command.** A completed write is durable on a PLP device
-  (`crates/nvme/src/lib.rs:104`). FUA is used only if the device reports a
+  ([`crates/nvme/src/lib.rs:104`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/crates/nvme/src/lib.rs#L104)). FUA is used only if the device reports a
   volatile write cache, and mkfs refuses such a device outside lab builds.
 - **Up to 16 units in flight.**
 - **A freed data block is reusable only after ack and checkpoint.** Replay
   re-checks data crcs, so a block named in the live WAL window must not be
   recycled.
 
-Replay on mount (`shard.rs:1615-2087`, `wal.rs:607-866`):
+Replay on mount ([`shard.rs:1615-2087`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/shard.rs#L1615-L2087), [`wal.rs:607-866`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/wal.rs#L607-L866)):
 
 1. Pick the newest valid root slot; load bitmap and tree root.
 2. Walk the unit chain from `wal_tail_pos`; stop at the first bad magic,
    crc, LSN gap, epoch or `prev_crc`.
 3. For each unit, read every data block it names and check the crc. One
    bad block ends the log at that unit; such a unit was never acked.
-4. Apply the good records through `state.rs`, the same code as commit.
+4. Apply the good records through [`state.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/state.rs), the same code as commit.
 5. If a later unit shows `acked_lsn` beyond the cut, acked data is lost:
    mount fails with `WalLost` unless `--accept-wal-loss` is given.
 6. Bump the epoch, force a checkpoint.
@@ -1091,24 +1091,24 @@ pattern repeats: the upper side calls `submit` / `queue`, then `poll`.
 | From | To | Interface | Main calls |
 |---|---|---|---|
 | Kernel | `rt` | io_uring | multishot RECV, SENDMSG, eventfd read |
-| `rt` | `osd` | trait `rt::stream::Driver` (`rt/stream.rs:15`) | `on_accept`, `on_bytes`, `on_closed`, `poll_output_chunks` |
+| `rt` | `osd` | trait `rt::stream::Driver` ([`rt/stream.rs:15`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/crates/rt/src/stream.rs#L15)) | `on_accept`, `on_bytes`, `on_closed`, `poll_output_chunks` |
 | `rt` loop | `osd` | direct calls | `poll_store`, `on_timer`, `end_pass`, `apply_late` |
 | `osd` | `msgr2` | struct `Connection` | `on_bytes`, `poll_event`, `send_message` |
 | `msgr2` | `cephx` | traits `AuthServerHandler`, `AuthClientHandler` | implemented by `DaemonAuthServer` |
 | Core | Core | enum `XMsg` over the SPSC mesh | `xsend`, `poll_xmsg`, `on_xmsg` |
 | `osd` | `opexec` | struct `Engine`; in `ClientReq`, out `Out` | `on_op`, `on_write_done`, `out_into` |
-| `opexec` | its host | trait `Env: ObjView`, implemented by `PgEnv` (`osd/ops.rs:35`) | `submit_write(WriteReq)`, `find_reqid`, object reads |
+| `opexec` | its host | trait `Env: ObjView`, implemented by `PgEnv` ([`osd/ops.rs:35`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/osd/src/ops.rs#L35)) | `submit_write(WriteReq)`, `find_reqid`, object reads |
 | `opexec` | `cls` | trait `ClsCtx` | `clsx::call`, `cls::lookup` |
 | `opexec` | `peering` | `PgSet::submit_write` | returns `(tid, Vec<Action>)` |
-| `peering` | `osd` | enum `Action` (`peering/types.rs:437`) | `Send`, `Persist`, `WriteDone`, ... |
-| `peering` | store | trait `PgStoreOps` (`peering/store.rs:365`), implemented by `StoreAdapter` | `queue`, `poll_commits`, `end_pass` |
+| `peering` | `osd` | enum `Action` ([`peering/types.rs:437`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/peering/src/types.rs#L437)) | `Send`, `Persist`, `WriteDone`, ... |
+| `peering` | store | trait `PgStoreOps` ([`peering/store.rs:365`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/peering/src/store.rs#L365)), implemented by `StoreAdapter` | `queue`, `poll_commits`, `end_pass` |
 | `storeadapt` | `store` | struct `store::obj::Store` | `queue(&OTxn, token)`, `poll(&mut acked)`, `read`, `getattr`, `omap_iter`, `list` |
 | Object layer | Shard | struct `Shard` | `submit(Txn) -> lsn`, `poll(now, events)` |
 | Shard | B+tree | struct `Tree` | §8.3 |
-| Shard | WAL | functions in `wal.rs` | §10.3 |
-| `store` | Device | trait `nvme::BlockDev` (`crates/nvme/src/lib.rs:438`) | `submit_write`, `submit_read`, `submit_deallocate`, `poll`, `alloc_buf` |
+| Shard | WAL | functions in [`wal.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/wal.rs) | §10.3 |
+| `store` | Device | trait `nvme::BlockDev` ([`crates/nvme/src/lib.rs:438`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/crates/nvme/src/lib.rs#L438)) | `submit_write`, `submit_read`, `submit_deallocate`, `poll`, `alloc_buf` |
 
-`OTxn` ops (`store/obj/txn.rs:72-207`): MkColl, RmColl, Touch, Write, Zero,
+`OTxn` ops ([`store/obj/txn.rs:72-207`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/obj/txn.rs#L72-L207)): MkColl, RmColl, Touch, Write, Zero,
 Truncate, Remove, SetAttrs, RmAttr, Clone, CloneRange, MoveRename,
 OmapSetKeys, OmapRmKeys, OmapRmKeyRange, OmapClear, OmapSetHeader, and a
 few internal ones.
@@ -1133,7 +1133,7 @@ and a comparison with BlueStore on the same device (12.5).
 |---|---|
 | `cargo build --release -p croit-flashstore-osd` (README) gives a binary with no network driver | Build with `--features knet,lab` |
 | No mkfs tool in the snapshot (`croit-flashstore-tool` is not included) | 60-line helper from the repo's own API: [`frs_mkfs.rs`]({{ site.baseurl }}/code/ceph/frs_mkfs.rs), built as an example of the daemon crate |
-| A v21.3.0-dev cluster has `require_osd_release` 22; the OSD refuses anything above 21 (`osd/release.rs`, exit 3) | Use a tentacle (v20.2.x) or umbrella (v21.2.0) cluster |
+| A v21.3.0-dev cluster has `require_osd_release` 22; the OSD refuses anything above 21 ([`osd/release.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/osd/src/release.rs), exit 3) | Use a tentacle (v20.2.x) or umbrella (v21.2.0) cluster |
 | The device must have 4096-byte blocks; QEMU NVMe defaults to 512 | `losetup --sector-size 4096` on a file, used as `kernel:/dev/loop0` (the `lab` feature allows a non-NVMe block device) |
 | vstart's `osd data` dir belongs to the classic OSD | Pass a new `--data-dir`; identity and cephx key live inside the store |
 
@@ -1344,5 +1344,5 @@ built very differently.
   LSM and RocksDB engines were not studied.
 - **Not covered**: EC pools, recovery and backfill, scrub, RDMA, the client
   libraries (`rustyrados`, `rustyrbd`).
-- **Docs that disagree with the code**: `docs/reference/configuration.md`
+- **Docs that disagree with the code**: [`docs/reference/configuration.md`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/docs/reference/configuration.md)
   says `flashstore_cores` defaults to 8; the code uses min(CPUs, shards).

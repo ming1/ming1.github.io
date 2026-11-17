@@ -47,7 +47,7 @@ The tree holds metadata only. Object data lives in data blocks.
 ### 2.1 What is stored
 
 Every key starts with a one-byte tag, then usually the object id
-(`obj/keys.rs`). Sizes are for 8 KiB pages.
+([`obj/keys.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/obj/keys.rs)). Sizes are for 8 KiB pages.
 
 | Tag | Record | Key bytes | Value bytes |
 |---|---|---|---|
@@ -83,13 +83,13 @@ Every key starts with a one-byte tag, then usually the object id
 | Kept out | Reason given in the code |
 |---|---|
 | Object data | Only extents are metadata |
-| Values of 2 KiB to 64 KiB (larger ones are split into fragment records in the tree) | "a 4 KiB omap value dirties a leaf share of ~20 B instead of half a page" (`shard.rs`) |
+| Values of 2 KiB to 64 KiB (larger ones are split into fragment records in the tree) | "a 4 KiB omap value dirties a leaf share of ~20 B instead of half a page" ([`shard.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/shard.rs)) |
 | Allocator bitmap | Lives in RAM; the WAL carries the diff; chunks enter the tree only before a checkpoint |
-| Large omap batches (64 keys and more) of ordinary objects | Kept as one sorted "run" in the WAL and RAM "instead of per-key tree mutations", merged later in key order (`runs.rs`) |
+| Large omap batches (64 keys and more) of ordinary objects | Kept as one sorted "run" in the WAL and RAM "instead of per-key tree mutations", merged later in key order ([`runs.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/runs.rs)) |
 
 The last row matters for this study. The code gives no reason for it,
 but the space accounting next to it says "random keys each may dirty a
-leaf of their own" (`obj/store.rs`). My reading: many random keys in one
+leaf of their own" ([`obj/store.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/obj/store.rs)). My reading: many random keys in one
 batch are the expensive case for the tree, and that one case is buffered
 outside it.
 

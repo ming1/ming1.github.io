@@ -35,7 +35,7 @@ three questions about that tree:
 |---|---|
 | Why a B+tree? | To drop RocksDB, BlueFS and LSM compaction from the metadata path, and to let **one core own one log and one tree** with no locks and no blocking call |
 | What is in it? | Metadata: names, onodes, xattrs, extents, omap (the PG log too), refcounts. Also the data of very small objects (up to 2016 bytes). One tree per shard; the first key byte picks the "table" |
-| Who calls it? | Mostly two files. `state.rs` makes every key change, live and in replay. `shard.rs` reads the tree, feeds it pages, runs checkpoints and does the upkeep |
+| Who calls it? | Mostly two files. [`state.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/state.rs) makes every key change, live and in replay. [`shard.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/shard.rs) reads the tree, feeds it pages, runs checkpoints and does the upkeep |
 | How does it persist? | A txn is one WAL record. Pages are changed in RAM. A checkpoint later writes dirty pages to **new** places (or as small deltas) and flips an A/B root slot |
 | What is special? | It never blocks: a missing page gives `Miss`, the caller reads the page and retries. Pages are linked by disk address, not by pointer |
 
@@ -63,12 +63,12 @@ ADR 0021) is not in the public repo. The module comments give the rules:
 
 | Rule in the code | Where | What it asks of the tree |
 |---|---|---|
-| "Sans-IO, single-threaded per shard, no locks." | `lib.rs` | One owner thread. No latches. The tree does no I/O itself |
-| "operations either complete on cached pages or return `StoreError::Miss`" | `tree.rs` | Never block. Report the missing page |
-| "A miss never leaves a partial mutation" | `tree.rs` | A txn is all or nothing, also when pages are missing |
-| "The previous version stays valid until the new root slot is durable." | `tree.rs` | Copy-on-write checkpoints. No torn tree |
-| "a checkpoint writes the few changed keys of a lightly dirty leaf into a shared delta page instead of rewriting the whole leaf (and, through the new address, its parents)" | `delta.rs` | Keep checkpoint writes small |
-| "`submit`/`poll(now)` only; the caller owns the loop. No locks, no threads." | `shard.rs` | The engine is a state machine driven from outside |
+| "Sans-IO, single-threaded per shard, no locks." | [`lib.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/lib.rs) | One owner thread. No latches. The tree does no I/O itself |
+| "operations either complete on cached pages or return `StoreError::Miss`" | [`tree.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/tree.rs) | Never block. Report the missing page |
+| "A miss never leaves a partial mutation" | [`tree.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/tree.rs) | A txn is all or nothing, also when pages are missing |
+| "The previous version stays valid until the new root slot is durable." | [`tree.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/tree.rs) | Copy-on-write checkpoints. No torn tree |
+| "a checkpoint writes the few changed keys of a lightly dirty leaf into a shared delta page instead of rewriting the whole leaf (and, through the new address, its parents)" | [`delta.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/delta.rs) | Keep checkpoint writes small |
+| "`submit`/`poll(now)` only; the caller owns the loop. No locks, no threads." | [`shard.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/shard.rs) | The engine is a state machine driven from outside |
 
 ### 2.3 Reading the motivation
 
@@ -95,16 +95,16 @@ Two notes:
 ### 3.1 The layers around it
 
 The knowledge graph sorts the 23 files into five layers. In the graph,
-imports go down with one exception (`runs.rs` uses the omap key encoding
+imports go down with one exception ([`runs.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/runs.rs) uses the omap key encoding
 of the object layer). The code has a few more upward uses.
 
 | Layer | Files | Job |
 |---|---|---|
-| Object layer | `obj/mod.rs`, `obj/txn.rs`, `obj/stage.rs`, `obj/store.rs`, `obj/shardio.rs`, `obj/keys.rs`, `obj/onode.rs` | Turn object transactions into key-value ops. Define keys and values |
-| Shard engine | `shard.rs`, `state.rs`, `wal.rs`, `runs.rs` | Log, apply, checkpoint, replay |
-| **B+tree** | `tree.rs`, `page.rs`, `delta.rs`, `fzarena.rs`, `pagepool.rs`, `fsck.rs` | The tree, its page format, its deltas, its memory, its checker |
-| Format and base | `layout.rs`, `codec.rs`, `error.rs` | On-disk layout, checksums, error type |
-| Crate root | `lib.rs`, `Cargo.toml` | Module list, block size |
+| Object layer | [`obj/mod.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/obj/mod.rs), [`obj/txn.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/obj/txn.rs), [`obj/stage.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/obj/stage.rs), [`obj/store.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/obj/store.rs), [`obj/shardio.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/obj/shardio.rs), [`obj/keys.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/obj/keys.rs), [`obj/onode.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/obj/onode.rs) | Turn object transactions into key-value ops. Define keys and values |
+| Shard engine | [`shard.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/shard.rs), [`state.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/state.rs), [`wal.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/wal.rs), [`runs.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/runs.rs) | Log, apply, checkpoint, replay |
+| **B+tree** | [`tree.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/tree.rs), [`page.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/page.rs), [`delta.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/delta.rs), [`fzarena.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/fzarena.rs), [`pagepool.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/pagepool.rs), [`fsck.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/fsck.rs) | The tree, its page format, its deltas, its memory, its checker |
+| Format and base | [`layout.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/layout.rs), [`codec.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/codec.rs), [`error.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/error.rs) | On-disk layout, checksums, error type |
+| Crate root | [`lib.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/lib.rs), [`Cargo.toml`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/Cargo.toml) | Module list, block size |
 
 ![An object transaction goes through Stage, Shard and State to the B+tree; the shard also calls the tree directly and WAL replay uses the same State]({{ site.baseurl }}/assets/images/ceph-rust-btree/ex-users.png)
 
@@ -114,24 +114,24 @@ Who else calls the tree:
 
 | File | Calls |
 |---|---|
-| `state.rs` | Every put, delete and range delete. Also the bitmap chunk puts before a checkpoint |
-| `shard.rs` | Reads and scans, `take_wants` and `install`, the freeze calls, eviction, background leaf merges (`compact_step`), lazy freeing of deleted subtrees (`dead_kick`) |
-| `pagepool.rs` | Moves page budget between shards |
-| `layout.rs` | Decodes part of the saved meta image |
+| [`state.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/state.rs) | Every put, delete and range delete. Also the bitmap chunk puts before a checkpoint |
+| [`shard.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/shard.rs) | Reads and scans, `take_wants` and `install`, the freeze calls, eviction, background leaf merges (`compact_step`), lazy freeing of deleted subtrees (`dead_kick`) |
+| [`pagepool.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/pagepool.rs) | Moves page budget between shards |
+| [`layout.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/layout.rs) | Decodes part of the saved meta image |
 | object layer | Scan cursors and size limits only |
 
 ### 3.2 The path of a write
 
 | Step | File | What happens |
 |---|---|---|
-| 1 | `obj/txn.rs` | The OSD builds an `OTxn`: an ordered list of object ops (write, setattr, omap set, clone, remove ...) |
-| 2 | `obj/stage.rs` | `Stage` runs the ops against an **overlay** on top of the tree. Reads look in the overlay first, then in the tree. At the end the overlay becomes one engine txn: deletes, range deletes, then puts and deletes in key order (omap runs last) |
-| 3 | `shard.rs` | `submit` checks the txn and asks `State::prepare` to make every needed tree page resident |
-| 4 | `state.rs` | `State::apply` changes the tree (`put_at`, `del_at`, `del_range`, `write_sorted_batch`) and the allocator. It ends with `finish_txn` |
-| 5 | `shard.rs` | The record goes into the WAL; the txn is acked when the record and its data blocks are durable |
-| later | `shard.rs` | `poll` runs checkpoints: freeze dirty pages, write them, write the root slot |
+| 1 | [`obj/txn.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/obj/txn.rs) | The OSD builds an `OTxn`: an ordered list of object ops (write, setattr, omap set, clone, remove ...) |
+| 2 | [`obj/stage.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/obj/stage.rs) | `Stage` runs the ops against an **overlay** on top of the tree. Reads look in the overlay first, then in the tree. At the end the overlay becomes one engine txn: deletes, range deletes, then puts and deletes in key order (omap runs last) |
+| 3 | [`shard.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/shard.rs) | `submit` checks the txn and asks `State::prepare` to make every needed tree page resident |
+| 4 | [`state.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/state.rs) | `State::apply` changes the tree (`put_at`, `del_at`, `del_range`, `write_sorted_batch`) and the allocator. It ends with `finish_txn` |
+| 5 | [`shard.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/shard.rs) | The record goes into the WAL; the txn is acked when the record and its data blocks are durable |
+| later | [`shard.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/shard.rs) | `poll` runs checkpoints: freeze dirty pages, write them, write the root slot |
 
-After a crash, `wal.rs` replays the records after the last checkpoint
+After a crash, [`wal.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/wal.rs) replays the records after the last checkpoint
 through the **same** `State::apply`. There is one way to change the tree.
 
 ### 3.3 One tree, many tables
@@ -173,11 +173,11 @@ through the **same** `State::apply`. There is one way to change the tree.
 
 | Helper | File | Why it exists |
 |---|---|---|
-| Point cache | `state.rs` | Committed values of the keys read on every txn (collection, name, onode), so most point reads do not touch the tree |
-| Overlay | `obj/stage.rs` | A txn sees its own changes before they reach the tree |
-| Omap runs | `runs.rs` | A batch of 64 or more omap keys is kept as one sorted run in the WAL and RAM, and merged into the tree later in key order |
-| Data blocks for big values | `obj/stage.rs` | Values of 2 KiB to 64 KiB go to data blocks; the tree keeps a reference |
-| Bitmap in RAM | `state.rs` | The allocator is in memory; its chunks enter the tree (`f`) only before a checkpoint |
+| Point cache | [`state.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/state.rs) | Committed values of the keys read on every txn (collection, name, onode), so most point reads do not touch the tree |
+| Overlay | [`obj/stage.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/obj/stage.rs) | A txn sees its own changes before they reach the tree |
+| Omap runs | [`runs.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/runs.rs) | A batch of 64 or more omap keys is kept as one sorted run in the WAL and RAM, and merged into the tree later in key order |
+| Data blocks for big values | [`obj/stage.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/obj/stage.rs) | Values of 2 KiB to 64 KiB go to data blocks; the tree keeps a reference |
+| Bitmap in RAM | [`state.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/state.rs) | The allocator is in memory; its chunks enter the tree (`f`) only before a checkpoint |
 
 ## 4. How the tree is designed and implemented
 
@@ -185,12 +185,12 @@ through the **same** `State::apply`. There is one way to change the tree.
 
 | File | Lines | Content |
 |---|---|---|
-| `tree.rs` | 5,175 | The tree: cache, locate, get/put/del, scan, range delete, install, eviction, freeze |
-| `page.rs` | 2,479 | The page image: header, slots, entries, search, compact interior format |
-| `delta.rs` | 790 | Leaf deltas: touch log, delta entries, chains, relog |
-| `pagepool.rs` | 679 | One page budget per device, shared by its shards |
-| `fsck.rs` | 738 | Offline check of the checkpointed tree |
-| `fzarena.rs` | 117 | Memory for the page images of one checkpoint |
+| [`tree.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/tree.rs) | 5,175 | The tree: cache, locate, get/put/del, scan, range delete, install, eviction, freeze |
+| [`page.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/page.rs) | 2,479 | The page image: header, slots, entries, search, compact interior format |
+| [`delta.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/delta.rs) | 790 | Leaf deltas: touch log, delta entries, chains, relog |
+| [`pagepool.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/pagepool.rs) | 679 | One page budget per device, shared by its shards |
+| [`fsck.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/fsck.rs) | 738 | Offline check of the checkpointed tree |
+| [`fzarena.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/fzarena.rs) | 117 | Memory for the page images of one checkpoint |
 
 ### 4.2 One page
 
@@ -312,8 +312,8 @@ space, after 5 seconds, or on request.
 |---|---|
 | Cache | Default 16,384 pages (128 MiB) per shard |
 | Eviction | CLOCK. Never evicted: dirty, in-flight, pinned, just installed. Leaves loaded by a listing go first |
-| Page pool (`pagepool.rs`) | One budget per device. Shards whose cache turns over fast get pages from shards whose cache turns over slowly |
-| Freeze arena (`fzarena.rs`) | Memory for checkpoint images is kept and reused. Allocating it fresh stalled the core for milliseconds |
+| Page pool ([`pagepool.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/pagepool.rs)) | One budget per device. Shards whose cache turns over fast get pages from shards whose cache turns over slowly |
+| Freeze arena ([`fzarena.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/fzarena.rs)) | Memory for checkpoint images is kept and reused. Allocating it fresh stalled the core for milliseconds |
 
 ### 4.9 Checks
 
@@ -321,7 +321,7 @@ space, after 5 seconds, or on request.
 |---|---|
 | Page crc, magic, kind, level, own address | Every `install` |
 | Child crc equals the crc in the parent's reference | Every `install`: finds lost and stale writes |
-| Whole-tree check (`fsck.rs`): key order inside the parent's range, every page referenced once, bitmaps equal what is reachable | Offline, on the checkpointed state |
+| Whole-tree check ([`fsck.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/fsck.rs)): key order inside the parent's range, every page referenced once, bitmaps equal what is reachable | Offline, on the checkpointed state |
 
 ## 5. Checked by tracing
 
@@ -375,7 +375,7 @@ Call stacks at `put_inner`, 5 seconds under load:
 | `State::flush_chunks_upto` | allocator bitmap chunks, before a checkpoint |
 
 No other caller appeared. This matches section 3.1: every key change goes
-through `state.rs`.
+through [`state.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/state.rs).
 
 ### 5.3 One checkpoint
 
@@ -421,18 +421,18 @@ The tour from the knowledge graph, as a reading list:
 
 | # | Read | To learn |
 |---|---|---|
-| 1 | `lib.rs` | The rules: sans-IO, one thread per shard, no locks |
-| 2 | `layout.rs` | Where the tree lives on disk: root slots, WAL, meta, data |
-| 3 | `obj/txn.rs` | What an object transaction is |
-| 4 | `obj/keys.rs`, `obj/onode.rs` | Keys and values |
-| 5 | `obj/stage.rs`, `obj/store.rs`, `obj/shardio.rs` | From object ops to tree ops |
-| 6 | `shard.rs`, `state.rs` | Submit, prepare, apply, poll |
-| 7 | `wal.rs`, `runs.rs` | Replay, omap runs |
-| 8 | `page.rs` | One page |
-| 9 | `tree.rs`: cache, `lookup`, `install`, `error.rs` | Miss and wants |
-| 10 | `tree.rs`: get, put, del, scan, `del_range` | The operations |
-| 11 | `tree.rs`: `freeze_*`, `delta.rs`, `shard.rs` checkpoint | Persistence |
-| 12 | `fsck.rs` | The invariants, written as checks |
+| 1 | [`lib.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/lib.rs) | The rules: sans-IO, one thread per shard, no locks |
+| 2 | [`layout.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/layout.rs) | Where the tree lives on disk: root slots, WAL, meta, data |
+| 3 | [`obj/txn.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/obj/txn.rs) | What an object transaction is |
+| 4 | [`obj/keys.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/obj/keys.rs), [`obj/onode.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/obj/onode.rs) | Keys and values |
+| 5 | [`obj/stage.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/obj/stage.rs), [`obj/store.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/obj/store.rs), [`obj/shardio.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/obj/shardio.rs) | From object ops to tree ops |
+| 6 | [`shard.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/shard.rs), [`state.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/state.rs) | Submit, prepare, apply, poll |
+| 7 | [`wal.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/wal.rs), [`runs.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/runs.rs) | Replay, omap runs |
+| 8 | [`page.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/page.rs) | One page |
+| 9 | [`tree.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/tree.rs): cache, `lookup`, `install`, [`error.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/error.rs) | Miss and wants |
+| 10 | [`tree.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/tree.rs): get, put, del, scan, `del_range` | The operations |
+| 11 | [`tree.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/tree.rs): `freeze_*`, [`delta.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/delta.rs), [`shard.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/shard.rs) checkpoint | Persistence |
+| 12 | [`fsck.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/fsck.rs) | The invariants, written as checks |
 
 The graph is saved next to the code in `services/osd/store/.ua/` and can
 be opened with the plugin's dashboard.
