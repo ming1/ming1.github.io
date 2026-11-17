@@ -403,6 +403,49 @@ So the op is handed over once, and the reply is handed back once.
 | Connection closes while ops are on n? | The link keeps a bitmask of cores it forwarded to; the close is told there | [`osd/mig.rs:1130`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/osd/src/mig.rs#L1130) (`l.fwd`) |
 | PG is being moved (merge)? | Its messages are held or queued until the move is released, never dropped | [`osd/mig.rs:1087`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/osd/src/mig.rs#L1087) (`pg_item`) |
 
+#### Which core gets the message from the network?
+
+The core that owns the connection. A core is picked once, when the
+connection is opened; after that every message of the connection is
+received by that core's own io_uring. The choice knows nothing about PGs.
+
+| Connection | Its core | Option (default) | Where |
+|---|---|---|---|
+| Client | The kernel hashes the 4-tuple to one core's listener (`SO_REUSEPORT`). That core then gives the new socket to the core with the fewest connections, before anything is read | `--knet-balance` (on) | [`rt/knet/listen.rs:6-9`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/crates/rt/src/knet/listen.rs#L6-L9), [`rt/place.rs:6-10`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/crates/rt/src/place.rs#L6-L10) |
+| Client, `--steer cpu` | The core pinned to the CPU that handled the SYN, so a flow stays on the core of its NIC queue. No balancing | `--steer` (hash) | [`fs/kprod.rs:755-766`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/croit-flashstore-osd/src/kprod.rs#L755-L766) |
+| Peer OSD | One link per peer, on core `peer id % cores`. The dialing OSD binds a TCP source port with `port % cores` = that core, and a BPF filter on the listener reads it | `--knet-peer-steer` (on with `--steer hash`) | [`osd/xcore.rs:166-171`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/osd/src/xcore.rs#L166-L171), [`rt/knet/listen.rs:304-309`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/crates/rt/src/knet/listen.rs#L304-L309) |
+
+So a replica op takes the same hop as a client op when the peer link's
+core is not the PG's core.
+
+#### Does core m wake core n?
+
+Yes, but only if n sleeps. Core m does it itself, with one eventfd write.
+
+```
+ core m (sender)                           core n (PG core)
+ ---------------                           ----------------
+ push XMsg::Op to the ring                 nothing to do:
+ flush_out, once per batch for n:            sleeping = true; fence
+   fence; read n.sleeping                    look at the inbox again
+     false -> done, n is polling             block in io_uring
+     true  -> set it false,                       |
+              write(n's eventfd) ---------------> read completes
+                                             loop pass: pump mesh -> pg_client_op
+```
+
+| Question | Answer | Where |
+|---|---|---|
+| When does m check? | After it moved a batch to n's rings: once per destination and batch, not per message | [`rt/xport.rs:302-313`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/crates/rt/src/xport.rs#L302-L313) |
+| Cost when n is awake | One fence and one load. No syscall | [`rt/wake.rs:82-94`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/crates/rt/src/wake.rs#L82-L94) |
+| Cost when n sleeps | One `write`. Only the first sender writes; it clears the flag, the others skip | [`rt/wake.rs:15-16`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/crates/rt/src/wake.rs#L15-L16) |
+| Can a wake be lost? | No. n sets the flag and then looks at its inbox again; m publishes and then reads the flag. One of the two sees the other | [`rt/wake.rs:9-13`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/crates/rt/src/wake.rs#L9-L13), [`rt/knet/mod.rs:1267-1275`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/crates/rt/src/knet/mod.rs#L1267-L1275) |
+| Does every message wake? | All but the later pieces of a pre-write frame; the op that follows wakes n anyway | [`osd/xcore.rs:786-792`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/osd/src/xcore.rs#L786-L792) |
+| When does n sleep? | `--idle sleep` (default): at once when nothing is in flight; it keeps polling while store I/O is in flight. `--idle spin`: never, so no wake is needed | [`fs/kprod.rs:403-417`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/croit-flashstore-osd/src/kprod.rs#L403-L417) |
+
+The reply goes back the same way: n pushes `XMsg::Wire` and wakes m if m
+sleeps.
+
 Large writes do not wait for the whole payload. The connection core
 forwards whole-block pieces of a still-arriving payload as
 `XMsg::PrePiece` on the same lane; the PG core writes them into reserved
@@ -411,9 +454,8 @@ writing again ([`store/pre.rs`](https://github.com/croit/ceph-rust/blob/c2720063
 
 How often, and what it costs:
 
-- Connections are spread by `SO_REUSEPORT` hash, then handed to the core
-  with the fewest connections at accept time ([`rt/place.rs`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/crates/rt/src/place.rs)). Placement is
-  not PG-aware and one connection carries ops for many PGs, so with N cores
+- Connection placement (above) is not PG-aware and one connection
+  carries ops for many PGs, so with N cores
   about (N-1)/N of the ops should take the hop (my estimate, not measured).
 - Measured (§12): 4K reads, median 29 us in the OSD, 7 us of it the hop
   in. A sparse write paid 30-58 us for the hop, probably because core n
