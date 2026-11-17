@@ -963,6 +963,12 @@ next to it.
 
 ![State machine of a checkpoint: Idle, Freezing with repeated freeze_step, Frozen, Written, Committed, then back to Idle after old pages are freed]({{ site.baseurl }}/assets/images/ceph-rust-flashstore/btree-checkpoint.png)
 
+- "Dirty pages in RAM" does not mean an acked write can be lost. A txn is
+  acked only after its WAL unit and its data writes are on disk
+  ([`store/shard.rs:7076-7080`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/shard.rs#L7076-L7080), §10.2). What waits for the checkpoint, 5 s at
+  most when idle, is only the tree's copy of that txn; after a crash the
+  WAL replay builds it again. BlueStore has the same shape: the ack
+  follows the RocksDB WAL sync, and the memtable is flushed later.
 - `freeze_step` runs in small slices; txns run in between.
 - Until the root slot is durable, a crash falls back to the old tree plus
   WAL replay.
