@@ -1,0 +1,93 @@
+=== fillA 10:46:09
+"dropped_tree_pages":0,"tree_page_evictions":0,"tree_page_loads":0,"tree_pages":32547
+Total writes made:      509995
+Average IOPS:           42488
+txns=509996 ckpts=41
+payload_B/txn=944 wal_B/txn=1178 ckpt_B/txn=1340 data_B/txn=4096
+ckpt_pages=83405 whole_leaves=79977 whole_ints=545 clean=43 delta_entries=24315 delta_pages=2838 delta_declined=1539 txn/ckpt_page=6.1 tree_WA(ckpt_B/payload_B)=1.42
+leaves by tag: {'attr': 29089, 'bitmap': 37, 'coll': 33, 'ext': 2440, 'name': 25889, 'omap': 19711, 'onode': 2778} why: {'dirty': 25, 'interval': 8, 'requested': 8} runs: {}
+"dropped_tree_pages":0,"tree_page_evictions":0,"tree_page_loads":0,"tree_pages":79377
+ckpt_declined_chain                      89 (now 89)
+=== A_ow_uniform 10:46:33
+"dropped_tree_pages":0,"tree_page_evictions":0,"tree_page_loads":0,"tree_pages":79377
+ops=465063 secs=40.0 iops=11626
+ops=462156 secs=40.0 iops=11553
+ops=444702 secs=40.0 iops=11117
+ops=458065 secs=40.0 iops=11451
+txns=1829986 ckpts=265
+payload_B/txn=674 wal_B/txn=853 ckpt_B/txn=1194 data_B/txn=4096
+ckpt_pages=266750 whole_leaves=195837 whole_ints=5128 clean=278 delta_entries=715684 delta_pages=63722 delta_declined=125128 txn/ckpt_page=6.9 tree_WA(ckpt_B/payload_B)=1.77
+leaves by tag: {'attr': 112517, 'bitmap': 565, 'ext': 12021, 'omap': 70711, 'onode': 23} why: {'dirty': 249, 'interval': 8, 'requested': 8} runs: {}
+"dropped_tree_pages":0,"tree_page_evictions":0,"tree_page_loads":0,"tree_pages":79157
+ckpt_declined_chain                  118674 (now 118763)
+=== A_ow_zipf 10:47:23
+"dropped_tree_pages":0,"tree_page_evictions":0,"tree_page_loads":0,"tree_pages":79157
+ops=490568 secs=40.0 iops=12263
+ops=490109 secs=40.0 iops=12252
+ops=490785 secs=40.0 iops=12269
+ops=495197 secs=40.0 iops=12379
+txns=1966659 ckpts=142
+payload_B/txn=674 wal_B/txn=851 ckpt_B/txn=655 data_B/txn=4096
+ckpt_pages=157132 whole_leaves=126651 whole_ints=2728 clean=53 delta_entries=344013 delta_pages=25494 delta_declined=53215 txn/ckpt_page=12.5 tree_WA(ckpt_B/payload_B)=0.97
+leaves by tag: {'attr': 49220, 'bitmap': 319, 'ext': 6218, 'omap': 70880, 'onode': 14} why: {'dirty': 125, 'interval': 8, 'requested': 9} runs: {}
+"dropped_tree_pages":0,"tree_page_evictions":0,"tree_page_loads":0,"tree_pages":78864
+ckpt_declined_chain                   52570 (now 171333)
+=== fillB 10:48:14
+"dropped_tree_pages":0,"tree_page_evictions":0,"tree_page_loads":0,"tree_pages":78864
+Total writes made:      10180956
+Average IOPS:           42420
+txns=10180959 ckpts=2751
+payload_B/txn=954 wal_B/txn=1153 ckpt_B/txn=1895 data_B/txn=4096
+ckpt_pages=2354754 whole_leaves=1974106 whole_ints=137756 clean=1512 delta_entries=7789977 delta_pages=188734 delta_declined=395392 txn/ckpt_page=4.3 tree_WA(ckpt_B/payload_B)=1.99
+leaves by tag: {'attr': 592876, 'bitmap': 1130, 'coll': 2735, 'ext': 52425, 'name': 852362, 'omap': 412614, 'onode': 59962, 'other': 2} why: {'dirty': 2727, 'interval': 8, 'requested': 16} runs: {}
+"dropped_tree_pages":0,"tree_page_evictions":1350125,"tree_page_loads":596047,"tree_pages":231180
+ckpt_declined_chain                  171547 (now 342880)
+ckpt_declined_room                   223708 (now 223708)
+dev_read_bytes                   4882817024 (now 4882817024)
+parks                                   113 (now 113)
+=== B_ow_uniform 10:52:25
+"dropped_tree_pages":0,"tree_page_evictions":1350125,"tree_page_loads":596047,"tree_pages":231180
+ops=486765 secs=90.0 iops=5408
+ops=484835 secs=90.0 iops=5387
+ops=486555 secs=90.0 iops=5406
+ops=473338 secs=90.0 iops=5259
+txns=1931493 ckpts=901
+payload_B/txn=682 wal_B/txn=1012 ckpt_B/txn=14097 data_B/txn=4096
+ckpt_pages=3323854 whole_leaves=3030776 whole_ints=257854 clean=1420 delta_entries=560506 delta_pages=15774 delta_declined=2931331 txn/ckpt_page=0.6 tree_WA(ckpt_B/payload_B)=20.67
+leaves by tag: {'attr': 1595860, 'bitmap': 32190, 'ext': 1308812, 'name': 6817, 'omap': 87096, 'onode': 1} why: {'dirty': 687, 'interval': 8, 'requested': 206} runs: {}
+"dropped_tree_pages":0,"tree_page_evictions":5592551,"tree_page_loads":4789972,"tree_pages":231097
+ckpt_declined_chain                      96 (now 342976)
+ckpt_declined_room                  2899177 (now 3122885)
+dev_read_bytes                  34356641792 (now 39239458816)
+parks                                 67126 (now 67239)
+=== B_ow_zipf 10:54:06
+"dropped_tree_pages":0,"tree_page_evictions":5592551,"tree_page_loads":4789972,"tree_pages":231097
+ops=683714 secs=90.0 iops=7596
+ops=710799 secs=90.0 iops=7897
+ops=698609 secs=90.0 iops=7762
+ops=677966 secs=90.0 iops=7533
+txns=2771088 ckpts=1306
+payload_B/txn=680 wal_B/txn=903 ckpt_B/txn=6289 data_B/txn=4096
+ckpt_pages=2127365 whole_leaves=1712097 whole_ints=343518 clean=38807 delta_entries=1599568 delta_pages=42750 delta_declined=1543428 txn/ckpt_page=1.3 tree_WA(ckpt_B/payload_B)=9.25
+leaves by tag: {'attr': 772841, 'bitmap': 47773, 'ext': 724686, 'name': 45344, 'omap': 121453} why: {'dirty': 586, 'interval': 8, 'requested': 712} runs: {}
+"dropped_tree_pages":0,"tree_page_evictions":8130529,"tree_page_loads":7272741,"tree_pages":231101
+ckpt_declined_chain                    1710 (now 344686)
+ckpt_declined_room                  1494144 (now 4617029)
+dev_read_bytes                  20338843648 (now 59578302464)
+parks                                 85030 (now 152269)
+=== B_ow_uniform2 10:55:56
+"dropped_tree_pages":0,"tree_page_evictions":8130529,"tree_page_loads":7272741,"tree_pages":231101
+ops=333076 secs=60.0 iops=5551
+ops=325912 secs=60.0 iops=5431
+ops=332948 secs=60.0 iops=5549
+ops=337368 secs=60.0 iops=5622
+txns=1329304 ckpts=1022
+payload_B/txn=682 wal_B/txn=1004 ckpt_B/txn=11058 data_B/txn=4096
+ckpt_pages=1794366 whole_leaves=1464818 whole_ints=268815 clean=17248 delta_entries=1157489 delta_pages=35209 delta_declined=1385616 txn/ckpt_page=0.7 tree_WA(ckpt_B/payload_B)=16.22
+leaves by tag: {'attr': 693452, 'bitmap': 37782, 'ext': 650503, 'name': 19420, 'omap': 63661} why: {'dirty': 458, 'interval': 8, 'requested': 556} runs: {}
+"dropped_tree_pages":0,"tree_page_evictions":11059688,"tree_page_loads":10169106,"tree_pages":231111
+ckpt_declined_chain                     250 (now 344936)
+ckpt_declined_room                  1347748 (now 5964777)
+dev_read_bytes                  23727022080 (now 83305324544)
+parks                                 45751 (now 198020)
+ALLDONE

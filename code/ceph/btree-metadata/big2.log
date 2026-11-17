@@ -1,0 +1,44 @@
+=== M24_warm 10:57:59
+"dropped_tree_pages":0,"tree_page_evictions":0,"tree_page_loads":12285,"tree_pages":12286
+ops=1414638 secs=150.0 iops=9431
+ops=1432470 secs=150.0 iops=9550
+ops=1419187 secs=150.0 iops=9461
+ops=1384794 secs=150.0 iops=9232
+txns=5651089 ckpts=268
+payload_B/txn=679 wal_B/txn=876 ckpt_B/txn=1137 data_B/txn=4096
+ckpt_pages=784089 whole_leaves=483938 whole_ints=35683 clean=35891 delta_entries=6052879 delta_pages=250736 delta_declined=229383 txn/ckpt_page=7.2 tree_WA(ckpt_B/payload_B)=1.67
+leaves by tag: {'attr': 193522, 'bitmap': 9704, 'ext': 26906, 'name': 36507, 'omap': 217298, 'onode': 1} why: {'dirty': 137, 'interval': 115, 'requested': 16} runs: {}
+"dropped_tree_pages":0,"tree_page_evictions":0,"tree_page_loads":933535,"tree_pages":933522
+ckpt_declined_chain                  199728 (now 199728)
+ckpt_declined_room                    20086 (now 20086)
+dev_read_bytes                   7546880000 (now 7644667904)
+=== M24_uniform 11:00:40
+"dropped_tree_pages":0,"tree_page_evictions":0,"tree_page_loads":933535,"tree_pages":933522
+ops=577600 secs=60.0 iops=9626
+ops=557845 secs=60.0 iops=9297
+ops=555921 secs=60.0 iops=9265
+ops=563150 secs=60.0 iops=9385
+txns=2254516 ckpts=116
+payload_B/txn=679 wal_B/txn=878 ckpt_B/txn=1620 data_B/txn=4096
+ckpt_pages=445751 whole_leaves=315453 whole_ints=27339 clean=1248 delta_entries=2291518 delta_pages=93507 delta_declined=221262 txn/ckpt_page=5.1 tree_WA(ckpt_B/payload_B)=2.39
+leaves by tag: {'attr': 202352, 'bitmap': 4013, 'ext': 22411, 'omap': 86677} why: {'dirty': 55, 'interval': 49, 'requested': 12} runs: {}
+"dropped_tree_pages":0,"tree_page_evictions":0,"tree_page_loads":933685,"tree_pages":933654
+ckpt_declined_chain                  209203 (now 408931)
+ckpt_declined_room                     8137 (now 28223)
+dev_read_bytes                      1228800 (now 7645896704)
+=== M24_zipf 11:01:51
+"dropped_tree_pages":0,"tree_page_evictions":0,"tree_page_loads":933685,"tree_pages":933654
+ops=654971 secs=60.0 iops=10916
+ops=640203 secs=60.0 iops=10670
+ops=646124 secs=60.0 iops=10767
+ops=642480 secs=60.0 iops=10708
+txns=2583778 ckpts=119
+payload_B/txn=679 wal_B/txn=873 ckpt_B/txn=844 data_B/txn=4096
+ckpt_pages=266182 whole_leaves=178796 whole_ints=25651 clean=2978 delta_entries=1490677 delta_pages=50596 delta_declined=85419 txn/ckpt_page=9.7 tree_WA(ckpt_B/payload_B)=1.24
+leaves by tag: {'attr': 83528, 'bitmap': 4058, 'ext': 1739, 'omap': 89471} why: {'interval': 104, 'requested': 15} runs: {}
+"dropped_tree_pages":0,"tree_page_evictions":0,"tree_page_loads":933689,"tree_pages":933683
+ckpt_declined_chain                   80762 (now 489693)
+ckpt_declined_room                      682 (now 28905)
+dev_read_bytes                        32768 (now 7645929472)
+{'tree_cache_cap_pages': 1766112, 'dirty_soft': 220752, 'delta_max_pages': 883056}
+ALLDONE
