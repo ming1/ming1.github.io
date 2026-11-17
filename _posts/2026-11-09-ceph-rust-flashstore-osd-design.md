@@ -260,6 +260,11 @@ Idle mode is `--idle spin` or `--idle sleep` (default sleep).
 **One owner core per PG, many PGs per core.** A PG never has two cores; a
 core does not serve just one PG.
 
+A "core" here is an OS thread (a pthread named `core{id}`), not a CPU. It
+is pinned to one CPU at start, but ownership follows the thread: if the
+pin fails, the thread runs unpinned and every rule below still holds
+([`rt/multi.rs:86-91`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/crates/rt/src/multi.rs#L86-L91)).
+
 ![Three cores, each with its own connections, PGs, store shards and NVMe queue]({{ site.baseurl }}/assets/images/ceph-rust-flashstore/core-model.png)
 
 ### 5.1 The mapping
