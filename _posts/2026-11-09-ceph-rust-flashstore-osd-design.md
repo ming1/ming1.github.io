@@ -1321,6 +1321,41 @@ The WAL has no `append()` or `sync()` of its own; the shard drives it.
 | Mount -> WAL | `wal::replay(io, dir, root, store_id, state, cfg)` | Rebuild state after restart |
 | Tools | `wal::inspect` | Dump the log |
 
+### 10.4 Why one WAL per shard, not one shared WAL
+
+Each shard has its own ring. Two other layouts are possible; this is my
+reading of why the code does not use them, not a statement by the authors.
+
+```
+ per shard (as built)       per core                   one for the device
+ core 0        core 1       core 0        core 1       core 0        core 1
+ s0   s2       s1   s3      s0   s2       s1   s3      s0   s2       s1   s3
+ |    |        |    |        \   /         \   /         \    \      /    /
+ W0   W2       W1   W3        W-c0          W-c1               one WAL
+```
+
+| | Per shard | Per core | One for the device |
+|---|---|---|---|
+| Lock on the write path | None | None (same thread) | A lock, or a log-writer core with a ring hop for every write |
+| Group commit | One batch per shard | One batch per core | One batch for all |
+| A shard with a slow checkpoint | Holds only its own ring | Holds the ring of its core | Holds the ring, and the freed blocks, of every shard |
+| Core count changes between runs | Nothing to do: a core replays the shards it mounts | Replay must split records by shard; layout depends on the core count | Same |
+| Txn across two logs | Never: a PG lives in one shard | Never | Never |
+
+- **One for the device** gives up the main win of the core model (5.4): a
+  write touches WAL, tree and allocator on one thread with no lock.
+  BlueStore's single RocksDB WAL behind one sync thread has this shape.
+  Its gain, larger group-commit batches, matters when a flush is slow;
+  a PLP drive needs no flush (10.2), and each shard has its own NVMe
+  queue already.
+- **Per core** would help only when a core owns several shards: its group
+  commit is then split, one batch per ring. The code warns about this at
+  start and asks for a redeploy with shards = cores
+  ([`osd/xcore.rs:142-147`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/osd/src/xcore.rs#L142-L147)), which gives one ring per core
+  with no format change.
+- With shards = cores the three layouts differ only in the last column,
+  and that one costs a lock.
+
 
 ## 11. Interfaces among core components
 
