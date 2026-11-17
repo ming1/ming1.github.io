@@ -1126,7 +1126,8 @@ takes one more cell from the data allocator.
 | Shard directory | from block 2 | 128 bytes per shard: where its roots, WAL, meta and data start |
 | Shard region | after the directory | `region = (total - first) / shards`; 64 MiB alignment in production |
 | WAL ring | per shard | Total min(4 GiB, device/64), split over shards, each 64 MiB to 4 GiB |
-| Meta area | per shard | `[bitmap A][bitmap B][tree pages]`; grows by taking 1 MiB cells from data |
+| Meta area | per shard | A small base area of tree pages (1 % of the region in production, capped). More pages come from the data area in ~1 MiB cells, on demand (§8.12) |
+| Meta bitmap | per shard | Which tree pages are in use. Default store: an image kept in tree pages. Legacy store: two fixed slots, A and B |
 
 One shard region ([`store/layout.rs:941-960`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/layout.rs#L941-L960)):
 
@@ -1138,6 +1139,30 @@ One shard region ([`store/layout.rs:941-960`](https://github.com/croit/ceph-rust
  | root A | root B |    WAL ring    |            meta           |      data       |
  | 1 blk  | 1 blk  |   wal_blocks   | bmap A | bmap B | pages.. | object blocks   |
  +--------+--------+----------------+---------------------------+-----------------+
+```
+
+Where the meta bitmap lives depends on the store format. mkfs makes the
+elastic one by default; the fixed one is kept for tests and comparison
+([`store/layout.rs:764-766`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/layout.rs#L764-L766)).
+
+| | Elastic meta (default) | Fixed meta (legacy) |
+|---|---|---|
+| Tree pages | Base area, plus cells taken from the data area | Base area only |
+| Meta bitmap | An image written into fresh tree pages at each checkpoint that changed something; the old image's pages are freed like any replaced page | Written whole into slot `bmap A` or `bmap B`, taking turns |
+| Root slot points at | The first page of the image | The slot just written |
+| `bmap A`, `bmap B` slots | Still laid out, not written | In use |
+| Where | [`store/tree.rs:4468-4471`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/tree.rs#L4468-L4471), [`store/shard.rs:6206-6210`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/shard.rs#L6206-L6210) | [`store/layout.rs:590-592`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/layout.rs#L590-L592), [`store/shard.rs:6211-6231`](https://github.com/croit/ceph-rust/blob/c272006334ba012ea5fbc16b21a2c1fcd81dd7a0/services/osd/store/src/shard.rs#L6211-L6231) |
+
+```
+ elastic: the image moves, the root slot follows
+
+ meta base area                           data area
+ +------+------+----------------------+   +---------+------+---------+
+ | bmA  | bmB  | pages .. [image] ..  |   | objects | cell | objects |
+ +------+------+--------------^-------+   +---------+--^---+---------+
+  unused                      |                        |
+                    root slot: addr, pages, crc    more tree pages; the image
+                                                   lists every cell
 ```
 
 ### 9.2 Root slot: the commit point
@@ -1152,7 +1177,7 @@ the newest checkpoint, never the tree.
 | `tree_root`, `tree_crc`, `tree_height` | Address and checksum of the root page |
 | `ckpt_lsn` | Tree on disk holds all records up to this LSN |
 | `wal_tail_pos`, `wal_tail_lsn`, `wal_tail_prev_crc` | Where replay starts in the ring |
-| `meta_bitmap` addr, len, crc | Which meta pages are in use |
+| `meta_bitmap` addr, len, crc | Which meta pages are in use: the image's first page and page count (elastic), or bitmap slot A or B (legacy) |
 | `next_onode_id`, `used_blocks` | Counters |
 
 ### 9.3 Tree page
